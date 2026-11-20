@@ -740,39 +740,72 @@ process.emitWarning("CUSTOM_NON_SQLITE_WARN", "DeprecationWarning");`
 test("P1-Hardening 6: Hook latency budgets (0-SQLite fast path & SQLite read-cache path p50/p95)", () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-lat-"));
   const tmpDb = path.join(tmpDir, "context.db");
+  const tmpCacheDir = path.join(tmpDir, "compile-cache");
   const skillFile = path.join(tmpDir, "SKILL.md");
   const smallFile = path.join(tmpDir, "mod.js");
   fs.writeFileSync(skillFile, "# skill\n", "utf8");
   fs.writeFileSync(smallFile, makeNumberedLines(60).join("\n") + "\n", "utf8");
 
-  const measure = (payload, runs = 7) => {
-    const times = [];
-    for (let i = 0; i < runs; i++) {
-      const t0 = performance.now();
-      const res = runHookRaw("hooks/pre-tool-use.mjs", payload, tmpDb, { AGY_DART_DISABLE_COMPILE_CACHE: "0" });
-      const dt = performance.now() - t0;
-      assert.equal(res.status, 0, res.stderr);
-      times.push(dt);
-    }
-    times.sort((a, b) => a - b);
-    const p50 = times[Math.floor(times.length / 2)];
-    const p95 = times[Math.min(times.length - 1, Math.floor(times.length * 0.95))];
-    return { p50, p95, min: times[0], max: times[times.length - 1] };
+  const hookEnv = {
+    AGY_DART_DISABLE_COMPILE_CACHE: "0",
+    AGY_DART_COMPILE_CACHE_DIR: tmpCacheDir
+  };
+  const fastPayload = { conversationId: "lat-fast", toolCall: { name: "read_file", args: { Path: skillFile } } };
+  const dbPayload = { conversationId: "lat-db", toolCall: { name: "read_file", args: { Path: smallFile } } };
+
+  const statsOf = (arr) => {
+    const sorted = [...arr].sort((a, b) => a - b);
+    const p50 = sorted[Math.floor(sorted.length / 2)];
+    const p95 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+    return { p50, p95, min: sorted[0], max: sorted[sorted.length - 1] };
   };
 
   try {
-    // Warm up once
-    runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "lat-warm", toolCall: { name: "read_file", args: { Path: skillFile } } }, tmpDb);
+    // Warm up compile cache and SQLite DB once before measuring
+    runHookRaw("hooks/pre-tool-use.mjs", fastPayload, tmpDb, hookEnv);
+    runHookRaw("hooks/pre-tool-use.mjs", dbPayload, tmpDb, hookEnv);
 
-    const fastStats = measure({ conversationId: "lat-fast", toolCall: { name: "read_file", args: { Path: skillFile } } });
-    const dbStats = measure({ conversationId: "lat-db", toolCall: { name: "read_file", args: { Path: smallFile } } });
+    // Interleave bare node startup, 0-SQLite fast path, and SQLite read-cache path so parallel
+    // test/CI CPU contention affects baseline and hooks equally while still catching real regressions.
+    const baseTimes = [];
+    const fastTimes = [];
+    const dbTimes = [];
+    const runs = 7;
+    for (let i = 0; i < runs; i++) {
+      const tb = performance.now();
+      const rb = spawnSync(process.execPath, ["-e", ""], { encoding: "utf8", windowsHide: true });
+      baseTimes.push(performance.now() - tb);
+      assert.equal(rb.status, 0);
 
-    // Generous multiplier on shared CI runners while still failing hard regressions
-    const ciMult = process.env.CI ? 3 : 2;
-    assert.ok(fastStats.p50 < 90 * ciMult, `0-SQLite fast path p50 too slow: ${fastStats.p50.toFixed(1)}ms`);
-    assert.ok(fastStats.p95 < 180 * ciMult, `0-SQLite fast path p95 too slow: ${fastStats.p95.toFixed(1)}ms`);
-    assert.ok(dbStats.p50 < 150 * ciMult, `SQLite read-cache path p50 too slow: ${dbStats.p50.toFixed(1)}ms`);
-    assert.ok(dbStats.p95 < 300 * ciMult, `SQLite read-cache path p95 too slow: ${dbStats.p95.toFixed(1)}ms`);
+      const tf = performance.now();
+      const rf = runHookRaw("hooks/pre-tool-use.mjs", fastPayload, tmpDb, hookEnv);
+      fastTimes.push(performance.now() - tf);
+      assert.equal(rf.status, 0, rf.stderr);
+
+      const td = performance.now();
+      const rd = runHookRaw("hooks/pre-tool-use.mjs", dbPayload, tmpDb, hookEnv);
+      dbTimes.push(performance.now() - td);
+      assert.equal(rd.status, 0, rd.stderr);
+    }
+
+    const baseStats = statsOf(baseTimes);
+    const fastStats = statsOf(fastTimes);
+    const dbStats = statsOf(dbTimes);
+    const fastOverheadP50 = Math.max(0, fastStats.p50 - baseStats.p50);
+    const dbOverheadP50 = Math.max(0, dbStats.p50 - baseStats.p50);
+
+    // Tight overhead budgets above bare node spawn + bounded absolute caps under parallel CI contention
+    const ciMult = process.env.CI ? 2.5 : 1;
+    assert.ok(
+      fastOverheadP50 < 60 * ciMult,
+      `0-SQLite fast path p50 overhead too high: +${fastOverheadP50.toFixed(1)}ms (fast=${fastStats.p50.toFixed(1)}ms, base=${baseStats.p50.toFixed(1)}ms)`
+    );
+    assert.ok(
+      dbOverheadP50 < 150 * ciMult,
+      `SQLite read-cache path p50 overhead too high: +${dbOverheadP50.toFixed(1)}ms (db=${dbStats.p50.toFixed(1)}ms, base=${baseStats.p50.toFixed(1)}ms)`
+    );
+    assert.ok(fastStats.p95 < 400 * (process.env.CI ? 3 : 1), `0-SQLite fast path p95 regression: ${fastStats.p95.toFixed(1)}ms`);
+    assert.ok(dbStats.p95 < 600 * (process.env.CI ? 3 : 1), `SQLite read-cache path p95 regression: ${dbStats.p95.toFixed(1)}ms`);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
