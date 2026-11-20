@@ -535,9 +535,12 @@
 
         const params = new URLSearchParams(window.location.search);
         const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
-        const url = `/api/toggle-active?scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}&paused=${nextPaused}`;
 
-        const res = await apiFetch(url, { method: 'POST', body: JSON.stringify({ paused: nextPaused }) });
+        const res = await apiFetch('/api/toggle-active', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scope: currentScope, conversationId: convId, paused: nextPaused })
+        });
         if (res.ok) {
           const data = await res.json();
           if (data && data.isPaused !== undefined) {
@@ -620,9 +623,14 @@
         .replace(/'/g, "&#39;");
     }
 
+    function getCsrfToken() {
+      return document.querySelector('meta[name="agy-dart-token"]')?.getAttribute('content') || '';
+    }
+
     async function apiFetch(path, options = {}) {
       const params = new URLSearchParams(window.location.search);
       const token = params.get('token');
+      const csrfToken = getCsrfToken();
 
       let finalUrl = path;
       if (token && !finalUrl.includes('token=')) {
@@ -634,15 +642,31 @@
       if (token && !headers.has('X-Sidecar-Token')) {
         headers.set('X-Sidecar-Token', token);
       }
+      if (csrfToken && !headers.has('X-Agy-Dart-Token')) {
+        headers.set('X-Agy-Dart-Token', csrfToken);
+      }
+      const method = (options.method || 'GET').toUpperCase();
+      let body = options.body;
+      if (method === 'POST') {
+        if (!headers.has('Content-Type')) {
+          headers.set('Content-Type', 'application/json');
+        }
+        if (body === undefined) {
+          body = '{}';
+        }
+      }
+
+      const fetchOpts = { ...options, method, headers };
+      if (body !== undefined) fetchOpts.body = body;
 
       if (window.sidecar && typeof window.sidecar.fetch === 'function') {
         try {
-          return await window.sidecar.fetch(finalUrl, { ...options, headers });
+          return await window.sidecar.fetch(finalUrl, fetchOpts);
         } catch (e) {
           // Fall through to native fetch
         }
       }
-      return fetch(finalUrl, { ...options, headers });
+      return fetch(finalUrl, fetchOpts);
     }
 
     function updateCutoffDropdown(s) {
@@ -716,8 +740,11 @@
           }
         }
 
-        const queryUrl = `/api/cutoff?cutoff=${encodeURIComponent(cutoffBytes)}&scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
-        const res = await apiFetch(queryUrl, { method: 'GET' });
+        const res = await apiFetch('/api/cutoff', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cutoff: cutoffBytes, scope: currentScope, conversationId: convId })
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const respData = await res.json().catch(() => null);
         if (respData && cachedStats) {
@@ -780,24 +807,26 @@
           const isActive = activeCats.includes(cat.id);
           const extCount = cat.extensions ? cat.extensions.length : 0;
           const extSample = cat.extensions ? cat.extensions.slice(0, 6).join(', ') + (cat.extensions.length > 6 ? ', ...' : '') : '';
-          const tooltip = `${cat.name} (${extCount} types: ${extSample}) — Click to ${isActive ? 'disable' : 'enable'}`;
+          const tooltip = escapeHtml(`${cat.name} (${extCount} types: ${extSample}) — Click to ${isActive ? 'disable' : 'enable'}`);
+          const safeId = escapeHtml(cat.id);
+          const safeName = escapeHtml(cat.name);
 
           if (isActive) {
             return `
-              <button onclick="toggleCategory('${cat.id}')" 
+              <button data-cat="${safeId}" onclick="toggleCategory(this.dataset.cat)" 
                       class="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/10 hover:bg-emerald-500/20 text-[#00e599] border border-emerald-500/30 flex items-center gap-1.5 transition cursor-pointer select-none"
                       title="${tooltip}">
                 <span class="w-1.5 h-1.5 rounded-full bg-[#00e599]"></span>
-                <span>${cat.name}</span>
+                <span>${safeName}</span>
               </button>
             `;
           } else {
             return `
-              <button onclick="toggleCategory('${cat.id}')" 
+              <button data-cat="${safeId}" onclick="toggleCategory(this.dataset.cat)" 
                       class="px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-white/[0.04] hover:bg-white/[0.08] text-slate-400 hover:text-slate-200 border border-white/10 flex items-center gap-1.5 transition cursor-pointer select-none"
                       title="${tooltip}">
                 <span class="w-1.5 h-1.5 rounded-full bg-slate-600"></span>
-                <span>${cat.name}</span>
+                <span>${safeName}</span>
               </button>
             `;
           }
@@ -824,12 +853,15 @@
 
       if (tagsContainer) {
         if (customList && customList.length > 0) {
-          tagsContainer.innerHTML = customList.map(ext => `
+          tagsContainer.innerHTML = customList.map(ext => {
+            const safeExt = escapeHtml(ext);
+            return `
             <span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 font-mono text-[11px]">
-              <span>${ext}</span>
-              <button onclick="removeExemption('${ext}')" class="hover:text-rose-400 text-slate-400 font-bold ml-1 transition cursor-pointer" title="Remove custom exemption">×</button>
+              <span>${safeExt}</span>
+              <button data-ext="${safeExt}" onclick="removeExemption(this.dataset.ext)" class="hover:text-rose-400 text-slate-400 font-bold ml-1 transition cursor-pointer" title="Remove custom exemption">×</button>
             </span>
-          `).join('');
+          `;
+          }).join('');
         } else {
           tagsContainer.innerHTML = '<span class="text-slate-500 italic text-xs">No custom file types added. Use input below to exempt custom extensions.</span>';
         }
@@ -856,8 +888,7 @@
       const params = new URLSearchParams(window.location.search);
       const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
       try {
-        const queryUrl = `/api/exemptions?action=toggleCategory&category=${encodeURIComponent(categoryId)}&scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
-        const res = await apiFetch(queryUrl, { 
+        const res = await apiFetch('/api/exemptions', { 
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'toggleCategory', category: categoryId, scope: currentScope, conversationId: convId })
@@ -886,8 +917,11 @@
       const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
 
       try {
-        const queryUrl = `/api/exemptions?action=add&ext=${encodeURIComponent(val)}&scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
-        const res = await apiFetch(queryUrl, { method: 'GET' });
+        const res = await apiFetch('/api/exemptions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'add', ext: val, scope: currentScope, conversationId: convId })
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         input.value = '';
         refreshData(true);
@@ -901,8 +935,11 @@
       const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
 
       try {
-        const queryUrl = `/api/exemptions?action=remove&ext=${encodeURIComponent(ext)}&scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
-        const res = await apiFetch(queryUrl, { method: 'GET' });
+        const res = await apiFetch('/api/exemptions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'remove', ext, scope: currentScope, conversationId: convId })
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         refreshData(true);
       } catch (err) {
@@ -916,8 +953,11 @@
       const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
 
       try {
-        const queryUrl = `/api/exemptions?action=reset&scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
-        const res = await apiFetch(queryUrl, { method: 'GET' });
+        const res = await apiFetch('/api/exemptions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'reset', scope: currentScope, conversationId: convId })
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         refreshData(true);
       } catch (err) {
@@ -1240,7 +1280,11 @@
       const params = new URLSearchParams(window.location.search);
       const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
       try {
-        const res = await apiFetch(`/api/cli-filter?enabled=${next}&scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`, { method: 'POST' });
+        const res = await apiFetch('/api/cli-filter', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: next, scope: currentScope, conversationId: convId })
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         refreshData(false);
       } catch (e) {
@@ -1257,7 +1301,11 @@
       const params = new URLSearchParams(window.location.search);
       const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
       try {
-        const res = await apiFetch(`/api/read-dedup?enabled=${next}&scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`, { method: 'POST' });
+        const res = await apiFetch('/api/read-dedup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: next, scope: currentScope, conversationId: convId })
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         refreshData(false);
       } catch (e) {
@@ -1974,7 +2022,11 @@
       const btn = document.getElementById('vacuum-btn');
       if (btn) btn.innerText = 'Vacuuming...';
       try {
-        const res = await apiFetch('/api/maintenance?action=vacuum&maxAgeDays=14', { method: 'POST' });
+        const res = await apiFetch('/api/maintenance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'vacuum', maxAgeDays: 14 })
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (btn) btn.innerText = data.reclaimedBytes > 0 ? `Freed ${formatBytes(data.reclaimedBytes)}` : 'Vacuum OK';
@@ -2000,8 +2052,12 @@
       if (!confirm(confirmMsg)) return;
 
       try {
-        const queryUrl = `/api/purge?scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
-        await apiFetch(queryUrl, { method: 'GET' });
+        const res = await apiFetch('/api/purge', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scope: currentScope, conversationId: convId })
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         refreshData(true);
       } catch (err) {
         alert("Purge failed: " + err.message);

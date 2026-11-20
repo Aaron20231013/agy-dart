@@ -1,9 +1,13 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import os from "node:os";
 import { execSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { suppressSqliteExperimentalWarning } from "../../hooks/compile-cache.mjs";
+suppressSqliteExperimentalWarning();
+import { getEffectiveConfig } from "../../context/lib/config.js";
 import { ContextModeStore, FILE_CATEGORIES } from "../../context/lib/store.js";
 import { buildHandoffBrief, inferWorkspaceFromStore } from "../../context/lib/handoff.js";
 import {
@@ -21,22 +25,111 @@ import {
   resolveModelProfile
 } from "../../context/lib/cache-analyzer.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const __selfPath = path.resolve(fileURLToPath(import.meta.url));
+const __dirname = path.dirname(__selfPath);
 const store = new ContextModeStore();
 const HTML_FILE = path.join(__dirname, "index.html");
+export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
+const SIDECAR_CSRF_TOKEN = crypto.randomBytes(24).toString("hex");
+
+const LOCAL_HOST_RE = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
+const LOCAL_ORIGIN_RE = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
+
+export function isAllowedHostHeader(hostHeader) {
+  if (typeof hostHeader !== "string") return false;
+  return LOCAL_HOST_RE.test(hostHeader.trim());
+}
+
+export function isAllowedOriginHeader(originHeader) {
+  if (originHeader === undefined || originHeader === null || originHeader === "") return true;
+  if (typeof originHeader !== "string") return false;
+  return LOCAL_ORIGIN_RE.test(originHeader.trim());
+}
+
+export function isCrossSiteFetchHeader(secFetchSite) {
+  return typeof secFetchSite === "string" && secFetchSite.trim().toLowerCase() === "cross-site";
+}
+
+export function isJsonContentType(contentType) {
+  return typeof contentType === "string" && /^application\/json(?:\s*;|$)/i.test(contentType.trim());
+}
+
+export function timingSafeTokenMatch(provided, expected) {
+  if (typeof provided !== "string" || typeof expected !== "string" || !provided || !expected) {
+    return false;
+  }
+  const a = Buffer.from(provided, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+    let overflowed = false;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    req.on("data", (chunk) => {
+      if (overflowed) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
+      totalBytes += buf.length;
+      if (totalBytes > maxBytes) {
+        overflowed = true;
+        chunks.length = 0;
+        req.resume();
+        finish({ ok: false, status: 413, error: `Request body exceeds ${Math.round(maxBytes / 1024)} KB limit` });
+        return;
+      }
+      chunks.push(buf);
+    });
+
+    req.on("end", () => {
+      if (overflowed || settled) return;
+      const raw = Buffer.concat(chunks).toString("utf8").trim();
+      if (!raw) {
+        finish({ ok: true, data: {} });
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          finish({ ok: false, status: 400, error: "Request body must be a JSON object" });
+          return;
+        }
+        finish({ ok: true, data: parsed });
+      } catch (err) {
+        finish({ ok: false, status: 400, error: err instanceof Error ? err.message : "Invalid JSON body" });
+      }
+    });
+
+    req.on("error", (err) => {
+      finish({ ok: false, status: 400, error: err instanceof Error ? err.message : "Request stream error" });
+    });
+  });
+}
 
 function getPackageVersion() {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../../package.json"), "utf8"));
     if (pkg.version) return pkg.version;
   } catch {}
-  return "1.0.0";
+  return "1.2.0";
 }
 
-function getRenderedHtml() {
+function getRenderedHtml(csrfToken = SIDECAR_CSRF_TOKEN) {
   const raw = fs.readFileSync(HTML_FILE, "utf8");
   const ver = getPackageVersion();
-  return raw.replace('id="dashboard-version">--</span>', `id="dashboard-version">v${ver}</span>`);
+  const withVer = raw.replace('id="dashboard-version">--</span>', `id="dashboard-version">v${ver}</span>`);
+  const tokenMeta = `  <meta name="agy-dart-token" content="${csrfToken}">\n</head>`;
+  return withVer.includes("</head>") ? withVer.replace("</head>", tokenMeta) : withVer;
 }
 
 let appStartTime = null;
@@ -131,6 +224,10 @@ function getStatsPayload(data, defaultConvId = "default") {
     targetSid,
     scope === "app" || scope === "session" ? { sinceTs: appStartTime } : {}
   );
+  stats.featureRoi = store.getFeatureRoi(
+    targetSid,
+    scope === "app" || scope === "session" ? { sinceTs: appStartTime } : {}
+  );
 
   stats.version = getPackageVersion();
 
@@ -198,11 +295,12 @@ function refreshWallClockTtl(diag, explicitTtlSec) {
 
 function getCacheDiagPayload(data, defaultConvId = "default") {
   const { scope, convId } = resolveTargetSession(data, defaultConvId);
-  const rawTtl = data.ttl !== undefined && data.ttl !== "" ? data.ttl : process.env.AGY_DART_CACHE_TTL_SEC;
+  const cfg = getEffectiveConfig();
+  const rawTtl = data.ttl !== undefined && data.ttl !== "" ? data.ttl : cfg.cacheTtlSec;
   const explicitTtlSec = parseOptionalPositiveNumber(rawTtl);
-  const envWindowTokens = parseOptionalPositiveNumber(process.env.AGY_DART_WINDOW_TOKENS);
-  const envWarnTokens = parseOptionalPositiveNumber(process.env.AGY_DART_WARN_TOKENS);
-  const envCritTokens = parseOptionalPositiveNumber(process.env.AGY_DART_CRITICAL_TOKENS);
+  const envWindowTokens = parseOptionalPositiveNumber(cfg.windowTokens);
+  const envWarnTokens = parseOptionalPositiveNumber(cfg.warnTokens);
+  const envCritTokens = parseOptionalPositiveNumber(cfg.criticalTokens);
   const isSpecificConv = scope === "conversation" && convId && convId !== "default" && convId !== "all" && convId !== "app";
   let transcriptPath = null;
   if (isSpecificConv) {
@@ -369,350 +467,147 @@ function getHandoffPayload(data = {}, defaultConvId = "default") {
   };
 }
 
-let SidecarApp = null;
-let ResponseClass = null;
-
-try {
-  const userSdkPath = path.join(os.homedir(), ".gemini", "config", "node_modules", "sidecar_sdk", "index.mjs");
-  const sdkModule = await import(pathToFileURL(userSdkPath).href);
-  SidecarApp = sdkModule.SidecarApp;
-  ResponseClass = sdkModule.Response;
-} catch {
-  try {
-    const sdkModule = await import("sidecar_sdk");
-    SidecarApp = sdkModule.SidecarApp;
-    ResponseClass = sdkModule.Response;
-  } catch {
-    // Standalone fallback
-  }
-}
-
-const isSidecarEnv = Boolean(
-  process.env.ANTIGRAVITY_LS_ADDRESS &&
-  process.env.ANTIGRAVITY_CSRF_TOKEN &&
-  process.env.ANTIGRAVITY_SIDECAR_WEB_PORT &&
-  SidecarApp
+const isDirectRun = Boolean(
+  process.argv[1] &&
+    (process.platform === "win32"
+      ? path.resolve(process.argv[1]).toLowerCase() === __selfPath.toLowerCase()
+      : path.resolve(process.argv[1]) === __selfPath)
 );
 
-if (isSidecarEnv) {
-  const app = new SidecarApp();
+function handleCutoffMutation(data, defaultConvId = "default") {
+  const { scope, targetSid, convId } = resolveTargetSession(data, defaultConvId);
+  const cutoffBytes = data.cutoff === "none" || data.cutoff === 0 || data.cutoff === "0" ? 0 : parseInt(data.cutoff, 10);
+  const saved = store.setCutoff(cutoffBytes, targetSid);
+  return {
+    ok: true,
+    cutoffBytes: saved,
+    scope,
+    sessionId: targetSid,
+    globalCutoffBytes: store.getCutoff(null),
+    appCutoffBytes: store.getCutoff("app"),
+    conversationCutoffBytes: store.getCutoff(convId)
+  };
+}
 
-  app.page("/", () => {
-    return getRenderedHtml();
+function handleExemptionsMutation(data, defaultConvId = "default") {
+  const { scope, targetSid } = resolveTargetSession(data, defaultConvId);
+  const action = data.action || "get";
+  if (action === "toggleCategory" && data.category) {
+    store.toggleExemptCategory(
+      data.category,
+      data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : null,
+      targetSid
+    );
+  } else if (action === "setCategories" && Array.isArray(data.categories)) {
+    store.setExemptCategories(data.categories, targetSid);
+  } else if (action === "add" && data.ext) {
+    store.addCustomExemptExtension(data.ext, targetSid);
+  } else if (action === "remove" && data.ext) {
+    store.removeCustomExemptExtension(data.ext, targetSid);
+  } else if (action === "reset") {
+    store.setExemptCategories(null, targetSid);
+    store.setCustomExemptExtensions([], targetSid);
+  } else if (action === "set" && Array.isArray(data.extensions)) {
+    store.setExemptExtensions(data.extensions, targetSid);
+  }
+  return {
+    ok: true,
+    exemptCategories: store.getExemptCategories(targetSid),
+    customExtensions: store.getCustomExemptExtensions(targetSid),
+    exemptExtensions: store.getExemptExtensions(targetSid),
+    scope,
+    sessionId: targetSid
+  };
+}
+
+function handleToggleActiveMutation(data, defaultConvId = "default") {
+  const { scope, targetSid } = resolveTargetSession(data, defaultConvId);
+  const current = store.isPaused(targetSid);
+  const newPaused =
+    data.paused !== undefined ? (data.paused === true || data.paused === "true" || data.paused === "1") : !current;
+  const saved = store.setPaused(newPaused, targetSid);
+  return { ok: true, isPaused: saved, scope, sessionId: targetSid };
+}
+
+function handlePurgeMutation(data, defaultConvId = "default") {
+  const { scope, convId } = resolveTargetSession(data, defaultConvId);
+  if (scope === "lifetime" || scope === "all") {
+    return store.purge({ scope: "all" });
+  } else if (scope === "app" || scope === "session") {
+    return store.purge({ scope: "app", sinceTs: appStartTime });
+  }
+  return store.purge({ scope: "conversation", sessionId: convId });
+}
+
+function handleMaintenanceMutation(data) {
+  const action = data.action || "prune";
+  const maxAgeDays = parseSafeMaxAgeDays(data.maxAgeDays, 14);
+  const vacuum = action === "vacuum" || data.vacuum === true || data.vacuum === "true" || data.vacuum === "1";
+  return store.pruneByTtl({ maxAgeDays, vacuum });
+}
+
+function handleFeatureToggleMutation(isCli, data, defaultConvId = "default") {
+  const { scope, targetSid } = resolveTargetSession(data, defaultConvId);
+  const cur = isCli ? store.isCliFilterEnabled(targetSid) : store.isReadDedupEnabled(targetSid);
+  const next = data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : !cur;
+  const saved = isCli ? store.setCliFilterEnabled(next, targetSid) : store.setReadDedupEnabled(next, targetSid);
+  return { ok: true, [isCli ? "cliFilterEnabled" : "readDedupEnabled"]: saved, scope, sessionId: targetSid };
+}
+
+function sendJson(res, status, payload, extraHeaders = {}) {
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store",
+    ...extraHeaders
   });
+  res.end(JSON.stringify(payload));
+}
 
-  app.api("/api/stats", (data) => {
-    return getStatsPayload(data, app.config.conversationId);
-  }, "GET");
+const MUTATING_ENDPOINTS = new Set([
+  "/api/cutoff",
+  "/api/exemptions",
+  "/api/toggle-active",
+  "/api/paused",
+  "/api/purge",
+  "/api/maintenance",
+  "/api/cli-filter",
+  "/api/read-dedup"
+]);
 
-  const handleCutoff = (data) => {
-    const { scope, targetSid, convId } = resolveTargetSession(data, app.config.conversationId);
-    const cutoffBytes = data.cutoff === "none" || data.cutoff === 0 || data.cutoff === "0" ? 0 : parseInt(data.cutoff, 10);
-    const saved = store.setCutoff(cutoffBytes, targetSid);
-    return {
-      ok: true,
-      cutoffBytes: saved,
-      scope,
-      sessionId: targetSid,
-      globalCutoffBytes: store.getCutoff(null),
-      appCutoffBytes: store.getCutoff("app"),
-      conversationCutoffBytes: store.getCutoff(convId)
-    };
-  };
-  app.api("/api/cutoff", handleCutoff, "GET");
-  app.api("/api/cutoff", handleCutoff, "POST");
-
-  const handleExemptions = (data) => {
-    const { scope, targetSid } = resolveTargetSession(data, app.config.conversationId);
-    const action = data.action || "get";
-    if (action === "toggleCategory" && data.category) {
-      store.toggleExemptCategory(data.category, data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : null, targetSid);
-    } else if (action === "setCategories" && Array.isArray(data.categories)) {
-      store.setExemptCategories(data.categories, targetSid);
-    } else if (action === "add" && data.ext) {
-      store.addCustomExemptExtension(data.ext, targetSid);
-    } else if (action === "remove" && data.ext) {
-      store.removeCustomExemptExtension(data.ext, targetSid);
-    } else if (action === "reset") {
-      store.setExemptCategories(null, targetSid);
-      store.setCustomExemptExtensions([], targetSid);
-    } else if (action === "set" && Array.isArray(data.extensions)) {
-      store.setExemptExtensions(data.extensions, targetSid);
+export function createStandaloneServer({ csrfToken = SIDECAR_CSRF_TOKEN, maxBodyBytes = MAX_REQUEST_BODY_BYTES } = {}) {
+  return http.createServer(async (req, res) => {
+    // 1. Anti-DNS-rebinding Host validation & anti-CSRF Origin/Sec-Fetch-Site validation
+    if (!isAllowedHostHeader(req.headers.host)) {
+      sendJson(res, 403, { error: "Forbidden host header" });
+      return;
     }
-    return {
-      ok: true,
-      exemptCategories: store.getExemptCategories(targetSid),
-      customExtensions: store.getCustomExemptExtensions(targetSid),
-      exemptExtensions: store.getExemptExtensions(targetSid),
-      scope,
-      sessionId: targetSid
-    };
-  };
-  app.api("/api/exemptions", handleExemptions, "GET");
-  app.api("/api/exemptions", handleExemptions, "POST");
-
-  const handleToggleActive = (data) => {
-    const { scope, targetSid } = resolveTargetSession(data, app.config.conversationId);
-    const current = store.isPaused(targetSid);
-    const newPaused = data.paused !== undefined ? (data.paused === true || data.paused === "true" || data.paused === "1") : !current;
-    const saved = store.setPaused(newPaused, targetSid);
-    return { ok: true, isPaused: saved, scope, sessionId: targetSid };
-  };
-  app.api("/api/toggle-active", handleToggleActive, "GET");
-  app.api("/api/toggle-active", handleToggleActive, "POST");
-  app.api("/api/paused", handleToggleActive, "GET");
-  app.api("/api/paused", handleToggleActive, "POST");
-
-  app.api("/api/doctor", () => {
-    return store.doctor();
-  }, "GET");
-
-  const handleResume = (data) => {
-    const { scope, convId } = resolveTargetSession(data, app.config.conversationId);
-    if (scope === "lifetime" || scope === "all") {
-      return store.getResumeState("all", 10);
-    } else if (scope === "app" || scope === "session") {
-      return store.getResumeState("app", 10, { sinceTs: appStartTime });
-    } else {
-      return store.getResumeState(convId, 10);
+    if (!isAllowedOriginHeader(req.headers.origin) || isCrossSiteFetchHeader(req.headers["sec-fetch-site"])) {
+      sendJson(res, 403, { error: "Cross-origin request blocked" });
+      return;
     }
-  };
-  app.api("/api/resume", handleResume, "GET");
 
-  const handleSourceChunks = (data) => {
-    const sourceId = data.sourceId;
-    if (!sourceId) return { ok: false, chunks: [] };
-    const chunks = store.getSourceChunks(sourceId);
-    return { ok: true, sourceId, chunks };
-  };
-  app.api("/api/source-chunks", handleSourceChunks, "GET");
-
-  const handleSearch = (data) => {
-    const queries = Array.isArray(data.queries) ? data.queries : [data.query || ""];
-    return store.search({ queries, limit: 5 });
-  };
-  app.api("/api/search", handleSearch, "GET");
-  app.api("/api/search", handleSearch, "POST");
-
-  const handlePurge = (data) => {
-    const { scope, convId } = resolveTargetSession(data, app.config.conversationId);
-    if (scope === "lifetime" || scope === "all") {
-      return store.purge({ scope: "all" });
-    } else if (scope === "app" || scope === "session") {
-      return store.purge({ scope: "app", sinceTs: appStartTime });
-    } else {
-      return store.purge({ scope: "conversation", sessionId: convId });
-    }
-  };
-  app.api("/api/purge", handlePurge, "GET");
-  app.api("/api/purge", handlePurge, "POST");
-
-  app.api("/api/cache-diag", (data) => {
-    return getCacheDiagPayload(data, app.config.conversationId);
-  }, "GET");
-
-  app.api("/api/handoff", (data) => {
-    return getHandoffPayload(data, app.config.conversationId);
-  }, "GET");
-
-  const handleMaintenance = (data) => {
-    const action = data.action || "prune";
-    const maxAgeDays = parseSafeMaxAgeDays(data.maxAgeDays, 14);
-    const vacuum = action === "vacuum" || data.vacuum === true || data.vacuum === "true" || data.vacuum === "1";
-    return store.pruneByTtl({ maxAgeDays, vacuum });
-  };
-  app.api("/api/maintenance", handleMaintenance, "GET");
-  app.api("/api/maintenance", handleMaintenance, "POST");
-
-  const handleCliFilter = (data) => {
-    const { scope, targetSid } = resolveTargetSession(data, app.config.conversationId);
-    const current = store.isCliFilterEnabled(targetSid);
-    const next = data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : !current;
-    const saved = store.setCliFilterEnabled(next, targetSid);
-    return { ok: true, cliFilterEnabled: saved, scope, sessionId: targetSid };
-  };
-  app.api("/api/cli-filter", handleCliFilter, "GET");
-  app.api("/api/cli-filter", handleCliFilter, "POST");
-
-  const handleReadDedup = (data) => {
-    const { scope, targetSid } = resolveTargetSession(data, app.config.conversationId);
-    const current = store.isReadDedupEnabled(targetSid);
-    const next = data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : !current;
-    const saved = store.setReadDedupEnabled(next, targetSid);
-    return { ok: true, readDedupEnabled: saved, scope, sessionId: targetSid };
-  };
-  app.api("/api/read-dedup", handleReadDedup, "GET");
-  app.api("/api/read-dedup", handleReadDedup, "POST");
-
-  await app.run();
-  console.log(`[context-mode sidecar] registered and running`);
-} else {
-  // Standalone HTTP server for preview/testing
-  const port = process.env.PORT || 8765;
-  const server = http.createServer((req, res) => {
-    const url = new URL(req.url, `http://localhost:${port}`);
+    const url = new URL(req.url, `http://${req.headers.host}`);
 
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(getRenderedHtml());
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-store"
+      });
+      res.end(getRenderedHtml(csrfToken));
       return;
     }
 
+    // 2. Read-only GET API endpoints
     if (req.method === "GET" && url.pathname === "/api/stats") {
       const data = Object.fromEntries(url.searchParams.entries());
-      const stats = getStatsPayload(data);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(stats));
-      return;
-    }
-
-    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/cutoff") {
-      const handleCutoffReq = (data) => {
-        const { scope, targetSid, convId } = resolveTargetSession(data);
-        const cutoffBytes = data.cutoff === "none" || data.cutoff === 0 || data.cutoff === "0" ? 0 : parseInt(data.cutoff, 10);
-        const saved = store.setCutoff(cutoffBytes, targetSid);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            ok: true,
-            cutoffBytes: saved,
-            scope,
-            sessionId: targetSid,
-            globalCutoffBytes: store.getCutoff(null),
-            appCutoffBytes: store.getCutoff("app"),
-            conversationCutoffBytes: store.getCutoff(convId)
-          })
-        );
-      };
-      if (req.method === "GET") {
-        const data = Object.fromEntries(url.searchParams.entries());
-        handleCutoffReq(data);
-      } else {
-        const queryData = Object.fromEntries(url.searchParams.entries());
-        let body = "";
-        req.on("data", (c) => (body += c));
-        req.on("end", () => {
-          try {
-            handleCutoffReq({ ...queryData, ...JSON.parse(body || "{}") });
-          } catch (e) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: e.message }));
-          }
-        });
-      }
-      return;
-    }
-
-    if ((req.method === "GET" || req.method === "POST") && (url.pathname === "/api/toggle-active" || url.pathname === "/api/paused")) {
-      const handleToggleReq = (data) => {
-        const { scope, targetSid } = resolveTargetSession(data);
-        const current = store.isPaused(targetSid);
-        const newPaused = data.paused !== undefined ? (data.paused === true || data.paused === "true" || data.paused === "1") : !current;
-        const saved = store.setPaused(newPaused, targetSid);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, isPaused: saved, scope, sessionId: targetSid }));
-      };
-      if (req.method === "GET") {
-        const data = Object.fromEntries(url.searchParams.entries());
-        handleToggleReq(data);
-      } else {
-        const queryData = Object.fromEntries(url.searchParams.entries());
-        let body = "";
-        req.on("data", (c) => (body += c));
-        req.on("end", () => {
-          try {
-            handleToggleReq({ ...queryData, ...JSON.parse(body || "{}") });
-          } catch (e) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: e.message }));
-          }
-        });
-      }
-      return;
-    }
-
-    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/exemptions") {
-      const handleExemptReq = (data) => {
-        const { scope, targetSid } = resolveTargetSession(data);
-        const action = data.action || "get";
-        if (action === "toggleCategory" && data.category) {
-          store.toggleExemptCategory(data.category, data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : null, targetSid);
-        } else if (action === "setCategories" && Array.isArray(data.categories)) {
-          store.setExemptCategories(data.categories, targetSid);
-        } else if (action === "add" && data.ext) {
-          store.addCustomExemptExtension(data.ext, targetSid);
-        } else if (action === "remove" && data.ext) {
-          store.removeCustomExemptExtension(data.ext, targetSid);
-        } else if (action === "reset") {
-          store.setExemptCategories(null, targetSid);
-          store.setCustomExemptExtensions([], targetSid);
-        } else if (action === "set" && Array.isArray(data.extensions)) {
-          store.setExemptExtensions(data.extensions, targetSid);
-        }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          ok: true,
-          exemptCategories: store.getExemptCategories(targetSid),
-          customExtensions: store.getCustomExemptExtensions(targetSid),
-          exemptExtensions: store.getExemptExtensions(targetSid),
-          scope,
-          sessionId: targetSid
-        }));
-      };
-      if (req.method === "GET") {
-        const data = Object.fromEntries(url.searchParams.entries());
-        handleExemptReq(data);
-      } else {
-        const queryData = Object.fromEntries(url.searchParams.entries());
-        let body = "";
-        req.on("data", (c) => (body += c));
-        req.on("end", () => {
-          try {
-            handleExemptReq({ ...queryData, ...JSON.parse(body || "{}") });
-          } catch (e) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: e.message }));
-          }
-        });
-      }
-      return;
-    }
-    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/purge") {
-      const handlePurgeReq = (data) => {
-        const { scope, convId } = resolveTargetSession(data);
-        let result;
-        if (scope === "lifetime" || scope === "all") {
-          result = store.purge({ scope: "all" });
-        } else if (scope === "app" || scope === "session") {
-          result = store.purge({ scope: "app", sinceTs: appStartTime });
-        } else {
-          result = store.purge({ scope: "conversation", sessionId: convId });
-        }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result));
-      };
-      if (req.method === "GET") {
-        const data = Object.fromEntries(url.searchParams.entries());
-        handlePurgeReq(data);
-      } else {
-        const queryData = Object.fromEntries(url.searchParams.entries());
-        let body = "";
-        req.on("data", (c) => (body += c));
-        req.on("end", () => {
-          try {
-            handlePurgeReq({ ...queryData, ...JSON.parse(body || "{}") });
-          } catch (e) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: e.message }));
-          }
-        });
-      }
+      sendJson(res, 200, getStatsPayload(data));
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/api/doctor") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(store.doctor()));
+      sendJson(res, 200, store.doctor());
       return;
     }
 
@@ -727,106 +622,159 @@ if (isSidecarEnv) {
       } else {
         resume = store.getResumeState(convId, 10);
       }
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(resume));
+      sendJson(res, 200, resume);
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/api/source-chunks") {
       const sourceId = url.searchParams.get("sourceId");
       const chunks = store.getSourceChunks(sourceId);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, sourceId, chunks }));
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/api/search") {
-      let body = "";
-      req.on("data", (c) => (body += c));
-      req.on("end", () => {
-        try {
-          const data = JSON.parse(body || "{}");
-          const queries = Array.isArray(data.queries) ? data.queries : [data.query || ""];
-          const result = store.search({ queries, limit: 5 });
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(result));
-        } catch (e) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: e.message }));
-        }
-      });
+      sendJson(res, 200, { ok: true, sourceId, chunks });
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/api/cache-diag") {
       const data = Object.fromEntries(url.searchParams.entries());
-      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify(getCacheDiagPayload(data)));
+      sendJson(res, 200, getCacheDiagPayload(data));
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/api/handoff") {
       const data = Object.fromEntries(url.searchParams.entries());
-      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify(getHandoffPayload(data)));
+      sendJson(res, 200, getHandoffPayload(data));
       return;
     }
 
-    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/maintenance") {
-      const queryData = Object.fromEntries(url.searchParams.entries());
-      const handleMaintReq = (data) => {
-        const action = data.action || "prune";
-        const maxAgeDays = parseSafeMaxAgeDays(data.maxAgeDays, 14);
-        const vacuum = action === "vacuum" || data.vacuum === true || data.vacuum === "true" || data.vacuum === "1";
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(store.pruneByTtl({ maxAgeDays, vacuum })));
-      };
-      if (req.method === "GET") {
-        handleMaintReq(queryData);
-      } else {
-        let body = "";
-        req.on("data", (c) => (body += c));
-        req.on("end", () => {
-          try { handleMaintReq({ ...queryData, ...JSON.parse(body || "{}") }); } catch (e) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: e.message }));
-          }
-        });
+    // 3. POST-only /api/search (read-only query, bounded JSON body)
+    if (url.pathname === "/api/search") {
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "Method Not Allowed: use POST with application/json" }, { Allow: "POST" });
+        return;
+      }
+      if (!isJsonContentType(req.headers["content-type"])) {
+        sendJson(res, 415, { error: "Content-Type must be application/json" });
+        return;
+      }
+      const parsed = await readBoundedJsonBody(req, maxBodyBytes);
+      if (!parsed.ok) {
+        sendJson(res, parsed.status, { error: parsed.error });
+        return;
+      }
+      const queries = Array.isArray(parsed.data.queries) ? parsed.data.queries : [parsed.data.query || ""];
+      sendJson(res, 200, store.search({ queries, limit: 5 }));
+      return;
+    }
+
+    // 4. Mutating endpoints: strictly POST + application/json + per-process CSRF token + <= 64 KB body
+    if (MUTATING_ENDPOINTS.has(url.pathname)) {
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "Method Not Allowed: mutating endpoints require POST" }, { Allow: "POST" });
+        return;
+      }
+      if (!timingSafeTokenMatch(req.headers["x-agy-dart-token"], csrfToken)) {
+        sendJson(res, 403, { error: "Invalid or missing X-Agy-Dart-Token" });
+        return;
+      }
+      if (!isJsonContentType(req.headers["content-type"])) {
+        sendJson(res, 415, { error: "Content-Type must be application/json" });
+        return;
+      }
+      const parsed = await readBoundedJsonBody(req, maxBodyBytes);
+      if (!parsed.ok) {
+        sendJson(res, parsed.status, { error: parsed.error });
+        return;
+      }
+      const data = parsed.data;
+      if (url.pathname === "/api/cutoff") {
+        sendJson(res, 200, handleCutoffMutation(data));
+      } else if (url.pathname === "/api/toggle-active" || url.pathname === "/api/paused") {
+        sendJson(res, 200, handleToggleActiveMutation(data));
+      } else if (url.pathname === "/api/exemptions") {
+        sendJson(res, 200, handleExemptionsMutation(data));
+      } else if (url.pathname === "/api/purge") {
+        sendJson(res, 200, handlePurgeMutation(data));
+      } else if (url.pathname === "/api/maintenance") {
+        sendJson(res, 200, handleMaintenanceMutation(data));
+      } else if (url.pathname === "/api/cli-filter" || url.pathname === "/api/read-dedup") {
+        sendJson(res, 200, handleFeatureToggleMutation(url.pathname === "/api/cli-filter", data));
       }
       return;
     }
 
-    if ((req.method === "GET" || req.method === "POST") && (url.pathname === "/api/cli-filter" || url.pathname === "/api/read-dedup")) {
-      const isCli = url.pathname === "/api/cli-filter";
-      const queryData = Object.fromEntries(url.searchParams.entries());
-      const handleFeatureReq = (data) => {
-        const { scope, targetSid } = resolveTargetSession(data);
-        const cur = isCli ? store.isCliFilterEnabled(targetSid) : store.isReadDedupEnabled(targetSid);
-        const next = data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : !cur;
-        const saved = isCli ? store.setCliFilterEnabled(next, targetSid) : store.setReadDedupEnabled(next, targetSid);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, [isCli ? "cliFilterEnabled" : "readDedupEnabled"]: saved, scope, sessionId: targetSid }));
-      };
-      if (req.method === "GET") {
-        handleFeatureReq(queryData);
-      } else {
-        let body = "";
-        req.on("data", (c) => (body += c));
-        req.on("end", () => {
-          try { handleFeatureReq({ ...queryData, ...JSON.parse(body || "{}") }); } catch (e) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: e.message }));
-          }
-        });
-      }
-      return;
-    }
-
-    res.writeHead(404);
+    res.writeHead(404, { "X-Content-Type-Options": "nosniff" });
     res.end("Not Found");
   });
+}
 
-  server.listen(port, "127.0.0.1", () => {
-    console.log(`[context-mode dashboard] standalone server listening at http://127.0.0.1:${port}`);
-  });
+if (isDirectRun) {
+  let SidecarApp = null;
+
+  try {
+    const userSdkPath = path.join(os.homedir(), ".gemini", "config", "node_modules", "sidecar_sdk", "index.mjs");
+    const sdkModule = await import(pathToFileURL(userSdkPath).href);
+    SidecarApp = sdkModule.SidecarApp;
+  } catch {
+    try {
+      const sdkModule = await import("sidecar_sdk");
+      SidecarApp = sdkModule.SidecarApp;
+    } catch {
+      // Standalone fallback
+    }
+  }
+
+  const isSidecarEnv = Boolean(
+    process.env.ANTIGRAVITY_LS_ADDRESS &&
+    process.env.ANTIGRAVITY_CSRF_TOKEN &&
+    process.env.ANTIGRAVITY_SIDECAR_WEB_PORT &&
+    process.env.SIDECAR_FORCE_HTTP !== "1" &&
+    SidecarApp
+  );
+
+  if (isSidecarEnv) {
+    const app = new SidecarApp();
+
+    app.page("/", () => {
+      return getRenderedHtml(SIDECAR_CSRF_TOKEN);
+    });
+
+    // Strictly read-only GET routes
+    app.api("/api/stats", (data) => getStatsPayload(data, app.config.conversationId), "GET");
+    app.api("/api/doctor", () => store.doctor(), "GET");
+    app.api("/api/resume", (data) => {
+      const { scope, convId } = resolveTargetSession(data, app.config.conversationId);
+      if (scope === "lifetime" || scope === "all") return store.getResumeState("all", 10);
+      if (scope === "app" || scope === "session") return store.getResumeState("app", 10, { sinceTs: appStartTime });
+      return store.getResumeState(convId, 10);
+    }, "GET");
+    app.api("/api/source-chunks", (data) => {
+      const sourceId = data.sourceId;
+      if (!sourceId) return { ok: false, chunks: [] };
+      return { ok: true, sourceId, chunks: store.getSourceChunks(sourceId) };
+    }, "GET");
+    app.api("/api/cache-diag", (data) => getCacheDiagPayload(data, app.config.conversationId), "GET");
+    app.api("/api/handoff", (data) => getHandoffPayload(data, app.config.conversationId), "GET");
+
+    // POST-only routes so sidecar_sdk always enforces X-Sidecar-Token validation (non-GET)
+    app.api("/api/search", (data) => {
+      const queries = Array.isArray(data.queries) ? data.queries : [data.query || ""];
+      return store.search({ queries, limit: 5 });
+    }, "POST");
+    app.api("/api/cutoff", (data) => handleCutoffMutation(data, app.config.conversationId), "POST");
+    app.api("/api/exemptions", (data) => handleExemptionsMutation(data, app.config.conversationId), "POST");
+    app.api("/api/toggle-active", (data) => handleToggleActiveMutation(data, app.config.conversationId), "POST");
+    app.api("/api/paused", (data) => handleToggleActiveMutation(data, app.config.conversationId), "POST");
+    app.api("/api/purge", (data) => handlePurgeMutation(data, app.config.conversationId), "POST");
+    app.api("/api/maintenance", (data) => handleMaintenanceMutation(data), "POST");
+    app.api("/api/cli-filter", (data) => handleFeatureToggleMutation(true, data, app.config.conversationId), "POST");
+    app.api("/api/read-dedup", (data) => handleFeatureToggleMutation(false, data, app.config.conversationId), "POST");
+
+    await app.run();
+    console.log(`[context-mode sidecar] registered and running`);
+  } else {
+    const port = process.env.PORT || 8765;
+    const server = createStandaloneServer();
+    server.listen(port, "127.0.0.1", () => {
+      console.log(`[context-mode dashboard] standalone server listening at http://127.0.0.1:${port}`);
+    });
+  }
 }
