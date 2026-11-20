@@ -154,6 +154,7 @@ export async function fetchUrlText(urlStr, timeoutOrOptions = 15000) {
         {
           timeout: remainingMs,
           lookup: pinnedLookup,
+          ...(opts.agent ? { agent: opts.agent } : {}),
           headers: { "User-Agent": "agy-dart/1.2" }
         },
         (res) => {
@@ -243,7 +244,12 @@ export function formatBytes(bytes) {
 }
 
 /** Build tools registry bound to store and active context */
-export function createTools({ store, getCwd = () => process.cwd(), getSessionId = () => "default" }) {
+export function createTools({
+  store,
+  getCwd = () => process.cwd(),
+  getSessionId = () => "default",
+  getDirectConversationId = null
+}) {
   return {
     // 1. ctx_execute
     async ctx_execute({ language = "shell", code = "", file = "", args = [], intent = "" } = {}) {
@@ -643,9 +649,16 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
         return { event: boundedEv };
       }
 
-      // Calling ctx_resume signals compaction recovery: clear session read-dedup table so fresh reads work immediately
+      // Calling ctx_resume signals compaction recovery: clear both shared and direct conversation read/snapshot caches
       try {
         store.invalidateFileReads(sessionId, null);
+        const directConvId =
+          typeof getDirectConversationId === "function"
+            ? getDirectConversationId()
+            : process.env.ANTIGRAVITY_CONVERSATION_ID || null;
+        if (directConvId && directConvId !== sessionId) {
+          store.invalidateFileReads(directConvId, null);
+        }
       } catch {}
 
       const state = store.getResumeState(sessionId, 5);

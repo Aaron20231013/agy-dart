@@ -24,15 +24,47 @@ export class ReadMethods {
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
   }
 
-  /** Increment and return monotonic per-conversation sequence counter */
+  /** Atomically increment and return monotonic per-conversation sequence counter (multi-process safe) */
   bumpConversationTurnSeq(sessionId) {
     this.open();
     const sid = sessionId || "default";
+    const key = `conv_turn_seq:${sid}`;
     return this._withBusyRetry(() => {
-      const next = this.getConversationTurnSeq(sid) + 1;
-      this.setTimedMeta(`conv_turn_seq:${sid}`, String(next));
-      return next;
-    });
+      let inTx = false;
+      try {
+        this.db.exec("BEGIN IMMEDIATE");
+        inTx = true;
+        const row = this.db.prepare("SELECT value FROM meta WHERE key = ?").get(key);
+        let cur = 0;
+        if (row && typeof row.value === "string") {
+          let rawVal = row.value;
+          if (rawVal.startsWith("{")) {
+            try {
+              const parsed = JSON.parse(rawVal);
+              if (parsed && typeof parsed === "object" && "v" in parsed) rawVal = parsed.v;
+            } catch {}
+          }
+          const n = Number(rawVal);
+          if (Number.isFinite(n) && n >= 0) cur = Math.floor(n);
+        }
+        const next = cur + 1;
+        this.db
+          .prepare(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+          )
+          .run(key, JSON.stringify({ v: String(next), ts: Date.now() }));
+        this.db.exec("COMMIT");
+        inTx = false;
+        return next;
+      } catch (err) {
+        if (inTx) {
+          try {
+            this.db.exec("ROLLBACK");
+          } catch {}
+        }
+        throw err;
+      }
+    }, 12);
   }
 
   /**

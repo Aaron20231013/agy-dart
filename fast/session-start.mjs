@@ -567,16 +567,17 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
   if (maxChars <= header.length + suffix.length + 4) {
     return fitSectionToChars(full, maxChars, suffix);
   }
-  const remainingAfterHeader = maxChars - header.length;
-  const nonEmptyCount = (gitSummary ? 1 : 0) + (projectSummary ? 1 : 0) + (treeSummary ? 1 : 0);
-  const availableForBodies = remainingAfterHeader - nonEmptyCount;
+  // Prefix-stability budget allocation: always budget stable sections (project + layout tree)
+  // deterministically BEFORE volatile gitSummary so dirty working trees NEVER clip or shift
+  // the stable Turn-0 prefix (preserving KV-cache prefix identity across clean/dirty/stable-only).
+  const availableStable = Math.max(0, maxChars - header.length - 3);
   let projectPart = "";
-  let gitPart = "";
   let treePart = "";
-  let budgetLeft = availableForBodies;
-  if (projectSummary) {
-    const otherPresent = Boolean(gitSummary || treeSummary);
-    const projectCap = otherPresent ? Math.min(projectSummary.length, Math.max(80, Math.floor(availableForBodies * 0.25))) : budgetLeft;
+  let gitPart = "";
+  let budgetLeft = availableStable;
+  if (projectSummary && budgetLeft > 0) {
+    const otherPresent = Boolean(treeSummary);
+    const projectCap = otherPresent ? Math.min(projectSummary.length, Math.max(80, Math.floor(availableStable * 0.25))) : budgetLeft;
     projectPart = fitSectionToChars(
       projectSummary,
       Math.min(budgetLeft, projectCap),
@@ -584,18 +585,17 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
     );
     budgetLeft -= projectPart.length;
   }
-  if (gitSummary && budgetLeft > 0) {
-    const gitCap = treeSummary ? Math.min(gitSummary.length, Math.max(100, Math.floor(budgetLeft * 0.48))) : budgetLeft;
-    gitPart = fitSectionToChars(
-      gitSummary,
-      Math.min(budgetLeft, gitCap),
-      "  ... [git capped]"
-    );
-    budgetLeft -= gitPart.length;
-  }
   if (treeSummary && budgetLeft > 0) {
     treePart = fitSectionToChars(treeSummary, budgetLeft, suffix);
     budgetLeft -= treePart.length;
+  }
+  if (gitSummary && budgetLeft >= 40) {
+    gitPart = fitSectionToChars(
+      gitSummary,
+      budgetLeft,
+      "  ... [git capped]"
+    );
+    budgetLeft -= gitPart.length;
   }
   const assembled = [header, gitPart, projectPart, treePart].filter(Boolean).join("\n");
   if (assembled.length <= maxChars) return assembled;

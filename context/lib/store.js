@@ -103,7 +103,8 @@ export class ContextModeStore {
         const isBusy = err?.code === "ERR_SQLITE_ERROR" && /database is locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(msg);
         if (!isBusy || attempt === maxAttempts - 1) throw err;
         try {
-          Atomics.wait(sleepBuf, 0, 0, 20 * (attempt + 1));
+          const jitter = Math.floor(Math.random() * 15);
+          Atomics.wait(sleepBuf, 0, 0, 15 * (attempt + 1) + jitter);
         } catch {}
       }
     }

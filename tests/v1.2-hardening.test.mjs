@@ -21,8 +21,12 @@ import {
   isJsonContentType,
   timingSafeTokenMatch
 } from "../sidecars/dashboard/server.mjs";
-import { auditPrefixBudget, calibrateTokenEstimator } from "../scripts/prefix-budget.mjs";
-import { verifyPackageManifest } from "../scripts/verify-package-graph.mjs";
+import {
+  auditPrefixBudget,
+  calibrateFromTranscript,
+  calibrateTokenEstimator
+} from "../scripts/prefix-budget.mjs";
+import { extractLocalSpecifiers, verifyPackageManifest } from "../scripts/verify-package-graph.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -63,6 +67,8 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
   assert.equal(isAllowedOriginHeader(undefined), true);
   assert.equal(isAllowedOriginHeader("http://127.0.0.1:8765"), true);
   assert.equal(isAllowedOriginHeader("http://localhost:8765"), true);
+  assert.equal(isAllowedOriginHeader("http://127.0.0.1:8765", "127.0.0.1:8765"), true);
+  assert.equal(isAllowedOriginHeader("http://localhost:3000", "127.0.0.1:8765"), false);
   assert.equal(isAllowedOriginHeader("https://evil.example"), false);
   assert.equal(isAllowedOriginHeader("null"), false);
 
@@ -89,6 +95,7 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
   assert.ok(htmlSrc.includes("X-Agy-Dart-Token"), "index.html must attach X-Agy-Dart-Token header");
   assert.ok(!htmlSrc.includes("removeExemption('${ext}')"), "index.html must not interpolate raw ext into onclick");
   assert.ok(htmlSrc.includes("data-ext=\"${safeExt}\""), "index.html must use escaped data-ext attribute");
+  assert.ok(htmlSrc.includes("${escapeHtml(scopeLabel)}"), "index.html must escape scopeLabel in telemetry-source");
 
   // Live standalone server attack simulation
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-sidecar-sec-"));
@@ -168,12 +175,27 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
     const rebind = await rawReq("/api/stats", { headers: { Host: `evil.attacker.test:${port}` } });
     assert.equal(rebind.status, 403);
 
-    // 3. Cross-origin / null Origin / Sec-Fetch-Site: cross-site -> 403
+    // 3. Cross-origin / null Origin / cross-port Origin / Sec-Fetch-Site: cross-site -> 403
     assert.equal((await rawReq("/api/stats", { headers: { Origin: "https://evil.example" } })).status, 403);
+    assert.equal((await rawReq("/api/stats", { headers: { Origin: "http://localhost:3000" } })).status, 403);
     assert.equal((await rawReq("/api/stats", { headers: { Origin: "null" } })).status, 403);
     assert.equal((await rawReq("/api/stats", { headers: { "Sec-Fetch-Site": "cross-site" } })).status, 403);
 
-    // 4. POST without token or wrong token -> 403
+    // 4. POST /api/search and mutating endpoints without token or wrong token -> 403
+    const searchNoTok = await rawReq("/api/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "precious" })
+    });
+    assert.equal(searchNoTok.status, 403, "POST /api/search must require X-Agy-Dart-Token");
+
+    const searchWithTok = await rawReq("/api/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Agy-Dart-Token": token },
+      body: JSON.stringify({ query: "precious" })
+    });
+    assert.equal(searchWithTok.status, 200);
+
     const noTok = await rawReq("/api/purge", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -209,7 +231,7 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
     const statsBefore = JSON.parse((await rawReq("/api/stats?scope=lifetime")).body);
     assert.equal(statsBefore.sourcesCount, 1, "Blocked CSRF attacks must NOT mutate database");
 
-    // 7. Legitimate authenticated JSON POST succeeds
+    // 7. Legitimate authenticated JSON POST succeeds & XSS custom extension payload is rejected by store sanitizer
     const validToggle = await rawReq("/api/toggle-active", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Agy-Dart-Token": token },
@@ -217,14 +239,103 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
     });
     assert.equal(validToggle.status, 200);
     assert.equal(JSON.parse(validToggle.body).isPaused, true);
+
+    const xssExtRes = await rawReq("/api/exemptions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Agy-Dart-Token": token },
+      body: JSON.stringify({ action: "add", ext: ".foo'\"><img src=x onerror=alert(1)>" })
+    });
+    assert.equal(xssExtRes.status, 200);
+    assert.deepEqual(JSON.parse(xssExtRes.body).customExtensions, [], "XSS payload must not be stored as custom extension");
+
+    const goodExtRes = await rawReq("/api/exemptions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Agy-Dart-Token": token },
+      body: JSON.stringify({ action: "add", ext: ".mdx" })
+    });
+    assert.equal(goodExtRes.status, 200);
+    assert.ok(JSON.parse(goodExtRes.body).customExtensions.includes(".mdx"));
   } finally {
     child.kill("SIGTERM");
     await new Promise((r) => setTimeout(r, 150));
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
+
+  // Live SidecarApp mode smoke test when host Antigravity sidecar_sdk is present
+  const userSdkPath = path.join(os.homedir(), ".gemini", "config", "node_modules", "sidecar_sdk", "index.mjs");
+  if (fs.existsSync(userSdkPath)) {
+    const sdkTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-sidecar-sdk-"));
+    const sdkDb = path.join(sdkTmpDir, "context.db");
+    const sdkPort = 29500 + Math.floor(Math.random() * 400);
+    const uiToken = "sidecar-test-ui-token-778899";
+    const sdkChild = spawn(process.execPath, [path.join(ROOT, "sidecars", "dashboard", "server.mjs")], {
+      cwd: ROOT,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        AGY_DART_DB_PATH: sdkDb,
+        ANTIGRAVITY_LS_ADDRESS: "127.0.0.1:1",
+        ANTIGRAVITY_CSRF_TOKEN: "dummy-csrf",
+        ANTIGRAVITY_SIDECAR_WEB_PORT: String(sdkPort),
+        ANTIGRAVITY_SIDECAR_UI_TOKEN: uiToken,
+        ANTIGRAVITY_CONVERSATION_ID: "sdk-conv-1",
+        AGY_DART_DISABLE_COMPILE_CACHE: "1"
+      }
+    });
+    let sdkStderr = "";
+    sdkChild.stderr.on("data", (d) => (sdkStderr += d.toString("utf8")));
+    const sdkReq = (urlPath, { method = "GET", headers = {}, body = null } = {}) =>
+      new Promise((resolve, reject) => {
+        const reqHeaders = { Host: `127.0.0.1:${sdkPort}`, ...headers };
+        if (body !== null) reqHeaders["Content-Length"] = Buffer.byteLength(body, "utf8");
+        const req = http.request({ hostname: "127.0.0.1", port: sdkPort, path: urlPath, method, headers: reqHeaders }, (res) => {
+          let out = "";
+          res.on("data", (c) => (out += c));
+          res.on("end", () => resolve({ status: res.statusCode, body: out }));
+        });
+        req.on("error", reject);
+        if (body !== null) req.write(body);
+        req.end();
+      });
+    try {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("SidecarApp startup timeout")), 5000);
+        sdkChild.stdout.on("data", (d) => {
+          const s = d.toString("utf8");
+          if (s.includes("listening on") || s.includes("registered and running")) {
+            clearTimeout(t);
+            resolve();
+          }
+        });
+        sdkChild.on("exit", (c) => {
+          clearTimeout(t);
+          reject(new Error(`SidecarApp exited early: ${c} ${sdkStderr}`));
+        });
+      });
+      assert.equal((await sdkReq("/api/purge?scope=all", { method: "GET" })).status, 405);
+      assert.equal(
+        (await sdkReq("/api/toggle-active", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ paused: true }) })).status,
+        401,
+        "SidecarApp mode must reject POST without X-Sidecar-Token"
+      );
+      const okPost = await sdkReq("/api/toggle-active", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Sidecar-Token": uiToken },
+        body: JSON.stringify({ paused: true })
+      });
+      assert.equal(okPost.status, 200);
+      assert.equal(JSON.parse(okPost.body).isPaused, true);
+      assert.equal(Buffer.byteLength(sdkStderr, "utf8"), 0, `SidecarApp emitted stderr: ${sdkStderr}`);
+    } finally {
+      sdkChild.kill("SIGTERM");
+      await new Promise((r) => setTimeout(r, 150));
+      fs.rmSync(sdkTmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  }
 });
 
-test("P0-Hardening 2: Diff-read is OFF by default, enforces direct conversation ownership (no subagent leak) & turn/age freshness bounds", () => {
+test("P0-Hardening 2: Diff-read is OFF by default, enforces direct conversation ownership (no subagent leak) & turn/age freshness bounds", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-diff-safe-"));
   const tmpDb = path.join(tmpDir, "context.db");
   const cfgPath = path.join(tmpDir, "config.json");
@@ -345,6 +456,62 @@ test("P0-Hardening 2: Diff-read is OFF by default, enforces direct conversation 
       runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "parent-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: modFile } } }, tmpDb, cleanEnv).stdout
     );
     assert.equal(pStaleAge.decision, "allow", "Snapshot older than diffReadMaxAgeMs must fall back to full file allow");
+
+    // 6. Non-read LLM turns via PreInvocation also advance conv_turn_seq and expire diff baselines
+    for (let i = 0; i < 4; i++) {
+      const pi = runHookRaw("hooks/pre-invocation.mjs", { conversationId: "parent-conv", cwd: tmpDir }, tmpDb, cleanEnv);
+      assert.equal(pi.status, 0);
+    }
+    const v6 = [...v5];
+    v6[70] = 'export const item_71 = "MODIFIED_AFTER_PREINV_TURNS";';
+    writeAndBumpMtime(modFile, v6.join("\n") + "\n", 60);
+    const pStalePreInv = JSON.parse(
+      runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "parent-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: modFile } } }, tmpDb, cleanEnv).stdout
+    );
+    assert.equal(pStalePreInv.decision, "allow", "PreInvocation turns must advance conv_turn_seq and expire stale diff baselines");
+
+    // 7. Concurrent multi-process conv_turn_seq atomicity (10 parallel pre-tool-use hooks, zero lost updates)
+    const parallelProcs = [];
+    for (let i = 0; i < 10; i++) {
+      const pf = path.join(tmpDir, `par_${i}.js`);
+      writeAndBumpMtime(pf, makeNumberedLines(45).join("\n") + "\n", 0);
+      parallelProcs.push(
+        new Promise((resolve, reject) => {
+          const child = spawn(process.execPath, [path.join(ROOT, "hooks", "pre-tool-use.mjs")], {
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+            env: { ...process.env, AGY_DART_DB_PATH: tmpDb, ...cleanEnv }
+          });
+          let stderr = "";
+          child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+          child.on("error", reject);
+          child.on("close", (code) => resolve({ code, stderr }));
+          child.stdin.end(
+            JSON.stringify({ conversationId: "par-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: pf } } })
+          );
+        })
+      );
+    }
+    const parResults = await Promise.all(parallelProcs);
+    assert.ok(parResults.every((r) => r.code === 0 && r.stderr === ""));
+    const verifyStore = new ContextModeStore({ dbPath: tmpDb });
+    assert.equal(verifyStore.getConversationTurnSeq("par-conv"), 10, "10 concurrent hooks must increment conv_turn_seq atomically with 0 lost updates");
+
+    // 8. ctx_resume invalidates both shared root sessionId AND direct conversationId snapshots
+    const resumeTools = createTools({
+      store: verifyStore,
+      getCwd: () => tmpDir,
+      getSessionId: () => "root-sess-x",
+      getDirectConversationId: () => "par-conv"
+    });
+    assert.ok(verifyStore.findFileSnapshot({ sessionId: "par-conv", filePath: path.join(tmpDir, "par_0.js") }));
+    await resumeTools.ctx_resume();
+    assert.equal(
+      verifyStore.findFileSnapshot({ sessionId: "par-conv", filePath: path.join(tmpDir, "par_0.js") }),
+      null,
+      "ctx_resume must clear directConvId snapshots too"
+    );
+    verifyStore.close();
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
@@ -360,6 +527,20 @@ test("P1-Hardening 3: Static import-graph verification proves RUNTIME_FILES comp
   assert.deepEqual(report.missingFromFullManifest, []);
   assert.ok(report.runtimeEntrypoints.length >= 8);
   assert.ok(report.runtimeReachableCount >= 25);
+
+  // Regression: `export const ...;` must NOT swallow a following side-effect `import "./side-effect.js";`
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-vpg-"));
+  try {
+    fs.writeFileSync(path.join(tmpDir, "side-effect.js"), "", "utf8");
+    fs.writeFileSync(path.join(tmpDir, "alpha.js"), "", "utf8");
+    fs.writeFileSync(path.join(tmpDir, "asset.json"), "{}", "utf8");
+    const entry = path.join(tmpDir, "entry.js");
+    const src = `export const X = 1;\nimport "./side-effect.js";\nimport { a } from "./alpha.js";\nconst u = new URL("./asset.json", import.meta.url);\n`;
+    const deps = extractLocalSpecifiers(src, entry, tmpDir);
+    assert.deepEqual(deps, ["alpha.js", "asset.json", "side-effect.js"]);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test("P1-Hardening 4: Unified config.json loader, env override precedence, malformed fail-open & doctor/ctx_doctor reporting", async () => {
@@ -402,6 +583,28 @@ test("P1-Hardening 4: Unified config.json loader, env override precedence, malfo
     assert.equal(cfgSnap.values.sensitiveFileGuard, "warn");
     assert.equal(cfgSnap.values.cacheTtlSec, 900);
     assert.equal(cfgSnap.sources.cacheTtlSec, "env");
+
+    // Explicit AGY_DART_DISABLE_*=0 env var must override config.json false
+    fs.writeFileSync(cfgPath, JSON.stringify({ compileCache: false, readDedup: false, cliFilter: false, maxReadBytes: 8192 }), "utf8");
+    resetConfigCache();
+    const envEnableSnap = getConfigSnapshot({
+      configPath: cfgPath,
+      env: {
+        AGY_DART_DISABLE_COMPILE_CACHE: "0",
+        AGY_DART_DISABLE_READ_DEDUP: "0",
+        AGY_DART_DISABLE_CLI_FILTER: "0",
+        CONTEXT_MODE_MAX_READ_BYTES: "32768",
+        CONTEXT_MODE_MAX_LINE_RANGE: "600",
+        CONTEXT_MODE_MAX_OUTPUT_BYTES: "7500"
+      }
+    });
+    assert.equal(envEnableSnap.values.compileCache, true);
+    assert.equal(envEnableSnap.sources.compileCache, "env");
+    assert.equal(envEnableSnap.values.readDedup, true);
+    assert.equal(envEnableSnap.values.cliFilter, true);
+    assert.equal(envEnableSnap.values.maxReadBytes, 32768);
+    assert.equal(envEnableSnap.values.maxLineRange, 600);
+    assert.equal(envEnableSnap.values.maxOutputBytes, 7500);
 
     const lines = formatEffectiveConfigLines(cfgSnap);
     assert.ok(lines.some((l) => l.includes("Config file")));
@@ -510,6 +713,25 @@ process.emitWarning("CUSTOM_NON_SQLITE_WARN", "DeprecationWarning");`
       { encoding: "utf8", windowsHide: true }
     );
     assert.ok(nonSqliteProbe.stderr.includes("CUSTOM_NON_SQLITE_WARN"), "Non-SQLite warnings must still pass through");
+
+    // ESM import-hoisting regression: importing compile-cache.mjs FIRST must suppress SQLite warning
+    // emitted at top-level of a subsequent static import (such as store.js -> node:sqlite in server.mjs).
+    const hoistEmitter = path.join(tmpDir, "fake-sqlite.mjs");
+    const hoistMain = path.join(tmpDir, "hoist-main.mjs");
+    fs.writeFileSync(
+      hoistEmitter,
+      'process.emitWarning("SQLite is an experimental feature and might change at any time", "ExperimentalWarning");\nexport const READY = true;\n',
+      "utf8"
+    );
+    fs.writeFileSync(
+      hoistMain,
+      `import ${JSON.stringify("file:///" + path.join(ROOT, "hooks", "compile-cache.mjs").replace(/\\/g, "/"))};\nimport { READY } from "./fake-sqlite.mjs";\nprocess.stdout.write(String(READY));\n`,
+      "utf8"
+    );
+    const hoistProbe = spawnSync(process.execPath, [hoistMain], { encoding: "utf8", windowsHide: true });
+    assert.equal(hoistProbe.status, 0);
+    assert.equal(hoistProbe.stdout, "true");
+    assert.equal(Buffer.byteLength(hoistProbe.stderr || "", "utf8"), 0, `ESM-hoisted SQLite warning leaked: ${hoistProbe.stderr}`);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
@@ -568,6 +790,21 @@ test("P1-Hardening 7: Token estimator empirical calibration + per-feature ROI te
   assert.equal(budget.errorBandPct, 15);
   assert.ok(budget.upperBoundTokens >= budget.totalTokens);
   assert.ok(budget.upperBoundTokens <= 4000, `Even +15% upper bound (${budget.upperBoundTokens}) should stay <= 4000 tokens`);
+  assert.equal(budget.exceedsUpperBound, false);
+
+  // Real transcript usageMetadata delta calibration
+  const syntheticSteps = [
+    { step_index: 1, type: "PLANNER_RESPONSE", input_tokens: 10000, cache_read_tokens: 0, output_tokens: 200 },
+    { step_index: 2, type: "TOOL_OUTPUT", content: "export function computeHash(data) { return data.length; }\n".repeat(12) },
+    { step_index: 3, type: "PLANNER_RESPONSE", input_tokens: 380, cache_read_tokens: 10000, output_tokens: 150 },
+    { step_index: 4, type: "TOOL_OUTPUT", content: "中文日志输出：测试服务端缓存校准精度与误差上界统计结果。\n".repeat(10) },
+    { step_index: 5, type: "PLANNER_RESPONSE", usageMetadata: { promptTokenCount: 10870, cachedContentTokenCount: 10380, candidatesTokenCount: 100 } }
+  ];
+  const trCal = calibrateFromTranscript(syntheticSteps);
+  assert.equal(trCal.source, "transcript");
+  assert.equal(trCal.fallbackUsed, false);
+  assert.equal(trCal.sampleCount, 2);
+  assert.ok(Number.isFinite(trCal.mapePct) && trCal.mapePct < 30);
 
   // 2. Per-feature ROI telemetry
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-roi-"));

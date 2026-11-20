@@ -48,15 +48,25 @@ export function extractLocalSpecifiers(source, fileAbsPath, rootDir = REPO_ROOT)
     }
   };
 
-  // 1. Static ESM import/export ... from "./..." and side-effect import "./..."
-  const staticRe = /\b(?:import|export)\s+(?:[\s\S]*?\s+from\s+)?["'](\.\.?\/[^"']+)["']/g;
-  for (const m of cleaned.matchAll(staticRe)) {
+  // 1. Static ESM import/export statements (bounded within a single statement so `export const ...;` never swallows a following `import`)
+  const staticFromRe = /\b(?:import|export)\s+[^;\r\n]*(?:\r?\n[^;\r\n]*)*?\bfrom\s*["'](\.\.?\/[^"']+)["']/g;
+  for (const m of cleaned.matchAll(staticFromRe)) {
+    addRel(m[1]);
+  }
+  const sideEffectImportRe = /\bimport\s*["'](\.\.?\/[^"']+)["']/g;
+  for (const m of cleaned.matchAll(sideEffectImportRe)) {
     addRel(m[1]);
   }
 
   // 2. Dynamic import("./...") and require("./...")
   const dynRe = /\b(?:import|require)\s*\(\s*["'](\.\.?\/[^"']+)["']\s*\)/g;
   for (const m of cleaned.matchAll(dynRe)) {
+    addRel(m[1]);
+  }
+
+  // 2b. Relative URL asset/module resolution via new URL("./...", import.meta.url)
+  const metaUrlRe = /new\s+URL\(\s*["'](\.\.?\/[^"']+)["']\s*,\s*import\.meta\.url\s*\)/g;
+  for (const m of cleaned.matchAll(metaUrlRe)) {
     addRel(m[1]);
   }
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "../hooks/compile-cache.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";

@@ -439,11 +439,10 @@ export class SettingsMaintenanceMethods {
       }
     }
 
-    // 2. Environment variable if explicitly set
-    const envVal = process.env.CONTEXT_MODE_MAX_READ_BYTES;
-    if (envVal) {
-      const parsed = parseInt(envVal, 10);
-      if (!Number.isNaN(parsed)) return parsed;
+    // 2. Unified config / env override if explicitly set
+    const cfgMaxRead = getEffectiveConfig().maxReadBytes;
+    if (cfgMaxRead !== null && cfgMaxRead !== undefined) {
+      return cfgMaxRead;
     }
 
     // 3. Saved global setting in SQLite
@@ -594,15 +593,23 @@ export class SettingsMaintenanceMethods {
     return [];
   }
 
+  /** Sanitize a custom file extension to safe dotted token (blocks HTML/whitespace/path-sep injection) */
+  _sanitizeCustomExtension(raw) {
+    const clean = String(raw || "").trim().toLowerCase();
+    if (!clean) return "";
+    const formatted = clean.startsWith(".") ? clean : `.${clean}`;
+    if (!/^\.[a-z0-9][a-z0-9._+-]{0,31}$/i.test(formatted)) return "";
+    return formatted;
+  }
+
   /** Set custom file extensions */
   setCustomExemptExtensions(extensions, sessionId = null) {
     this.open();
     const cleanList = Array.from(
       new Set(
         (Array.isArray(extensions) ? extensions : [])
-          .map((ext) => String(ext || "").trim().toLowerCase())
+          .map((ext) => this._sanitizeCustomExtension(ext))
           .filter(Boolean)
-          .map((ext) => (ext.startsWith(".") ? ext : `.${ext}`))
       )
     );
     const serialized = JSON.stringify(cleanList);
@@ -618,9 +625,8 @@ export class SettingsMaintenanceMethods {
   /** Add custom file extension */
   addCustomExemptExtension(ext, sessionId = null) {
     const list = this.getCustomExemptExtensions(sessionId);
-    const cleanExt = String(ext || "").trim().toLowerCase();
-    if (!cleanExt) return list;
-    const formatted = cleanExt.startsWith(".") ? cleanExt : `.${cleanExt}`;
+    const formatted = this._sanitizeCustomExtension(ext);
+    if (!formatted) return list;
     if (!list.includes(formatted)) {
       list.push(formatted);
       this.setCustomExemptExtensions(list, sessionId);
@@ -632,6 +638,7 @@ export class SettingsMaintenanceMethods {
   removeCustomExemptExtension(ext, sessionId = null) {
     const list = this.getCustomExemptExtensions(sessionId);
     const cleanExt = String(ext || "").trim().toLowerCase();
+    if (!cleanExt) return list;
     const formatted = cleanExt.startsWith(".") ? cleanExt : `.${cleanExt}`;
     const filtered = list.filter((e) => e !== formatted);
     this.setCustomExemptExtensions(filtered, sessionId);

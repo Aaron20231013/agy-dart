@@ -1170,7 +1170,7 @@
           scopeLabel = `CONVERSATION (${convId.slice(0, 8)}...)`;
         }
         document.getElementById('telemetry-source').innerHTML = `
-          Showing stats for: <span class="font-semibold text-slate-200">${scopeLabel}</span>
+          Showing stats for: <span class="font-semibold text-slate-200">${escapeHtml(scopeLabel)}</span>
         `;
 
       } catch (err) {

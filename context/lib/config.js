@@ -21,6 +21,9 @@ export const CONFIG_DEFAULTS = Object.freeze({
   diffRead: false, // Opt-in until multi-turn/fork baseline freshness is battle-tested
   diffReadMaxTurns: 12,
   diffReadMaxAgeMs: 15 * 60 * 1000,
+  maxReadBytes: null,
+  maxLineRange: null,
+  maxOutputBytes: 8100,
   cliFilter: true,
   outlineDb: true,
   searchCacheTtlMs: 15000,
@@ -56,6 +59,11 @@ function parseEnvBool(raw) {
   if (s === "1" || s === "true" || s === "yes" || s === "on") return true;
   if (s === "0" || s === "false" || s === "no" || s === "off") return false;
   return undefined;
+}
+
+function parseDisableEnvFlag(raw) {
+  const b = parseEnvBool(raw);
+  return b === undefined ? undefined : !b;
 }
 
 function parsePositiveNumber(raw) {
@@ -155,7 +163,7 @@ export function getConfigSnapshot(options = {}) {
   pick("dbPath", envStr("AGY_DART_DB_PATH") ?? envStr("CONTEXT_MODE_DB_PATH"), cfgStr("dbPath"));
   pick(
     "compileCache",
-    env?.AGY_DART_DISABLE_COMPILE_CACHE === "1" ? false : undefined,
+    parseDisableEnvFlag(env?.AGY_DART_DISABLE_COMPILE_CACHE),
     cfgBool("compileCache")
   );
   pick("compileCacheDir", envStr("AGY_DART_COMPILE_CACHE_DIR"), cfgStr("compileCacheDir"));
@@ -163,13 +171,13 @@ export function getConfigSnapshot(options = {}) {
   // 2. Prefix stability & repo hubs
   pick("stablePrefixOnly", parseEnvBool(env?.AGY_DART_STABLE_PREFIX_ONLY), cfgBool("stablePrefixOnly"));
   pick("subagentIncludeGit", parseEnvBool(env?.AGY_DART_SUBAGENT_INCLUDE_GIT), cfgBool("subagentIncludeGit"));
-  pick("repoHubs", env?.AGY_DART_DISABLE_REPO_HUBS === "1" ? false : undefined, cfgBool("repoHubs"));
+  pick("repoHubs", parseDisableEnvFlag(env?.AGY_DART_DISABLE_REPO_HUBS), cfgBool("repoHubs"));
 
   // 3. Read guards & three-state diff-read (default OFF)
-  pick("readHook", env?.AGY_DART_DISABLE_READ_HOOK === "1" ? false : undefined, cfgBool("readHook"));
-  pick("readDedup", env?.AGY_DART_DISABLE_READ_DEDUP === "1" ? false : undefined, cfgBool("readDedup"));
+  pick("readHook", parseDisableEnvFlag(env?.AGY_DART_DISABLE_READ_HOOK), cfgBool("readHook"));
+  pick("readDedup", parseDisableEnvFlag(env?.AGY_DART_DISABLE_READ_DEDUP), cfgBool("readDedup"));
   let diffEnv;
-  if (env?.AGY_DART_DISABLE_DIFF_READ === "1") {
+  if (parseEnvBool(env?.AGY_DART_DISABLE_DIFF_READ) === true) {
     diffEnv = false;
   } else {
     diffEnv = parseEnvBool(env?.AGY_DART_ENABLE_DIFF_READ);
@@ -189,10 +197,33 @@ export function getConfigSnapshot(options = {}) {
     parsePositiveNumber(env?.AGY_DART_DIFF_READ_MAX_AGE_MS),
     parsePositiveNumber(cfg.diffReadMaxAgeMs)
   );
+  pick(
+    "maxReadBytes",
+    parseNonNegativeInt(env?.CONTEXT_MODE_MAX_READ_BYTES),
+    parseNonNegativeInt(cfg.maxReadBytes)
+  );
+  pick(
+    "maxLineRange",
+    parsePositiveNumber(env?.CONTEXT_MODE_MAX_LINE_RANGE) !== undefined
+      ? Math.floor(Number(env.CONTEXT_MODE_MAX_LINE_RANGE))
+      : undefined,
+    parsePositiveNumber(cfg.maxLineRange) !== undefined
+      ? Math.floor(Number(cfg.maxLineRange))
+      : undefined
+  );
+  pick(
+    "maxOutputBytes",
+    parsePositiveNumber(env?.CONTEXT_MODE_MAX_OUTPUT_BYTES) !== undefined
+      ? Math.floor(Number(env.CONTEXT_MODE_MAX_OUTPUT_BYTES))
+      : undefined,
+    parsePositiveNumber(cfg.maxOutputBytes) !== undefined
+      ? Math.floor(Number(cfg.maxOutputBytes))
+      : undefined
+  );
 
   // 4. CLI filter & fast MCP caches
-  pick("cliFilter", env?.AGY_DART_DISABLE_CLI_FILTER === "1" ? false : undefined, cfgBool("cliFilter"));
-  pick("outlineDb", env?.AGY_DART_DISABLE_OUTLINE_DB === "1" ? false : undefined, cfgBool("outlineDb"));
+  pick("cliFilter", parseDisableEnvFlag(env?.AGY_DART_DISABLE_CLI_FILTER), cfgBool("cliFilter"));
+  pick("outlineDb", parseDisableEnvFlag(env?.AGY_DART_DISABLE_OUTLINE_DB), cfgBool("outlineDb"));
   pick(
     "searchCacheTtlMs",
     parseNonNegativeInt(env?.AGY_DART_SEARCH_CACHE_TTL_MS),
@@ -200,7 +231,7 @@ export function getConfigSnapshot(options = {}) {
   );
 
   // 5. PreInvocation KV-cache watch & thresholds
-  pick("cacheWatch", env?.AGY_DART_DISABLE_CACHE_WATCH === "1" ? false : undefined, cfgBool("cacheWatch"));
+  pick("cacheWatch", parseDisableEnvFlag(env?.AGY_DART_DISABLE_CACHE_WATCH), cfgBool("cacheWatch"));
   pick("cacheTtlSec", parsePositiveNumber(env?.AGY_DART_CACHE_TTL_SEC), parsePositiveNumber(cfg.cacheTtlSec));
   pick("windowTokens", parsePositiveNumber(env?.AGY_DART_WINDOW_TOKENS), parsePositiveNumber(cfg.windowTokens));
   pick("warnTokens", parsePositiveNumber(env?.AGY_DART_WARN_TOKENS), parsePositiveNumber(cfg.warnTokens));
@@ -208,10 +239,12 @@ export function getConfigSnapshot(options = {}) {
 
   // 6. Security controls
   let redactionEnv;
-  if (env?.AGY_DART_DISABLE_SECRET_REDACTION === "1") {
+  if (parseEnvBool(env?.AGY_DART_DISABLE_SECRET_REDACTION) === true) {
     redactionEnv = false;
   } else {
-    redactionEnv = parseEnvBool(env?.AGY_DART_SECRET_REDACTION);
+    redactionEnv =
+      parseEnvBool(env?.AGY_DART_SECRET_REDACTION) ??
+      parseDisableEnvFlag(env?.AGY_DART_DISABLE_SECRET_REDACTION);
   }
   pick("secretRedaction", redactionEnv, cfgBool("secretRedaction"));
   pick(

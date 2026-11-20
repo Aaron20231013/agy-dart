@@ -101,11 +101,8 @@ function getMaxReadBytes(sessionId = null) {
   try {
     return getSharedStore().getCutoff(sessionId);
   } catch {
-    const envVal = process.env.CONTEXT_MODE_MAX_READ_BYTES;
-    if (envVal) {
-      const parsed = parseInt(envVal, 10);
-      if (!Number.isNaN(parsed)) return parsed;
-    }
+    const cfgMax = getEffectiveConfig().maxReadBytes;
+    if (cfgMax !== null && cfgMax !== undefined) return cfgMax;
     return DEFAULT_MAX_READ_BYTES;
   }
 }
@@ -119,10 +116,9 @@ function getExemptExtensions(sessionId = null) {
 }
 
 function getMaxLineRange(maxReadBytes = DEFAULT_MAX_READ_BYTES) {
-  const envVal = process.env.CONTEXT_MODE_MAX_LINE_RANGE;
-  if (envVal) {
-    const parsed = parseInt(envVal, 10);
-    if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+  const cfgRange = getEffectiveConfig().maxLineRange;
+  if (cfgRange !== null && cfgRange !== undefined && cfgRange > 0) {
+    return cfgRange;
   }
   if (maxReadBytes === 0) return 0;
   return Math.max(50, Math.round(maxReadBytes / 40));
@@ -804,8 +800,7 @@ async function main() {
               const turnsFresh =
                 !snapshot ||
                 diffReadMaxTurns <= 0 ||
-                baselineFullSeq <= 0 ||
-                convTurnSeq - baselineFullSeq <= diffReadMaxTurns;
+                convTurnSeq - Math.max(0, baselineFullSeq) <= diffReadMaxTurns;
 
               if (snapshot && ageFresh && turnsFresh && (await loadCurrentRange())) {
                 const { computeUnifiedDiff, extractLineSlice } = await ensureTextDiffModule();

@@ -16,7 +16,7 @@ const [{ stableSortObject }, { ContextModeStore }, { createTools }] = await Prom
 ]);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-let pkgVersion = "1.0.0";
+let pkgVersion = "1.2.0";
 try {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
   if (pkg.version) pkgVersion = pkg.version;
@@ -33,6 +33,11 @@ const tools = createTools({
     currentSessionId ||
     process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
     process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID ||
+    process.env.ANTIGRAVITY_CONVERSATION_ID ||
+    process.env.CONVERSATION_ID ||
+    "default",
+  getDirectConversationId: () =>
+    currentSessionId ||
     process.env.ANTIGRAVITY_CONVERSATION_ID ||
     process.env.CONVERSATION_ID ||
     "default"

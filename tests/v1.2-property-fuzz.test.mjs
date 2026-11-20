@@ -146,6 +146,11 @@ test("Property 2: ReDoS validator rejects catastrophic patterns, accepts safe pa
     "a{1,10000}",
     "(?:[a-z]+)+$",
     "(?=a+)+",
+    "a+a+a+a+a+b",
+    "\\s+\\s+\\s+\\s+X",
+    "\\w+\\w+\\w+\\w+!",
+    "[a-z]+[a-z]+",
+    "a+b?a+",
     "unclosed(",
     "",
     "x".repeat(500)
@@ -195,7 +200,14 @@ test("Property 3: Shell syntax hardening (cmd %, !, ^; PowerShell {}, @) + unwra
     "git diff HEAD^ && whoami",
     "git diff ^HEAD",
     "cd sub && npm test %PATH%",
-    "cd sub && pytest { a }"
+    "cd sub && pytest { a }",
+    "cd 'foo!bar' && npm test",
+    "cd foo^bar && npm test",
+    "cd {sub} && npm test",
+    "cd @splat && npm test",
+    "cd foo\0bar && npm test",
+    'cd "foo^bar" && npm test',
+    'cd "foo{a}" && npm test'
   ];
   for (const cmd of mustBlock) {
     assert.equal(matchFilterRule(cmd), null, `Unsafe/cross-shell-drift command must NOT match filter rule: ${cmd}`);
@@ -348,9 +360,11 @@ test("Property 5: SSRF IPv4-mapped IPv6 bypasses & TTL=0 DNS rebinding protectio
   await new Promise((resolve) => canaryServer.listen(0, "127.0.0.1", resolve));
   const canaryPort = canaryServer.address().port;
 
-  // Redirector server that tries to redirect to a rebinding hostname whose hop-2 lookup returns 127.0.0.1
+  // Redirector server that tries to redirect to the SAME rebinding hostname whose hop-2 TTL=0 lookup flips to 127.0.0.1
+  let redirectorHits = 0;
   const redirector = http.createServer((req, res) => {
-    res.writeHead(302, { Location: `http://rebind-hop2.example:${canaryPort}/secret` });
+    redirectorHits++;
+    res.writeHead(302, { Location: `http://rebind-e2e.example:${canaryPort}/secret` });
     res.end();
   });
   await new Promise((resolve) => redirector.listen(0, "127.0.0.1", resolve));
@@ -369,25 +383,36 @@ test("Property 5: SSRF IPv4-mapped IPv6 bypasses & TTL=0 DNS rebinding protectio
     );
     assert.equal(canaryTouched, false, "IPv4-mapped IPv6 loopback must NEVER touch canary");
 
-    await assert.rejects(
-      () => fetchUrlText(`http://127.0.0.1:${redirPort}/start`),
-      /Blocked SSRF/i
-    );
-    assert.equal(canaryTouched, false);
-
-    // TTL=0 rebinding across lookup calls inside fetchUrlText:
-    // If DNS returns private IP on re-resolution, fetchUrlText rejects BEFORE opening a socket.
-    let ttl0Calls = 0;
-    const ttl0Lookup = async () => {
-      ttl0Calls++;
-      return [{ address: ttl0Calls === 1 ? "127.0.0.1" : "169.254.169.254", family: 4 }];
+    // End-to-end 2-hop TTL=0 DNS rebinding + IP pinning test (allowPrivate remains FALSE throughout!):
+    // Hop 1 resolves rebind-e2e.example -> 93.184.216.34 (public). Our test Agent verifies pinnedLookup
+    // actually hands out 93.184.216.34 (not re-querying DNS!) and routes that hop-1 connection to `redirector`.
+    // Redirector replies 302 -> http://rebind-e2e.example:<canaryPort>/secret; Hop 2 re-resolves DNS,
+    // gets 127.0.0.1 (TTL=0 rebind!), and MUST block BEFORE touching canaryServer.
+    let e2eDnsCalls = 0;
+    const e2eLookup = async () => {
+      e2eDnsCalls++;
+      if (e2eDnsCalls === 1) return [{ address: "93.184.216.34", family: 4 }];
+      return [{ address: "127.0.0.1", family: 4 }];
+    };
+    const pinnedIpsSeen = [];
+    const testAgent = new http.Agent({ keepAlive: false });
+    const origCreateConn = testAgent.createConnection.bind(testAgent);
+    testAgent.createConnection = (opts, cb) => {
+      assert.equal(typeof opts.lookup, "function", "fetchUrlText must supply a pinned lookup function");
+      opts.lookup(opts.host, { family: 4 }, (err, addr) => {
+        assert.equal(err, null);
+        pinnedIpsSeen.push(Array.isArray(addr) ? addr[0]?.address : addr);
+      });
+      return origCreateConn({ ...opts, host: "127.0.0.1", port: redirPort, lookup: undefined }, cb);
     };
     await assert.rejects(
-      () => fetchUrlText(`http://ttl0.rebind.test:${canaryPort}/secret`, { lookupFn: ttl0Lookup }),
+      () => fetchUrlText(`http://rebind-e2e.example:${redirPort}/start`, { lookupFn: e2eLookup, agent: testAgent }),
       /Blocked SSRF DNS resolution/i
     );
-    assert.equal(ttl0Calls, 1, "DNS lookup must fail closed on first private resolution");
-    assert.equal(canaryTouched, false);
+    assert.equal(redirectorHits, 1, "Hop 1 public target must reach redirector once");
+    assert.deepEqual(pinnedIpsSeen, ["93.184.216.34"], "Hop 1 socket must use pinned IP without re-resolving DNS");
+    assert.equal(e2eDnsCalls, 2, "DNS must be re-validated on hop 2 and blocked when TTL=0 flips to 127.0.0.1");
+    assert.equal(canaryTouched, false, "Canary loopback server must NEVER be contacted on hop-2 TTL=0 rebind");
   } finally {
     await new Promise((r) => canaryServer.close(r));
     await new Promise((r) => redirector.close(r));

@@ -277,6 +277,14 @@ async function main() {
       return;
     }
 
+    // Advance per-conversation turn sequence on every LLM turn when opt-in diff-read is active
+    // so non-read turns (edits/commands/chat) accurately age diff-read baselines.
+    if (effectiveCfg.diffRead && directConvId) {
+      try {
+        store.bumpConversationTurnSeq(directConvId);
+      } catch {}
+    }
+
     let transcriptPath =
       typeof payload.transcriptPath === "string" && payload.transcriptPath.trim()
         ? payload.transcriptPath.trim()

@@ -106,19 +106,20 @@ export function hasUnsafeShellSyntax(cmd) {
 }
 
 const LEADING_SAFE_CD_RE =
-  /^(cd(?:\s+\/d)?\s+)("(?:[^"`$%()|;&<>!\r\n]+)"|'(?:[^'`$%()|;&<>\r\n]+)'|[^\s"'`$%()|;&<>\r\n]+)(\s+&&\s+)([\s\S]+)$/i;
+  /^(cd(?:\s+\/d)?\s+)("(?:[^"`$%()|;&<>!^{}@\0\r\n]+)"|'(?:[^'`$%()|;&<>!^{}@\0\r\n]+)'|[^\s"'`$%()|;&<>!^{}@\0\r\n]+)(\s+&&\s+)([\s\S]+)$/i;
 const TRAILING_STDERR_REDIRECT_RE = /^([\s\S]+?)\s+(2>&1)$/;
 
 /**
  * Safely unwrap optional single leading `cd [/d] <safe_path> && ` and optional
  * single trailing `2>&1`. Rejects subshells, extra chaining, pipes, file redirects,
- * backticks, `$()`, and unsafe cd targets.
+ * backticks, `$()`, NUL bytes, and unsafe cd targets.
  * Returns { cdPrefix, cdPath, innerCommand, hasStderrRedirect, trailingRedirect } or null.
  */
 export function unwrapSafeCompoundCommand(commandLine) {
   if (!commandLine || typeof commandLine !== "string") return null;
+  if (/[\r\n\0]/.test(commandLine)) return null;
   const trimmed = commandLine.trim();
-  if (!trimmed || /[\r\n]/.test(trimmed)) return null;
+  if (!trimmed) return null;
 
   let cdPrefix = "";
   let cdPath = null;
@@ -202,11 +203,11 @@ export function isSafeRegex(source) {
     const ch = str[pos];
     if (ch === "+" || ch === "*") {
       const lazy = str[pos + 1] === "?" ? 1 : 0;
-      return { end: pos + 1 + lazy, isRepeating: true, isUnbounded: true };
+      return { end: pos + 1 + lazy, isRepeating: true, isUnbounded: true, minZero: ch === "*" };
     }
     if (ch === "?") {
       const lazy = str[pos + 1] === "?" ? 1 : 0;
-      return { end: pos + 1 + lazy, isRepeating: false, isUnbounded: false };
+      return { end: pos + 1 + lazy, isRepeating: false, isUnbounded: false, minZero: true };
     }
     if (ch === "{") {
       const m = /^\{(\d+)(?:,(\d*))?\}/.exec(str.slice(pos));
@@ -222,10 +223,43 @@ export function isSafeRegex(source) {
       return {
         end: nextPos + lazy,
         isRepeating: max > 1,
-        isUnbounded: !Number.isFinite(max)
+        isUnbounded: !Number.isFinite(max),
+        minZero: min === 0
       };
     }
     return null;
+  };
+
+  const atomsCanOverlap = (a, b) => {
+    if (!a || !b) return false;
+    if (a === "." || b === ".") return true;
+    if (a === b) return true;
+    const pair = new Set([a, b]);
+    if (
+      (pair.has("\\d") && pair.has("\\s")) ||
+      (pair.has("\\w") && pair.has("\\s")) ||
+      (pair.has("\\d") && pair.has("\\D")) ||
+      (pair.has("\\w") && pair.has("\\W")) ||
+      (pair.has("\\s") && pair.has("\\S"))
+    ) {
+      return false;
+    }
+    const isLit = (x) => x.length === 1 && x !== ".";
+    if (isLit(a) && isLit(b)) {
+      return a.toLowerCase() === b.toLowerCase();
+    }
+    const checkShorthandLit = (sh, lit) => {
+      if (sh === "\\d") return /[0-9]/.test(lit);
+      if (sh === "\\D") return !/[0-9]/.test(lit);
+      if (sh === "\\s") return /\s/.test(lit);
+      if (sh === "\\S") return !/\s/.test(lit);
+      if (sh === "\\w") return /[A-Za-z0-9_]/.test(lit);
+      if (sh === "\\W") return !/[A-Za-z0-9_]/.test(lit);
+      return true;
+    };
+    if (a.startsWith("\\") && isLit(b)) return checkShorthandLit(a, b);
+    if (b.startsWith("\\") && isLit(a)) return checkShorthandLit(b, a);
+    return true;
   };
 
   const hasAmbiguousAlternation = (branches) => {
@@ -247,7 +281,8 @@ export function isSafeRegex(source) {
 
   const stack = [];
   let inCharClass = false;
-  let prevWasUnboundedWildcard = false;
+  let charClassStart = -1;
+  let prevUnboundedAtom = null;
 
   for (let i = 0; i < source.length; i++) {
     const ch = source[i];
@@ -259,10 +294,33 @@ export function isSafeRegex(source) {
         // Backreferences can trigger exponential backtracking
         return false;
       }
-      if (!inCharClass && stack.length > 0) {
-        stack[stack.length - 1].curBranch += `\\${next}`;
+      if (!inCharClass) {
+        const atom = `\\${next}`;
+        const isZeroWidthAssertion = next === "b" || next === "B";
+        if (stack.length > 0) {
+          stack[stack.length - 1].curBranch += atom;
+        }
+        const q = readQuantifier(source, i + 2);
+        if (q?.invalid) return false;
+        if (q) {
+          if (readQuantifier(source, q.end)) return false;
+          if (stack.length > 0) {
+            stack[stack.length - 1].hasQuantifier = true;
+            stack[stack.length - 1].curBranch += source.slice(i + 2, q.end);
+          }
+          if (q.isUnbounded) {
+            if (atomsCanOverlap(prevUnboundedAtom, atom)) return false;
+            prevUnboundedAtom = atom;
+          } else if (!q.minZero) {
+            prevUnboundedAtom = null;
+          }
+          i = q.end - 1;
+          continue;
+        }
+        if (!isZeroWidthAssertion) {
+          prevUnboundedAtom = null;
+        }
       }
-      prevWasUnboundedWildcard = false;
       i += 1;
       continue;
     }
@@ -270,23 +328,32 @@ export function isSafeRegex(source) {
     if (inCharClass) {
       if (ch === "]") {
         inCharClass = false;
+        const atom = source.slice(charClassStart, i + 1);
         const q = readQuantifier(source, i + 1);
         if (q?.invalid) return false;
         if (q) {
+          if (readQuantifier(source, q.end)) return false;
           if (stack.length > 0) {
             stack[stack.length - 1].hasQuantifier = true;
           }
+          if (q.isUnbounded) {
+            if (atomsCanOverlap(prevUnboundedAtom, atom)) return false;
+            prevUnboundedAtom = atom;
+          } else if (!q.minZero) {
+            prevUnboundedAtom = null;
+          }
           i = q.end - 1;
+        } else {
+          prevUnboundedAtom = null;
         }
       }
-      prevWasUnboundedWildcard = false;
       continue;
     }
 
     if (ch === "[") {
       inCharClass = true;
+      charClassStart = i;
       if (stack.length > 0) stack[stack.length - 1].curBranch += "[";
-      prevWasUnboundedWildcard = false;
       continue;
     }
 
@@ -305,7 +372,7 @@ export function isSafeRegex(source) {
           i = closeAngle;
         }
       }
-      prevWasUnboundedWildcard = false;
+      prevUnboundedAtom = null;
       continue;
     }
 
@@ -316,7 +383,7 @@ export function isSafeRegex(source) {
         top.branches.push(top.curBranch);
         top.curBranch = "";
       }
-      prevWasUnboundedWildcard = false;
+      prevUnboundedAtom = null;
       continue;
     }
 
@@ -343,7 +410,7 @@ export function isSafeRegex(source) {
       if (q) {
         i = q.end - 1;
       }
-      prevWasUnboundedWildcard = false;
+      prevUnboundedAtom = null;
       continue;
     }
 
@@ -351,9 +418,10 @@ export function isSafeRegex(source) {
       const q = readQuantifier(source, i + 1);
       if (q?.invalid) return false;
       if (q && q.isUnbounded) {
-        if (prevWasUnboundedWildcard) return false;
+        if (readQuantifier(source, q.end)) return false;
+        if (atomsCanOverlap(prevUnboundedAtom, ".")) return false;
         if (stack.length > 0) stack[stack.length - 1].hasQuantifier = true;
-        prevWasUnboundedWildcard = true;
+        prevUnboundedAtom = ".";
         i = q.end - 1;
         continue;
       }
@@ -361,7 +429,7 @@ export function isSafeRegex(source) {
         stack[stack.length - 1].hasQuantifier = true;
       }
       if (stack.length > 0) stack[stack.length - 1].curBranch += ".";
-      prevWasUnboundedWildcard = false;
+      if (!q || !q.minZero) prevUnboundedAtom = null;
       if (q) i = q.end - 1;
       continue;
     }
@@ -384,7 +452,28 @@ export function isSafeRegex(source) {
     if (stack.length > 0) {
       stack[stack.length - 1].curBranch += ch;
     }
-    prevWasUnboundedWildcard = false;
+    if (ch === "^" || ch === "$") {
+      prevUnboundedAtom = null;
+      continue;
+    }
+    const litQ = readQuantifier(source, i + 1);
+    if (litQ?.invalid) return false;
+    if (litQ) {
+      if (readQuantifier(source, litQ.end)) return false;
+      if (stack.length > 0) {
+        stack[stack.length - 1].hasQuantifier = true;
+        stack[stack.length - 1].curBranch += source.slice(i + 1, litQ.end);
+      }
+      if (litQ.isUnbounded) {
+        if (atomsCanOverlap(prevUnboundedAtom, ch)) return false;
+        prevUnboundedAtom = ch;
+      } else if (!litQ.minZero) {
+        prevUnboundedAtom = null;
+      }
+      i = litQ.end - 1;
+    } else {
+      prevUnboundedAtom = null;
+    }
   }
 
   if (inCharClass || stack.length !== 0) return false;

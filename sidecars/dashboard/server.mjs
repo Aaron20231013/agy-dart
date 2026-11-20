@@ -1,3 +1,4 @@
+import { suppressSqliteExperimentalWarning } from "../../hooks/compile-cache.mjs";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -5,10 +6,9 @@ import http from "node:http";
 import os from "node:os";
 import { execSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { suppressSqliteExperimentalWarning } from "../../hooks/compile-cache.mjs";
-suppressSqliteExperimentalWarning();
 import { getEffectiveConfig } from "../../context/lib/config.js";
 import { ContextModeStore, FILE_CATEGORIES } from "../../context/lib/store.js";
+suppressSqliteExperimentalWarning();
 import { buildHandoffBrief, inferWorkspaceFromStore } from "../../context/lib/handoff.js";
 import {
   analyzeTranscriptCache,
@@ -40,10 +40,23 @@ export function isAllowedHostHeader(hostHeader) {
   return LOCAL_HOST_RE.test(hostHeader.trim());
 }
 
-export function isAllowedOriginHeader(originHeader) {
+export function isAllowedOriginHeader(originHeader, hostHeader = null) {
   if (originHeader === undefined || originHeader === null || originHeader === "") return true;
   if (typeof originHeader !== "string") return false;
-  return LOCAL_ORIGIN_RE.test(originHeader.trim());
+  const trimmed = originHeader.trim();
+  if (!LOCAL_ORIGIN_RE.test(trimmed)) return false;
+  if (typeof hostHeader === "string" && hostHeader.trim()) {
+    try {
+      const originUrl = new URL(trimmed);
+      const reqHostUrl = new URL(`http://${hostHeader.trim()}`);
+      const originPort = originUrl.port || (originUrl.protocol === "https:" ? "443" : "80");
+      const hostPort = reqHostUrl.port || "80";
+      if (originPort !== hostPort) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function isCrossSiteFetchHeader(secFetchSite) {
@@ -66,6 +79,15 @@ export function timingSafeTokenMatch(provided, expected) {
 
 export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
   return new Promise((resolve) => {
+    const rawContentLen = req.headers?.["content-length"];
+    if (rawContentLen !== undefined) {
+      const declaredLen = Number(rawContentLen);
+      if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+        req.resume();
+        resolve({ ok: false, status: 413, error: `Request body exceeds ${Math.round(maxBytes / 1024)} KB limit` });
+        return;
+      }
+    }
     const chunks = [];
     let totalBytes = 0;
     let settled = false;
@@ -211,11 +233,12 @@ function getStatsPayload(data, defaultConvId = "default") {
     : (scope === "app" ? stats.appCustomExtensions : stats.conversationCustomExtensions);
 
   // Sandbox preview cap is double cutoff, hard-capped at 8100 B to prevent Antigravity MCP output.txt spills
+  const cfgMaxOutputBytes = getEffectiveConfig().maxOutputBytes || 8100;
   stats.sandboxCapBytes = Math.min(
     8100,
     stats.cutoffBytes > 0
       ? stats.cutoffBytes * 2
-      : parseInt(process.env.CONTEXT_MODE_MAX_OUTPUT_BYTES || "8100", 10)
+      : cfgMaxOutputBytes
   );
   stats.isPaused = store.isPaused(targetSid);
   stats.cliFilterEnabled = store.isCliFilterEnabled(targetSid);
@@ -582,7 +605,7 @@ export function createStandaloneServer({ csrfToken = SIDECAR_CSRF_TOKEN, maxBody
       sendJson(res, 403, { error: "Forbidden host header" });
       return;
     }
-    if (!isAllowedOriginHeader(req.headers.origin) || isCrossSiteFetchHeader(req.headers["sec-fetch-site"])) {
+    if (!isAllowedOriginHeader(req.headers.origin, req.headers.host) || isCrossSiteFetchHeader(req.headers["sec-fetch-site"])) {
       sendJson(res, 403, { error: "Cross-origin request blocked" });
       return;
     }
@@ -645,10 +668,14 @@ export function createStandaloneServer({ csrfToken = SIDECAR_CSRF_TOKEN, maxBody
       return;
     }
 
-    // 3. POST-only /api/search (read-only query, bounded JSON body)
+    // 3. POST-only /api/search (authenticated read-only FTS5 query, bounded JSON body)
     if (url.pathname === "/api/search") {
       if (req.method !== "POST") {
         sendJson(res, 405, { error: "Method Not Allowed: use POST with application/json" }, { Allow: "POST" });
+        return;
+      }
+      if (!timingSafeTokenMatch(req.headers["x-agy-dart-token"], csrfToken)) {
+        sendJson(res, 403, { error: "Invalid or missing X-Agy-Dart-Token" });
         return;
       }
       if (!isJsonContentType(req.headers["content-type"])) {
@@ -657,7 +684,7 @@ export function createStandaloneServer({ csrfToken = SIDECAR_CSRF_TOKEN, maxBody
       }
       const parsed = await readBoundedJsonBody(req, maxBodyBytes);
       if (!parsed.ok) {
-        sendJson(res, parsed.status, { error: parsed.error });
+        sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
         return;
       }
       const queries = Array.isArray(parsed.data.queries) ? parsed.data.queries : [parsed.data.query || ""];
@@ -681,7 +708,7 @@ export function createStandaloneServer({ csrfToken = SIDECAR_CSRF_TOKEN, maxBody
       }
       const parsed = await readBoundedJsonBody(req, maxBodyBytes);
       if (!parsed.ok) {
-        sendJson(res, parsed.status, { error: parsed.error });
+        sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
         return;
       }
       const data = parsed.data;

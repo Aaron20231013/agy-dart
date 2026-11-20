@@ -12,6 +12,11 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  extractStepTokenUsage,
+  findTranscriptForConversation,
+  parseTranscriptLines
+} from "../context/lib/cache-analyzer.js";
 import { sha256Hex, stableSortObject, stableStringify } from "../context/lib/stable-json.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -139,6 +144,136 @@ export function calibrateTokenEstimator(samples = TOKEN_CALIBRATION_CORPUS) {
     meanBiasPct: n > 0 ? Number(((signedRelSum / n) * 100).toFixed(1)) : 0,
     recommendedErrorBandPct: ESTIMATOR_ERROR_BAND_PCT,
     samples: details
+  };
+}
+
+function collectStepVisibleText(step) {
+  if (!step || typeof step !== "object") return { text: "", hasMedia: false };
+  const hasMedia = Boolean(
+    step.media ||
+      step.images ||
+      step.type === "image" ||
+      (Array.isArray(step.content) &&
+        step.content.some((p) => p && typeof p === "object" && (p.type === "image" || p.type === "image_url" || p.type === "media")))
+  );
+  const parts = [];
+  for (const key of ["content", "output", "result", "user_input", "text"]) {
+    const val = step[key];
+    if (typeof val === "string" && val) {
+      parts.push(val);
+    } else if (Array.isArray(val)) {
+      for (const item of val) {
+        if (typeof item === "string") parts.push(item);
+        else if (item && typeof item === "object" && typeof item.text === "string") parts.push(item.text);
+      }
+    }
+  }
+  if (step.tool_result !== undefined) {
+    parts.push(typeof step.tool_result === "string" ? step.tool_result : JSON.stringify(step.tool_result));
+  }
+  return { text: parts.join("\n"), hasMedia };
+}
+
+/**
+ * Extract empirical `{ id, text, actualTokens }` calibration pairs from real transcript
+ * steps using actual provider `usageMetadata` / `input_tokens` context deltas between turns.
+ */
+export function extractTranscriptCalibrationSamples(steps = [], { minActualTokens = 50, minChars = 100 } = {}) {
+  const samples = [];
+  if (!Array.isArray(steps) || steps.length === 0) return samples;
+
+  let prevCtx = null;
+  let prevOut = 0;
+  let accParts = [];
+  let sawMedia = false;
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (!step || typeof step !== "object") continue;
+
+    // Direct single-step labeled sample (e.g. `{ text, usageMetadata: { promptTokenCount } }`)
+    if (typeof step.text === "string" && step.text.length >= minChars && step.usageMetadata && !prevCtx) {
+      const directTok = Number(
+        step.usageMetadata.promptTokenCount ??
+          step.usageMetadata.input_tokens ??
+          step.usageMetadata.totalTokenCount ??
+          0
+      );
+      if (Number.isFinite(directTok) && directTok >= minActualTokens && accParts.length === 0) {
+        samples.push({
+          id: String(step.id || `step#${step.step_index ?? i}`),
+          text: step.text,
+          actualTokens: Math.round(directTok)
+        });
+        continue;
+      }
+    }
+
+    const usage = extractStepTokenUsage(step);
+    const hasUsage = Boolean(usage && usage.contextTokens > 0);
+    if (hasUsage) {
+      if (prevCtx !== null && usage.contextTokens > prevCtx && accParts.length > 0 && !sawMedia) {
+        const text = accParts.join("\n");
+        const actualDelta = usage.contextTokens - prevCtx - prevOut;
+        if (actualDelta >= minActualTokens && text.length >= minChars) {
+          samples.push({
+            id: `turn#${step.step_index ?? i}`,
+            text,
+            actualTokens: Math.round(actualDelta)
+          });
+        }
+      }
+      prevCtx = usage.contextTokens;
+      prevOut = (usage.outputTokens || 0) + (usage.thinkingTokens || 0);
+      accParts = [];
+      sawMedia = false;
+    } else {
+      const { text, hasMedia } = collectStepVisibleText(step);
+      if (hasMedia) sawMedia = true;
+      if (text) accParts.push(text);
+    }
+  }
+
+  return samples;
+}
+
+/**
+ * Calibrate `estimateTokens` against a real transcript JSONL file (or pre-parsed steps array).
+ * Falls back transparently to `TOKEN_CALIBRATION_CORPUS` if the transcript has no usable pairs.
+ */
+export function calibrateFromTranscript(transcriptPathOrSteps) {
+  let steps = [];
+  let transcriptPath = null;
+  if (typeof transcriptPathOrSteps === "string") {
+    transcriptPath = path.resolve(transcriptPathOrSteps);
+    if (fs.existsSync(transcriptPath)) {
+      steps = parseTranscriptLines(fs.readFileSync(transcriptPath, "utf8"));
+    }
+  } else if (Array.isArray(transcriptPathOrSteps)) {
+    steps = transcriptPathOrSteps;
+  }
+
+  const extracted = extractTranscriptCalibrationSamples(steps);
+  if (extracted.length > 0) {
+    const metrics = calibrateTokenEstimator(extracted);
+    const recommendedBand = Math.max(
+      ESTIMATOR_ERROR_BAND_PCT,
+      Math.min(50, Math.ceil(metrics.mapePct / 5) * 5)
+    );
+    return {
+      source: "transcript",
+      transcriptPath,
+      fallbackUsed: false,
+      ...metrics,
+      recommendedErrorBandPct: recommendedBand
+    };
+  }
+
+  return {
+    source: "reference_corpus",
+    transcriptPath,
+    fallbackUsed: true,
+    ...calibrateTokenEstimator(TOKEN_CALIBRATION_CORPUS)
   };
 }
 
@@ -381,9 +516,12 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
     const errorBandPct = ESTIMATOR_ERROR_BAND_PCT;
     const upperBoundTokens = Math.ceil(totalTokens * (1 + errorBandPct / 100));
     const exceedsBudget = totalTokens > TOKEN_WARN_LIMIT;
+    const exceedsUpperBound = upperBoundTokens > TOKEN_WARN_LIMIT;
     const warning = exceedsBudget
       ? `Turn-0 resident prefix (${totalTokens} est. tokens) exceeds recommended ${TOKEN_WARN_LIMIT}-token budget.`
-      : null;
+      : exceedsUpperBound
+        ? `Turn-0 resident prefix upper bound (${upperBoundTokens} tok at +${errorBandPct}%) exceeds ${TOKEN_WARN_LIMIT}-token budget.`
+        : null;
 
     return stableSortObject({
       rootDir,
@@ -396,6 +534,7 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
       errorBandPct,
       upperBoundTokens,
       exceedsBudget,
+      exceedsUpperBound,
       warning,
       toolsFingerprint,
       blocks: {
@@ -443,6 +582,14 @@ async function main() {
   const asJson = args.includes("--json");
   const stableOnly = args.includes("--stable-only");
   const calibrate = args.includes("--calibrate");
+  const autoTranscript = args.includes("--auto-transcript");
+  let transcriptPath = "";
+  const trIdx = args.indexOf("--transcript");
+  if (trIdx !== -1 && args[trIdx + 1]) {
+    transcriptPath = path.resolve(args[trIdx + 1]);
+  } else if (autoTranscript) {
+    transcriptPath = findTranscriptForConversation() || "";
+  }
   let rootDir = REPO_ROOT;
   const targetIdx = args.indexOf("--target");
   if (targetIdx !== -1 && args[targetIdx + 1]) {
@@ -450,11 +597,15 @@ async function main() {
   }
 
   if (calibrate) {
-    const cal = calibrateTokenEstimator();
+    const cal = transcriptPath ? calibrateFromTranscript(transcriptPath) : calibrateTokenEstimator();
     if (asJson) {
       process.stdout.write(JSON.stringify(cal, null, 2) + "\n");
     } else {
-      console.log(`Token estimator calibration (${cal.sampleCount} cross-script samples):`);
+      const label =
+        cal.source === "transcript"
+          ? `${cal.sampleCount} transcript usageMetadata turns (${path.basename(cal.transcriptPath || "transcript")})`
+          : `${cal.sampleCount} cross-script samples`;
+      console.log(`Token estimator calibration (${label}):`);
       console.log(`  - MAE          : ${cal.maeTokens} tokens`);
       console.log(`  - MAPE         : ${cal.mapePct}% (max rel error: ${cal.maxRelErrorPct}%)`);
       console.log(`  - Mean bias    : ${cal.meanBiasPct >= 0 ? "+" : ""}${cal.meanBiasPct}%`);

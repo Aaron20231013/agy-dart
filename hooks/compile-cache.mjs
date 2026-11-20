@@ -32,6 +32,10 @@ export function suppressSqliteExperimentalWarning() {
   }
 }
 
+// Install SQLite ExperimentalWarning filter immediately upon module evaluation so
+// static ESM entrypoints importing compile-cache.mjs before store.js stay 0-byte stderr on Node 22.x.
+suppressSqliteExperimentalWarning();
+
 function readCompileCacheConfigOverrides() {
   try {
     const cfgPath =
@@ -143,11 +147,13 @@ export function pruneStaleCompileCaches(rootDir, activeTag, keepRecent = 3) {
 export function enableVersionedCompileCache(options = {}) {
   suppressSqliteExperimentalWarning();
   try {
-    if (process.env.AGY_DART_DISABLE_COMPILE_CACHE === "1") {
+    const rawDisable = String(process.env.AGY_DART_DISABLE_COMPILE_CACHE ?? "").trim().toLowerCase();
+    if (rawDisable === "1" || rawDisable === "true" || rawDisable === "yes" || rawDisable === "on") {
       return { enabled: false, reason: "disabled", cacheDir: null, tag: null };
     }
+    const envExplicitEnable = rawDisable === "0" || rawDisable === "false" || rawDisable === "no" || rawDisable === "off";
     const fileCfg = options.rootDir !== undefined ? {} : readCompileCacheConfigOverrides();
-    if (process.env.AGY_DART_DISABLE_COMPILE_CACHE === undefined && fileCfg.compileCache === false) {
+    if (!envExplicitEnable && fileCfg.compileCache === false) {
       return { enabled: false, reason: "disabled", cacheDir: null, tag: null };
     }
 

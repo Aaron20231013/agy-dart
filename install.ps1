@@ -4,6 +4,7 @@
 .EXAMPLE
   .\install.ps1
   .\install.ps1 -InstallRg
+  .\install.ps1 -WithDevtools
   .\install.ps1 -Mode fast-32k
   .\install.ps1 -Command doctor
 #>
@@ -13,6 +14,7 @@ param(
   [ValidateSet("balanced-16k", "fast-32k", "strict-8k", "no-read-hook")]
   [string]$Mode = "balanced-16k",
   [switch]$InstallRg,
+  [switch]$WithDevtools,
   [string]$Project = ""
 )
 
@@ -29,6 +31,7 @@ $nodeArgs = @($Installer, $Command)
 if ($Command -eq "install") {
   $nodeArgs += @("--mode", $Mode)
   if ($InstallRg) { $nodeArgs += "--install-rg" }
+  if ($WithDevtools) { $nodeArgs += "--with-devtools" }
 } elseif ($Command -eq "mode") {
   $nodeArgs += $Mode
 }
