@@ -3,8 +3,17 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
-import { ContextModeStore } from "./lib/store.js";
-import { createTools } from "./lib/tools.js";
+import { enableVersionedCompileCache } from "../hooks/compile-cache.mjs";
+
+try {
+  enableVersionedCompileCache();
+} catch {}
+
+const [{ stableSortObject }, { ContextModeStore }, { createTools }] = await Promise.all([
+  import("./lib/stable-json.js"),
+  import("./lib/store.js"),
+  import("./lib/tools.js")
+]);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let pkgVersion = "1.0.0";
@@ -15,133 +24,120 @@ try {
 
 const store = new ContextModeStore();
 let currentCwd = process.cwd();
-let currentSessionId =
-  process.env.ANTIGRAVITY_CONVERSATION_ID ||
-  process.env.CONVERSATION_ID ||
-  "default";
+let currentSessionId = null;
 
 const tools = createTools({
   store,
   getCwd: () => currentCwd,
   getSessionId: () =>
+    currentSessionId ||
     process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
     process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID ||
     process.env.ANTIGRAVITY_CONVERSATION_ID ||
     process.env.CONVERSATION_ID ||
-    currentSessionId ||
     "default"
 });
 
-const TOOL_DEFINITIONS = [
-  {
-    name: "ctx_execute",
-    description:
-      "Execute JavaScript, Python, PowerShell, or Shell code in a local sandbox to filter large logs (>16 KB), aggregate giant JSON/CSV/API data, and return only concise results (hard-capped <=8.8 KB inline).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        language: {
-          type: "string",
-          enum: ["javascript", "nodejs", "python", "shell", "powershell", "cmd"],
-          description: "Runtime language"
-        },
-        code: { type: "string", description: "Source code snippet to execute" },
-        file: { type: "string", description: "Optional script file path to execute" },
-        args: { type: "array", items: { type: "string" }, description: "Optional command-line arguments" },
-        intent: { type: "string", description: "One-line explanation of what this script analyzes" }
-      }
-    }
-  },
+// Deterministic, compact Turn-0 tool schemas (keeps server KV-cache prefix lean and stable)
+const RAW_TOOL_DEFINITIONS = [
   {
     name: "ctx_batch",
-    description:
-      "Execute multiple shell commands sequentially, indexing combined outputs and returning matching search snippets (for concurrent build/lint/test checks prefer agy-dart_fast run_checks).",
+    description: "Run sequential shell commands, index combined output into FTS5, and return matching snippets (<=8.8 KB). Prefer agy-dart_fast run_checks for concurrent builds/tests.",
     inputSchema: {
       type: "object",
       properties: {
-        commands: { type: "array", items: { type: "string" }, description: "List of shell commands to execute" },
-        queries: {
-          type: "array",
-          items: { type: "string" },
-          description: "Search queries to filter and extract from the combined output"
-        }
+        commands: { type: "array", items: { type: "string" }, description: "Shell commands" },
+        queries: { type: "array", items: { type: "string" }, description: "Optional search queries" }
       },
       required: ["commands"]
     }
   },
   {
-    name: "ctx_index",
-    description: "Index a local file, URL, or raw text into local SQLite FTS5 for fast BM25/trigram searching.",
+    name: "ctx_doctor",
+    description: "Check SQLite WAL/FTS5 health, DB size, feature toggles, and runtimes.",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "ctx_execute",
+    description: "Run JS/Python/Shell/PowerShell in a local sandbox to filter >16 KB logs or giant JSON/CSV/API data; returns concise output (<=8.8 KB) and indexes full output.",
     inputSchema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Path to local file to index" },
-        url: { type: "string", description: "HTTP/HTTPS URL to fetch and index" },
-        content: { type: "string", description: "Raw string content to index" },
-        label: { type: "string", description: "Descriptive label for this source" }
+        language: { type: "string", enum: ["javascript", "nodejs", "python", "shell", "powershell", "cmd"] },
+        code: { type: "string", description: "Script source" },
+        file: { type: "string", description: "Script path" },
+        args: { type: "array", items: { type: "string" }, description: "CLI args" },
+        intent: { type: "string", description: "Short purpose label" }
+      }
+    }
+  },
+  {
+    name: "ctx_index",
+    description: "Index a local file, URL, or raw text into SQLite FTS5 (heading-aware for Markdown).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Local file path" },
+        url: { type: "string", description: "HTTP/HTTPS URL" },
+        content: { type: "string", description: "Raw text" },
+        label: { type: "string", description: "Source label" }
+      }
+    }
+  },
+  {
+    name: "ctx_purge",
+    description: "Purge indexed sources/events for session, worktree, all, or stale TTL entries (with optional VACUUM).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: { type: "string", enum: ["session", "worktree", "all", "stale"] },
+        olderThanDays: { type: "integer", description: "TTL age in days for scope='stale' (default 14)" },
+        vacuum: { type: "boolean", description: "Run SQLite VACUUM when scope='stale'" }
+      }
+    }
+  },
+  {
+    name: "ctx_resume",
+    description: "Recover indexed sources/events after /compact (also clears session read-dedup cache).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        seq: { type: "integer", description: "Optional event sequence #" }
       }
     }
   },
   {
     name: "ctx_search",
-    description:
-      "Search the local SQLite FTS5 database across indexed logs, tool outputs, and documentation using Reciprocal Rank Fusion (Porter BM25 + Trigram).",
+    description: "Search SQLite FTS5 sources via Porter BM25 + Trigram RRF.",
     inputSchema: {
       type: "object",
       properties: {
-        queries: { type: "array", items: { type: "string" }, description: "Search queries or tokens to match" },
-        sourceId: { type: "string", description: "Optional sourceId to restrict search" },
-        scope: {
-          type: "string",
-          enum: ["session", "worktree", "all"],
-          description: "Search scope (default: session)"
-        },
-        limit: { type: "integer", description: "Max number of snippets to return (default 5)" },
-        offset: { type: "integer", description: "Offset for pagination" }
+        queries: { type: "array", items: { type: "string" }, description: "Search queries" },
+        sourceId: { type: "string", description: "Restrict to sourceId" },
+        scope: { type: "string", enum: ["session", "worktree", "all"] },
+        limit: { type: "integer", description: "Max hits (default 5)" },
+        offset: { type: "integer", description: "Pagination offset" }
       },
       required: ["queries"]
     }
   },
   {
-    name: "ctx_resume",
-    description: "Retrieve current session state, active indexed sources, and compaction pointers.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        seq: { type: "integer", description: "Optional journal event sequence to retrieve" }
-      }
-    }
-  },
-  {
     name: "ctx_stats",
-    description:
-      "Show context window savings report (raw bytes vs tokens returned to LLM, savings percentage, and database metrics).",
+    description: "Show context savings report (sandbox, CLI filter, read dedup, interceptions).",
     inputSchema: {
       type: "object",
       properties: {
-        reset: { type: "boolean", description: "Reset session statistics" }
-      }
-    }
-  },
-  {
-    name: "ctx_doctor",
-    description: "Check SQLite database health, FTS5 availability, schema, and active sandbox runtimes.",
-    inputSchema: {
-      type: "object",
-      properties: {}
-    }
-  },
-  {
-    name: "ctx_purge",
-    description: "Purge indexed sources and journal records for this session, worktree, or entire database.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        scope: { type: "string", enum: ["session", "worktree", "all"], description: "Purge scope" }
+        reset: { type: "boolean", description: "Reset session stats" }
       }
     }
   }
 ];
+
+export const TOOL_DEFINITIONS = Object.freeze(
+  RAW_TOOL_DEFINITIONS
+    .map((def) => stableSortObject(def))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+);
 
 function sendJsonRpc(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");

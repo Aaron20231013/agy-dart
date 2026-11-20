@@ -170,6 +170,116 @@
       </div>
     </div>
 
+    <!-- KV-Cache & Context Watermark Telemetry Card -->
+    <div id="kv-cache-card" class="p-3.5 sm:p-4 rounded-xl bg-[#181a28] border border-white/[0.07] space-y-3">
+      <div class="flex items-center justify-between flex-wrap gap-2">
+        <div class="flex items-center gap-2 text-xs font-bold text-slate-200">
+          <svg class="w-4 h-4 text-cyan-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
+          KV-Cache &amp; Context Watermark
+        </div>
+        <div class="flex items-center gap-1.5 text-[10px] font-mono flex-wrap">
+          <span id="kv-watermark-badge" class="px-2 py-0.5 rounded-full bg-emerald-500/10 text-[#00e599] border border-emerald-500/30 font-semibold">OK</span>
+          <span id="kv-temp-badge" class="px-2 py-0.5 rounded-full bg-white/[0.04] text-slate-400 border border-white/10 font-semibold">COLD</span>
+          <span id="kv-ttl-badge" class="px-2 py-0.5 rounded-full bg-white/[0.04] text-slate-300 border border-white/10">TTL: --</span>
+          <span id="kv-model-badge" class="px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 hidden">--</span>
+          <span id="kv-cost-savings" class="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 hidden">Est. ~0% saved</span>
+          <span id="kv-subagent-badge" class="px-2 py-0.5 rounded-full bg-purple-500/15 text-purple-300 border border-purple-500/30 font-semibold hidden">Subagent</span>
+          <span id="kv-loop-badge" class="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 font-semibold hidden">LOOP</span>
+          <button id="kv-handoff-btn" onclick="toggleHandoffDrawer()"
+                  class="px-2 py-0.5 rounded-full bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-300 border border-indigo-500/30 font-semibold transition cursor-pointer flex items-center gap-1"
+                  title="Generate cache-friendly compaction / session-switch Handoff Brief">
+            <span>Handoff Brief</span>
+            <span id="kv-handoff-cue" class="hidden"></span>
+          </button>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
+        <div class="p-2 rounded-lg bg-[#121420] border border-white/[0.05]">
+          <div class="text-[9px] text-slate-500 uppercase font-semibold">CACHE HIT</div>
+          <div id="kv-hit-rate" class="text-sm font-bold text-cyan-400 mt-0.5">--%</div>
+        </div>
+        <div class="p-2 rounded-lg bg-[#121420] border border-white/[0.05]">
+          <div class="text-[9px] text-slate-500 uppercase font-semibold">CONTEXT</div>
+          <div id="kv-ctx-tokens" class="text-sm font-bold text-slate-200 mt-0.5">--</div>
+        </div>
+        <div class="p-2 rounded-lg bg-[#121420] border border-white/[0.05]">
+          <div class="text-[9px] text-slate-500 uppercase font-semibold">CACHE BUSTS</div>
+          <div id="kv-bust-count" class="text-sm font-bold text-amber-400 mt-0.5">0</div>
+        </div>
+        <div class="p-2 rounded-lg bg-[#121420] border border-white/[0.05]">
+          <div class="text-[9px] text-slate-500 uppercase font-semibold">RE-PREFILL WASTE</div>
+          <div id="kv-wasted-tokens" class="text-sm font-bold text-rose-400 mt-0.5">0</div>
+        </div>
+      </div>
+      <!-- Smooth 1-second local TTL draining bar (zero extra HTTP polling) -->
+      <div id="kv-ttl-bar-row" class="hidden space-y-1">
+        <div class="flex items-center justify-between text-[10px] font-mono">
+          <span id="kv-ttl-bar-label" class="text-slate-400">Prompt Cache TTL</span>
+          <span id="kv-ttl-bar-text" class="text-cyan-300 font-semibold">-- / --</span>
+        </div>
+        <div id="kv-ttl-bar-track" class="w-full h-1.5 rounded-full bg-[#23273c] overflow-hidden border border-white/[0.05] transition-colors">
+          <div id="kv-ttl-bar-fill" class="h-full bg-gradient-to-r from-emerald-400 to-cyan-400 transition-all duration-700 ease-linear" style="width: 0%;"></div>
+        </div>
+      </div>
+      <!-- Context Composition Stacked Bar -->
+      <div id="kv-composition-row" class="hidden pt-2 border-t border-white/[0.06] space-y-1.5">
+        <div class="flex items-center justify-between text-[10px] font-mono text-slate-400 gap-2">
+          <span id="kv-composition-label" class="truncate">Context Composition</span>
+          <span id="kv-composition-total" class="text-slate-300 font-semibold flex-shrink-0">--</span>
+        </div>
+        <div id="kv-composition-bar" class="w-full h-2.5 rounded-full bg-[#23273c] overflow-hidden flex border border-white/[0.05]"></div>
+        <div id="kv-composition-legend" class="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[10px] font-mono text-slate-400"></div>
+      </div>
+      <div id="kv-turns-chart-row" class="hidden pt-2 border-t border-white/[0.06] space-y-1.5">
+        <div class="flex items-center justify-between text-[10px] font-mono text-slate-400">
+          <span id="kv-turns-chart-label">Recent turns hit rate</span>
+          <span class="text-[9px] text-slate-500">green &ge;85% &middot; cyan &ge;50% &middot; rose bust</span>
+        </div>
+        <div id="kv-turns-bars" class="h-8 flex items-end gap-1 px-1.5 py-1 rounded-lg bg-[#121420] border border-white/[0.05]"></div>
+        <div id="kv-top-deltas-row" class="hidden text-[10px] font-mono text-slate-400 flex flex-wrap items-center gap-1.5"></div>
+      </div>
+      <div id="kv-loop-row" class="hidden px-2.5 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[10px] font-mono text-amber-200"></div>
+      <div id="kv-bust-causes" class="text-[10px] font-mono text-slate-400 flex flex-wrap gap-x-3 gap-y-1">
+        <span>Bust attribution: awaiting transcript...</span>
+      </div>
+      <div id="kv-ghost-row" class="hidden pt-2 border-t border-white/[0.06] text-[10px] font-mono flex flex-col gap-1">
+        <div class="flex items-center justify-between gap-2 text-slate-300">
+          <span id="kv-ghost-efficiency">Guard efficiency: 100%</span>
+          <span id="kv-ghost-recalls" class="text-slate-400"></span>
+        </div>
+        <div id="kv-ghost-recommendation" class="hidden text-amber-300"></div>
+      </div>
+      <!-- Collapsible Cache-Friendly Handoff Brief Drawer -->
+      <div id="kv-handoff-drawer" class="hidden pt-2.5 border-t border-white/[0.06] space-y-2">
+        <div class="flex items-center justify-between flex-wrap gap-2 text-[10px] font-mono">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="text-indigo-300 font-semibold">Handoff Brief</span>
+            <span id="kv-handoff-meta" class="text-slate-400 truncate">--</span>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <button id="kv-handoff-refresh-btn" onclick="loadHandoffBrief()"
+                    class="px-2 py-0.5 rounded bg-white/[0.04] hover:bg-white/10 text-slate-300 border border-white/10 transition cursor-pointer"
+                    title="Regenerate brief from latest workspace &amp; checkpoint state">
+              Refresh
+            </button>
+            <button id="kv-handoff-copy-btn" onclick="copyHandoffBrief()"
+                    class="px-2.5 py-0.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-semibold transition cursor-pointer"
+                    title="Copy Markdown handoff brief to clipboard">
+              Copy Brief
+            </button>
+            <button id="kv-handoff-close-btn" onclick="toggleHandoffDrawer(false)"
+                    class="px-1.5 py-0.5 rounded bg-white/[0.04] hover:bg-white/10 text-slate-400 hover:text-white border border-white/10 transition cursor-pointer"
+                    title="Close Handoff Brief preview">
+              ×
+            </button>
+          </div>
+        </div>
+        <pre id="kv-handoff-preview" class="p-2.5 rounded-lg bg-[#0e101a] border border-white/[0.07] text-[11px] font-mono text-slate-200 whitespace-pre-wrap break-words max-h-60 overflow-y-auto select-text custom-scrollbar">Click Handoff Brief to generate snapshot...</pre>
+      </div>
+    </div>
+
     <!-- Exempt File Types & Chat Attachments -->
     <div class="p-4 sm:p-5 rounded-xl bg-[#181a28] border border-white/[0.07] space-y-3.5">
       <div class="flex justify-between items-center flex-wrap gap-2">
@@ -306,32 +416,42 @@
     <div class="p-3.5 sm:p-4 rounded-xl bg-[#181a28] border border-white/[0.07] space-y-4">
       <!-- Section 1: Active Lifecycle Gates -->
       <div>
-        <div class="flex items-center gap-2 text-xs font-bold text-slate-200">
-          <svg class="w-4 h-4 text-emerald-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-          Active Lifecycle Gates
+        <div class="flex items-center justify-between flex-wrap gap-2">
+          <div class="flex items-center gap-2 text-xs font-bold text-slate-200">
+            <svg class="w-4 h-4 text-emerald-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Active Lifecycle Gates
+          </div>
+          <div class="flex items-center gap-1.5">
+            <button id="toggle-cli-filter-btn" onclick="toggleCliFilter()" class="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-emerald-500/10 text-[#00e599] border border-emerald-500/30 cursor-pointer transition" title="Toggle transparent PreToolUse.overwrite CLI filtering">
+              CLI Filter: ON
+            </button>
+            <button id="toggle-read-dedup-btn" onclick="toggleReadDedup()" class="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-emerald-500/10 text-[#00e599] border border-emerald-500/30 cursor-pointer transition" title="Toggle unchanged read_file session deduplication">
+              Read Dedup: ON
+            </button>
+          </div>
         </div>
         <div class="mt-2.5 space-y-2 text-[11px]">
-          <div class="flex items-start gap-2" title="Prevents huge files from overflowing the LLM context window by requiring line ranges or targeted searches">
+          <div class="flex items-start gap-2" title="Prevents huge files from overflowing the LLM context window and guards against unchanged duplicate re-reads">
             <span class="text-emerald-400 font-bold leading-none mt-0.5">✓</span>
             <div class="leading-relaxed">
               <strong class="font-mono text-slate-200 font-semibold">PreToolUse (read_file):</strong> 
-              <span id="gate-read-cutoff" class="text-slate-400">Blocks files &gt;16 KB un-paged; requires line slices (&le;410 lines)</span>
+              <span id="gate-read-cutoff" class="text-slate-400">Blocks files &gt;16 KB un-paged; requires line slices (&le;410 lines) + 2-strike unchanged dedup</span>
             </div>
           </div>
-          <div class="flex items-start gap-2" title="Prevents massive terminal command outputs from flooding the context window and causing model forgetfulness">
+          <div class="flex items-start gap-2" title="Transparently filters noisy dev CLI outputs via PreToolUse.overwrite and blocks unbounded raw file dumps">
             <span class="text-emerald-400 font-bold leading-none mt-0.5">✓</span>
             <div class="leading-relaxed">
               <strong class="font-mono text-slate-200 font-semibold">PreToolUse (run_command):</strong> 
-              <span class="text-slate-400">Intercepts unbounded command output (<code class="text-slate-300">cat</code>, <code class="text-slate-300">Get-Content</code>, <code class="text-slate-300">git diff</code>)</span>
+              <span class="text-slate-400">Transparently compacts noisy CLI (<code class="text-slate-300">git</code>, tests, builds) to &le;8.8 KB + blocks unbounded <code class="text-slate-300">cat</code>/<code class="text-slate-300">Get-Content</code></span>
             </div>
           </div>
-          <div class="flex items-start gap-2" title="Guides the AI to summarize and search data offline instead of dumping full files into context">
+          <div class="flex items-start gap-2" title="Invalidates read-dedup entries on edits and emits zero-prefix-pollution UI-only KV-cache watermark/TTL warnings">
             <span class="text-emerald-400 font-bold leading-none mt-0.5">✓</span>
             <div class="leading-relaxed">
-              <strong class="font-mono text-slate-200 font-semibold">SessionStart:</strong> 
-              <span class="text-slate-400">Auto-injects guidance &amp; state recovery pointers</span>
+              <strong class="font-mono text-slate-200 font-semibold">SessionStart / PostToolUse / PreInvocation:</strong> 
+              <span class="text-slate-400">Prefix-stable snapshot + edit invalidation + UI-only KV-cache watch</span>
             </div>
           </div>
         </div>
@@ -339,27 +459,36 @@
 
       <!-- Section 2: Engine & Storage Health -->
       <div class="border-t border-white/[0.06] pt-3.5">
-        <div class="flex items-center justify-between mb-2.5">
+        <div class="flex items-center justify-between mb-2.5 flex-wrap gap-2">
           <div class="flex items-center gap-2 text-xs font-bold text-slate-200">
             <svg class="w-4 h-4 text-indigo-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
             </svg>
             Engine &amp; Storage Health
           </div>
-          <span id="doctor-status" class="text-[11px] font-mono font-bold text-[#00e599]">HEALTHY</span>
+          <div class="flex items-center gap-2">
+            <button id="vacuum-btn" onclick="runMaintenanceVacuum()" class="text-[10px] font-mono px-2 py-0.5 rounded bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-300 border border-indigo-500/30 transition cursor-pointer" title="Prune stale records (>14d) and run SQLite VACUUM + WAL checkpoint">
+              Prune &amp; Vacuum
+            </button>
+            <span id="doctor-status" class="text-[11px] font-mono font-bold text-[#00e599]">HEALTHY</span>
+          </div>
         </div>
-        <div class="grid grid-cols-2 sm:grid-cols-3 gap-2">
-          <div class="p-2 rounded-lg bg-[#121420] border border-white/[0.05]" title="Local native SQLite database engine for instant background storage">
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <div class="p-2 rounded-lg bg-[#121420] border border-white/[0.05]" title="Local native SQLite database engine + disk size">
             <div class="text-[9px] font-mono text-slate-500 uppercase tracking-wider font-semibold">STORAGE</div>
-            <div class="text-xs font-mono font-semibold text-slate-200 mt-0.5">SQLite (WAL)</div>
+            <div id="db-size-label" class="text-xs font-mono font-semibold text-slate-200 mt-0.5">SQLite (WAL)</div>
           </div>
-          <div class="p-2 rounded-lg bg-[#121420] border border-white/[0.05]" title="Hybrid search combining full-text keywords with substring matching for pinpoint accuracy">
+          <div class="p-2 rounded-lg bg-[#121420] border border-white/[0.05]" title="Hybrid search combining Porter BM25 + Trigram RRF with heading-aware Markdown chunking">
             <div class="text-[9px] font-mono text-slate-500 uppercase tracking-wider font-semibold">SEARCH MODE</div>
-            <div class="text-xs font-mono font-semibold text-slate-200 mt-0.5">Hybrid (BM25 + Tri)</div>
+            <div class="text-xs font-mono font-semibold text-slate-200 mt-0.5">BM25 + Tri (MD)</div>
           </div>
-          <div class="p-2 rounded-lg bg-[#121420] border border-white/[0.05] col-span-2 sm:col-span-1" title="Maximum preview slice of command/script output returned into context; full output remains indexed offline and queryable via search">
-            <div class="text-[9px] font-mono text-slate-500 uppercase tracking-wider font-semibold">PREVIEW LIMIT</div>
-            <div id="sandbox-cap" class="text-xs font-mono font-semibold text-slate-200 mt-0.5">16 KB preview</div>
+          <div class="p-2 rounded-lg bg-[#121420] border border-white/[0.05]" title="Maximum preview slice of command/script output returned into context">
+            <div class="text-[9px] font-mono text-slate-500 uppercase tracking-wider font-semibold">INLINE CAP</div>
+            <div id="sandbox-cap" class="text-xs font-mono font-semibold text-slate-200 mt-0.5">7.9 KB cap</div>
+          </div>
+          <div class="p-2 rounded-lg bg-[#121420] border border-white/[0.05]" title="Breakdown of CLI filters and unchanged read-dedup saves in current scope">
+            <div class="text-[9px] font-mono text-slate-500 uppercase tracking-wider font-semibold">CLI / DEDUP</div>
+            <div id="cli-dedup-counts" class="text-xs font-mono font-semibold text-slate-200 mt-0.5">0 / 0</div>
           </div>
         </div>
       </div>
@@ -371,6 +500,13 @@
     let currentScope = 'conversation';
     let cachedStats = null;
     let isProtectionPaused = false;
+    let kvTtlState = null;
+    let kvTtlTimer = null;
+    let pollTimer = null;
+    let handoffDrawerOpen = false;
+    let lastHandoffMarkdown = '';
+    let handoffCopyResetTimer = null;
+    let handoffFetchSeq = 0;
 
     function updateActiveBadge(isPaused) {
       isProtectionPaused = Boolean(isPaused);
@@ -454,6 +590,10 @@
         updateExemptionsList(cachedStats);
       }
 
+      if (handoffDrawerOpen) {
+        loadHandoffBrief();
+      }
+
       refreshData(true);
     }
 
@@ -469,6 +609,15 @@
       if (b < 1024) return b + " B";
       if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB";
       return (b / (1024 * 1024)).toFixed(2) + " MB";
+    }
+
+    function escapeHtml(val) {
+      return String(val ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
 
     async function apiFetch(path, options = {}) {
@@ -796,13 +945,20 @@
         if (s.isPaused !== undefined) {
           updateActiveBadge(s.isPaused);
         }
+        updateFeaturePill('toggle-cli-filter-btn', 'CLI Filter', s.cliFilterEnabled !== false);
+        updateFeaturePill('toggle-read-dedup-btn', 'Read Dedup', s.readDedupEnabled !== false);
+        if (s.breakdown) {
+          const cdEl = document.getElementById('cli-dedup-counts');
+          if (cdEl) cdEl.innerText = `${s.breakdown.cliFilters || 0} / ${s.breakdown.dedups || 0}`;
+        }
+        renderGhostEfficiency(s.ghost);
         if (s.version) {
           const verEl = document.getElementById('dashboard-version');
           if (verEl) verEl.innerText = s.version.startsWith('v') ? s.version : `v${s.version}`;
         }
 
         if (s.sandboxCapBytes) {
-          document.getElementById('sandbox-cap').innerText = formatBytes(s.sandboxCapBytes) + " preview";
+          document.getElementById('sandbox-cap').innerText = formatBytes(s.sandboxCapBytes) + " cap";
         }
 
         const totalRaw = Number(s.totalRawBytes || 0);
@@ -842,7 +998,7 @@
           if (usedFillEl) usedFillEl.style.width = '0%';
         }
 
-        // Doctor health
+        // Doctor health + DB size
         try {
           const docRes = await apiFetch('/api/doctor', { method: 'GET' });
           if (docRes.ok) {
@@ -850,10 +1006,25 @@
             if (d.status) {
               document.getElementById('doctor-status').innerText = d.status;
             }
+            const dbSizeEl = document.getElementById('db-size-label');
+            if (dbSizeEl && d.dbSizeBytes !== undefined) {
+              const totalDb = Number(d.dbSizeBytes || 0) + Number(d.walSizeBytes || 0);
+              dbSizeEl.innerText = `SQLite (${formatBytes(totalDb)})`;
+            }
           }
         } catch {}
 
-        // Recent sources
+        // KV-Cache & Context Watermark telemetry
+        try {
+          const kvUrl = `/api/cache-diag?scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
+          const kvRes = await apiFetch(kvUrl, { method: 'GET' });
+          if (kvRes.ok) {
+            const kv = await kvRes.json();
+            renderKvCacheCard(kv);
+          }
+        } catch {}
+
+        // Recent sources & guard events
         const resumeUrl = `/api/resume?scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
         const resumeRes = await apiFetch(resumeUrl, { method: 'GET' });
         if (resumeRes.ok) {
@@ -870,25 +1041,44 @@
 
           const items = [];
           if (r.recentEvents && r.recentEvents.length > 0) {
-            const interceptions = r.recentEvents.filter(ev => ev.kind === 'interception');
-            for (const ev of interceptions) {
-              const displayPath = formatItemPath(ev.path || ev.tool);
+            const guardEvents = r.recentEvents.filter(ev => ev.kind === 'interception' || ev.kind === 'cli_filter' || ev.kind === 'dedup');
+            for (const ev of guardEvents) {
+              const displayPath = escapeHtml(formatItemPath(ev.path || ev.tool));
+              const rawTitle = escapeHtml(`${ev.path || ev.tool}`);
+              const saved = Math.max(0, Number(ev.sandbox_bytes || 0) - Number(ev.returned_bytes || 0));
+              const safeAgent = escapeHtml(ev.agent || '');
               const agentBadge = (ev.agent && ev.agent !== 'antigravity' && ev.agent !== 'primary')
-                ? `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-purple-500/20 text-purple-300 border border-purple-500/30 font-semibold flex-shrink-0" title="Triggered by subagent: ${ev.agent}">${ev.agent}</span>`
+                ? `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-purple-500/20 text-purple-300 border border-purple-500/30 font-semibold flex-shrink-0" title="Triggered by subagent: ${safeAgent}">${safeAgent}</span>`
                 : '';
+              const isFilter = ev.kind === 'cli_filter';
+              const isDedup = ev.kind === 'dedup';
+              const boxCls = isFilter
+                ? 'bg-emerald-500/10 border-emerald-500/20'
+                : isDedup
+                  ? 'bg-amber-500/10 border-amber-500/20'
+                  : 'bg-rose-500/10 border-rose-500/20';
+              const dotCls = isFilter ? 'bg-emerald-400' : isDedup ? 'bg-amber-400' : 'bg-rose-400';
+              const labelCls = isFilter ? 'text-emerald-300' : isDedup ? 'text-amber-300' : 'text-rose-300';
+              const actionText = escapeHtml(
+                isFilter
+                  ? `Filtered (${ev.key || 'cli'}):`
+                  : isDedup
+                    ? `Dedup ${ev.tool}:`
+                    : `Blocked ${ev.tool}:`
+              );
               items.push(`
-                <div class="p-2 rounded-lg bg-rose-500/10 border border-rose-500/20 flex justify-between items-center gap-3 transition" 
-                     title="Intercepted by Context Mode to reduce context size: ${ev.path || ev.tool}${ev.agent ? ' (Agent: ' + ev.agent + ')' : ''}">
+                <div class="p-2 rounded-lg ${boxCls} border flex justify-between items-center gap-3 transition" 
+                     title="${actionText} ${rawTitle}">
                   <div class="flex items-center gap-2 min-w-0 flex-1">
-                    <span class="w-1.5 h-1.5 rounded-full bg-rose-400 flex-shrink-0"></span>
+                    <span class="w-1.5 h-1.5 rounded-full ${dotCls} flex-shrink-0"></span>
                     ${agentBadge}
                     <span class="truncate text-xs font-mono">
-                      <span class="font-bold text-rose-300">Blocked ${ev.tool}:</span> 
+                      <span class="font-bold ${labelCls}">${actionText}</span> 
                       <span class="text-slate-200">${displayPath}</span>
                     </span>
                   </div>
                   <div class="flex items-center gap-1.5 flex-shrink-0 font-mono text-[11px]">
-                    <span class="text-rose-400 font-bold">${formatBytes(ev.sandbox_bytes || 0)}</span>
+                    <span class="${labelCls} font-bold">${formatBytes(saved)}</span>
                     <span class="text-slate-500 text-[10px]">saved</span>
                   </div>
                 </div>
@@ -898,13 +1088,15 @@
 
           if (r.recentSources && r.recentSources.length > 0) {
             for (const src of r.recentSources) {
+              const safeId = escapeHtml(src.id);
+              const safeLabel = escapeHtml(src.label);
               items.push(`
-                <div onclick="inspectSource('${src.id}', '${encodeURIComponent(src.label)}')" 
+                <div data-source-id="${safeId}" data-source-label="${safeLabel}" onclick="inspectSourceEl(this)" 
                      class="p-2 rounded-lg bg-black/40 hover:bg-white/[0.06] border border-white/5 hover:border-indigo-500/40 flex justify-between items-center gap-3 cursor-pointer transition group" 
-                     title="Click to view indexed chunks in Search Inspector: ${src.label}">
+                     title="Click to view indexed chunks in Search Inspector: ${safeLabel}">
                   <div class="flex items-center gap-2 min-w-0 flex-1">
                     <span class="w-1.5 h-1.5 rounded-full bg-indigo-400 group-hover:scale-125 transition-transform flex-shrink-0"></span>
-                    <span class="truncate text-slate-300 group-hover:text-white font-medium text-xs font-mono">${src.label}</span>
+                    <span class="truncate text-slate-300 group-hover:text-white font-medium text-xs font-mono">${safeLabel}</span>
                   </div>
                   <div class="flex items-center gap-1.5 flex-shrink-0 font-mono text-[11px]">
                     <span class="text-indigo-400">${formatBytes(src.bytes_total)}</span>
@@ -954,6 +1146,11 @@
       }
     }
 
+    function inspectSourceEl(el) {
+      if (!el) return;
+      return inspectSource(el.dataset.sourceId || '', encodeURIComponent(el.dataset.sourceLabel || ''));
+    }
+
     async function inspectSource(sourceId, encodedLabel) {
       const label = decodeURIComponent(encodedLabel || '');
       const input = document.getElementById('search-input');
@@ -970,10 +1167,10 @@
             resultsDiv.innerHTML = data.chunks.map((ch, idx) => `
               <div class="p-2.5 rounded-lg bg-black/50 border border-white/10 space-y-1.5">
                 <div class="flex justify-between text-xs text-indigo-400 font-mono">
-                  <span class="truncate font-semibold text-slate-200">${label} [Chunk ${idx + 1}/${data.chunks.length}]</span>
+                  <span class="truncate font-semibold text-slate-200">${escapeHtml(ch.title || label)} [Chunk ${idx + 1}/${data.chunks.length}]</span>
                   <span class="bg-indigo-500/20 text-indigo-300 px-1.5 py-0.5 rounded text-[10px]">${ch.body.length} B</span>
                 </div>
-                <div class="text-[11px] text-slate-300 font-mono whitespace-pre-wrap break-all leading-relaxed">${ch.body.slice(0, 380)}${ch.body.length > 380 ? '...' : ''}</div>
+                <div class="text-[11px] text-slate-300 font-mono whitespace-pre-wrap break-all leading-relaxed">${escapeHtml(ch.body.slice(0, 380))}${ch.body.length > 380 ? '...' : ''}</div>
               </div>
             `).join('');
             const card = document.getElementById('search-inspector-card');
@@ -1008,17 +1205,784 @@
           resultsDiv.innerHTML = data.hits.map(h => `
             <div class="p-2.5 rounded-lg bg-black/50 border border-white/10 space-y-1.5">
               <div class="flex justify-between text-xs text-indigo-400 font-mono">
-                <span class="truncate font-semibold text-slate-200">${h.title || h.sourceId}</span>
+                <span class="truncate font-semibold text-slate-200">${escapeHtml(h.title || h.sourceId)}</span>
                 <span class="bg-indigo-500/20 text-indigo-300 px-1.5 py-0.5 rounded text-[10px]">RRF: ${h.rrfScore}</span>
               </div>
-              <div class="text-[11px] text-slate-300 font-mono whitespace-pre-wrap break-all leading-relaxed">${h.snippet.slice(0, 260)}...</div>
+              <div class="text-[11px] text-slate-300 font-mono whitespace-pre-wrap break-all leading-relaxed">${escapeHtml((h.snippet || '').slice(0, 260))}...</div>
             </div>
           `).join('');
         } else {
           resultsDiv.innerHTML = '<div class="text-slate-500 text-xs p-2">No matching chunks found.</div>';
         }
       } catch (err) {
-        resultsDiv.innerHTML = `<div class="text-rose-400 text-xs p-2">Search failed: ${err.message}</div>`;
+        resultsDiv.innerHTML = `<div class="text-rose-400 text-xs p-2">Search failed: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    function updateFeaturePill(elId, label, enabled) {
+      const btn = document.getElementById(elId);
+      if (!btn) return;
+      btn.dataset.enabled = enabled ? '1' : '0';
+      if (enabled) {
+        btn.className = 'px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-emerald-500/10 hover:bg-emerald-500/20 text-[#00e599] border border-emerald-500/30 cursor-pointer transition';
+        btn.innerText = `${label}: ON`;
+      } else {
+        btn.className = 'px-2 py-0.5 rounded-full text-[10px] font-mono font-medium bg-white/[0.04] hover:bg-white/[0.08] text-slate-400 border border-white/10 cursor-pointer transition';
+        btn.innerText = `${label}: OFF`;
+      }
+    }
+
+    async function toggleCliFilter() {
+      const btn = document.getElementById('toggle-cli-filter-btn');
+      const prev = btn?.dataset.enabled === '1';
+      const next = !prev;
+      updateFeaturePill('toggle-cli-filter-btn', 'CLI Filter', next);
+      const params = new URLSearchParams(window.location.search);
+      const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
+      try {
+        const res = await apiFetch(`/api/cli-filter?enabled=${next}&scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`, { method: 'POST' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        refreshData(false);
+      } catch (e) {
+        console.error(e);
+        updateFeaturePill('toggle-cli-filter-btn', 'CLI Filter', prev);
+      }
+    }
+
+    async function toggleReadDedup() {
+      const btn = document.getElementById('toggle-read-dedup-btn');
+      const prev = btn?.dataset.enabled === '1';
+      const next = !prev;
+      updateFeaturePill('toggle-read-dedup-btn', 'Read Dedup', next);
+      const params = new URLSearchParams(window.location.search);
+      const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
+      try {
+        const res = await apiFetch(`/api/read-dedup?enabled=${next}&scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`, { method: 'POST' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        refreshData(false);
+      } catch (e) {
+        console.error(e);
+        updateFeaturePill('toggle-read-dedup-btn', 'Read Dedup', prev);
+      }
+    }
+
+    function fmtSec(sec) {
+      if (sec === null || sec === undefined) return '--';
+      const s = Math.max(0, Math.round(sec));
+      if (s >= 3600) {
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        return m > 0 ? `${h}h ${m}m` : `${h}h`;
+      }
+      const m = Math.floor(s / 60);
+      const r = s % 60;
+      return m > 0 ? `${m}m ${r}s` : `${r}s`;
+    }
+
+    function fmtUsd(val) {
+      const n = Number(val);
+      if (!Number.isFinite(n) || n === 0) return '$0.00';
+      const abs = Math.abs(n);
+      const sign = n < 0 ? '-' : '';
+      if (abs < 0.01) return `${sign}$${abs.toFixed(4)}`;
+      return `${sign}$${abs.toFixed(2)}`;
+    }
+
+    function renderGhostEfficiency(ghost) {
+      const rowEl = document.getElementById('kv-ghost-row');
+      const effEl = document.getElementById('kv-ghost-efficiency');
+      const recEl = document.getElementById('kv-ghost-recalls');
+      const tipEl = document.getElementById('kv-ghost-recommendation');
+      if (!rowEl) return;
+      if (!ghost || !ghost.totalBlocked) {
+        rowEl.classList.add('hidden');
+        return;
+      }
+      rowEl.classList.remove('hidden');
+      const effPct = Math.round(Number(ghost.evictionEfficiency ?? 1) * 100);
+      if (effEl) {
+        effEl.innerText = `Guard efficiency: ${effPct}%`;
+        effEl.className = effPct < 65 ? 'text-amber-300 font-semibold' : 'text-emerald-300 font-semibold';
+      }
+      if (recEl) {
+        recEl.innerText = `recalls: ${ghost.ghostRecalls || 0}/${ghost.totalBlocked}`;
+      }
+      if (tipEl) {
+        if (ghost.recommendation) {
+          tipEl.innerText = ghost.recommendation;
+          tipEl.classList.remove('hidden');
+        } else {
+          tipEl.innerText = '';
+          tipEl.classList.add('hidden');
+        }
+      }
+    }
+
+    function updateHandoffButtonStyle(compactAdvice) {
+      const btn = document.getElementById('kv-handoff-btn');
+      const cue = document.getElementById('kv-handoff-cue');
+      if (!btn) return;
+      const advice = String(compactAdvice || 'none');
+      if (advice === 'critical_compact') {
+        btn.className = 'px-2 py-0.5 rounded-full bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-400/50 font-semibold transition cursor-pointer flex items-center gap-1 shadow-[0_0_10px_rgba(245,158,11,0.25)]';
+        btn.title = 'Critical context watermark — copy Handoff Brief before /compact';
+        if (cue) {
+          cue.textContent = 'COMPACT';
+          cue.className = 'text-[9px] px-1 rounded bg-rose-500/25 text-rose-200';
+        }
+      } else if (advice === 'opportunistic_cold_compact') {
+        btn.className = 'px-2 py-0.5 rounded-full bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 font-semibold transition cursor-pointer flex items-center gap-1';
+        btn.title = 'Cache is cold — good moment to copy Handoff Brief before /compact';
+        if (cue) {
+          cue.textContent = 'COLD';
+          cue.className = 'text-[9px] px-1 rounded bg-amber-500/25 text-amber-200';
+        }
+      } else {
+        btn.className = 'px-2 py-0.5 rounded-full bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-300 border border-indigo-500/30 font-semibold transition cursor-pointer flex items-center gap-1';
+        btn.title = 'Generate cache-friendly compaction / session-switch Handoff Brief';
+        if (cue) {
+          cue.textContent = '';
+          cue.className = 'hidden';
+        }
+      }
+    }
+
+    function stopKvTtlTimer() {
+      if (kvTtlTimer !== null) {
+        clearInterval(kvTtlTimer);
+        kvTtlTimer = null;
+      }
+    }
+
+    function computeLocalTtlSnapshot(state, nowMs = Date.now()) {
+      if (!state || !Number.isFinite(state.lastPlannerMs) || !(state.cacheTtlSec > 0)) {
+        return null;
+      }
+      const safeNow = Number.isFinite(nowMs) ? nowMs : Date.now();
+      const offset = Number.isFinite(state.clockOffsetMs) ? state.clockOffsetMs : 0;
+      const estServerNow = safeNow + offset;
+      const elapsedExact = Math.max(0, (estServerNow - state.lastPlannerMs) / 1000);
+      const idleSeconds = Math.max(0, Math.round(elapsedExact));
+      const remainingExact = Math.max(0, state.cacheTtlSec - elapsedExact);
+      const remainingSec = Math.max(0, state.cacheTtlSec - idleSeconds);
+      const pct = Math.max(0, Math.min(100, (remainingExact / state.cacheTtlSec) * 100));
+      let ttlStatus = 'warm';
+      if (idleSeconds >= state.cacheTtlSec || remainingSec <= 0) ttlStatus = 'expired';
+      else if (remainingSec <= 60) ttlStatus = 'expiring';
+      let cacheTemperature = 'cold';
+      if (idleSeconds < Math.min(60, state.cacheTtlSec)) cacheTemperature = 'hot';
+      else if (idleSeconds < state.cacheTtlSec) cacheTemperature = 'warm';
+      return {
+        idleSeconds,
+        remainingSec,
+        cacheTtlSec: state.cacheTtlSec,
+        pct: Number(pct.toFixed(2)),
+        ttlStatus,
+        cacheTemperature
+      };
+    }
+
+    function renderLocalTtlCountdown() {
+      const rowEl = document.getElementById('kv-ttl-bar-row');
+      const labelEl = document.getElementById('kv-ttl-bar-label');
+      const textEl = document.getElementById('kv-ttl-bar-text');
+      const trackEl = document.getElementById('kv-ttl-bar-track');
+      const fillEl = document.getElementById('kv-ttl-bar-fill');
+      const ttlEl = document.getElementById('kv-ttl-badge');
+      const tempEl = document.getElementById('kv-temp-badge');
+
+      const snap = computeLocalTtlSnapshot(kvTtlState);
+      if (!snap || !kvTtlState) {
+        if (rowEl) rowEl.classList.add('hidden');
+        if (fillEl) fillEl.style.width = '0%';
+        stopKvTtlTimer();
+        return;
+      }
+
+      if (rowEl) rowEl.classList.remove('hidden');
+      const ttlSrcTag = kvTtlState.ttlSource && kvTtlState.ttlSource !== 'profile' ? ` (${kvTtlState.ttlSource})` : '';
+      if (labelEl) {
+        labelEl.textContent = `Prompt Cache TTL${ttlSrcTag}`;
+      }
+
+      if (snap.ttlStatus === 'expired') {
+        if (fillEl) {
+          fillEl.style.width = '0%';
+          fillEl.className = 'h-full bg-rose-500 transition-all duration-700 ease-linear';
+        }
+        if (trackEl) {
+          trackEl.className = 'w-full h-1.5 rounded-full bg-rose-500/20 overflow-hidden border border-rose-500/40 transition-colors';
+        }
+        if (textEl) {
+          textEl.className = 'text-rose-300 font-semibold';
+          textEl.textContent = `0s / ${fmtSec(snap.cacheTtlSec)} · Expired (${fmtSec(snap.idleSeconds)} idle)`;
+        }
+        if (ttlEl) {
+          ttlEl.className = 'px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-300 border border-rose-500/30';
+          ttlEl.textContent = `TTL EXPIRED (${fmtSec(snap.idleSeconds)} idle)`;
+        }
+      } else if (snap.ttlStatus === 'expiring') {
+        if (fillEl) {
+          fillEl.style.width = `${snap.pct}%`;
+          fillEl.className = 'h-full bg-amber-400 animate-pulse transition-all duration-700 ease-linear';
+        }
+        if (trackEl) {
+          trackEl.className = 'w-full h-1.5 rounded-full bg-amber-500/15 overflow-hidden border border-amber-400/40 transition-colors';
+        }
+        if (textEl) {
+          textEl.className = 'text-amber-300 font-semibold animate-pulse';
+          textEl.textContent = `${fmtSec(snap.remainingSec)} / ${fmtSec(snap.cacheTtlSec)} · Expiring soon`;
+        }
+        if (ttlEl) {
+          ttlEl.className = 'px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/40 animate-pulse';
+          ttlEl.textContent = `TTL ${fmtSec(snap.remainingSec)} left`;
+        }
+      } else {
+        if (fillEl) {
+          fillEl.style.width = `${snap.pct}%`;
+          fillEl.className = 'h-full bg-gradient-to-r from-emerald-400 to-cyan-400 transition-all duration-700 ease-linear';
+        }
+        if (trackEl) {
+          trackEl.className = 'w-full h-1.5 rounded-full bg-[#23273c] overflow-hidden border border-white/[0.05] transition-colors';
+        }
+        if (textEl) {
+          textEl.className = 'text-cyan-300 font-semibold';
+          textEl.textContent = `${fmtSec(snap.remainingSec)} / ${fmtSec(snap.cacheTtlSec)}`;
+        }
+        if (ttlEl) {
+          ttlEl.className = 'px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30';
+          ttlEl.textContent = `TTL ${fmtSec(snap.remainingSec)} left`;
+        }
+      }
+
+      if (tempEl) {
+        if (snap.cacheTemperature === 'hot') {
+          tempEl.className = 'px-2 py-0.5 rounded-full bg-rose-500/15 text-orange-300 border border-orange-400/30 font-semibold';
+          tempEl.textContent = 'HOT';
+        } else if (snap.cacheTemperature === 'warm') {
+          tempEl.className = 'px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-semibold';
+          tempEl.textContent = 'WARM';
+        } else {
+          tempEl.className = 'px-2 py-0.5 rounded-full bg-white/[0.04] text-slate-400 border border-white/10 font-semibold';
+          tempEl.textContent = 'COLD';
+        }
+      }
+
+      if (snap.ttlStatus === 'expired' && kvTtlState.compactAdvice !== 'critical_compact' && kvTtlState.currentContextTokens >= kvTtlState.coldCompactTokens) {
+        updateHandoffButtonStyle('opportunistic_cold_compact');
+      }
+    }
+
+    function syncKvTtlState(kv) {
+      const lastMs = kv && kv.lastPlannerAt ? Date.parse(kv.lastPlannerAt) : NaN;
+      const ttlSec = Number(kv?.cacheTtlSec);
+      const ctxTokens = Number(kv?.currentContextTokens || 0);
+      if (!kv || !kv.transcriptFound || !kv.turnsWithUsage || !Number.isFinite(lastMs) || !(ttlSec > 0) || ctxTokens < 4000) {
+        kvTtlState = null;
+        stopKvTtlTimer();
+        const rowEl = document.getElementById('kv-ttl-bar-row');
+        const fillEl = document.getElementById('kv-ttl-bar-fill');
+        if (rowEl) rowEl.classList.add('hidden');
+        if (fillEl) fillEl.style.width = '0%';
+        return;
+      }
+      const serverNow = Number(kv.serverNowMs);
+      const clockOffsetMs = Number.isFinite(serverNow) && serverNow > 0 ? serverNow - Date.now() : 0;
+      kvTtlState = {
+        lastPlannerMs: lastMs,
+        cacheTtlSec: ttlSec,
+        clockOffsetMs,
+        currentContextTokens: ctxTokens,
+        coldCompactTokens: Number(kv.coldCompactTokens) > 0 ? Number(kv.coldCompactTokens) : 60000,
+        compactAdvice: kv.compactAdvice || 'none',
+        ttlSource: kv.ttlSource || 'profile',
+        maxWarmHitGapSec: kv.maxWarmHitGapSec ?? null
+      };
+      renderLocalTtlCountdown();
+      if (kvTtlTimer === null) {
+        kvTtlTimer = setInterval(renderLocalTtlCountdown, 1000);
+      }
+    }
+
+    async function loadHandoffBrief() {
+      const previewEl = document.getElementById('kv-handoff-preview');
+      const metaEl = document.getElementById('kv-handoff-meta');
+      const reqSeq = ++handoffFetchSeq;
+      if (metaEl) metaEl.textContent = 'Generating...';
+      if (previewEl && !lastHandoffMarkdown) {
+        previewEl.textContent = 'Generating cache-friendly handoff brief...';
+      }
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
+        const url = `/api/handoff?scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
+        const res = await apiFetch(url, { method: 'GET' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (reqSeq !== handoffFetchSeq) return;
+        lastHandoffMarkdown = typeof data.markdown === 'string' ? data.markdown : '';
+        if (previewEl) {
+          previewEl.textContent = lastHandoffMarkdown || '(empty handoff brief)';
+        }
+        if (metaEl) {
+          const sizeLabel = formatBytes(Number(data.bytes || 0));
+          const truncTag = data.truncated ? ' · truncated' : '';
+          const sumPart = data.summary ? ` · ${data.summary}` : '';
+          metaEl.textContent = `${sizeLabel}${truncTag}${sumPart}`;
+        }
+      } catch (err) {
+        if (reqSeq !== handoffFetchSeq) return;
+        if (metaEl) metaEl.textContent = 'Error';
+        if (previewEl) previewEl.textContent = `Failed to build handoff brief: ${err?.message || String(err)}`;
+      }
+    }
+
+    function toggleHandoffDrawer(forceState) {
+      const drawer = document.getElementById('kv-handoff-drawer');
+      if (!drawer) return;
+      const nextOpen = typeof forceState === 'boolean' ? forceState : !handoffDrawerOpen;
+      handoffDrawerOpen = nextOpen;
+      if (handoffDrawerOpen) {
+        drawer.classList.remove('hidden');
+        loadHandoffBrief();
+      } else {
+        drawer.classList.add('hidden');
+      }
+    }
+
+    async function copyHandoffBrief() {
+      const btn = document.getElementById('kv-handoff-copy-btn');
+      const previewEl = document.getElementById('kv-handoff-preview');
+      const text = lastHandoffMarkdown || (previewEl ? previewEl.textContent : '') || '';
+      if (!text) return;
+      let copied = false;
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        try {
+          await navigator.clipboard.writeText(text);
+          copied = true;
+        } catch {}
+      }
+      if (!copied) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '-9999px';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try {
+          copied = Boolean(document.execCommand('copy'));
+        } catch {
+          copied = false;
+        } finally {
+          document.body.removeChild(ta);
+        }
+      }
+      if (btn) {
+        btn.textContent = copied ? 'Copied!' : 'Copy failed';
+        if (handoffCopyResetTimer !== null) clearTimeout(handoffCopyResetTimer);
+        handoffCopyResetTimer = setTimeout(() => {
+          btn.textContent = 'Copy Brief';
+          handoffCopyResetTimer = null;
+        }, 2000);
+      }
+    }
+
+    const KV_COMPOSITION_SEGMENTS = [
+      { key: 'thinking', label: 'Thinking', barClass: 'bg-purple-400', dotClass: 'bg-purple-400', textClass: 'text-purple-300' },
+      { key: 'fileReads', label: 'File Reads', barClass: 'bg-cyan-400', dotClass: 'bg-cyan-400', textClass: 'text-cyan-300' },
+      { key: 'toolResults', label: 'Tool Outputs', barClass: 'bg-amber-400', dotClass: 'bg-amber-400', textClass: 'text-amber-300' },
+      { key: 'assistant', label: 'Assistant', barClass: 'bg-[#00e599]', dotClass: 'bg-[#00e599]', textClass: 'text-emerald-300' },
+      { key: 'user', label: 'User', barClass: 'bg-indigo-400', dotClass: 'bg-indigo-400', textClass: 'text-indigo-300' },
+      { key: 'toolCalls', label: 'Tool Calls', barClass: 'bg-sky-400', dotClass: 'bg-sky-400', textClass: 'text-sky-300' },
+      { key: 'media', label: 'Media', barClass: 'bg-rose-400', dotClass: 'bg-rose-400', textClass: 'text-rose-300' }
+    ];
+
+    function fmtEstTokShort(tok) {
+      const n = Number(tok);
+      if (!Number.isFinite(n) || n <= 0) return '0';
+      if (n >= 1000000) return `${(n / 1000000).toFixed(2)}M`;
+      if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+      return String(Math.round(n));
+    }
+
+    function toFiniteNonNeg(val) {
+      if (val === null || val === undefined || val === '' || typeof val === 'boolean') return null;
+      const n = Number(val);
+      return Number.isFinite(n) && n >= 0 ? n : null;
+    }
+
+    function renderContextComposition(comp, sub) {
+      const rowEl = document.getElementById('kv-composition-row');
+      const labelEl = document.getElementById('kv-composition-label');
+      const totalEl = document.getElementById('kv-composition-total');
+      const barEl = document.getElementById('kv-composition-bar');
+      const legendEl = document.getElementById('kv-composition-legend');
+      const subBadgeEl = document.getElementById('kv-subagent-badge');
+
+      const rawTotal = comp ? toFiniteNonNeg(comp.totalEstTokens) : null;
+      const totalEstTokens = rawTotal !== null && rawTotal > 0 ? Math.round(rawTotal) : 0;
+
+      if (rowEl && barEl && legendEl) {
+        if (totalEstTokens <= 0) {
+          rowEl.classList.add('hidden');
+          barEl.innerHTML = '';
+          legendEl.innerHTML = '';
+          if (labelEl) labelEl.textContent = 'Context Composition';
+          if (totalEl) totalEl.textContent = '--';
+        } else {
+          const activeSegs = [];
+          for (const seg of KV_COMPOSITION_SEGMENTS) {
+            const bucket = comp[seg.key];
+            const rawEstTok = bucket ? toFiniteNonNeg(bucket.estTokens) : null;
+            const estTok = rawEstTok !== null && rawEstTok > 0 ? Math.round(rawEstTok) : 0;
+            if (estTok <= 0) continue;
+            const exactPct = Math.max(0, Math.min(100, (estTok / totalEstTokens) * 100));
+            const explicitPct = bucket ? toFiniteNonNeg(bucket.pct) : null;
+            const rawPct = explicitPct !== null ? Math.min(100, explicitPct) : Number(exactPct.toFixed(1));
+            const rawMediaCnt = seg.key === 'media' ? toFiniteNonNeg(bucket?.mediaCount ?? comp.mediaCount) : null;
+            const mediaCnt = rawMediaCnt !== null ? Math.round(rawMediaCnt) : 0;
+            activeSegs.push({
+              ...seg,
+              estTokens: estTok,
+              widthPct: exactPct,
+              pct: rawPct,
+              mediaCount: mediaCnt
+            });
+          }
+
+          if (activeSegs.length === 0) {
+            rowEl.classList.add('hidden');
+            barEl.innerHTML = '';
+            legendEl.innerHTML = '';
+            if (labelEl) labelEl.textContent = 'Context Composition';
+            if (totalEl) totalEl.textContent = '--';
+          } else {
+            rowEl.classList.remove('hidden');
+            const domSeg = KV_COMPOSITION_SEGMENTS.find((s) => s.key === comp.dominantCategory) || null;
+            const rawTotalBytes = toFiniteNonNeg(comp.totalBytes);
+            const safeTotalBytes = rawTotalBytes !== null ? Math.round(rawTotalBytes) : 0;
+            if (labelEl) {
+              labelEl.textContent = domSeg ? `Context Composition · top: ${domSeg.label}` : 'Context Composition';
+            }
+            if (totalEl) {
+              totalEl.textContent = `~${fmtEstTokShort(totalEstTokens)} est. tok`;
+              totalEl.title = `Estimated content volume: ${totalEstTokens.toLocaleString()} tokens (${safeTotalBytes.toLocaleString()} bytes)`;
+            }
+            barEl.innerHTML = activeSegs
+              .map((s) => {
+                const mediaNote = s.key === 'media' && s.mediaCount > 0 ? ` (${s.mediaCount} ${s.mediaCount === 1 ? 'item' : 'items'})` : '';
+                const tip = escapeHtml(`${s.label}${mediaNote}: ~${s.estTokens.toLocaleString()} est. tok (${s.pct.toFixed(1)}%)`);
+                return `<div class="h-full ${s.barClass} min-w-[2px] transition-all duration-300" style="width:${s.widthPct.toFixed(2)}%" title="${tip}"></div>`;
+              })
+              .join('');
+            legendEl.innerHTML = activeSegs
+              .map((s) => {
+                const mediaNote = s.key === 'media' && s.mediaCount > 0 ? ` (${s.mediaCount})` : '';
+                const tip = escapeHtml(`${s.label}${mediaNote}: ~${s.estTokens.toLocaleString()} est. tok (${s.pct.toFixed(1)}%)`);
+                const labelSafe = escapeHtml(`${s.label}${mediaNote}`);
+                const pctSafe = escapeHtml(`${s.pct.toFixed(1)}%`);
+                const tokSafe = escapeHtml(fmtEstTokShort(s.estTokens));
+                return `<span class="inline-flex items-center gap-1" title="${tip}"><span class="w-1.5 h-1.5 rounded-full ${s.dotClass} flex-shrink-0"></span><span class="${s.textClass}">${labelSafe}</span><span class="text-slate-400">${pctSafe}</span><span class="text-slate-500">(${tokSafe})</span></span>`;
+              })
+              .join('');
+          }
+        }
+      }
+
+      if (subBadgeEl) {
+        const subDeleg = Math.round(toFiniteNonNeg(sub?.subagentDelegations) ?? 0);
+        const subTurns = Math.round(toFiniteNonNeg(sub?.subagentTurns) ?? 0);
+        const priTurns = Math.round(toFiniteNonNeg(sub?.primaryTurns) ?? 0);
+        const priTools = Math.round(toFiniteNonNeg(sub?.primaryToolCalls) ?? 0);
+        const subTools = Math.round(toFiniteNonNeg(sub?.subagentToolCalls) ?? 0);
+        const subTrafficTok = Math.round(
+          toFiniteNonNeg(sub?.subagentTrafficEstTokens) ??
+          toFiniteNonNeg(sub?.subagentResultEstTokens) ??
+          0
+        );
+        const subShare = Math.min(100, toFiniteNonNeg(sub?.subagentSharePct) ?? 0);
+
+        if (subDeleg > 0 || subTurns > 0) {
+          const countPart = subDeleg > 0
+            ? `${subDeleg} subagent${subDeleg === 1 ? '' : 's'}`
+            : `${subTurns} sub-turn${subTurns === 1 ? '' : 's'}`;
+          const sharePart = subShare > 0 ? ` (${Math.round(subShare)}%)` : '';
+          subBadgeEl.textContent = `Subagents: ${countPart}${sharePart}`;
+          subBadgeEl.title = `Primary vs Subagent | Delegations: ${subDeleg} | Turns: ${priTurns} primary / ${subTurns} subagent | Tool calls: ${priTools} primary / ${subTools} subagent | Subagent traffic: ~${subTrafficTok.toLocaleString()} est. tok (${subShare.toFixed(1)}%)`;
+          subBadgeEl.classList.remove('hidden');
+        } else {
+          subBadgeEl.textContent = '';
+          subBadgeEl.title = '';
+          subBadgeEl.classList.add('hidden');
+        }
+      }
+    }
+
+    function renderKvCacheCard(kv) {
+      if (!kv) return;
+      const hitEl = document.getElementById('kv-hit-rate');
+      const ctxEl = document.getElementById('kv-ctx-tokens');
+      const bustEl = document.getElementById('kv-bust-count');
+      const wasteEl = document.getElementById('kv-wasted-tokens');
+      const wmEl = document.getElementById('kv-watermark-badge');
+      const tempEl = document.getElementById('kv-temp-badge');
+      const ttlEl = document.getElementById('kv-ttl-badge');
+      const modelEl = document.getElementById('kv-model-badge');
+      const savingsEl = document.getElementById('kv-cost-savings');
+      const loopBadgeEl = document.getElementById('kv-loop-badge');
+      const loopRowEl = document.getElementById('kv-loop-row');
+      const turnsRowEl = document.getElementById('kv-turns-chart-row');
+      const turnsLabelEl = document.getElementById('kv-turns-chart-label');
+      const turnsBarsEl = document.getElementById('kv-turns-bars');
+      const deltasRowEl = document.getElementById('kv-top-deltas-row');
+      const causesEl = document.getElementById('kv-bust-causes');
+
+      if (!kv.transcriptFound || !kv.turnsWithUsage) {
+        if (hitEl) hitEl.innerText = '--%';
+        if (ctxEl) { ctxEl.innerText = '0 tok'; ctxEl.title = ''; }
+        if (bustEl) bustEl.innerText = '0';
+        if (wasteEl) { wasteEl.innerText = '0'; wasteEl.title = ''; }
+        if (wmEl) {
+          wmEl.className = 'px-2 py-0.5 rounded-full bg-emerald-500/10 text-[#00e599] border border-emerald-500/30 font-semibold';
+          wmEl.innerText = 'OK';
+          wmEl.title = '';
+        }
+        if (tempEl) {
+          tempEl.className = 'px-2 py-0.5 rounded-full bg-white/[0.04] text-slate-400 border border-white/10 font-semibold';
+          tempEl.innerText = 'COLD';
+        }
+        if (ttlEl) {
+          ttlEl.className = 'px-2 py-0.5 rounded-full bg-white/[0.04] text-slate-300 border border-white/10';
+          ttlEl.innerText = 'TTL: --';
+          ttlEl.title = '';
+        }
+        if (modelEl) modelEl.classList.add('hidden');
+        if (savingsEl) { savingsEl.classList.add('hidden'); savingsEl.title = ''; }
+        if (loopBadgeEl) loopBadgeEl.classList.add('hidden');
+        if (loopRowEl) loopRowEl.classList.add('hidden');
+        if (turnsRowEl) turnsRowEl.classList.add('hidden');
+        if (deltasRowEl) deltasRowEl.classList.add('hidden');
+        if (causesEl) causesEl.innerHTML = '<span class="text-slate-500">No transcript token usage recorded yet.</span>';
+        renderContextComposition(
+          kv.transcriptFound ? kv.contextComposition : null,
+          kv.transcriptFound ? kv.subagentBreakdown : null
+        );
+        syncKvTtlState(null);
+        updateHandoffButtonStyle('none');
+        return;
+      }
+
+      const warnK = Math.round((kv.warnTokens || 130000) / 1000);
+      const critK = Math.round((kv.criticalTokens || 160000) / 1000);
+      const winK = kv.modelProfile?.windowTokens ? Math.round(kv.modelProfile.windowTokens / 1000) : 200;
+      const winSrc = kv.windowSource || kv.modelProfile?.windowSource || 'profile';
+      const ttlSrc = kv.ttlSource || 'profile';
+      const writeMult = Number(kv.cacheWriteMultiplier || kv.modelProfile?.cacheWriteMultiplier || 1);
+
+      if (hitEl) hitEl.innerText = `${(Number(kv.weightedHitRate || 0) * 100).toFixed(1)}%`;
+      if (ctxEl) {
+        const curK = Math.round((kv.currentContextTokens || 0) / 1000);
+        ctxEl.innerText = `${curK}k / ${winK}k`;
+        ctxEl.title = `Context: ${(kv.currentContextTokens || 0).toLocaleString()} / ${(kv.modelProfile?.windowTokens || 200000).toLocaleString()} tokens (source: ${winSrc})`;
+      }
+      if (bustEl) bustEl.innerText = String(kv.bustCount || 0);
+      if (wasteEl) {
+        wasteEl.innerText = `${Math.round((kv.wastedTokensTotal || 0) / 1000)}k tok`;
+        const wastedUsd = Number(kv.estimatedWastedUsd || 0);
+        wasteEl.title = wastedUsd > 0
+          ? `Est. re-prefill waste: ${fmtUsd(wastedUsd)} (${(kv.wastedTokensTotal || 0).toLocaleString()} tokens)`
+          : `Re-prefill waste: ${(kv.wastedTokensTotal || 0).toLocaleString()} tokens`;
+      }
+
+      if (wmEl) {
+        if (kv.watermark === 'critical') {
+          wmEl.className = 'px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-400 border border-rose-500/30 font-semibold';
+          wmEl.innerText = `CRITICAL >=${critK}k`;
+        } else if (kv.watermark === 'warn') {
+          wmEl.className = 'px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 font-semibold';
+          wmEl.innerText = `HIGH >=${warnK}k`;
+        } else {
+          wmEl.className = 'px-2 py-0.5 rounded-full bg-emerald-500/10 text-[#00e599] border border-emerald-500/30 font-semibold';
+          wmEl.innerText = 'OK';
+        }
+        wmEl.title = `Window: ${winK}k (${winSrc}) | Warn >=${warnK}k | Critical >=${critK}k`;
+      }
+
+      if (tempEl) {
+        const temp = String(kv.cacheTemperature || 'cold').toLowerCase();
+        if (temp === 'hot') {
+          tempEl.className = 'px-2 py-0.5 rounded-full bg-rose-500/15 text-orange-300 border border-orange-400/30 font-semibold';
+          tempEl.innerText = 'HOT';
+        } else if (temp === 'warm') {
+          tempEl.className = 'px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-semibold';
+          tempEl.innerText = 'WARM';
+        } else {
+          tempEl.className = 'px-2 py-0.5 rounded-full bg-white/[0.04] text-slate-400 border border-white/10 font-semibold';
+          tempEl.innerText = 'COLD';
+        }
+      }
+
+      if (modelEl) {
+        if (kv.modelProfile?.id) {
+          modelEl.innerText = `${kv.modelProfile.id}`;
+          modelEl.title = `Model: ${kv.currentModel || 'default'} | Window: ${winK}k (${winSrc}) | Discount: ${Math.round((kv.cacheDiscountRate ?? 0.9) * 100)}% | Write: ${writeMult.toFixed(2)}x`;
+          modelEl.classList.remove('hidden');
+        } else {
+          modelEl.classList.add('hidden');
+        }
+      }
+
+      if (savingsEl) {
+        const pct = Number(kv.estimatedCostSavingsPct || 0);
+        const savedUsd = Number(kv.estimatedSavedUsd);
+        const hasUsd = Number.isFinite(savedUsd) && Math.abs(savedUsd) >= 0.005;
+        if (hasUsd) {
+          savingsEl.innerText = savedUsd >= 0
+            ? `Est. ~${Math.round(pct)}% (${fmtUsd(savedUsd)} saved)`
+            : `Est. ${Math.round(pct)}% (${fmtUsd(savedUsd)})`;
+        } else {
+          savingsEl.innerText = `Est. ~${Math.round(pct)}% saved`;
+        }
+        savingsEl.className = pct < 0
+          ? 'px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20'
+          : 'px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-300 border border-emerald-500/20';
+        const writeHint = kv.cacheCreationTokensTotal ? ` | Writes: ${Math.round(kv.cacheCreationTokensTotal / 1000)}k tok` : '';
+        savingsEl.title = `Est. input cost: ${fmtUsd(kv.estimatedInputCostUsd || 0)} | Saved: ${fmtUsd(kv.estimatedSavedUsd || 0)} | Write mult: ${writeMult.toFixed(2)}x${writeHint}`;
+        savingsEl.classList.remove('hidden');
+      }
+
+      if (ttlEl) {
+        if (kv.ttlStatus === 'expired') {
+          ttlEl.className = 'px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-300 border border-rose-500/30';
+          ttlEl.innerText = `TTL EXPIRED (${fmtSec(kv.idleSeconds)} idle)`;
+        } else if (kv.ttlStatus === 'expiring') {
+          ttlEl.className = 'px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30';
+          ttlEl.innerText = `TTL ${fmtSec(kv.ttlRemainingSec)} left`;
+        } else if (kv.ttlStatus === 'warm') {
+          ttlEl.className = 'px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30';
+          ttlEl.innerText = `TTL ${fmtSec(kv.ttlRemainingSec)} left`;
+        } else {
+          ttlEl.className = 'px-2 py-0.5 rounded-full bg-white/[0.04] text-slate-400 border border-white/10';
+          ttlEl.innerText = 'TTL: cold';
+        }
+        const gapTip = kv.maxWarmHitGapSec ? ` | Max warm gap: ${fmtSec(kv.maxWarmHitGapSec)}` : '';
+        ttlEl.title = `Effective TTL: ${fmtSec(kv.cacheTtlSec)} (source: ${ttlSrc})${gapTip}`;
+      }
+
+      updateHandoffButtonStyle(kv.compactAdvice);
+      syncKvTtlState(kv);
+      renderContextComposition(kv.contextComposition, kv.subagentBreakdown);
+
+      // Convergence / Doom-loop watch badge & banner
+      const lw = kv.loopWatch;
+      if (lw && (lw.status === 'warn' || lw.status === 'critical')) {
+        const isCrit = lw.status === 'critical';
+        if (loopBadgeEl) {
+          loopBadgeEl.className = isCrit
+            ? 'px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-300 border border-rose-500/30 font-semibold'
+            : 'px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 font-semibold';
+          loopBadgeEl.innerText = lw.editFailOscillations >= 2 ? `OSCILLATION x${lw.editFailOscillations}` : `LOOP x${lw.maxRepeatCount}`;
+          loopBadgeEl.classList.remove('hidden');
+        }
+        if (loopRowEl) {
+          const parts = [];
+          if (lw.editFailOscillations >= 2) {
+            const fTxt = Array.isArray(lw.oscillatingFiles) && lw.oscillatingFiles.length > 0 ? ` (${lw.oscillatingFiles.join(', ')})` : '';
+            parts.push(`${lw.editFailOscillations}x edit↔fail oscillation${fTxt}`);
+          }
+          const showRepeat = lw.reason === 'repeat_loop' || lw.reason === 'repeat_and_oscillation';
+          if (showRepeat && lw.maxRepeatCount >= 3) {
+            parts.push(`${Math.round((lw.repeatRate || 0) * 100)}% repeat (${lw.topRepeatedCall || 'tool'} ×${lw.maxRepeatCount})`);
+          }
+          loopRowEl.className = isCrit
+            ? 'px-2.5 py-1.5 rounded-lg bg-rose-500/10 border border-rose-500/30 text-[10px] font-mono text-rose-200'
+            : 'px-2.5 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[10px] font-mono text-amber-200';
+          loopRowEl.innerText = `Convergence watch (${lw.status.toUpperCase()}): ${parts.join(' + ')}`;
+          loopRowEl.classList.remove('hidden');
+        }
+      } else {
+        if (loopBadgeEl) loopBadgeEl.classList.add('hidden');
+        if (loopRowEl) loopRowEl.classList.add('hidden');
+      }
+
+      // Mini 15-turn hit-rate bar chart + Top-3 context-delta attribution
+      const turns = Array.isArray(kv.recentTurns) ? kv.recentTurns : [];
+      if (turnsRowEl && turnsBarsEl) {
+        if (turns.length > 0) {
+          turnsRowEl.classList.remove('hidden');
+          if (turnsLabelEl) turnsLabelEl.innerText = `Recent ${turns.length} turns hit rate`;
+          turnsBarsEl.innerHTML = turns.map((t) => {
+            const pctVal = Math.max(0, Math.min(100, Math.round(Number(t.hitRate || 0) * 100)));
+            const hPct = Math.max(10, pctVal);
+            const cls = t.isBust
+              ? 'bg-rose-400'
+              : pctVal >= 85
+                ? 'bg-[#00e599]'
+                : pctVal >= 50
+                  ? 'bg-cyan-400'
+                  : 'bg-amber-400';
+            const deltaStr = Number(t.deltaTokens || 0) >= 0 ? `+${Math.round((t.deltaTokens || 0) / 1000)}k` : `${Math.round((t.deltaTokens || 0) / 1000)}k`;
+            const tip = escapeHtml(
+              `Turn #${t.turn}: ${pctVal}% hit | ${Math.round((t.ctxTokens || 0) / 1000)}k tok (${deltaStr})${t.triggerTool ? ` | ${t.triggerTool}` : ''}${t.isBust ? ` | BUST: ${t.bustCause}` : ''}`
+            );
+            return `<div class="flex-1 h-full flex items-end" title="${tip}"><div class="w-full rounded-t ${cls} transition-all" style="height:${hPct}%"></div></div>`;
+          }).join('');
+        } else {
+          turnsRowEl.classList.add('hidden');
+        }
+      }
+
+      if (deltasRowEl) {
+        const deltas = Array.isArray(kv.topContextDeltas) ? kv.topContextDeltas : [];
+        if (deltas.length > 0) {
+          deltasRowEl.classList.remove('hidden');
+          deltasRowEl.innerHTML =
+            `<span class="text-slate-500">Top growth:</span>` +
+            deltas.map((d) => {
+              const kStr = `+${(Number(d.deltaTokens || 0) / 1000).toFixed(1)}k`;
+              const safeLbl = escapeHtml(d.label || d.tool || 'tool');
+              const turnNum = Number(d.turn || 0);
+              const deltaNum = Number(d.deltaTokens || 0);
+              return `<span class="px-1.5 py-0.5 rounded bg-white/[0.04] border border-white/[0.07] text-slate-300 max-w-full truncate" title="Turn #${turnNum}: +${deltaNum} tokens"><strong class="text-amber-300">${kStr}</strong> ${safeLbl}</span>`;
+            }).join('');
+        } else {
+          deltasRowEl.classList.add('hidden');
+        }
+      }
+
+      if (causesEl) {
+        const c = kv.bustsByCause || {};
+        causesEl.innerHTML = [
+          `<span class="text-slate-500">Busts:</span>`,
+          `<span>TTL <strong class="text-slate-200">${c.ttl_idle_expiry || 0}</strong></span>`,
+          `<span>Compact <strong class="text-slate-200">${c.compaction_or_truncation || 0}</strong></span>`,
+          `<span>Model <strong class="text-slate-200">${c.model_switch || 0}</strong></span>`,
+          `<span>SysMsg <strong class="text-slate-200">${c.system_injection || 0}</strong></span>`,
+          `<span>Media <strong class="text-slate-200">${c.multimodal_media || 0}</strong></span>`,
+          `<span>Drift <strong class="text-slate-200">${c.prefix_drift || 0}</strong></span>`,
+          kv.duplicateReadCount ? `<span class="text-amber-300">DupReads: <strong>${kv.duplicateReadCount}</strong></span>` : '',
+          kv.cacheCreationTokensTotal ? `<span class="text-indigo-300" title="Prompt cache write tokens (${writeMult.toFixed(2)}x billing)">Writes: <strong>${Math.round(kv.cacheCreationTokensTotal / 1000)}k</strong></span>` : '',
+          kv.thinkingTokensTotal ? `<span class="text-purple-300" title="Thinking / reasoning tokens">Think: <strong>${Math.round(kv.thinkingTokensTotal / 1000)}k</strong></span>` : ''
+        ].filter(Boolean).join('');
+      }
+    }
+
+    async function runMaintenanceVacuum() {
+      const btn = document.getElementById('vacuum-btn');
+      if (btn) btn.innerText = 'Vacuuming...';
+      try {
+        const res = await apiFetch('/api/maintenance?action=vacuum&maxAgeDays=14', { method: 'POST' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (btn) btn.innerText = data.reclaimedBytes > 0 ? `Freed ${formatBytes(data.reclaimedBytes)}` : 'Vacuum OK';
+        setTimeout(() => { if (btn) btn.innerText = 'Prune & Vacuum'; }, 2500);
+        refreshData(true);
+      } catch (err) {
+        if (btn) btn.innerText = 'Prune & Vacuum';
+        alert("Maintenance failed: " + err.message);
       }
     }
 
@@ -1046,7 +2010,18 @@
 
     // Auto-refresh polling every 3 seconds
     refreshData(true);
-    setInterval(() => refreshData(false), 3000);
+    pollTimer = setInterval(() => refreshData(false), 3000);
+    window.addEventListener('beforeunload', () => {
+      stopKvTtlTimer();
+      if (pollTimer !== null) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      if (handoffCopyResetTimer !== null) {
+        clearTimeout(handoffCopyResetTimer);
+        handoffCopyResetTimer = null;
+      }
+    });
   </script>
 </body>
 </html>

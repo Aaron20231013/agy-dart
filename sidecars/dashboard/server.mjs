@@ -5,6 +5,21 @@ import os from "node:os";
 import { execSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ContextModeStore, FILE_CATEGORIES } from "../../context/lib/store.js";
+import { buildHandoffBrief, inferWorkspaceFromStore } from "../../context/lib/handoff.js";
+import {
+  analyzeTranscriptCache,
+  computeCacheWarmth,
+  CONTEXT_CRITICAL_TOKENS,
+  CONTEXT_WARN_TOKENS,
+  createEmptyContextComposition,
+  createEmptySubagentBreakdown,
+  DEFAULT_CACHE_TTL_SEC,
+  findTranscriptForConversation,
+  MIN_CACHEABLE_CONTEXT_TOKENS,
+  parseTranscriptLines,
+  readTranscriptTail,
+  resolveModelProfile
+} from "../../context/lib/cache-analyzer.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const store = new ContextModeStore();
@@ -25,14 +40,16 @@ function getRenderedHtml() {
 }
 
 let appStartTime = null;
-try {
-  const out = execSync(
-    'powershell -NoProfile -Command "(Get-Process -Name language_server, Antigravity | Measure-Object -Property StartTime -Minimum).Minimum.ToUniversalTime().ToString(\'yyyy-MM-ddTHH:mm:ss.fffZ\')"',
-    { encoding: "utf8", timeout: 3000 }
-  );
-  const ts = new Date(out.trim()).getTime();
-  if (!Number.isNaN(ts) && ts > 0) appStartTime = ts;
-} catch {}
+if (process.platform === "win32") {
+  try {
+    const out = execSync(
+      'powershell -NoProfile -Command "(Get-Process -Name language_server, Antigravity | Measure-Object -Property StartTime -Minimum).Minimum.ToUniversalTime().ToString(\'yyyy-MM-ddTHH:mm:ss.fffZ\')"',
+      { encoding: "utf8", timeout: 3000, windowsHide: true }
+    );
+    const ts = new Date(out.trim()).getTime();
+    if (!Number.isNaN(ts) && ts > 0) appStartTime = ts;
+  } catch {}
+}
 if (!appStartTime) {
   appStartTime = Date.now() - Math.round(process.uptime() * 1000);
 }
@@ -108,10 +125,248 @@ function getStatsPayload(data, defaultConvId = "default") {
       : parseInt(process.env.CONTEXT_MODE_MAX_OUTPUT_BYTES || "8100", 10)
   );
   stats.isPaused = store.isPaused(targetSid);
+  stats.cliFilterEnabled = store.isCliFilterEnabled(targetSid);
+  stats.readDedupEnabled = store.isReadDedupEnabled(targetSid);
+  stats.ghost = store.getGhostStats(
+    targetSid,
+    scope === "app" || scope === "session" ? { sinceTs: appStartTime } : {}
+  );
 
   stats.version = getPackageVersion();
 
   return stats;
+}
+
+const LATEST_SCAN_TTL_MS = 10000;
+let cachedLatestScan = { ts: 0, path: null };
+const parsedDiagCache = new Map(); // key -> { mtimeMs, size, ttlSec, diag }
+
+function parseSafeMaxAgeDays(raw, fallback = 14) {
+  if (raw === undefined || raw === null) return fallback;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return fallback;
+  const n = Number(trimmed);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function parseOptionalPositiveNumber(raw) {
+  if (raw === undefined || raw === null) return undefined;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return undefined;
+  const n = Number(trimmed);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function refreshWallClockTtl(diag, explicitTtlSec) {
+  const nowMs = Date.now();
+  if (!diag || !diag.lastPlannerAt) return diag ? { ...diag, serverNowMs: nowMs } : diag;
+  const safeTtl =
+    parseOptionalPositiveNumber(explicitTtlSec) ??
+    parseOptionalPositiveNumber(diag.cacheTtlSec) ??
+    DEFAULT_CACHE_TTL_SEC;
+  const lastMs = Date.parse(diag.lastPlannerAt);
+  if (!Number.isFinite(lastMs)) return { ...diag, serverNowMs: nowMs };
+  const idleSeconds = Math.max(0, Math.round((nowMs - lastMs) / 1000));
+  const ttlRemainingSec = Math.max(0, safeTtl - idleSeconds);
+  const currentContextTokens = diag.currentContextTokens || 0;
+  let ttlStatus = "cold";
+  if (currentContextTokens >= MIN_CACHEABLE_CONTEXT_TOKENS) {
+    if (idleSeconds >= safeTtl) ttlStatus = "expired";
+    else if (ttlRemainingSec <= 60) ttlStatus = "expiring";
+    else ttlStatus = "warm";
+  }
+  const { cacheTemperature, compactAdvice } = computeCacheWarmth({
+    currentContextTokens,
+    idleSeconds,
+    ttlSec: safeTtl,
+    weightedHitRate: diag.weightedHitRate || 0,
+    criticalTokens: diag.criticalTokens || CONTEXT_CRITICAL_TOKENS,
+    coldCompactTokens: diag.coldCompactTokens || 60000,
+    delayHotMinTokens: diag.delayHotMinTokens || 30000
+  });
+  return {
+    ...diag,
+    cacheTtlSec: safeTtl,
+    idleSeconds,
+    ttlRemainingSec,
+    ttlStatus,
+    cacheTemperature,
+    compactAdvice,
+    serverNowMs: nowMs
+  };
+}
+
+function getCacheDiagPayload(data, defaultConvId = "default") {
+  const { scope, convId } = resolveTargetSession(data, defaultConvId);
+  const rawTtl = data.ttl !== undefined && data.ttl !== "" ? data.ttl : process.env.AGY_DART_CACHE_TTL_SEC;
+  const explicitTtlSec = parseOptionalPositiveNumber(rawTtl);
+  const envWindowTokens = parseOptionalPositiveNumber(process.env.AGY_DART_WINDOW_TOKENS);
+  const envWarnTokens = parseOptionalPositiveNumber(process.env.AGY_DART_WARN_TOKENS);
+  const envCritTokens = parseOptionalPositiveNumber(process.env.AGY_DART_CRITICAL_TOKENS);
+  const isSpecificConv = scope === "conversation" && convId && convId !== "default" && convId !== "all" && convId !== "app";
+  let transcriptPath = null;
+  if (isSpecificConv) {
+    transcriptPath = findTranscriptForConversation(convId, { exactOnly: true });
+  } else {
+    const now = Date.now();
+    if (now - cachedLatestScan.ts < LATEST_SCAN_TTL_MS && cachedLatestScan.path && fs.existsSync(cachedLatestScan.path)) {
+      transcriptPath = cachedLatestScan.path;
+    } else {
+      transcriptPath = findTranscriptForConversation(null);
+      cachedLatestScan = { ts: now, path: transcriptPath };
+    }
+  }
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) {
+    const defProfile = resolveModelProfile(null);
+    const effectiveWindow = envWindowTokens ?? defProfile.windowTokens;
+    const windowSource = envWindowTokens !== undefined ? "explicit" : "profile";
+    const ttlSource = explicitTtlSec !== undefined ? "explicit" : "profile";
+    return {
+      ok: true,
+      transcriptFound: false,
+      scope,
+      conversationId: convId,
+      serverNowMs: Date.now(),
+      cacheTtlSec: explicitTtlSec ?? defProfile.ttlSec,
+      ttlSource,
+      maxWarmHitGapSec: null,
+      ttlStatus: "cold",
+      cacheTemperature: "cold",
+      compactAdvice: "none",
+      estimatedCostSavingsPct: 0,
+      estimatedInputCostUsd: 0,
+      estimatedSavedUsd: 0,
+      estimatedWastedUsd: 0,
+      cacheCreationTokensTotal: 0,
+      thinkingTokensTotal: 0,
+      cacheWriteMultiplier: defProfile.cacheWriteMultiplier,
+      windowSource,
+      watermark: "ok",
+      warnTokens: envWarnTokens ?? Math.round(effectiveWindow * 0.65),
+      criticalTokens: envCritTokens ?? Math.round(effectiveWindow * 0.80),
+      contextUtilization: 0,
+      modelProfile: {
+        id: defProfile.id,
+        windowTokens: effectiveWindow,
+        windowSource,
+        defaultTtlSec: defProfile.ttlSec,
+        cacheDiscountRate: defProfile.cacheDiscountRate,
+        inputPer1M: defProfile.inputPer1M,
+        cacheWriteMultiplier: defProfile.cacheWriteMultiplier,
+        cacheWrite1hMultiplier: defProfile.cacheWrite1hMultiplier
+      },
+      weightedHitRate: 0,
+      avgTurnHitRate: 0,
+      currentContextTokens: 0,
+      peakContextTokens: 0,
+      bustCount: 0,
+      bustsByCause: {
+        ttl_idle_expiry: 0,
+        model_switch: 0,
+        compaction_or_truncation: 0,
+        system_injection: 0,
+        multimodal_media: 0,
+        prefix_drift: 0
+      },
+      wastedTokensTotal: 0,
+      duplicateReadCount: 0,
+      loopWatch: {
+        status: "ok",
+        windowSize: 0,
+        repeatRate: 0,
+        maxRepeatCount: 0,
+        topRepeatedCall: null,
+        editFailOscillations: 0,
+        oscillatingFiles: [],
+        reason: null
+      },
+      contextComposition: createEmptyContextComposition(),
+      subagentBreakdown: createEmptySubagentBreakdown(),
+      recentTurns: [],
+      topContextDeltas: []
+    };
+  }
+  try {
+    const st = fs.statSync(transcriptPath);
+    const cacheKey = `${transcriptPath}:${explicitTtlSec ?? "auto"}:${envWindowTokens ?? ""}:${envWarnTokens ?? ""}:${envCritTokens ?? ""}`;
+    const cached = parsedDiagCache.get(cacheKey);
+    let diag;
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+      diag = refreshWallClockTtl(cached.diag, explicitTtlSec);
+    } else {
+      const steps =
+        st.size <= 2 * 1024 * 1024
+          ? parseTranscriptLines(fs.readFileSync(transcriptPath, "utf8"))
+          : readTranscriptTail(transcriptPath, 524288);
+      const nowMs = Date.now();
+      const diagOpts = { nowMs };
+      if (explicitTtlSec !== undefined) diagOpts.ttlSec = explicitTtlSec;
+      if (envWindowTokens !== undefined) diagOpts.windowTokens = envWindowTokens;
+      if (envWarnTokens !== undefined) diagOpts.warnTokens = envWarnTokens;
+      if (envCritTokens !== undefined) diagOpts.criticalTokens = envCritTokens;
+      diag = analyzeTranscriptCache(steps, diagOpts);
+      if (parsedDiagCache.size > 16) parsedDiagCache.clear();
+      parsedDiagCache.set(cacheKey, { mtimeMs: st.mtimeMs, size: st.size, ttlSec: explicitTtlSec, diag });
+      diag = { ...diag, serverNowMs: nowMs };
+    }
+    return {
+      ok: true,
+      transcriptFound: true,
+      scope,
+      conversationId: convId,
+      ...diag,
+      contextComposition: diag.contextComposition ?? createEmptyContextComposition(),
+      subagentBreakdown: diag.subagentBreakdown ?? createEmptySubagentBreakdown(),
+      serverNowMs: diag.serverNowMs ?? Date.now()
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      transcriptFound: false,
+      serverNowMs: Date.now(),
+      contextComposition: createEmptyContextComposition(),
+      subagentBreakdown: createEmptySubagentBreakdown(),
+      error: err?.message || String(err)
+    };
+  }
+}
+
+function getHandoffPayload(data = {}, defaultConvId = "default") {
+  const { scope, convId, targetSid } = resolveTargetSession(data, defaultConvId);
+  const sinceTs = scope === "app" || scope === "session" ? appStartTime : null;
+  const rawCwd = typeof data.cwd === "string" ? data.cwd.trim() : "";
+  const cwd = rawCwd && !rawCwd.includes("\0")
+    ? rawCwd
+    : inferWorkspaceFromStore(store, targetSid, sinceTs);
+  const rawMaxBytes = parseOptionalPositiveNumber(data.maxBytes);
+  const maxBytes = rawMaxBytes !== undefined
+    ? Math.min(16384, Math.max(256, Math.floor(rawMaxBytes)))
+    : 5800;
+  let cacheDiag = null;
+  try {
+    const diag = getCacheDiagPayload(data, defaultConvId);
+    if (diag && diag.ok && diag.transcriptFound) {
+      cacheDiag = diag;
+    }
+  } catch {}
+  const brief = buildHandoffBrief({
+    store,
+    sessionId: targetSid,
+    cwd,
+    cacheDiag,
+    maxBytes,
+    sinceTs
+  });
+  return {
+    ok: true,
+    scope,
+    conversationId: convId,
+    sessionId: targetSid,
+    markdown: brief.markdown,
+    summary: brief.summary,
+    bytes: brief.bytes,
+    truncated: brief.truncated
+  };
 }
 
 let SidecarApp = null;
@@ -252,6 +507,43 @@ if (isSidecarEnv) {
   app.api("/api/purge", handlePurge, "GET");
   app.api("/api/purge", handlePurge, "POST");
 
+  app.api("/api/cache-diag", (data) => {
+    return getCacheDiagPayload(data, app.config.conversationId);
+  }, "GET");
+
+  app.api("/api/handoff", (data) => {
+    return getHandoffPayload(data, app.config.conversationId);
+  }, "GET");
+
+  const handleMaintenance = (data) => {
+    const action = data.action || "prune";
+    const maxAgeDays = parseSafeMaxAgeDays(data.maxAgeDays, 14);
+    const vacuum = action === "vacuum" || data.vacuum === true || data.vacuum === "true" || data.vacuum === "1";
+    return store.pruneByTtl({ maxAgeDays, vacuum });
+  };
+  app.api("/api/maintenance", handleMaintenance, "GET");
+  app.api("/api/maintenance", handleMaintenance, "POST");
+
+  const handleCliFilter = (data) => {
+    const { scope, targetSid } = resolveTargetSession(data, app.config.conversationId);
+    const current = store.isCliFilterEnabled(targetSid);
+    const next = data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : !current;
+    const saved = store.setCliFilterEnabled(next, targetSid);
+    return { ok: true, cliFilterEnabled: saved, scope, sessionId: targetSid };
+  };
+  app.api("/api/cli-filter", handleCliFilter, "GET");
+  app.api("/api/cli-filter", handleCliFilter, "POST");
+
+  const handleReadDedup = (data) => {
+    const { scope, targetSid } = resolveTargetSession(data, app.config.conversationId);
+    const current = store.isReadDedupEnabled(targetSid);
+    const next = data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : !current;
+    const saved = store.setReadDedupEnabled(next, targetSid);
+    return { ok: true, readDedupEnabled: saved, scope, sessionId: targetSid };
+  };
+  app.api("/api/read-dedup", handleReadDedup, "GET");
+  app.api("/api/read-dedup", handleReadDedup, "POST");
+
   await app.run();
   console.log(`[context-mode sidecar] registered and running`);
 } else {
@@ -296,11 +588,12 @@ if (isSidecarEnv) {
         const data = Object.fromEntries(url.searchParams.entries());
         handleCutoffReq(data);
       } else {
+        const queryData = Object.fromEntries(url.searchParams.entries());
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", () => {
           try {
-            handleCutoffReq(JSON.parse(body || "{}"));
+            handleCutoffReq({ ...queryData, ...JSON.parse(body || "{}") });
           } catch (e) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: e.message }));
@@ -323,11 +616,12 @@ if (isSidecarEnv) {
         const data = Object.fromEntries(url.searchParams.entries());
         handleToggleReq(data);
       } else {
+        const queryData = Object.fromEntries(url.searchParams.entries());
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", () => {
           try {
-            handleToggleReq(JSON.parse(body || "{}"));
+            handleToggleReq({ ...queryData, ...JSON.parse(body || "{}") });
           } catch (e) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: e.message }));
@@ -369,11 +663,12 @@ if (isSidecarEnv) {
         const data = Object.fromEntries(url.searchParams.entries());
         handleExemptReq(data);
       } else {
+        const queryData = Object.fromEntries(url.searchParams.entries());
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", () => {
           try {
-            handleExemptReq(JSON.parse(body || "{}"));
+            handleExemptReq({ ...queryData, ...JSON.parse(body || "{}") });
           } catch (e) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: e.message }));
@@ -400,11 +695,12 @@ if (isSidecarEnv) {
         const data = Object.fromEntries(url.searchParams.entries());
         handlePurgeReq(data);
       } else {
+        const queryData = Object.fromEntries(url.searchParams.entries());
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", () => {
           try {
-            handlePurgeReq(JSON.parse(body || "{}"));
+            handlePurgeReq({ ...queryData, ...JSON.parse(body || "{}") });
           } catch (e) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: e.message }));
@@ -459,6 +755,70 @@ if (isSidecarEnv) {
           res.end(JSON.stringify({ error: e.message }));
         }
       });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/cache-diag") {
+      const data = Object.fromEntries(url.searchParams.entries());
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(getCacheDiagPayload(data)));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/handoff") {
+      const data = Object.fromEntries(url.searchParams.entries());
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(getHandoffPayload(data)));
+      return;
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/maintenance") {
+      const queryData = Object.fromEntries(url.searchParams.entries());
+      const handleMaintReq = (data) => {
+        const action = data.action || "prune";
+        const maxAgeDays = parseSafeMaxAgeDays(data.maxAgeDays, 14);
+        const vacuum = action === "vacuum" || data.vacuum === true || data.vacuum === "true" || data.vacuum === "1";
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(store.pruneByTtl({ maxAgeDays, vacuum })));
+      };
+      if (req.method === "GET") {
+        handleMaintReq(queryData);
+      } else {
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          try { handleMaintReq({ ...queryData, ...JSON.parse(body || "{}") }); } catch (e) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: e.message }));
+          }
+        });
+      }
+      return;
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && (url.pathname === "/api/cli-filter" || url.pathname === "/api/read-dedup")) {
+      const isCli = url.pathname === "/api/cli-filter";
+      const queryData = Object.fromEntries(url.searchParams.entries());
+      const handleFeatureReq = (data) => {
+        const { scope, targetSid } = resolveTargetSession(data);
+        const cur = isCli ? store.isCliFilterEnabled(targetSid) : store.isReadDedupEnabled(targetSid);
+        const next = data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : !cur;
+        const saved = isCli ? store.setCliFilterEnabled(next, targetSid) : store.setReadDedupEnabled(next, targetSid);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, [isCli ? "cliFilterEnabled" : "readDedupEnabled"]: saved, scope, sessionId: targetSid }));
+      };
+      if (req.method === "GET") {
+        handleFeatureReq(queryData);
+      } else {
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          try { handleFeatureReq({ ...queryData, ...JSON.parse(body || "{}") }); } catch (e) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: e.message }));
+          }
+        });
+      }
       return;
     }
 

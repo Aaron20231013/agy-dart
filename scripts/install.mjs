@@ -35,12 +35,27 @@ const FILES_TO_COPY = [
   "context/lib/store.js",
   "context/lib/executor.js",
   "context/lib/tools.js",
+  "context/lib/cache-analyzer.js",
+  "context/lib/cache-simulator.js",
+  "context/lib/repo-skeleton.js",
+  "context/lib/stable-json.js",
+  "context/lib/security.js",
+  "context/lib/text-diff.js",
+  "context/lib/json-crusher.js",
+  "context/lib/handoff.js",
+  "hooks/compile-cache.mjs",
   "hooks/session-start.mjs",
   "hooks/pre-tool-use.mjs",
+  "hooks/post-tool-use.mjs",
+  "hooks/pre-invocation.mjs",
+  "hooks/cli-filter.mjs",
+  "hooks/filter-rules.mjs",
   "sidecars/dashboard/sidecar.json",
   "sidecars/dashboard/server.mjs",
   "sidecars/dashboard/index.html",
-  "scripts/install.mjs"
+  "scripts/install.mjs",
+  "scripts/prefix-budget.mjs",
+  "scripts/cache-audit.mjs"
 ];
 
 function getHomeDir() {
@@ -173,6 +188,25 @@ async function applyMode(targetDir, modeKey, skipDb = false) {
               timeout: 10
             }
           ]
+        }
+      ],
+      PostToolUse: [
+        {
+          matcher: "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|.*apply_edits|.*run_checks|.*ctx_resume|call_mcp_tool",
+          hooks: [
+            {
+              type: "command",
+              command: "node ./hooks/post-tool-use.mjs",
+              timeout: 5
+            }
+          ]
+        }
+      ],
+      PreInvocation: [
+        {
+          type: "command",
+          command: "node ./hooks/pre-invocation.mjs",
+          timeout: 5
         }
       ]
     }
@@ -325,19 +359,30 @@ async function runDoctor(targetDir) {
     const ctxCheck = await verifyMcpServer(path.join(targetDir, "context", "server.js"), { AGY_DART_DB_PATH: tmpDb });
     const hookCheck = await verifySessionStart(path.join(targetDir, "hooks", "session-start.mjs"), targetDir, tmpDb);
     const hasSidecar = await pathExists(path.join(targetDir, "sidecars", "dashboard", "sidecar.json"));
+    const hasCliFilter = await pathExists(path.join(targetDir, "hooks", "cli-filter.mjs"));
+    const hasPostHook = await pathExists(path.join(targetDir, "hooks", "post-tool-use.mjs"));
+    const hasPreInvHook = await pathExists(path.join(targetDir, "hooks", "pre-invocation.mjs"));
+    const hasCompileCacheHelper = await pathExists(path.join(targetDir, "hooks", "compile-cache.mjs"));
     const hasRg = hasCommand("rg", ["--version"]);
+    const nodeModule = await import("node:module");
+    const hasCompileCache = typeof nodeModule?.enableCompileCache === "function";
 
     const hooksRaw = JSON.parse(await fs.readFile(path.join(targetDir, "hooks.json"), "utf8"));
     const matcher = hooksRaw?.["agy-dart-lifecycle"]?.PreToolUse?.[0]?.matcher || "";
+    const hasPostCfg = Array.isArray(hooksRaw?.["agy-dart-lifecycle"]?.PostToolUse);
+    const hasPreInvCfg = Array.isArray(hooksRaw?.["agy-dart-lifecycle"]?.PreInvocation);
 
     console.log("agy-dart health check:");
     console.log(`  - Plugin path   : ${targetDir}`);
     console.log(`  - Node / SQLite : v${nodeVer} (OK)`);
+    console.log(`  - V8 CompileCache : ${hasCompileCache ? "available" : "unavailable"}${hasCompileCache && hasCompileCacheHelper ? " (versioned hook cache active)" : ""}`);
     console.log(`  - ripgrep (rg)  : ${hasRg ? "available (fast search active)" : "not found (Node.js fallback active; rerun with --install-rg on Windows)"}`);
     console.log(`  - MCP [fast]    : OK (${fastCheck.tools.length} tools: ${fastCheck.tools.join(", ")})`);
     console.log(`  - MCP [context] : OK (${ctxCheck.tools.length} tools: ${ctxCheck.tools.join(", ")})`);
     console.log(`  - SessionStart  : OK (${hookCheck.durationMs}ms, ${hookCheck.bytes} bytes)`);
-    console.log(`  - PreToolUse    : OK (matcher: ${matcher})`);
+    console.log(`  - PreToolUse    : OK (matcher: ${matcher}; cli-filter: ${hasCliFilter ? "OK" : "MISSING"})`);
+    console.log(`  - PostToolUse   : ${hasPostHook && hasPostCfg ? "OK (edit/compaction read-dedup invalidation)" : "MISSING"}`);
+    console.log(`  - PreInvocation : ${hasPreInvHook && hasPreInvCfg ? "OK (UI-only KV-cache watermark/TTL watch)" : "MISSING"}`);
     console.log(`  - Sidecar UI    : ${hasSidecar ? "OK (sidecars/dashboard present)" : "MISSING"}`);
 
     // Friendly warning if standalone legacy plugins coexist globally
@@ -351,7 +396,7 @@ async function runDoctor(targetDir) {
       }
     }
 
-    return fastCheck.tools.length === 4 && ctxCheck.tools.length === 8 && hookCheck.bytes > 0 && hasSidecar;
+    return fastCheck.tools.length === 4 && ctxCheck.tools.length === 8 && hookCheck.bytes > 0 && hasSidecar && hasCliFilter && hasPostHook && hasPreInvHook && hasCompileCacheHelper;
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }

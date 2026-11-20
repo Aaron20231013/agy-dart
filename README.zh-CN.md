@@ -26,15 +26,33 @@
 
 ---
 
+## v1.1.0 核心新增能力
+
+1. **透明 CLI 输出过滤（`PreToolUse.overwrite`）**：对常见高噪单条开发命令（`git status/diff/log`、`npm/pnpm/yarn/node/pytest/cargo/go/dotnet` 测试、`tsc/eslint/ruff/mypy/vite/cargo` 构建、`npm/pip install`、`docker build`）通过零依赖 `hooks/cli-filter.mjs` 在 **1 轮内透明降噪**（免去拦截重试多一轮），严格保留原始退出码、剥离 ANSI 与进度条、强制输出 `<= 8.8 KB`，并将原始大输出自动落库 FTS5 可查。
+2. **服务端 KV-Cache / Prompt Cache 保护与诊断**：
+   - 确定性前缀稳定 `SessionStart` 排布（静态路由头 → 半静态项目/目录结构 + `git HEAD` 缓存的核心导入枢纽 → 易变 `git status` 置尾）+ 瘦身冻结 Turn-0 MCP Schema（`npm run prefix:budget` 常驻约 ~2,912 tok）。
+   - **模型感知动态水位 / TTL / 缓存折扣**（自动匹配 Claude / Gemini / GPT / DeepSeek / Qwen 档位并保留环境变量覆写）+ **收敛与死循环监控**（追踪近期工具指纹重复率与 `edit↔fail` 震荡计数）。
+   - 零前缀污染 `PreInvocation` 钩子：利用 Antigravity 原生纯 UI 提示 `metadata.user_markdown`（`systemMessage: ""` 零 token 注入），在动态水位、热缓存延迟压缩、空闲 TTL 过期、高上下文多模态风险及死循环震荡时仅向用户预警。
+   - `fast/benchmark.mjs cache` 与 Sidecar 实时面板支持失效归因、最近 15 轮 ASCII 命中率趋势条 / 微型柱状图与单步上下文增量 Top-3 工具归因。
+3. **会话级读去重、有界切片缓存与结构化 `ctx_resume` 恢复卡**：
+   - SQLite 追踪 `(session, file, range, mtime, size)` 拦截重复未变更读取并在编辑/压缩时自动失效；`PostToolUse` 与 `cli-filter` 轻量记录已改文件与最近一次测试/构建状态，`ctx_resume` 零新增工具返回紧凑 `sessionCheckpoint` 恢复卡。
+   - `agy-dart_fast` 的 `read_slices` 同时支持符号大纲 LRU（128 条）与文本行跨调用缓存（总计 ≤ 4 MB、单文件 ≤ 256 KB，`apply_edits` 写入后主动失效）。
+4. **安全补强与数据库 TTL/Vacuum 维护**：
+   - `ctx_index(url)` 补齐 SSRF 防护（仅 `http:`/`https:`、最多 5 跳相对重定向、逐跳 DNS 私网/回环/链路本地 IP 拦截与 DNS pinning），落库/回传前默认执行轻量密钥正则脱敏（可用 `AGY_DART_DISABLE_SECRET_REDACTION=1` 关闭），并支持可选敏感文件读取提醒（`AGY_DART_SENSITIVE_FILE_GUARD=warn|deny`）。
+   - Markdown 标题感知分块、SHA-256 内容去重、每日轻量 TTL 清理、`ctx_purge({ scope: "stale", vacuum: true })` 与 Sidecar 一键 **Prune & Vacuum**。
+
+---
+
 ## 设计来源与开源致谢（Credits & Inspirations）
 
-本项目站在以下三个优秀开源项目的肩膀上二次整合开发，特此致谢并明确注明借鉴边界（完整许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）：
+本项目严格遵循 **MIT 协议** 与 **零运行期 npm 依赖**，所有复用声明与合规红线详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)：
 
-| 项目 | 协议 | 借鉴 / 复用内容 | `agy-dart` 的融合改造 |
+| 项目 | 协议 | 借鉴 / 复用内容 | `agy-dart` 的融合与净室实现 |
 | :--- | :---: | :--- | :--- |
-| **[INK-Q/agy-fast](https://github.com/INK-Q/agy-fast)** | MIT | 复用其零依赖 4 工具批处理引擎（`batch_search`、`apply_edits`、`read_slices`、`run_checks`）、`SessionStart` 仓库快照、`<=8.8 KB` 零溢盘规范、多模态 TTFT 卫生规则与本地 `benchmark.mjs` | 封装为插件内 `agy-dart_fast` 服务，合并进统一启动钩子（关闭上游覆盖式自更新），并与上下文护栏共享一套路由仲裁表 |
-| **[Domush/antigravity-plugin-context-mode](https://github.com/Domush/antigravity-plugin-context-mode)** | MIT | 复用并改造其零依赖 `node:sqlite` FTS5（Porter BM25 + Trigram RRF）引擎、8 个 `ctx_*` 工具、`PreToolUse` 护栏与 Aux Pane Sidecar 实时面板 | 封装为 `agy-dart_context` 服务，修复 `${PLUGIN_ROOT}` 路径、补全 `sidecars/` 安装、消除硬编码作者路径、单次 Hook 复用 SQLite 连接、默认阈值调至 **16 KB / 410 行**、强制截断响应 **`<= 8.8 KB`**、独立数据库 `~/.agy-dart/context.db` |
-| **[mksglu/context-mode](https://github.com/mksglu/context-mode)** | Elastic-2.0（**不含其代码**） | 借鉴其开创的“Thinking in Code”沙盒过滤思想、双 FTS5 索引 RRF 融合范式，以及 v2 中豁免 Agent 自用 `SKILL.md`/规则文件的工程设计 | 仅架构思想参考，零代码引入；据此为 `PreToolUse` 新增 `SKILL.md` / `AGENTS.md` / `GEMINI.md` 与内置技能目录自动白名单 |
+| **[INK-Q/agy-fast](https://github.com/INK-Q/agy-fast)** | MIT | 复用 4 工具批处理引擎、`SessionStart` 快照、`<=8.8 KB` 规范与 `benchmark.mjs` | 封装为 `agy-dart_fast`，升级前缀稳定启动钩子，并为 `benchmark.mjs` 扩展 KV-Cache 失效归因与 `cache` 子命令 |
+| **[Domush/antigravity-plugin-context-mode](https://github.com/Domush/antigravity-plugin-context-mode)** | MIT | 复用并改造 `node:sqlite` FTS5 引擎、8 个 `ctx_*` 工具、`PreToolUse` 护栏与 Sidecar 面板 | 修复 `${PLUGIN_ROOT}`、16 KB/410 行阈值、`<=8.8 KB` 封顶、`SKILL.md` 白名单、Markdown 标题感知分块、DB TTL/Vacuum 与 KV-Cache 实时面板 |
+| **MIT 模式参考**（`mpecan/tokf`、`uuie/agent-cache-optimizer`、`rkolesnichenko/ccdrift`、`ooples/token-optimizer-mcp`、`tobi/qmd`、`DeusData/codebase-memory-mcp`、`tirth8205/code-review-graph`） | MIT | 借鉴声明式 CLI 过滤、前缀稳定性、缓存归因、读去重、Markdown 标题分块与 `git HEAD` 缓存依赖枢纽模式 | 纯零依赖 Node.js ESM 净室实现，原生融合 Antigravity 四大钩子与 Sidecar |
+| **仅架构思想借鉴**（`mksglu/context-mode`、`rtk-ai/rtk`、`opencode-dynamic-context-pruning`、`huiliyi37/Tianshu-harness`） | 非 MIT / Apache-2.0（**零源码引入**） | 仅参考高层次架构范式（沙盒过滤、透明钩子改写、会话去重、版本化 V8 编译缓存、SHA-256 内容去重、前缀预算审计、Ghost 拦截效率反馈、热缓存延迟压缩） | **严守红线，未引入任何一行源码**，全部自主 MIT 净室实现 |
 
 ---
 
@@ -132,15 +150,21 @@ node scripts/install.mjs mode no-read-hook
 ## 效果量化与本地测试
 
 ```bash
-# 运行本仓库端到端集成测试（双 MCP 握手、8.8 KB 硬封顶、16 KB 策略、SKILL.md 白名单、安装器干跑）
+# 运行本仓库全量端到端与 v1.1 新特性测试套件
 npm test
 
-# 跑几天真实任务后，离线分析本地 Antigravity 轨迹的轮次/缓存/额度收益（纯本地，不上传任何数据）
+# 离线分析本地 Antigravity 轨迹的轮次 / 缓存 / 额度收益（纯本地，不上传任何数据）
 node ~/.gemini/config/plugins/agy-dart/fast/benchmark.mjs analyze --local --recent 10
+
+# 专项查看服务端 Prompt Cache (KV-Cache) 命中率与失效归因报告
+node ~/.gemini/config/plugins/agy-dart/fast/benchmark.mjs cache --local --recent 10
+
+# 审计 Turn-0 常驻前缀 Token 预算与双 MCP Schema 确定性指纹
+npm run prefix:budget
 ```
 
 ---
 
 ## 开源协议
 
-本项目基于 [MIT License](LICENSE) 开源；复用组件保留其原有 MIT 版权声明，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+本项目基于 [MIT License](LICENSE) 开源；复用组件保留其原有 MIT 版权声明，合规边界详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

@@ -1,5 +1,8 @@
 // agy-fast MCP Stdio Server (bundled zero-dependency ESM)
-
+import { enableVersionedCompileCache } from "../hooks/compile-cache.mjs";
+try {
+  enableVersionedCompileCache();
+} catch {}
 
 // src/protocol/mcp.ts
 var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
@@ -9,6 +12,17 @@ var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
   "2024-11-05"
 ]);
 var DEFAULT_PROTOCOL_VERSION = "2025-03-26";
+function stableSortObject(value) {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => stableSortObject(item));
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return value;
+  const sorted = {};
+  for (const key of Object.keys(value).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))) {
+    sorted[key] = stableSortObject(value[key]);
+  }
+  return sorted;
+}
 var McpStdioServer = class {
   tools = /* @__PURE__ */ new Map();
   serverName;
@@ -67,7 +81,9 @@ var McpStdioServer = class {
       return { jsonrpc: "2.0", id, result: {} };
     }
     if (method === "tools/list") {
-      const definitions = [...this.tools.values()].map((t) => t.definition);
+      const definitions = [...this.tools.values()]
+        .map((t) => stableSortObject(t.definition))
+        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
       return { jsonrpc: "2.0", id, result: { tools: definitions } };
     }
     if (method === "resources/list") {
@@ -484,7 +500,7 @@ async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
   }
   const content = buf.toString("utf8");
   const eol = content.includes("\r\n") ? "\r\n" : "\n";
-  return { content, eol, size: stat.size, mode: stat.mode & 4095, rawBuffer: buf };
+  return { content, eol, size: stat.size, mtimeMs: stat.mtimeMs, mode: stat.mode & 4095, rawBuffer: buf };
 }
 function globToRegExp(pattern) {
   const normalized = pattern.trim().replace(/\\/g, "/").replace(/^\.\//, "");
@@ -777,11 +793,21 @@ var ALWAYS_NOISE_LINE_PATTERNS = [
   /^\(node:\d+\)\s*ExperimentalWarning:/,
   /^\(Use `node --trace-warnings/
 ];
+var FAILURE_PROTECT_PATTERN = /\b(?:error|fail(?:ed|ure|ing)?|exception|fatal|assert(?:ion)?|panic|traceback)\b|[A-Za-z]+(?:Error|Exception)\b|\berr!|✖|✗/i;
+var PASS_PROGRESS_NOISE_PATTERNS = [
+  /^\s*[✔✓]\s*/,
+  /^\s*---\s*PASS:/,
+  /^\s*ok\s+\d+\b/,
+  /^\s*npm\s+warn\s+deprecated\b/i,
+  /\blooking for funding\b/i
+];
 function isFailureNoiseLine(line) {
   if (ALWAYS_NOISE_LINE_PATTERNS.some((re) => re.test(line))) return true;
   if (JSON_INFO_LOG_PATTERNS.some((re) => re.test(line))) {
     return !/"statusCode"\s*:\s*5\d\d|\b(?:error|exception|failed|fatal)\b/i.test(line);
   }
+  if (FAILURE_PROTECT_PATTERN.test(line)) return false;
+  if (PASS_PROGRESS_NOISE_PATTERNS.some((re) => re.test(line))) return true;
   return false;
 }
 var SUMMARY_LINE_PATTERN = /\b(passed|tests?|specs?|suites?|ok|warnings?|errors?|built in|compiled|done in|finished)\b/i;
@@ -1338,11 +1364,13 @@ async function runApplyEdits(input) {
     try {
       await commitPlannedWrites(plans);
     } catch (err) {
+      await invalidateFileCaches(plans.flatMap((p) => [p.absPath, p.writeTargetPath]));
       return {
         text: `Write failed (changes rolled back): ${err instanceof Error ? err.message : String(err)}`,
         isError: true
       };
     }
+    await invalidateFileCaches(plans.flatMap((p) => [p.absPath, p.writeTargetPath]));
   }
   const summaryLines = plans.map((p) => {
     const deltaStr = p.lineDelta >= 0 ? `+${p.lineDelta}` : `${p.lineDelta}`;
@@ -1984,21 +2012,39 @@ function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, notePrefi
 ... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}]`;
   return `${header}${items.join("\n")}${suffix}`;
 }
-async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
+async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget, trackCtx = null) {
   const maxResults = clampInt(query.maxResults ?? 80, 1, 300);
   const pattern = query.pattern.trim() || "**/*";
   const matcher = globToRegExp(pattern);
   const matchBasename = !pattern.includes("/");
   const includeHidden = pattern.startsWith(".") || pattern.includes("/.");
+  const recordGlobPaths = (relList) => {
+    if (!trackCtx) return;
+    for (const rel of relList) {
+      if (trackCtx.matchedAbsPaths.size >= MAX_SEARCH_TRACKED_FILES) break;
+      trackCtx.matchedAbsPaths.add(path3.join(searchRoot, rel));
+    }
+  };
   if (isFileTarget) {
     const rel = toPosixPath(path3.relative(baseCwd, searchRoot)) || path3.basename(searchRoot);
     const base = path3.basename(searchRoot);
     const matched = matcher.test(rel) || matchBasename && matcher.test(base);
-    if (matched) return rel;
+    if (matched) {
+      if (trackCtx && trackCtx.matchedAbsPaths.size < MAX_SEARCH_TRACKED_FILES) {
+        trackCtx.matchedAbsPaths.add(searchRoot);
+      }
+      return rel;
+    }
     const fallback2 = buildGlobFallbackPlan(pattern);
     if (fallback2) {
-      return fallback2.match(rel, base) ? `${fallback2.matchedNote}
-${rel}` : fallback2.emptyMessage;
+      if (fallback2.match(rel, base)) {
+        if (trackCtx && trackCtx.matchedAbsPaths.size < MAX_SEARCH_TRACKED_FILES) {
+          trackCtx.matchedAbsPaths.add(searchRoot);
+        }
+        return `${fallback2.matchedNote}
+${rel}`;
+      }
+      return fallback2.emptyMessage;
     }
     return "(no files matched)";
   }
@@ -2016,6 +2062,7 @@ ${rel}` : fallback2.emptyMessage;
     }
   });
   if (walked.files.length > 0) {
+    recordGlobPaths(walked.files);
     return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults);
   }
   const fallback = buildGlobFallbackPlan(pattern);
@@ -2029,6 +2076,7 @@ ${rel}` : fallback2.emptyMessage;
       }
     });
     if (fallbackWalked.files.length > 0) {
+      recordGlobPaths(fallbackWalked.files);
       return formatGlobWalkResult(
         fallbackWalked,
         searchRoot,
@@ -2079,7 +2127,186 @@ ${lines.join("\n")}`);
 ... [truncated at ${totalMatches} matches]` : "";
   return `${blocks.join("\n")}${footer}`;
 }
-async function executeSingleQuery(query, index, baseCwd, useRg) {
+var MAX_SEARCH_CACHE_ENTRIES = 32;
+var DEFAULT_SEARCH_CACHE_TTL_MS = 15e3;
+var MAX_SEARCH_TRACKED_FILES = 32;
+var MAX_SEARCH_TRACKED_DIRS = 16;
+var BATCH_SEARCH_CACHE = /* @__PURE__ */ new Map();
+function getSearchCacheTtlMs() {
+  const raw = process.env.AGY_DART_SEARCH_CACHE_TTL_MS;
+  if (raw === void 0 || raw === null || String(raw).trim() === "") {
+    return DEFAULT_SEARCH_CACHE_TTL_MS;
+  }
+  const parsed = Number(String(raw).trim());
+  if (!Number.isFinite(parsed)) return DEFAULT_SEARCH_CACHE_TTL_MS;
+  if (parsed <= 0) return 0;
+  return Math.min(Math.trunc(parsed), 3e5);
+}
+async function statFingerprintPart(targetPath) {
+  try {
+    const st = await fs3.stat(targetPath);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return "-";
+  }
+}
+async function resolveGitDirFast(baseCwd) {
+  let dir = baseCwd;
+  for (let depth = 0; depth < 4; depth++) {
+    const dotGit = path3.join(dir, ".git");
+    try {
+      const st = await fs3.stat(dotGit);
+      if (st.isDirectory()) return dotGit;
+      if (st.isFile() && st.size < 4096) {
+        const raw = await fs3.readFile(dotGit, "utf8");
+        const m = /^gitdir:\s*(.+)$/im.exec(raw.trim());
+        if (m && m[1]) {
+          return path3.resolve(dir, m[1].trim());
+        }
+      }
+      return null;
+    } catch {
+      const parent = path3.dirname(dir);
+      if (!parent || parent === dir) break;
+      dir = parent;
+    }
+  }
+  return null;
+}
+async function computeWorktreeFingerprint(baseCwd, queries) {
+  try {
+    const targets = [baseCwd];
+    const gitDir = await resolveGitDirFast(baseCwd);
+    if (gitDir) {
+      targets.push(path3.join(gitDir, "index"));
+      targets.push(path3.join(gitDir, "HEAD"));
+      targets.push(path3.join(gitDir, "logs", "HEAD"));
+    }
+    const extraPaths = /* @__PURE__ */ new Set();
+    for (const q of queries) {
+      if (q && typeof q.path === "string" && q.path.trim()) {
+        extraPaths.add(resolvePath(q.path, baseCwd));
+      }
+    }
+    const sortedExtra = [...extraPaths].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    for (const p of sortedExtra) {
+      targets.push(p);
+    }
+    const parts = await Promise.all(targets.map((t) => statFingerprintPart(t)));
+    return parts.join("|");
+  } catch {
+    return "";
+  }
+}
+async function areTrackedFilesFresh(trackedFiles) {
+  if (!Array.isArray(trackedFiles) || trackedFiles.length === 0) return true;
+  const checks = await Promise.all(
+    trackedFiles.map(async (f) => {
+      try {
+        const st = await fs3.stat(f.absPath);
+        return st.mtimeMs === f.mtimeMs && st.size === f.size;
+      } catch {
+        return false;
+      }
+    })
+  );
+  return checks.every(Boolean);
+}
+async function collectSmallDirProbePaths(baseCwd, queries, maxFiles = 24) {
+  try {
+    const roots = /* @__PURE__ */ new Set();
+    for (const q of queries) {
+      if (q && typeof q.path === "string" && q.path.trim()) {
+        roots.add(resolvePath(q.path, baseCwd));
+      } else {
+        roots.add(baseCwd);
+      }
+    }
+    const found = /* @__PURE__ */ new Set();
+    for (const root of roots) {
+      let st;
+      try {
+        st = await fs3.stat(root);
+      } catch {
+        continue;
+      }
+      if (st.isFile()) {
+        found.add(root);
+        if (found.size > maxFiles) return [];
+        continue;
+      }
+      if (!st.isDirectory()) continue;
+      let entries;
+      try {
+        entries = await fs3.readdir(root, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      if (entries.length > 48) return [];
+      const subdirs = [];
+      for (const entry of entries) {
+        if (entry.name.startsWith(".") || DEFAULT_IGNORE_DIRS.has(entry.name)) continue;
+        const abs = path3.join(root, entry.name);
+        if (entry.isFile()) {
+          found.add(abs);
+          if (found.size > maxFiles) return [];
+        } else if (entry.isDirectory()) {
+          subdirs.push(abs);
+        }
+      }
+      if (subdirs.length > 12) return [];
+      for (const sub of subdirs) {
+        let subEntries;
+        try {
+          subEntries = await fs3.readdir(sub, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        if (subEntries.length > 48) return [];
+        for (const se of subEntries) {
+          if (se.name.startsWith(".") || DEFAULT_IGNORE_DIRS.has(se.name)) continue;
+          if (se.isFile()) {
+            found.add(path3.join(sub, se.name));
+            if (found.size > maxFiles) return [];
+          }
+        }
+      }
+    }
+    return [...found];
+  } catch {
+    return [];
+  }
+}
+async function snapshotTrackedFiles(absPathsSet, baseCwd = "") {
+  if (!absPathsSet || absPathsSet.size === 0) return [];
+  const fileList = [...absPathsSet].slice(0, MAX_SEARCH_TRACKED_FILES);
+  const normBase = baseCwd ? normalizeFileCacheKey(baseCwd) : "";
+  const parentDirs = /* @__PURE__ */ new Set();
+  for (const absPath of fileList) {
+    if (parentDirs.size >= MAX_SEARCH_TRACKED_DIRS) break;
+    const dir = path3.dirname(absPath);
+    if (dir && dir !== absPath && normalizeFileCacheKey(dir) !== normBase) {
+      parentDirs.add(dir);
+    }
+  }
+  const targets = [
+    ...fileList.map((absPath) => ({ absPath, expectDir: false })),
+    ...[...parentDirs].map((absPath) => ({ absPath, expectDir: true }))
+  ];
+  const results = await Promise.all(
+    targets.map(async ({ absPath, expectDir }) => {
+      try {
+        const st = await fs3.stat(absPath);
+        if (expectDir ? !st.isDirectory() : !st.isFile()) return null;
+        return { absPath, mtimeMs: st.mtimeMs, size: st.size };
+      } catch {
+        return null;
+      }
+    })
+  );
+  return results.filter(Boolean);
+}
+async function executeSingleQuery(query, index, baseCwd, useRg, trackCtx = null) {
   const header = `## Query ${index + 1} [${query.type}] ${query.pattern}${query.path ? ` (in ${query.path})` : ""}`;
   try {
     if (!query.pattern || typeof query.pattern !== "string") {
@@ -2099,7 +2326,7 @@ async function executeSingleQuery(query, index, baseCwd, useRg) {
 ${out}`;
     }
     if (query.type === "glob") {
-      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile());
+      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile(), trackCtx);
       return `${header}
 ${out}`;
     }
@@ -2118,11 +2345,20 @@ ${out}`;
       } else {
         res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
       }
+      if (trackCtx && Array.isArray(res.files)) {
+        for (const fm of res.files) {
+          if (trackCtx.matchedAbsPaths.size >= MAX_SEARCH_TRACKED_FILES) break;
+          if (fm && fm.file) {
+            trackCtx.matchedAbsPaths.add(path3.resolve(baseCwd, fm.file));
+          }
+        }
+      }
       return `${header}
 ${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
     }
     throw new Error(`Unsupported query type: ${String(query.type)}`);
   } catch (err) {
+    if (trackCtx) trackCtx.hasError = true;
     return `${header}
 ERROR: ${err instanceof Error ? err.message : String(err)}`;
   }
@@ -2151,15 +2387,61 @@ async function runBatchSearch(input, options = {}) {
   }
   const maxChars = clampInt(input.maxChars ?? 8500, 500, DEFAULT_INLINE_MAX_BYTES);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
+  // Working-tree git queries (status/diff/log) depend on arbitrary tracked/untracked files across subdirs; bypass cache.
+  const hasGitQuery = input.queries.some((q) => q && q.type === "git");
+  const ttlMs = hasGitQuery ? 0 : getSearchCacheTtlMs();
+  let cacheKey = null;
+  if (ttlMs > 0) {
+    const worktreeFp = await computeWorktreeFingerprint(baseCwd, input.queries);
+    const canonicalQueriesJson = JSON.stringify(stableSortObject(input.queries));
+    cacheKey = `${normalizeFileCacheKey(baseCwd)}|${maxChars}|${Boolean(options.forceNodeFallback)}|${canonicalQueriesJson}|${worktreeFp}`;
+    const cached = BATCH_SEARCH_CACHE.get(cacheKey);
+    if (cached) {
+      const now = Date.now();
+      if (now - cached.createdAt <= ttlMs && await areTrackedFilesFresh(cached.trackedFiles)) {
+        BATCH_SEARCH_CACHE.delete(cacheKey);
+        BATCH_SEARCH_CACHE.set(cacheKey, cached);
+        return {
+          text: cached.text,
+          isError: false
+        };
+      }
+      BATCH_SEARCH_CACHE.delete(cacheKey);
+    }
+  }
   const needsTextSearch = input.queries.some(
     (q) => q.type === "text" || q.type === "regex"
   );
   const useRg = needsTextSearch && !options.forceNodeFallback && await isRipgrepAvailable();
+  const trackCtx = ttlMs > 0 ? { matchedAbsPaths: /* @__PURE__ */ new Set(), hasError: false } : null;
   const sections = await Promise.all(
-    input.queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg))
+    input.queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, trackCtx))
   );
+  const resultText = fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n");
+  if (cacheKey && trackCtx && !trackCtx.hasError) {
+    try {
+      if (trackCtx.matchedAbsPaths.size === 0) {
+        const probePaths = await collectSmallDirProbePaths(baseCwd, input.queries, 24);
+        for (const p of probePaths) trackCtx.matchedAbsPaths.add(p);
+      }
+      const trackedFiles = await snapshotTrackedFiles(trackCtx.matchedAbsPaths, baseCwd);
+      if (BATCH_SEARCH_CACHE.has(cacheKey)) {
+        BATCH_SEARCH_CACHE.delete(cacheKey);
+      } else if (BATCH_SEARCH_CACHE.size >= MAX_SEARCH_CACHE_ENTRIES) {
+        const oldestKey = BATCH_SEARCH_CACHE.keys().next().value;
+        if (oldestKey !== void 0) BATCH_SEARCH_CACHE.delete(oldestKey);
+      }
+      BATCH_SEARCH_CACHE.set(cacheKey, {
+        createdAt: Date.now(),
+        text: resultText,
+        trackedFiles
+      });
+    } catch {
+      // Fail-open cache populate
+    }
+  }
   return {
-    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
+    text: resultText,
     isError: false
   };
 }
@@ -3439,6 +3721,153 @@ function extractSymbolsFromLines(filePath, lines) {
 }
 var MAX_OUTLINES = 40;
 var MAX_SLICE_FILES = 30;
+var MAX_OUTLINE_CACHE_ENTRIES = 128;
+var OUTLINE_SYMBOL_CACHE = /* @__PURE__ */ new Map();
+var MAX_OUTLINE_L1_EVICTED_TRACK = 512;
+var OUTLINE_L1_EVICTED_KEYS = /* @__PURE__ */ new Set();
+var MAX_SLICE_CACHE_TOTAL_BYTES = 4 * 1024 * 1024;
+var MAX_SLICE_CACHE_FILE_BYTES = 256 * 1024;
+var SLICE_LINES_CACHE = /* @__PURE__ */ new Map();
+var sliceLinesCacheBytes = 0;
+var outlineDbStore = null;
+var outlineDbInitPromise = null;
+var outlineDbDisabled = false;
+var sqliteWarningFilterInstalled = false;
+function installSqliteWarningFilter() {
+  if (sqliteWarningFilterInstalled) return;
+  sqliteWarningFilterInstalled = true;
+  try {
+    const origEmitWarning = process.emitWarning.bind(process);
+    process.emitWarning = (warning, ...args) => {
+      const msg = typeof warning === "string" ? warning : String(warning?.message || "");
+      const type = typeof args[0] === "string" ? args[0] : (args[0]?.type || warning?.name || "");
+      if (/ExperimentalWarning/i.test(String(type)) && /sqlite/i.test(msg)) {
+        return;
+      }
+      return origEmitWarning(warning, ...args);
+    };
+  } catch {
+  }
+}
+function isOutlineDbDisabled() {
+  return outlineDbDisabled || process.env.AGY_DART_DISABLE_OUTLINE_DB === "1";
+}
+function resolveOutlineDbPath() {
+  if (process.env.AGY_DART_DB_PATH && process.env.AGY_DART_DB_PATH.trim()) {
+    return process.env.AGY_DART_DB_PATH.trim();
+  }
+  if (process.env.CONTEXT_MODE_DB_PATH && process.env.CONTEXT_MODE_DB_PATH.trim()) {
+    return process.env.CONTEXT_MODE_DB_PATH.trim();
+  }
+  return path.join(os.homedir(), ".agy-dart", "context.db");
+}
+async function getOutlineDbStore() {
+  if (isOutlineDbDisabled()) return null;
+  if (outlineDbStore) return outlineDbStore;
+  if (!outlineDbInitPromise) {
+    outlineDbInitPromise = (async () => {
+      installSqliteWarningFilter();
+      try {
+        const mod = await import("../context/lib/store.js");
+        const store = new mod.ContextModeStore();
+        store.open();
+        outlineDbStore = store;
+        return store;
+      } catch {
+        outlineDbDisabled = true;
+        return null;
+      }
+    })();
+  }
+  return outlineDbInitPromise;
+}
+function closeOutlineDbStore() {
+  if (outlineDbStore) {
+    try {
+      outlineDbStore.close();
+    } catch {
+    }
+    outlineDbStore = null;
+  }
+  outlineDbInitPromise = null;
+}
+function setOutlineL1Cache(cacheKey, entry) {
+  OUTLINE_L1_EVICTED_KEYS.delete(cacheKey);
+  if (OUTLINE_SYMBOL_CACHE.has(cacheKey)) {
+    OUTLINE_SYMBOL_CACHE.delete(cacheKey);
+  } else if (OUTLINE_SYMBOL_CACHE.size >= MAX_OUTLINE_CACHE_ENTRIES) {
+    const oldestKey = OUTLINE_SYMBOL_CACHE.keys().next().value;
+    if (oldestKey !== void 0) {
+      OUTLINE_SYMBOL_CACHE.delete(oldestKey);
+      if (OUTLINE_L1_EVICTED_KEYS.size >= MAX_OUTLINE_L1_EVICTED_TRACK) {
+        const oldestEvicted = OUTLINE_L1_EVICTED_KEYS.values().next().value;
+        if (oldestEvicted !== void 0) OUTLINE_L1_EVICTED_KEYS.delete(oldestEvicted);
+      }
+      OUTLINE_L1_EVICTED_KEYS.add(oldestKey);
+    }
+  }
+  OUTLINE_SYMBOL_CACHE.set(cacheKey, entry);
+}
+function normalizeFileCacheKey(absPath) {
+  return process.platform === "win32" ? absPath.toLowerCase() : absPath;
+}
+function deleteSliceCacheKey(cacheKey) {
+  const prev = SLICE_LINES_CACHE.get(cacheKey);
+  if (!prev) return;
+  SLICE_LINES_CACHE.delete(cacheKey);
+  sliceLinesCacheBytes = Math.max(0, sliceLinesCacheBytes - prev.byteWeight);
+}
+function setSliceCacheEntry(cacheKey, entry) {
+  const size = Number(entry?.size ?? 0);
+  if (!Number.isFinite(size) || size > MAX_SLICE_CACHE_FILE_BYTES) {
+    deleteSliceCacheKey(cacheKey);
+    return false;
+  }
+  const byteWeight = Math.max(1, size);
+  deleteSliceCacheKey(cacheKey);
+  while (sliceLinesCacheBytes + byteWeight > MAX_SLICE_CACHE_TOTAL_BYTES && SLICE_LINES_CACHE.size > 0) {
+    const oldestKey = SLICE_LINES_CACHE.keys().next().value;
+    if (oldestKey === void 0) break;
+    deleteSliceCacheKey(oldestKey);
+  }
+  SLICE_LINES_CACHE.set(cacheKey, {
+    mtimeMs: entry.mtimeMs,
+    size,
+    byteWeight,
+    lines: entry.lines
+  });
+  sliceLinesCacheBytes += byteWeight;
+  return true;
+}
+async function invalidateFileCaches(absPaths) {
+  BATCH_SEARCH_CACHE.clear();
+  if (!Array.isArray(absPaths)) return;
+  const validPaths = [];
+  for (const p of absPaths) {
+    if (!p || typeof p !== "string") continue;
+    validPaths.push(p);
+    const key = normalizeFileCacheKey(p);
+    OUTLINE_SYMBOL_CACHE.delete(key);
+    OUTLINE_L1_EVICTED_KEYS.delete(key);
+    deleteSliceCacheKey(key);
+  }
+  if (validPaths.length === 0 || isOutlineDbDisabled()) return;
+  try {
+    let store = outlineDbStore;
+    if (!store) {
+      const dbPath = resolveOutlineDbPath();
+      const exists = await fs.access(dbPath).then(() => true).catch(() => false);
+      if (exists) {
+        store = await getOutlineDbStore();
+      }
+    }
+    if (store) {
+      store.deleteOutlineCache(validPaths);
+    }
+  } catch {
+    // Strictly fail-open
+  }
+}
 var SLICE_TRUNCATION_TIP = "\n[tip: MCP responses are hard-capped <=8.8KB inline; for >150 lines across files, use parallel read_file(StartLine, EndLine) (46KB/call, 0 remote check)]";
 var OUTLINE_BATCH_TIP = "\n[tip: outlining >20 files splits the 8.8KB cap thinly; batch 10-20 files per call for fuller outlines]";
 function selectOutlineSymbols(symbols, limit) {
@@ -3475,13 +3904,37 @@ async function runReadSlices(input) {
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
   const perFileSymbolLimit = outlines.length <= 1 ? 120 : outlines.length <= 4 ? 60 : outlines.length <= 10 ? 30 : outlines.length <= 20 ? 16 : 10;
   const fileCache = /* @__PURE__ */ new Map();
-  async function loadLines(absPath) {
-    const cached = fileCache.get(absPath);
-    if (cached) return cached;
+  const normalizeCacheKey = normalizeFileCacheKey;
+  async function loadLines(absPath, { useSliceCache = false, existingStat = null } = {}) {
+    const key = normalizeCacheKey(absPath);
+    const cachedInCall = fileCache.get(key);
+    if (cachedInCall) {
+      if (useSliceCache) {
+        setSliceCacheEntry(key, cachedInCall);
+      }
+      return cachedInCall;
+    }
+    if (useSliceCache) {
+      const stat = existingStat ?? await fs.stat(absPath);
+      if (!stat.isFile()) {
+        throw new Error(`Not a regular file: ${absPath}`);
+      }
+      const crossCached = SLICE_LINES_CACHE.get(key);
+      if (crossCached && crossCached.mtimeMs === stat.mtimeMs && crossCached.size === stat.size) {
+        SLICE_LINES_CACHE.delete(key);
+        SLICE_LINES_CACHE.set(key, crossCached);
+        const entry2 = { lines: crossCached.lines, size: crossCached.size, mtimeMs: crossCached.mtimeMs };
+        fileCache.set(key, entry2);
+        return entry2;
+      }
+    }
     const data = await readTextFile(absPath);
     const lines = data.content.replace(/\r\n/g, "\n").split("\n");
-    const entry = { lines, size: data.size };
-    fileCache.set(absPath, entry);
+    const entry = { lines, size: data.size, mtimeMs: data.mtimeMs };
+    fileCache.set(key, entry);
+    if (useSliceCache) {
+      setSliceCacheEntry(key, entry);
+    }
     return entry;
   }
   const sections = [];
@@ -3489,12 +3942,64 @@ async function runReadSlices(input) {
     const outlineResults = await Promise.all(
       outlines.map(async (rawPath) => {
         const absPath = resolvePath(rawPath, baseCwd);
+        const cacheKey = normalizeCacheKey(absPath);
         const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
         try {
-          const { lines } = await loadLines(absPath);
-          const symbols = extractSymbolsFromLines(absPath, lines);
+          const stat = await fs.stat(absPath);
+          if (!stat.isFile()) {
+            throw new Error(`Not a regular file: ${absPath}`);
+          }
+          let lineCount;
+          let symbols;
+          const cached = OUTLINE_SYMBOL_CACHE.get(cacheKey);
+          if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+            OUTLINE_SYMBOL_CACHE.delete(cacheKey);
+            OUTLINE_SYMBOL_CACHE.set(cacheKey, cached);
+            lineCount = cached.lineCount;
+            symbols = cached.symbols;
+          } else {
+            const wasEvictedFromL1 = OUTLINE_L1_EVICTED_KEYS.delete(cacheKey);
+            let l2Hit = null;
+            const dbStore = await getOutlineDbStore();
+            if (dbStore && !wasEvictedFromL1) {
+              try {
+                l2Hit = dbStore.getOutlineCache(absPath, stat.mtimeMs, stat.size);
+              } catch {
+                l2Hit = null;
+              }
+            }
+            if (l2Hit) {
+              lineCount = l2Hit.lineCount;
+              symbols = l2Hit.symbols;
+              setOutlineL1Cache(cacheKey, {
+                mtimeMs: stat.mtimeMs,
+                size: stat.size,
+                lineCount,
+                symbols
+              });
+            } else {
+              const { lines, size, mtimeMs } = await loadLines(absPath, { useSliceCache: false, existingStat: stat });
+              lineCount = lines.length;
+              symbols = extractSymbolsFromLines(absPath, lines);
+              const effMtime = mtimeMs ?? stat.mtimeMs;
+              const effSize = size ?? stat.size;
+              setOutlineL1Cache(cacheKey, {
+                mtimeMs: effMtime,
+                size: effSize,
+                lineCount,
+                symbols
+              });
+              if (dbStore) {
+                try {
+                  dbStore.setOutlineCache(absPath, effMtime, effSize, lineCount, symbols);
+                } catch {
+                  // Strictly fail-open
+                }
+              }
+            }
+          }
           if (symbols.length === 0) {
-            return `## Outline: ${relPath} (${lines.length} lines)
+            return `## Outline: ${relPath} (${lineCount} lines)
 (no top-level symbols detected)`;
           }
           const picked = selectOutlineSymbols(symbols, perFileSymbolLimit);
@@ -3506,9 +4011,19 @@ async function runReadSlices(input) {
           const extra = symbols.length > picked.length ? outlines.length > 10 ? `
 ... (+${symbols.length - picked.length} more symbols)` : `
 ... (${symbols.length - picked.length} more symbols omitted; outline this file alone for full list)` : "";
-          return `## Outline: ${relPath} (${lines.length} lines)
+          return `## Outline: ${relPath} (${lineCount} lines)
 ${formatted.join("\n")}${extra}`;
         } catch (err) {
+          if (err && err.code === "ENOENT") {
+            OUTLINE_SYMBOL_CACHE.delete(cacheKey);
+            deleteSliceCacheKey(cacheKey);
+            if (outlineDbStore) {
+              try {
+                outlineDbStore.deleteOutlineCache(absPath);
+              } catch {
+              }
+            }
+          }
           return `## Outline: ${relPath}
 ERROR: ${err instanceof Error ? err.message : String(err)}`;
         }
@@ -3523,13 +4038,14 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
           return "## Slice: (invalid)\nERROR: 'path' must be a non-empty string";
         }
         const absPath = resolvePath(req.path, baseCwd);
+        const cacheKey = normalizeCacheKey(absPath);
         const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
         if (!Array.isArray(req.ranges) || req.ranges.length === 0) {
           return `## Slice: ${relPath}
 ERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`;
         }
         try {
-          const { lines } = await loadLines(absPath);
+          const { lines } = await loadLines(absPath, { useSliceCache: true });
           const totalLines = lines.length;
           const blocks = [];
           for (const range of req.ranges) {
@@ -3568,6 +4084,16 @@ ERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`;
           return `## Slice: ${relPath} (${totalLines} lines)
 ${blocks.join("\n")}`;
         } catch (err) {
+          if (err && err.code === "ENOENT") {
+            OUTLINE_SYMBOL_CACHE.delete(cacheKey);
+            deleteSliceCacheKey(cacheKey);
+            if (outlineDbStore) {
+              try {
+                outlineDbStore.deleteOutlineCache(absPath);
+              } catch {
+              }
+            }
+          }
           return `## Slice: ${relPath}
 ERROR: ${err instanceof Error ? err.message : String(err)}`;
         }
@@ -3765,64 +4291,30 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "batch_search",
-      description: "Run multiple read-only text/regex searches, file globs, and read-only git queries (status/diff/log/show/branch) concurrently in one call with bounded output.",
+      description: "Run concurrent text/regex searches, globs, and read-only git queries (<=8.8KB).",
       inputSchema: {
         type: "object",
         properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace directory (defaults to current working directory)."
-          },
+          cwd: { type: "string" },
           queries: {
             type: "array",
             minItems: 1,
             maxItems: 20,
-            description: "List of search/glob/git queries to run concurrently.",
             items: {
               type: "object",
               properties: {
-                type: {
-                  type: "string",
-                  enum: ["text", "regex", "glob", "git"]
-                },
-                pattern: {
-                  type: "string",
-                  description: "Literal text, regex, glob pattern (use * and {a,b}, not regex |), or read-only git subcommand (e.g. 'status --short', 'log -n 5 --oneline')."
-                },
-                path: {
-                  type: "string",
-                  description: "Optional subdirectory or file relative to cwd."
-                },
-                glob: {
-                  type: "string",
-                  description: "Optional file filter glob for text/regex queries (e.g. '*.ts')."
-                },
-                caseSensitive: {
-                  type: "boolean",
-                  description: "Case sensitivity for text/regex (default true)."
-                },
-                contextLines: {
-                  type: "integer",
-                  minimum: 0,
-                  maximum: 5,
-                  description: "Context lines around matches (default 0)."
-                },
-                maxResults: {
-                  type: "integer",
-                  minimum: 1,
-                  maximum: 200,
-                  description: "Max matches/files for this query (default 40)."
-                }
+                type: { type: "string", enum: ["text", "regex", "glob", "git"] },
+                pattern: { type: "string", description: "Text, regex, glob (*,{a,b}), or read-only git subcommand" },
+                path: { type: "string" },
+                glob: { type: "string" },
+                caseSensitive: { type: "boolean" },
+                contextLines: { type: "integer", minimum: 0, maximum: 5 },
+                maxResults: { type: "integer", minimum: 1, maximum: 200 }
               },
               required: ["type", "pattern"]
             }
           },
-          maxChars: {
-            type: "integer",
-            minimum: 500,
-            maximum: 8800,
-            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes to avoid disk spills)."
-          }
+          maxChars: { type: "integer", minimum: 500, maximum: 8800 }
         },
         required: ["queries"]
       }
@@ -3832,19 +4324,15 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "apply_edits",
-      description: "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command.",
+      description: "Atomically apply multi-hunk edits or file creation across files, with optional verify command.",
       inputSchema: {
         type: "object",
         properties: {
-          cwd: {
-            type: "string",
-            description: "Base directory for relative file paths and verify command."
-          },
+          cwd: { type: "string" },
           edits: {
             type: "array",
             minItems: 1,
             maxItems: 50,
-            description: "Files to edit or create.",
             items: {
               type: "object",
               properties: {
@@ -3854,62 +4342,26 @@ function createAgyFastServer() {
                   items: {
                     type: "object",
                     properties: {
-                      target: { type: "string", description: "Exact text to replace." },
-                      replacement: { type: "string", description: "Replacement text." },
-                      startLine: {
-                        type: "integer",
-                        minimum: 1,
-                        description: "Optional 1-based start line to narrow matching."
-                      },
-                      endLine: {
-                        type: "integer",
-                        minimum: 1,
-                        description: "Optional 1-based end line to narrow matching."
-                      },
-                      replaceAll: {
-                        type: "boolean",
-                        description: "Replace every occurrence in range (default false)."
-                      }
+                      target: { type: "string" },
+                      replacement: { type: "string" },
+                      startLine: { type: "integer", minimum: 1 },
+                      endLine: { type: "integer", minimum: 1 },
+                      replaceAll: { type: "boolean" }
                     },
                     required: ["target", "replacement"]
                   }
                 },
-                create: {
-                  type: "string",
-                  description: "Create file with this full content instead of hunks."
-                },
-                overwrite: {
-                  type: "boolean",
-                  description: "Allow overwriting existing file when using 'create'."
-                }
+                create: { type: "string", description: "Full content instead of hunks" },
+                overwrite: { type: "boolean" }
               },
               required: ["path"]
             }
           },
-          dryRun: {
-            type: "boolean",
-            description: "Validate all hunks without writing files (default false)."
-          },
-          bestEffort: {
-            type: "boolean",
-            description: "When true, write valid files even if other files fail validation (each file remains atomic; failed files return closest-line snippets and verify is skipped until fixed). Default false (all-or-nothing)."
-          },
-          verify: {
-            type: "string",
-            description: "Optional shell command run right after writing (e.g. 'npm run typecheck')."
-          },
-          verifyTimeoutSec: {
-            type: "integer",
-            minimum: 1,
-            maximum: 300,
-            description: "Optional timeout in seconds for the verify command (default 60)."
-          },
-          maxVerifyChars: {
-            type: "integer",
-            minimum: 300,
-            maximum: 7500,
-            description: "Optional character cap for verify output (default 4000; full response hard-capped <= 8800 UTF-8 bytes)."
-          }
+          dryRun: { type: "boolean" },
+          bestEffort: { type: "boolean", description: "Commit valid files even if others fail" },
+          verify: { type: "string", description: "Post-write shell command" },
+          verifyTimeoutSec: { type: "integer", minimum: 1, maximum: 300 },
+          maxVerifyChars: { type: "integer", minimum: 300, maximum: 7500 }
         },
         required: ["edits"]
       }
@@ -3919,7 +4371,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "read_slices",
-      description: "Batch-extract symbol/section outlines (TS/JS/Vue/Svelte/CSS/Python/GDScript/Go/Rust/Java/MD/JSON/YAML) across files (prefer 10-20 files/batch, max 40) in one call, plus optional tiny <=120-line slices. For reading >150 lines of known ranges, prefer parallel built-in read_file(StartLine, EndLine) (46KB/call inline, 0 remote check).",
+      description: "Batch-extract symbol outlines (max 40 files) and small 1-based line slices (<=8.8KB).",
       inputSchema: {
         type: "object",
         properties: {
@@ -3928,12 +4380,12 @@ function createAgyFastServer() {
             type: "array",
             maxItems: 40,
             items: { type: "string" },
-            description: "File paths to extract top-level symbol/section line ranges from (prefer 10-20 per batch for fuller outlines; max 40)."
+            description: "File paths to outline (prefer 10-20/batch)"
           },
           slices: {
             type: "array",
             maxItems: 30,
-            description: "Optional tiny 1-based inclusive [startLine, endLine] ranges to piggyback (total response hard-capped <= 8800 UTF-8 bytes).",
+            description: "1-based inclusive [startLine,endLine] ranges",
             items: {
               type: "object",
               properties: {
@@ -3952,12 +4404,7 @@ function createAgyFastServer() {
               required: ["path", "ranges"]
             }
           },
-          maxChars: {
-            type: "integer",
-            minimum: 1e3,
-            maximum: 8800,
-            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes to prevent output.txt spills)."
-          }
+          maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
         }
       }
     },
@@ -3966,7 +4413,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "run_checks",
-      description: "Run multiple independent non-interactive shell commands concurrently under one check (build/typecheck/lint/test with outputMode 'compact', or diagnostic/audit scripts with outputMode 'full').",
+      description: "Run independent shell checks concurrently (<=8.8KB).",
       inputSchema: {
         type: "object",
         properties: {
@@ -3975,41 +4422,25 @@ function createAgyFastServer() {
             type: "array",
             minItems: 1,
             maxItems: 12,
-            description: "Commands to execute concurrently.",
             items: {
               type: "object",
               properties: {
-                name: { type: "string", description: "Short label (e.g. 'typecheck')." },
-                command: { type: "string", description: "Shell command to run." },
-                cwd: { type: "string", description: "Optional working directory override." },
+                name: { type: "string" },
+                command: { type: "string" },
+                cwd: { type: "string" },
                 timeoutSec: { type: "integer", minimum: 1, maximum: 300 }
               },
               required: ["command"]
             }
           },
-          concurrency: {
-            type: "integer",
-            minimum: 1,
-            maximum: 8,
-            description: "Max parallel commands (default 4)."
-          },
-          timeoutSec: {
-            type: "integer",
-            minimum: 1,
-            maximum: 300,
-            description: "Default per-command timeout in seconds (default 60)."
-          },
+          concurrency: { type: "integer", minimum: 1, maximum: 8 },
+          timeoutSec: { type: "integer", minimum: 1, maximum: 300 },
           outputMode: {
             type: "string",
             enum: ["compact", "full"],
-            description: "'compact' hides verbose pass logs (default); 'full' preserves stdout for diagnostic/inspection commands."
+            description: "compact hides pass logs (default)"
           },
-          maxChars: {
-            type: "integer",
-            minimum: 500,
-            maximum: 8800,
-            description: "Total character cap (default 8000; hard inline UTF-8 cap <= 8800 bytes)."
-          }
+          maxChars: { type: "integer", minimum: 500, maximum: 8800 }
         },
         required: ["commands"]
       }
@@ -4021,15 +4452,20 @@ function createAgyFastServer() {
 function main() {
   const server = createAgyFastServer();
   const exitImmediately = () => {
+    closeOutlineDbStore();
     process.exit(0);
   };
   const flushAndExit = () => {
+    closeOutlineDbStore();
     process.stdout.end(() => {
       process.exit(0);
     });
   };
   process.on("SIGINT", exitImmediately);
   process.on("SIGTERM", exitImmediately);
+  process.on("exit", () => {
+    closeOutlineDbStore();
+  });
   server.listen(process.stdin, process.stdout, flushAndExit);
 }
 main();
