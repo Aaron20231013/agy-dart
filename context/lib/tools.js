@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import https from "node:https";
+import { getConfigSnapshot } from "./config.js";
 import { executeCode, runProcess, OUTPUT_CAP } from "./executor.js";
 import { SNIPPET_MAX_BYTES } from "./store.js";
 import {
@@ -43,7 +44,7 @@ function truncateUtf8(text, maxBytes) {
  * Guarantee that JSON.stringify(obj, null, 2) stays strictly <= maxJsonBytes UTF-8 bytes
  * even after JSON escaping (e.g. thousands of \n -> \\n or quotes) expands string fields.
  */
-function capSerializedJsonField(obj, fieldName, rawBody, suffix = "", maxJsonBytes = MAX_MCP_JSON_BYTES) {
+export function capSerializedJsonField(obj, fieldName, rawBody, suffix = "", maxJsonBytes = MAX_MCP_JSON_BYTES) {
   obj[fieldName] = `${rawBody}${suffix}`;
   const measure = () => Buffer.byteLength(JSON.stringify(obj, null, 2), "utf8");
   if (measure() <= maxJsonBytes) {
@@ -153,7 +154,7 @@ export async function fetchUrlText(urlStr, timeoutOrOptions = 15000) {
         {
           timeout: remainingMs,
           lookup: pinnedLookup,
-          headers: { "User-Agent": "agy-dart/1.1" }
+          headers: { "User-Agent": "agy-dart/1.2" }
         },
         (res) => {
           const code = res.statusCode || 0;
@@ -730,6 +731,7 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
 
       const s = store.getStats(sessionId);
       const ghost = store.getGhostStats(sessionId);
+      const featureRoi = store.getFeatureRoi(sessionId);
       const bd = s.breakdown || {};
       const reportLines = [
         "────────────────────────────────────────────────────────────────────────────────",
@@ -757,6 +759,7 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
       return {
         stats: s,
         ghost,
+        featureRoi,
         report
       };
     },
@@ -764,14 +767,26 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
     // 7. ctx_doctor
     async ctx_doctor() {
       const doc = store.doctor();
+      const cfgSnap = getConfigSnapshot();
       return {
         doctor: doc,
         features: {
           cliFilterEnabled: store.isCliFilterEnabled(getSessionId()),
           readDedupEnabled: store.isReadDedupEnabled(getSessionId()),
+          diffReadEnabled: cfgSnap.values.diffRead,
           headingAwareMarkdownChunking: true,
           secretRedactionEnabled: isSecretRedactionEnabled(),
           sensitiveFileGuardMode: getSensitiveFileGuardMode()
+        },
+        config: {
+          path: cfgSnap.configPath,
+          loaded: cfgSnap.fileExists && !cfgSnap.configError,
+          error: cfgSnap.configError,
+          overrides: Object.fromEntries(
+            Object.entries(cfgSnap.sources)
+              .filter(([, src]) => src !== "default")
+              .map(([k, src]) => [k, { value: cfgSnap.values[k], source: src }])
+          )
         },
         runtimes: {
           node: process.version,
