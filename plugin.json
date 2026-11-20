@@ -1,0 +1,21 @@
+{
+  "name": "agy-dart",
+  "displayName": "agy-dart",
+  "version": "1.0.0",
+  "description": "All-in-one Antigravity latency accelerator & context-window guard: combines batched code search/edits/outlines/checks, local SQLite FTS5 sandboxed execution, smart PreToolUse protection, and a live Sidecar dashboard.",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "zou172866",
+    "url": "https://github.com/zou172866"
+  },
+  "homepage": "https://github.com/zou172866/agy-dart",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zou172866/agy-dart.git"
+  },
+  "suggestedPrompts": [
+    "Search symbols across the codebase, outline large files, and apply multi-file edits with inline verification",
+    "Analyze a large build or server log in the sandbox and summarize only the root causes",
+    "Show agy-dart context savings report and verify plugin health"
+  ]
+}

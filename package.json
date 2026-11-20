@@ -1,0 +1,35 @@
+{
+  "name": "agy-dart",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "All-in-one Antigravity plugin uniting agy-fast latency batching with SQLite FTS5 context-window protection and a live Sidecar dashboard.",
+  "license": "MIT",
+  "author": "zou172866 <https://github.com/zou172866>",
+  "homepage": "https://github.com/zou172866/agy-dart#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zou172866/agy-dart.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zou172866/agy-dart/issues"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "install:plugin": "node scripts/install.mjs install",
+    "uninstall:plugin": "node scripts/install.mjs uninstall",
+    "doctor": "node scripts/install.mjs doctor",
+    "test": "node --test tests/integration.test.mjs"
+  },
+  "keywords": [
+    "antigravity",
+    "antigravity-plugin",
+    "performance",
+    "latency",
+    "context-window",
+    "fts5",
+    "mcp",
+    "ripgrep"
+  ]
+}
