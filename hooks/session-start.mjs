@@ -11,6 +11,7 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
+import { getEffectiveConfig } from "../context/lib/config.js";
 
 const __selfPath = path.resolve(fileURLToPath(import.meta.url));
 const __dirname = path.dirname(__selfPath);
@@ -202,9 +203,10 @@ async function main() {
   const rawInput = (await readStdin()).trim();
   const payload = parseHookPayload(rawInput);
   const workspaceDir = resolveWorkspaceDir(payload);
+  const effectiveCfg = getEffectiveConfig();
   const stablePrefixOnly =
-    process.env.AGY_DART_STABLE_PREFIX_ONLY === "1" ||
-    (process.env.AGY_DART_SUBAGENT_INCLUDE_GIT !== "1" && isSubagentPayload(payload, process.env));
+    effectiveCfg.stablePrefixOnly === true ||
+    (!effectiveCfg.subagentIncludeGit && isSubagentPayload(payload, process.env));
 
   // 1. Reset transient session overrides, run lightweight daily DB TTL cleanup, & fetch git-HEAD-cached repo hubs
   let hotspotsLine = "";
@@ -217,7 +219,7 @@ async function main() {
     store = new ContextModeStore();
     store.clearSessionOverrides();
     store.maybeRunDailyMaintenance(14);
-    if (workspaceDir && process.env.AGY_DART_DISABLE_REPO_HUBS !== "1") {
+    if (workspaceDir && effectiveCfg.repoHubs) {
       hotspotsLine = getCachedRepoHotspots(workspaceDir, store, { maxFiles: 120, maxHubs: 5 });
     }
   } catch {

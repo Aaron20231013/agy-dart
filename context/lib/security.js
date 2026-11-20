@@ -7,6 +7,7 @@
 import dns from "node:dns";
 import net from "node:net";
 import path from "node:path";
+import { getEffectiveConfig } from "./config.js";
 
 const BLOCKED_HOSTNAMES = new Set([
   "localhost",
@@ -230,7 +231,7 @@ export function isBlockedHostname(hostname) {
  */
 export async function validateFetchTarget(urlStr, options = {}) {
   const allowPrivate =
-    Boolean(options.allowPrivate) || process.env.AGY_DART_ALLOW_PRIVATE_URLS === "1";
+    Boolean(options.allowPrivate) || getEffectiveConfig().allowPrivateUrls;
   const lookupFn = options.lookupFn || dns.promises.lookup;
 
   let parsed;
@@ -312,12 +313,9 @@ export function sanitizeUrlForDisplay(urlStr) {
   }
 }
 
-/** Check whether secret redaction is active (enabled by default; disable via env) */
+/** Check whether secret redaction is active (enabled by default; disable via config/env) */
 export function isSecretRedactionEnabled() {
-  if (process.env.AGY_DART_DISABLE_SECRET_REDACTION === "1") return false;
-  const flag = (process.env.AGY_DART_SECRET_REDACTION || "").trim().toLowerCase();
-  if (flag === "0" || flag === "false" || flag === "off") return false;
-  return true;
+  return getEffectiveConfig().secretRedaction !== false;
 }
 
 const PLACEHOLDER_VALUE_RE =
@@ -460,10 +458,7 @@ export function redactSecrets(text, options = {}) {
 
 /** Optional sensitive-file guard mode for PreToolUse: "off" (default) | "warn" | "deny" */
 export function getSensitiveFileGuardMode() {
-  const raw = (process.env.AGY_DART_SENSITIVE_FILE_GUARD || "").trim().toLowerCase();
-  if (raw === "deny" || raw === "block" || raw === "strict") return "deny";
-  if (raw === "warn" || raw === "1" || raw === "true" || raw === "remind") return "warn";
-  return "off";
+  return getEffectiveConfig().sensitiveFileGuard || "off";
 }
 
 const SAFE_DOTENV_SUFFIXES = [".example", ".sample", ".template", ".schema", ".dist", ".defaults"];

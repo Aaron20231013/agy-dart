@@ -49,6 +49,17 @@ function resolveSessionId(payload = {}) {
   );
 }
 
+function resolveDirectConversationId(payload = {}) {
+  return (
+    payload.conversationId ||
+    payload.conversation_id ||
+    payload.sessionId ||
+    payload.session_id ||
+    process.env.ANTIGRAVITY_CONVERSATION_ID ||
+    "default"
+  );
+}
+
 function cleanPath(val) {
   if (!val) return "";
   let p = String(val).trim();
@@ -297,6 +308,7 @@ async function main() {
   const args = toolCall.args || {};
   const cwd = payload.cwd || process.cwd();
   const sessionId = resolveSessionId(payload);
+  const directConvId = resolveDirectConversationId(payload);
 
   const { paths, clearAllSession } = extractInvalidationTargets(toolName, args, cwd);
   const responseText = extractToolResponseText(payload);
@@ -310,6 +322,9 @@ async function main() {
       store = new ContextModeStore();
       if (clearAllSession) {
         store.invalidateFileReads(sessionId, null);
+        if (directConvId && directConvId !== sessionId) {
+          store.invalidateFileReads(directConvId, null);
+        }
       } else if (paths.length > 0) {
         const partialApplied = extractPartialAppliedPaths(responseText, toolName, args, cwd);
         const abortedNoWrite =
@@ -322,6 +337,9 @@ async function main() {
         if (effectivePaths.length > 0) {
           for (const absPath of effectivePaths) {
             store.invalidateFileReads(sessionId, absPath);
+            if (directConvId && directConvId !== sessionId) {
+              store.invalidateFileReads(directConvId, absPath);
+            }
           }
           store.recordModifiedFiles(sessionId, effectivePaths, { worktree: cwd, tool: toolName });
         }

@@ -1,5 +1,6 @@
 // agy-fast MCP Stdio Server (bundled zero-dependency ESM)
 import { enableVersionedCompileCache } from "../hooks/compile-cache.mjs";
+import { getEffectiveConfig } from "../context/lib/config.js";
 try {
   enableVersionedCompileCache();
 } catch {}
@@ -2133,14 +2134,10 @@ var MAX_SEARCH_TRACKED_FILES = 32;
 var MAX_SEARCH_TRACKED_DIRS = 16;
 var BATCH_SEARCH_CACHE = /* @__PURE__ */ new Map();
 function getSearchCacheTtlMs() {
-  const raw = process.env.AGY_DART_SEARCH_CACHE_TTL_MS;
-  if (raw === void 0 || raw === null || String(raw).trim() === "") {
-    return DEFAULT_SEARCH_CACHE_TTL_MS;
-  }
-  const parsed = Number(String(raw).trim());
-  if (!Number.isFinite(parsed)) return DEFAULT_SEARCH_CACHE_TTL_MS;
-  if (parsed <= 0) return 0;
-  return Math.min(Math.trunc(parsed), 3e5);
+  const cfgVal = getEffectiveConfig().searchCacheTtlMs;
+  if (!Number.isFinite(cfgVal)) return DEFAULT_SEARCH_CACHE_TTL_MS;
+  if (cfgVal <= 0) return 0;
+  return Math.min(Math.trunc(cfgVal), 3e5);
 }
 async function statFingerprintPart(targetPath) {
   try {
@@ -3750,15 +3747,11 @@ function installSqliteWarningFilter() {
   }
 }
 function isOutlineDbDisabled() {
-  return outlineDbDisabled || process.env.AGY_DART_DISABLE_OUTLINE_DB === "1";
+  return outlineDbDisabled || !getEffectiveConfig().outlineDb;
 }
 function resolveOutlineDbPath() {
-  if (process.env.AGY_DART_DB_PATH && process.env.AGY_DART_DB_PATH.trim()) {
-    return process.env.AGY_DART_DB_PATH.trim();
-  }
-  if (process.env.CONTEXT_MODE_DB_PATH && process.env.CONTEXT_MODE_DB_PATH.trim()) {
-    return process.env.CONTEXT_MODE_DB_PATH.trim();
-  }
+  const cfgDb = getEffectiveConfig().dbPath;
+  if (cfgDb) return cfgDb;
   return path.join(os.homedir(), ".agy-dart", "context.db");
 }
 async function getOutlineDbStore() {

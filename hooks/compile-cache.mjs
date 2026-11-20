@@ -6,6 +6,45 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let cachedPluginVersion = null;
+let sqliteWarningFilterInstalled = false;
+
+/**
+ * Suppress Node 22.x `ExperimentalWarning: SQLite is an experimental feature`
+ * on stderr so JSON-RPC stdio MCP servers and lifecycle hooks emit strictly 0 bytes
+ * of stderr noise across Node 22.x and 24.x. Non-SQLite warnings pass through untouched.
+ */
+export function suppressSqliteExperimentalWarning() {
+  if (sqliteWarningFilterInstalled) return false;
+  sqliteWarningFilterInstalled = true;
+  try {
+    const origEmitWarning = process.emitWarning.bind(process);
+    process.emitWarning = (warning, ...args) => {
+      const msg = typeof warning === "string" ? warning : String(warning?.message || "");
+      const type = typeof args[0] === "string" ? args[0] : (args[0]?.type || warning?.name || "");
+      if (/ExperimentalWarning/i.test(String(type)) && /sqlite/i.test(msg)) {
+        return;
+      }
+      return origEmitWarning(warning, ...args);
+    };
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readCompileCacheConfigOverrides() {
+  try {
+    const cfgPath =
+      typeof process.env.AGY_DART_CONFIG_PATH === "string" && process.env.AGY_DART_CONFIG_PATH.trim()
+        ? path.resolve(process.env.AGY_DART_CONFIG_PATH.trim())
+        : path.join(os.homedir(), ".agy-dart", "config.json");
+    if (!fs.existsSync(cfgPath)) return {};
+    const parsed = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
 
 function readPluginVersion() {
   if (cachedPluginVersion) return cachedPluginVersion;
@@ -17,7 +56,7 @@ function readPluginVersion() {
       return cachedPluginVersion;
     }
   } catch {}
-  cachedPluginVersion = "1.1.0";
+  cachedPluginVersion = "1.2.0";
   return cachedPluginVersion;
 }
 
@@ -102,8 +141,13 @@ export function pruneStaleCompileCaches(rootDir, activeTag, keepRecent = 3) {
  * Strictly fail-open and silent on stdout/stderr so hook JSON protocol is never corrupted.
  */
 export function enableVersionedCompileCache(options = {}) {
+  suppressSqliteExperimentalWarning();
   try {
     if (process.env.AGY_DART_DISABLE_COMPILE_CACHE === "1") {
+      return { enabled: false, reason: "disabled", cacheDir: null, tag: null };
+    }
+    const fileCfg = options.rootDir !== undefined ? {} : readCompileCacheConfigOverrides();
+    if (process.env.AGY_DART_DISABLE_COMPILE_CACHE === undefined && fileCfg.compileCache === false) {
       return { enabled: false, reason: "disabled", cacheDir: null, tag: null };
     }
 
@@ -119,8 +163,12 @@ export function enableVersionedCompileCache(options = {}) {
       typeof process.env.AGY_DART_COMPILE_CACHE_DIR === "string"
         ? process.env.AGY_DART_COMPILE_CACHE_DIR.trim()
         : "";
+    const cfgDir =
+      typeof fileCfg.compileCacheDir === "string" && fileCfg.compileCacheDir.trim()
+        ? fileCfg.compileCacheDir.trim()
+        : "";
     const rootDir = path.resolve(
-      options.rootDir || envDir || path.join(os.homedir(), ".agy-dart", "compile-cache")
+      options.rootDir || envDir || cfgDir || path.join(os.homedir(), ".agy-dart", "compile-cache")
     );
     const rawTag = options.tag !== undefined ? options.tag : readPluginVersion();
     const activeTag = sanitizeCacheTag(rawTag);

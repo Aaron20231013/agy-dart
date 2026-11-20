@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
+import { getEffectiveConfig } from "../context/lib/config.js";
 
 const CONTEXT_WARN_TOKENS = 130000;
 const CONTEXT_CRITICAL_TOKENS = 160000;
@@ -46,6 +47,17 @@ function resolveSessionId(payload = {}) {
     payload.session_id ||
     process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
     process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID ||
+    process.env.ANTIGRAVITY_CONVERSATION_ID ||
+    "default"
+  );
+}
+
+function resolveDirectConversationId(payload = {}) {
+  return (
+    payload.conversationId ||
+    payload.conversation_id ||
+    payload.sessionId ||
+    payload.session_id ||
     process.env.ANTIGRAVITY_CONVERSATION_ID ||
     "default"
   );
@@ -225,7 +237,8 @@ export function evaluateCacheAlerts(diag, { sessionId, store }) {
 }
 
 async function main() {
-  if (process.env.AGY_DART_DISABLE_CACHE_WATCH === "1") {
+  const effectiveCfg = getEffectiveConfig();
+  if (!effectiveCfg.cacheWatch) {
     process.stdout.write("{}\n");
     return;
   }
@@ -245,6 +258,7 @@ async function main() {
   }
 
   const sessionId = resolveSessionId(payload);
+  const directConvId = resolveDirectConversationId(payload);
   enableVersionedCompileCache();
 
   let store = null;
@@ -285,31 +299,24 @@ async function main() {
       return;
     }
 
-    const parsePositiveEnv = (name) => {
-      const raw = process.env[name];
-      if (!raw || !String(raw).trim()) return undefined;
-      const n = Number(raw);
-      return Number.isFinite(n) && n > 0 ? n : undefined;
-    };
     const diagOpts = {};
-    const envTtl = parsePositiveEnv("AGY_DART_CACHE_TTL_SEC");
-    const envWindow = parsePositiveEnv("AGY_DART_WINDOW_TOKENS");
-    const envWarn = parsePositiveEnv("AGY_DART_WARN_TOKENS");
-    const envCrit = parsePositiveEnv("AGY_DART_CRITICAL_TOKENS");
-    if (envTtl !== undefined) diagOpts.ttlSec = envTtl;
-    if (envWindow !== undefined) diagOpts.windowTokens = envWindow;
-    if (envWarn !== undefined) diagOpts.warnTokens = envWarn;
-    if (envCrit !== undefined) diagOpts.criticalTokens = envCrit;
+    if (effectiveCfg.cacheTtlSec !== null) diagOpts.ttlSec = effectiveCfg.cacheTtlSec;
+    if (effectiveCfg.windowTokens !== null) diagOpts.windowTokens = effectiveCfg.windowTokens;
+    if (effectiveCfg.warnTokens !== null) diagOpts.warnTokens = effectiveCfg.warnTokens;
+    if (effectiveCfg.criticalTokens !== null) diagOpts.criticalTokens = effectiveCfg.criticalTokens;
 
     const diag = analyzeTranscriptCache(steps, diagOpts);
 
-    // Auto-invalidate file_reads if compaction just occurred in this session
+    // Auto-invalidate file_reads & file_snapshots if compaction just occurred in this session
     const lastBust = diag.recentBusts[diag.recentBusts.length - 1];
     if (lastBust && lastBust.cause === "compaction_or_truncation") {
       const lastCompactKey = `compact_invalidated:${sessionId}`;
       const stamp = String(lastBust.at || lastBust.stepIndex);
       if (store.getTimedMeta(lastCompactKey, "") !== stamp) {
         store.invalidateFileReads(sessionId, null);
+        if (directConvId && directConvId !== sessionId) {
+          store.invalidateFileReads(directConvId, null);
+        }
         store.setTimedMeta(lastCompactKey, stamp);
       }
     }

@@ -87,11 +87,21 @@ export function stripAnsiAndProgress(text) {
 
 /**
  * Returns true if the command contains shell pipelines, redirections, chaining,
- * subshells, or newlines — we never transparently rewrite arbitrary compound commands.
+ * subshells, newlines, NUL bytes, cmd.exe expansion/escape characters (`%`, `!`,
+ * non-git-rev `^`), or PowerShell script blocks/splatting (`{`, `}`, leading `@` / `@(` / `@{`).
+ * Prevents both shell injection and cross-shell semantic drift when rewriting via cli-filter.mjs.
  */
 export function hasUnsafeShellSyntax(cmd) {
   if (!cmd || typeof cmd !== "string") return true;
-  if (/[\r\n|;&<>`$()]/.test(cmd)) return true;
+  if (/[\r\n\0|;&<>`$()%!{}]/.test(cmd)) return true;
+  // PowerShell splatting (`@var`), array/hash/here-string (`@(`, `@{`, `@"`, `@'`), or cmd `@echo`
+  if (/(?:^|\s)@|@[({"']/.test(cmd)) return true;
+  // Caret `^`: cmd.exe escape char. Only allow benign git parent-revspec suffixes (e.g. `git diff HEAD^`, `HEAD^1..HEAD`).
+  if (cmd.includes("^")) {
+    if (!/^\s*git(?:\.exe)?\s+(?:diff|log|show)\b/i.test(cmd)) return true;
+    const strippedGitRefs = cmd.replace(/(?<=[A-Za-z0-9_.-])\^+(?:\d+)?(?=\s|\.\.|$)/g, "");
+    if (strippedGitRefs.includes("^")) return true;
+  }
   return false;
 }
 
