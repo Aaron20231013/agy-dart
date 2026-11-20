@@ -1,8 +1,8 @@
 {
   "name": "agy-dart",
   "displayName": "agy-dart",
-  "version": "1.1.0",
-  "description": "All-in-one Antigravity latency accelerator, KV-cache protector & context-window guard: batched code search/edits/outlines/checks, transparent CLI output filtering, unchanged read dedup, heading-aware SQLite FTS5, and a live Sidecar dashboard.",
+  "version": "1.2.0",
+  "description": "All-in-one Antigravity latency accelerator, KV-cache protector & context-window guard: batched code search/edits/outlines/checks, transparent CLI & JSON crushing, unified config, heading-aware SQLite FTS5, and a CSRF-hardened live Sidecar dashboard.",
   "logo": "assets/logo.svg",
   "author": {
     "name": "zou172866",

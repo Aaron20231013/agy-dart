@@ -26,6 +26,21 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 
 ---
 
+## What's New in v1.2.0
+
+1. **Sidecar Security Hardening & Unified Config (`~/.agy-dart/config.json`)**:
+   - All mutating Sidecar endpoints (`/api/purge`, `/api/toggle-active`, `/api/cutoff`, `/api/exemptions`, `/api/maintenance`, `/api/cli-filter`, `/api/read-dedup`) are strictly `POST`-only with `Content-Type: application/json`, per-process `X-Agy-Dart-Token` CSRF validation, `Host`/`Origin`/`Sec-Fetch-Site` anti-DNS-rebinding guards, a `64 KB` request body cap, and XSS-safe DOM rendering.
+   - Consolidated 20+ `AGY_DART_*` toggles into `~/.agy-dart/config.json` (with `AGY_DART_*` env vars always overriding); `doctor` and `ctx_doctor` print effective flags and override provenance.
+2. **SmartCrusher, Expanded CLI Rules & Hardened Shell Guard**:
+   - Reversible zero-dep JSON/JSONL structural compactor (`context/lib/json-crusher.js`) extracts schema, head/tail samples, and prioritized anomalies (`status >= 400`, `ok: false`, fatal/error rows) while indexing raw output into FTS5.
+   - Added built-in CLI rules for `gh`, `kubectl`, `terraform`, and `playwright`, project-level declarative `.agy-dart/filters.json` (with ReDoS validator), safe `cd [/d] <path> && <cmd> [2>&1]` unwrapping, and stricter cmd/PowerShell metacharacter rejection (`%`, `!`, `{}`, `@`, non-git `^`).
+3. **Opt-In Three-State Diff-Read Cache (Safe by Default)**:
+   - Compact unified-diff re-reads on modified files are **OFF by default** (`diffRead: true` in `~/.agy-dart/config.json` or `AGY_DART_ENABLE_DIFF_READ=1` to opt in), scoped strictly to direct `conversationId` (zero parent↔subagent baseline leaks), bounded by recency (`diffReadMaxTurns` / `diffReadMaxAgeMs`), and carry baseline SHA/timestamp + 2-strike full-file bypass hints.
+4. **KV-Cache Diagnostics, Policy Replay, Handoff Brief & Persistent L2 Caches**:
+   - Added `npm run cache:audit` (global Prompt Cache audit), `npm run cache:simulate` (7-policy offline replay comparing 5m vs 1h TTL, cold-boundary compact, and cutoffs), Sidecar **Handoff Brief** + live 1s TTL countdown, 7-bucket `contextComposition` & `subagentBreakdown`, subagent Turn-0 stable-prefix sharing, persistent SQLite L2 `outline_cache`, per-feature ROI telemetry (`featureRoi`), and cross-Node 22/24 zero-`stderr` SQLite warning suppression.
+5. **Modular Store & Lean Runtime Install**:
+   - Split `context/lib/store.js` into focused `context/lib/store/` submodules and `context/lib/cache/profiles.js`; default `scripts/install.mjs install` copies **runtime files only** (pass `--with-devtools` to also copy offline benchmark/audit CLIs), verified automatically by `npm run verify:pkg`.
+
 ## What's New in v1.1.0
 
 1. **Transparent CLI Output Filtering (`PreToolUse.overwrite`)**: Automatically wraps safe noisy dev commands (`git status/diff/log`, `npm/pnpm/yarn/node/pytest/cargo/go/dotnet` tests, `tsc/eslint/ruff/mypy/vite/cargo` builds, package installs, `docker build`) through zero-dependency `hooks/cli-filter.mjs` in **1 turn** (zero deny/retry overhead!), preserving exact exit codes, stripping ANSI/spinners, capping inline output `<= 8.8 KB`, and indexing raw output in SQLite FTS5.
@@ -96,6 +111,7 @@ cd agy-dart
 ### Cross-Platform CLI
 ```bash
 node scripts/install.mjs install --mode balanced-16k
+node scripts/install.mjs install --with-devtools             # also install offline audit/benchmark CLIs
 node scripts/install.mjs install --project /path/to/repo   # workspace-scoped
 node scripts/install.mjs doctor
 node scripts/install.mjs mode fast-32k                     # balanced-16k | fast-32k | strict-8k | no-read-hook
@@ -117,17 +133,19 @@ Restart Antigravity (or reload window) and start a new conversation. If you prev
 ## Testing & Benchmarking
 
 ```bash
-# Run full integration & v1.1 feature test suite
+# Run full test suite (integration, v1.1, v1.2, security hardening & property/fuzz tests)
 npm test
 
-# Measure real-world round-trip & token-quota savings locally (offline)
-node ~/.gemini/config/plugins/agy-dart/fast/benchmark.mjs analyze --local --recent 10
+# Verify static runtime import graph & zero devtools leakage
+npm run verify:pkg
 
-# Inspect server-side Prompt Cache (KV-Cache) hit rate & bust attribution
-node ~/.gemini/config/plugins/agy-dart/fast/benchmark.mjs cache --local --recent 10
-
-# Audit always-loaded Turn-0 prefix token budget & MCP schema SHA-256 fingerprints
+# Audit Turn-0 prefix budget, MCP schema determinism & token estimator calibration
 npm run prefix:budget
+node scripts/prefix-budget.mjs --calibrate
+
+# Audit global Antigravity Prompt Cache hygiene & simulate 7 cache policies locally
+npm run cache:audit -- --workspace . --no-live
+npm run cache:simulate
 ```
 
 ## License

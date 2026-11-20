@@ -30,19 +30,20 @@ For logs, test dumps, CSV/JSON files, or API responses larger than 16 KB, extrac
 2. Search repeatedly via Porter BM25 + Trigram RRF: `ctx_search({ queries: ["rate limit", "OAuthError"], limit: 5 })`.
 3. After `/compact`, call `ctx_resume({})` to recover recent indexed `sourceId` handles plus the structured `sessionCheckpoint` (modified files + latest test/build status) while clearing session read-dedup entries.
 
-## 3. Transparent CLI Filtering, Security & Read Dedup
+## 3. Transparent CLI Filtering, SmartCrusher, Config & Read Dedup
 
-- Single noisy commands (`git status/diff/log`, `npm/pnpm/yarn/node/pytest/cargo/go` tests, builds, linters, installs, docker builds) are transparently rewritten via `PreToolUse.overwrite` through `hooks/cli-filter.mjs` to return `<= 8.8 KB` output in 1 turn while preserving exact exit codes and indexing redacted raw output into FTS5.
-- `ctx_index({ url })` enforces SSRF protection (`http:`/`https:` only, max 5 redirects, per-hop DNS private/loopback/link-local blocking), and common API keys/private keys/DB passwords are redacted before indexing/returning.
-- Redundant unchanged `read_file` calls in the same session are caught on strike 1; if context was compacted and you truly need a fresh copy, retry once to bypass (strike 2) or edit the file (`PostToolUse` auto-invalidates).
-- Env controls: `AGY_DART_DISABLE_CLI_FILTER=1`, `AGY_DART_DISABLE_READ_DEDUP=1`, `AGY_DART_DISABLE_CACHE_WATCH=1`, `AGY_DART_DISABLE_READ_HOOK=1`, `AGY_DART_DISABLE_SECRET_REDACTION=1`, `AGY_DART_SENSITIVE_FILE_GUARD=warn|deny`, `AGY_DART_CACHE_TTL_SEC`, `AGY_DART_WARN_TOKENS`, `AGY_DART_CRITICAL_TOKENS`.
+- Single noisy commands (`git status/diff/log`, `npm/pnpm/yarn/node/pytest/cargo/go` tests, builds, linters, installs, `docker build`, `gh`, `kubectl`, `terraform`, `playwright`) and safe `cd <dir> && <cmd> 2>&1` wrappers are transparently compacted `<= 8.8 KB` via `PreToolUse.overwrite` + `hooks/cli-filter.mjs` (preserving exact exit codes, applying project `.agy-dart/filters.json`, structurally compacting large JSON/JSONL via SmartCrusher, and indexing redacted raw output into FTS5).
+- `ctx_index({ url })` enforces SSRF protection (`http:`/`https:` only, max 5 redirects, per-hop DNS private/loopback/IPv6-mapped blocking with IP pinning), and common credentials are redacted before indexing/returning.
+- Redundant unchanged `read_file` calls in the same direct conversation are caught on strike 1 (retry once to bypass). Opt-in modified-file compact diff-read (`diffRead: true` in `~/.agy-dart/config.json` or `AGY_DART_ENABLE_DIFF_READ=1`) is OFF by default and strictly scoped to the same direct conversation within recent turns/age.
+- Unified config: configure persistent toggles in `~/.agy-dart/config.json` (overridable via `AGY_DART_*` env vars); run `node scripts/install.mjs doctor` or `ctx_doctor` to inspect effective settings.
 
-## 4. KV-Cache Diagnostics & DB Maintenance
+## 4. KV-Cache Diagnostics, Audit, Simulation & DB Maintenance
 
-- Check live Prompt Cache hit rate, bust attribution, idle TTL countdown, and DB size in the **agy-dart Context** Aux Pane Sidecar dashboard (or run `ctx_stats` / `ctx_doctor`).
+- Check live Prompt Cache hit rate, 1s TTL countdown, 7-bucket context composition, subagent breakdown, feature ROI (`featureRoi`), and one-click **Handoff Brief** in the **agy-dart Context** Aux Pane Sidecar dashboard (or run `ctx_stats` / `ctx_doctor`).
 - Prune stale entries (>14 days) and reclaim disk space: `ctx_purge({ scope: "stale", olderThanDays: 14, vacuum: true })`.
-- Run offline transcript benchmarks & KV-cache bust attribution locally:
+- Run offline cache audit, policy replay, prefix budget & transcript benchmarks (install with `--with-devtools` or run from source repo):
   ```bash
-  node ~/.gemini/config/plugins/agy-dart/fast/benchmark.mjs analyze --local --recent 10
-  node ~/.gemini/config/plugins/agy-dart/fast/benchmark.mjs cache --local --recent 10
+  npm run prefix:budget
+  npm run cache:audit -- --workspace . --no-live
+  npm run cache:simulate
   ```

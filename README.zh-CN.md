@@ -26,6 +26,21 @@
 
 ---
 
+## v1.2.0 核心新增能力
+
+1. **Sidecar 安全加固与统一配置（`~/.agy-dart/config.json`）**：
+   - Sidecar 所有写接口（`/api/purge`、`/api/toggle-active`、`/api/cutoff`、`/api/exemptions`、`/api/maintenance`、`/api/cli-filter`、`/api/read-dedup`）强制仅允许 `POST` + `Content-Type: application/json` + 进程级随机 `X-Agy-Dart-Token` CSRF 校验，全站强制 `Host`/`Origin`/`Sec-Fetch-Site` 防 DNS Rebinding 与跨站拦截、请求体上限 `64 KB`，并加固自定义扩展名 XSS 转义。
+   - 将 20+ 项 `AGY_DART_*` 环境变量收敛至 `~/.agy-dart/config.json`（环境变量始终优先覆盖），`doctor` 与 `ctx_doctor` 直接输出当前生效配置及覆盖来源。
+2. **SmartCrusher 结构化 JSON 粉碎、扩展 CLI 规则与跨 Shell 语法护栏**：
+   - 新增零依赖可逆 JSON/JSONL 粉碎器（`context/lib/json-crusher.js`），自动提取大数组 Schema、首尾样本与异常项（`status >= 400`、`ok: false`、错误/空值异常），原文同步入库 FTS5。
+   - 新增 `gh`、`kubectl`、`terraform`、`playwright` 规则、项目级 `.agy-dart/filters.json` 声明式过滤（带 ReDoS 校验）、安全 `cd [/d] <path> && <cmd> [2>&1]` 拆解，并拦截 cmd/PowerShell 易引起语义漂移的元字符（`%`、`!`、`{}`、`@`、非 git `^`）。
+3. **三态增量 Diff 读缓存（默认关闭、按需开启）**：
+   - 修改后仅返 Unified Diff 默认关闭（通过 `~/.agy-dart/config.json` 的 `diffRead: true` 或 `AGY_DART_ENABLE_DIFF_READ=1` 手动开启）；开启后严格按直接 `conversationId` 隔离（杜绝父子 Agent 串底稿）并受最近轮次与时间窗口新鲜度约束，头部标明基线版本并提供 2-strike 重读全文旁路。
+4. **KV-Cache 审计/策略回放、Handoff 交接卡与持久化 L2 缓存**：
+   - 新增 `npm run cache:audit` 全域缓存体检、`npm run cache:simulate` 7 套缓存策略离线回放、Sidecar 一键 **Handoff Brief** 与 1s 本地 TTL 倒计时、7 桶 `contextComposition` 与 `subagentBreakdown`、子 Agent 自动共享稳定 Turn-0 前缀、SQLite L2 `outline_cache` 持久化、按功能维度量化的 `featureRoi` 遥测，以及跨 Node 22/24 的 SQLite 零 `stderr` 告警拦截。
+5. **存储模块化与运行时/开发工具分离安装**：
+   - 将 `context/lib/store.js` 拆分为 `context/lib/store/` 5 个职责子模块与 `context/lib/cache/profiles.js`；默认 `install` 仅拷贝运行时文件（加 `--with-devtools` 同步安装离线审计与压测 CLI），并由 `npm run verify:pkg` 静态校验完整 Import 图。
+
 ## v1.1.0 核心新增能力
 
 1. **透明 CLI 输出过滤（`PreToolUse.overwrite`）**：对常见高噪单条开发命令（`git status/diff/log`、`npm/pnpm/yarn/node/pytest/cargo/go/dotnet` 测试、`tsc/eslint/ruff/mypy/vite/cargo` 构建、`npm/pip install`、`docker build`）通过零依赖 `hooks/cli-filter.mjs` 在 **1 轮内透明降噪**（免去拦截重试多一轮），严格保留原始退出码、剥离 ANSI 与进度条、强制输出 `<= 8.8 KB`，并将原始大输出自动落库 FTS5 可查。
@@ -102,8 +117,11 @@ brew install ripgrep   # macOS
 ### 通用 Node.js 命令（全平台 / 支持项目级安装）
 
 ```bash
-# 全局安装到 ~/.gemini/config/plugins/agy-dart
+# 全局安装到 ~/.gemini/config/plugins/agy-dart（默认仅安装运行时）
 node scripts/install.mjs install --mode balanced-16k
+
+# 同时安装离线审计 / 压测 / 策略回放等开发工具 CLI
+node scripts/install.mjs install --mode balanced-16k --with-devtools
 
 # 仅安装到当前项目仓库（.agents/plugins/agy-dart）
 node scripts/install.mjs install --project /path/to/your-repo
@@ -150,17 +168,19 @@ node scripts/install.mjs mode no-read-hook
 ## 效果量化与本地测试
 
 ```bash
-# 运行本仓库全量端到端与 v1.1 新特性测试套件
+# 运行本仓库全量测试套件（含集成、v1.1、v1.2、安全加固与属性/模糊测试）
 npm test
 
-# 离线分析本地 Antigravity 轨迹的轮次 / 缓存 / 额度收益（纯本地，不上传任何数据）
-node ~/.gemini/config/plugins/agy-dart/fast/benchmark.mjs analyze --local --recent 10
+# 静态校验运行时 Import 依赖图与打包清单（防漏文件）
+npm run verify:pkg
 
-# 专项查看服务端 Prompt Cache (KV-Cache) 命中率与失效归因报告
-node ~/.gemini/config/plugins/agy-dart/fast/benchmark.mjs cache --local --recent 10
-
-# 审计 Turn-0 常驻前缀 Token 预算与双 MCP Schema 确定性指纹
+# 审计 Turn-0 常驻前缀 Token 预算、双 MCP 指纹与 Token 估算误差校准
 npm run prefix:budget
+node scripts/prefix-budget.mjs --calibrate
+
+# 全域 Prompt Cache 体检与 7 套缓存策略离线回放
+npm run cache:audit -- --workspace . --no-live
+npm run cache:simulate
 ```
 
 ---
