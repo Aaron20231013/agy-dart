@@ -304,12 +304,12 @@ function splitStartupStability(text) {
   };
 }
 
-function fetchMcpTools(scriptPath, extraEnv = {}) {
+function fetchMcpTools(scriptPath, extraEnv = {}, baseEnv = process.env) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [scriptPath], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
-      env: { ...process.env, ...extraEnv }
+      env: { ...baseEnv, ...extraEnv }
     });
     let stdout = "";
     let stderr = "";
@@ -369,7 +369,15 @@ function fetchMcpTools(scriptPath, extraEnv = {}) {
 
 function runSessionStartHook(rootDir, dbPath, options = {}) {
   const hookScript = path.join(rootDir, "hooks", "session-start.mjs");
-  const childEnv = { ...process.env, AGY_DART_DB_PATH: dbPath };
+  const childEnv = { ...(options.env || process.env), AGY_DART_DB_PATH: dbPath };
+  // Prevent inherited subagent env markers from silently stripping volatile Git tail
+  // when prefix-budget audits a top-level Turn-0 session from inside a worker/subagent.
+  if (!options.env || !Object.prototype.hasOwnProperty.call(options.env, "ANTIGRAVITY_PARENT_CONVERSATION_ID")) {
+    delete childEnv.ANTIGRAVITY_PARENT_CONVERSATION_ID;
+  }
+  if (!options.env || !Object.prototype.hasOwnProperty.call(options.env, "ANTIGRAVITY_SUBAGENT")) {
+    delete childEnv.ANTIGRAVITY_SUBAGENT;
+  }
   if (options.configPath) {
     childEnv.AGY_DART_CONFIG_PATH = options.configPath;
   }
@@ -437,14 +445,17 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
     };
 
     // 3. tools: live JSON-RPC handshake with both MCP servers
+    const mcpBaseEnv = options.env || process.env;
+    const mcpExtra = options.configPath ? { AGY_DART_CONFIG_PATH: options.configPath } : {};
     const [fastRes, ctxRes] = await Promise.all([
-      fetchMcpTools(path.join(rootDir, "fast", "mcp-server.mjs")),
-      fetchMcpTools(path.join(rootDir, "context", "server.js"), { AGY_DART_DB_PATH: tmpDb })
+      fetchMcpTools(path.join(rootDir, "fast", "mcp-server.mjs"), mcpExtra, mcpBaseEnv),
+      fetchMcpTools(path.join(rootDir, "context", "server.js"), { ...mcpExtra, AGY_DART_DB_PATH: tmpDb }, mcpBaseEnv)
     ]);
 
     const isSortedByName = (list) => {
+      if (!Array.isArray(list) || list.length === 0) return false;
       for (let i = 1; i < list.length; i++) {
-        if (String(list[i - 1]?.name ?? "") > String(list[i]?.name ?? "")) {
+        if (String(list[i - 1]?.name ?? "") >= String(list[i]?.name ?? "")) {
           return false;
         }
       }
@@ -495,7 +506,8 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
     // 4. startup: live hooks/session-start.mjs output split into stable vs volatile Git tail
     const startupText = runSessionStartHook(rootDir, tmpDb, {
       stableOnly: stablePrefixOnly,
-      configPath: options.configPath
+      configPath: options.configPath,
+      env: options.env
     });
     const { stableText, volatileText } = splitStartupStability(startupText);
     const startupTotalBytes = Buffer.byteLength(startupText, "utf8");

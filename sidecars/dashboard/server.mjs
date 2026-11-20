@@ -49,7 +49,9 @@ export function isAllowedOriginHeader(originHeader, hostHeader = null) {
     try {
       const originUrl = new URL(trimmed);
       const reqHostUrl = new URL(`http://${hostHeader.trim()}`);
-      const originPort = originUrl.port || (originUrl.protocol === "https:" ? "443" : "80");
+      if (originUrl.protocol !== "http:") return false;
+      if (originUrl.hostname.toLowerCase() !== reqHostUrl.hostname.toLowerCase()) return false;
+      const originPort = originUrl.port || "80";
       const hostPort = reqHostUrl.port || "80";
       if (originPort !== hostPort) return false;
     } catch {
@@ -60,11 +62,12 @@ export function isAllowedOriginHeader(originHeader, hostHeader = null) {
 }
 
 export function isCrossSiteFetchHeader(secFetchSite, { allowSameSite = false } = {}) {
-  if (typeof secFetchSite !== "string") return false;
+  if (secFetchSite === undefined || secFetchSite === null) return false;
+  if (typeof secFetchSite !== "string") return true;
   const normalized = secFetchSite.trim().toLowerCase();
-  if (normalized === "cross-site") return true;
-  if (!allowSameSite && normalized === "same-site") return true;
-  return false;
+  if (!normalized || normalized === "same-origin" || normalized === "none") return false;
+  if (allowSameSite && normalized === "same-site") return false;
+  return true;
 }
 
 export function isJsonContentType(contentType) {
@@ -138,6 +141,16 @@ export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
 
     req.on("error", (err) => {
       finish({ ok: false, status: 400, error: err instanceof Error ? err.message : "Request stream error" });
+    });
+
+    req.on("aborted", () => {
+      finish({ ok: false, status: 400, error: "Request stream aborted" });
+    });
+
+    req.on("close", () => {
+      if (!settled && !req.complete) {
+        finish({ ok: false, status: 400, error: "Request stream closed prematurely" });
+      }
     });
   });
 }
@@ -602,158 +615,171 @@ const MUTATING_ENDPOINTS = new Set([
   "/api/read-dedup"
 ]);
 
-export function createStandaloneServer({ csrfToken = SIDECAR_CSRF_TOKEN, maxBodyBytes = MAX_REQUEST_BODY_BYTES } = {}) {
+export function createStandaloneServer({
+  csrfToken = crypto.randomBytes(24).toString("hex"),
+  maxBodyBytes = MAX_REQUEST_BODY_BYTES
+} = {}) {
   return http.createServer(async (req, res) => {
-    // 1. Anti-DNS-rebinding Host validation & anti-CSRF Origin/Sec-Fetch-Site validation
-    if (!isAllowedHostHeader(req.headers.host)) {
-      sendJson(res, 403, { error: "Forbidden host header" });
-      return;
-    }
-
-    let url;
     try {
-      url = new URL(req.url, `http://${req.headers.host}`);
+      // 1. Anti-DNS-rebinding Host validation & anti-CSRF Origin/Sec-Fetch-Site validation
+      if (!isAllowedHostHeader(req.headers.host)) {
+        sendJson(res, 403, { error: "Forbidden host header" });
+        return;
+      }
+
+      let url;
+      try {
+        url = new URL(req.url, `http://${req.headers.host}`);
+      } catch {
+        sendJson(res, 400, { error: "Invalid request URL" });
+        return;
+      }
+
+      const isHtmlEntry = req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html");
+      if (
+        !isAllowedOriginHeader(req.headers.origin, req.headers.host) ||
+        isCrossSiteFetchHeader(req.headers["sec-fetch-site"], { allowSameSite: isHtmlEntry })
+      ) {
+        sendJson(res, 403, { error: "Cross-origin request blocked" });
+        return;
+      }
+
+      if (isHtmlEntry) {
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "X-Content-Type-Options": "nosniff",
+          "X-Frame-Options": "DENY",
+          "Content-Security-Policy": "frame-ancestors 'none'",
+          "Cache-Control": "no-store"
+        });
+        res.end(getRenderedHtml(csrfToken));
+        return;
+      }
+
+      // 2. Enforce POST-only method semantics on /api/search and mutating endpoints first
+      //    so cross-site <img> GET attacks explicitly return 405 Method Not Allowed (Allow: POST).
+      if ((url.pathname === "/api/search" || MUTATING_ENDPOINTS.has(url.pathname)) && req.method !== "POST") {
+        sendJson(
+          res,
+          405,
+          {
+            error:
+              url.pathname === "/api/search"
+                ? "Method Not Allowed: use POST with application/json"
+                : "Method Not Allowed: mutating endpoints require POST"
+          },
+          { Allow: "POST" }
+        );
+        return;
+      }
+
+      // 3. Require per-server random X-Agy-Dart-Token on EVERY standalone /api/* endpoint (GET and POST)
+      if (url.pathname.startsWith("/api/")) {
+        if (!timingSafeTokenMatch(req.headers["x-agy-dart-token"], csrfToken)) {
+          sendJson(res, 403, { error: "Invalid or missing X-Agy-Dart-Token" });
+          return;
+        }
+      }
+
+      // 4. Authenticated read-only GET API endpoints
+      if (req.method === "GET" && url.pathname === "/api/stats") {
+        const data = Object.fromEntries(url.searchParams.entries());
+        sendJson(res, 200, getStatsPayload(data));
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/doctor") {
+        sendJson(res, 200, store.doctor());
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/resume") {
+        const data = Object.fromEntries(url.searchParams.entries());
+        const { scope, convId } = resolveTargetSession(data);
+        let resume;
+        if (scope === "lifetime" || scope === "all") {
+          resume = store.getResumeState("all", 10);
+        } else if (scope === "app" || scope === "session") {
+          resume = store.getResumeState("app", 10, { sinceTs: appStartTime });
+        } else {
+          resume = store.getResumeState(convId, 10);
+        }
+        sendJson(res, 200, resume);
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/source-chunks") {
+        const sourceId = url.searchParams.get("sourceId");
+        const chunks = store.getSourceChunks(sourceId);
+        sendJson(res, 200, { ok: true, sourceId, chunks });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/cache-diag") {
+        const data = Object.fromEntries(url.searchParams.entries());
+        sendJson(res, 200, getCacheDiagPayload(data));
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/handoff") {
+        const data = Object.fromEntries(url.searchParams.entries());
+        sendJson(res, 200, getHandoffPayload(data));
+        return;
+      }
+
+      // 5. POST-only /api/search (authenticated read-only FTS5 query, bounded JSON body)
+      if (url.pathname === "/api/search") {
+        if (!isJsonContentType(req.headers["content-type"])) {
+          sendJson(res, 415, { error: "Content-Type must be application/json" });
+          return;
+        }
+        const parsed = await readBoundedJsonBody(req, maxBodyBytes);
+        if (!parsed.ok) {
+          sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
+          return;
+        }
+        const queries = Array.isArray(parsed.data.queries) ? parsed.data.queries : [parsed.data.query || ""];
+        sendJson(res, 200, store.search({ queries, limit: 5 }));
+        return;
+      }
+
+      // 6. Mutating endpoints: strictly POST + application/json + per-server CSRF token + <= 64 KB body
+      if (MUTATING_ENDPOINTS.has(url.pathname)) {
+        if (!isJsonContentType(req.headers["content-type"])) {
+          sendJson(res, 415, { error: "Content-Type must be application/json" });
+          return;
+        }
+        const parsed = await readBoundedJsonBody(req, maxBodyBytes);
+        if (!parsed.ok) {
+          sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
+          return;
+        }
+        const data = parsed.data;
+        if (url.pathname === "/api/cutoff") {
+          sendJson(res, 200, handleCutoffMutation(data));
+        } else if (url.pathname === "/api/toggle-active" || url.pathname === "/api/paused") {
+          sendJson(res, 200, handleToggleActiveMutation(data));
+        } else if (url.pathname === "/api/exemptions") {
+          sendJson(res, 200, handleExemptionsMutation(data));
+        } else if (url.pathname === "/api/purge") {
+          sendJson(res, 200, handlePurgeMutation(data));
+        } else if (url.pathname === "/api/maintenance") {
+          sendJson(res, 200, handleMaintenanceMutation(data));
+        } else if (url.pathname === "/api/cli-filter" || url.pathname === "/api/read-dedup") {
+          sendJson(res, 200, handleFeatureToggleMutation(url.pathname === "/api/cli-filter", data));
+        }
+        return;
+      }
+
+      res.writeHead(404, { "X-Content-Type-Options": "nosniff" });
+      res.end("Not Found");
     } catch {
-      sendJson(res, 400, { error: "Invalid request URL" });
-      return;
-    }
-
-    const isHtmlEntry = req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html");
-    if (
-      !isAllowedOriginHeader(req.headers.origin, req.headers.host) ||
-      isCrossSiteFetchHeader(req.headers["sec-fetch-site"], { allowSameSite: isHtmlEntry })
-    ) {
-      sendJson(res, 403, { error: "Cross-origin request blocked" });
-      return;
-    }
-
-    if (isHtmlEntry) {
-      res.writeHead(200, {
-        "Content-Type": "text/html; charset=utf-8",
-        "X-Content-Type-Options": "nosniff",
-        "Cache-Control": "no-store"
-      });
-      res.end(getRenderedHtml(csrfToken));
-      return;
-    }
-
-    // 2. Enforce POST-only method semantics on /api/search and mutating endpoints first
-    //    so cross-site <img> GET attacks explicitly return 405 Method Not Allowed (Allow: POST).
-    if ((url.pathname === "/api/search" || MUTATING_ENDPOINTS.has(url.pathname)) && req.method !== "POST") {
-      sendJson(
-        res,
-        405,
-        {
-          error:
-            url.pathname === "/api/search"
-              ? "Method Not Allowed: use POST with application/json"
-              : "Method Not Allowed: mutating endpoints require POST"
-        },
-        { Allow: "POST" }
-      );
-      return;
-    }
-
-    // 3. Require per-process random X-Agy-Dart-Token on EVERY standalone /api/* endpoint (GET and POST)
-    if (url.pathname.startsWith("/api/")) {
-      if (!timingSafeTokenMatch(req.headers["x-agy-dart-token"], csrfToken)) {
-        sendJson(res, 403, { error: "Invalid or missing X-Agy-Dart-Token" });
-        return;
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: "Internal server error" });
+      } else if (!res.writableEnded) {
+        res.end();
       }
     }
-
-    // 4. Authenticated read-only GET API endpoints
-    if (req.method === "GET" && url.pathname === "/api/stats") {
-      const data = Object.fromEntries(url.searchParams.entries());
-      sendJson(res, 200, getStatsPayload(data));
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/api/doctor") {
-      sendJson(res, 200, store.doctor());
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/api/resume") {
-      const data = Object.fromEntries(url.searchParams.entries());
-      const { scope, convId } = resolveTargetSession(data);
-      let resume;
-      if (scope === "lifetime" || scope === "all") {
-        resume = store.getResumeState("all", 10);
-      } else if (scope === "app" || scope === "session") {
-        resume = store.getResumeState("app", 10, { sinceTs: appStartTime });
-      } else {
-        resume = store.getResumeState(convId, 10);
-      }
-      sendJson(res, 200, resume);
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/api/source-chunks") {
-      const sourceId = url.searchParams.get("sourceId");
-      const chunks = store.getSourceChunks(sourceId);
-      sendJson(res, 200, { ok: true, sourceId, chunks });
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/api/cache-diag") {
-      const data = Object.fromEntries(url.searchParams.entries());
-      sendJson(res, 200, getCacheDiagPayload(data));
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/api/handoff") {
-      const data = Object.fromEntries(url.searchParams.entries());
-      sendJson(res, 200, getHandoffPayload(data));
-      return;
-    }
-
-    // 5. POST-only /api/search (authenticated read-only FTS5 query, bounded JSON body)
-    if (url.pathname === "/api/search") {
-      if (!isJsonContentType(req.headers["content-type"])) {
-        sendJson(res, 415, { error: "Content-Type must be application/json" });
-        return;
-      }
-      const parsed = await readBoundedJsonBody(req, maxBodyBytes);
-      if (!parsed.ok) {
-        sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
-        return;
-      }
-      const queries = Array.isArray(parsed.data.queries) ? parsed.data.queries : [parsed.data.query || ""];
-      sendJson(res, 200, store.search({ queries, limit: 5 }));
-      return;
-    }
-
-    // 6. Mutating endpoints: strictly POST + application/json + per-process CSRF token + <= 64 KB body
-    if (MUTATING_ENDPOINTS.has(url.pathname)) {
-      if (!isJsonContentType(req.headers["content-type"])) {
-        sendJson(res, 415, { error: "Content-Type must be application/json" });
-        return;
-      }
-      const parsed = await readBoundedJsonBody(req, maxBodyBytes);
-      if (!parsed.ok) {
-        sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
-        return;
-      }
-      const data = parsed.data;
-      if (url.pathname === "/api/cutoff") {
-        sendJson(res, 200, handleCutoffMutation(data));
-      } else if (url.pathname === "/api/toggle-active" || url.pathname === "/api/paused") {
-        sendJson(res, 200, handleToggleActiveMutation(data));
-      } else if (url.pathname === "/api/exemptions") {
-        sendJson(res, 200, handleExemptionsMutation(data));
-      } else if (url.pathname === "/api/purge") {
-        sendJson(res, 200, handlePurgeMutation(data));
-      } else if (url.pathname === "/api/maintenance") {
-        sendJson(res, 200, handleMaintenanceMutation(data));
-      } else if (url.pathname === "/api/cli-filter" || url.pathname === "/api/read-dedup") {
-        sendJson(res, 200, handleFeatureToggleMutation(url.pathname === "/api/cli-filter", data));
-      }
-      return;
-    }
-
-    res.writeHead(404, { "X-Content-Type-Options": "nosniff" });
-    res.end("Not Found");
   });
 }
 

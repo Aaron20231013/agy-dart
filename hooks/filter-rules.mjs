@@ -243,90 +243,251 @@ export function isSafeRegex(source) {
     return null;
   };
 
-  const unwrapLiteral = (x) => {
-    if (typeof x !== "string") return null;
-    if (x.length === 1 && x !== ".") return x;
-    if (x.length === 2 && x[0] === "\\") {
-      const c = x[1];
-      if (c === "n") return "\n";
-      if (c === "r") return "\r";
-      if (c === "t") return "\t";
-      if (c === "f") return "\f";
-      if (c === "v") return "\v";
-      if (!/[dDsSwWpPuxckbB0-9]/.test(c)) return c;
-    }
-    return null;
+  // Exact ASCII (0..127) bitmask + 2 disjoint non-ASCII buckets (whitespace vs non-whitespace).
+  // All ASCII letters are case-folded because custom filter rules compile with the `i` flag.
+  const csEmpty = () => [0, 0, 0, 0, false, false];
+  const csClone = (cs) => [cs[0], cs[1], cs[2], cs[3], cs[4], cs[5]];
+  const csAll = () => [0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, true, true];
+
+  const csAddBitRaw = (cs, code) => {
+    cs[code >>> 5] = (cs[code >>> 5] | (1 << (code & 31))) >>> 0;
   };
 
-  const atomsCanOverlap = (a, b) => {
-    if (!a || !b) return false;
-    if (a === "." || b === ".") return true;
-    if (a === b) return true;
-    const litA = unwrapLiteral(a);
-    const litB = unwrapLiteral(b);
-    if (litA !== null && litB !== null) {
-      return litA.toLowerCase() === litB.toLowerCase();
+  const csAddCode = (cs, code) => {
+    if (code >= 0 && code < 128) {
+      csAddBitRaw(cs, code);
+      if (code >= 65 && code <= 90) csAddBitRaw(cs, code + 32);
+      else if (code >= 97 && code <= 122) csAddBitRaw(cs, code - 32);
+    } else if (code >= 128) {
+      if (/\s/.test(String.fromCodePoint(code))) cs[4] = true;
+      else cs[5] = true;
     }
-    const pair = new Set([a, b]);
-    if (
-      (pair.has("\\d") && pair.has("\\s")) ||
-      (pair.has("\\w") && pair.has("\\s")) ||
-      (pair.has("\\d") && pair.has("\\D")) ||
-      (pair.has("\\d") && pair.has("\\W")) ||
-      (pair.has("\\w") && pair.has("\\W")) ||
-      (pair.has("\\s") && pair.has("\\S"))
-    ) {
-      return false;
+  };
+
+  const csFromCode = (code) => {
+    const cs = csEmpty();
+    csAddCode(cs, code);
+    return cs;
+  };
+
+  const csUnionInto = (dst, src) => {
+    dst[0] = (dst[0] | src[0]) >>> 0;
+    dst[1] = (dst[1] | src[1]) >>> 0;
+    dst[2] = (dst[2] | src[2]) >>> 0;
+    dst[3] = (dst[3] | src[3]) >>> 0;
+    if (src[4]) dst[4] = true;
+    if (src[5]) dst[5] = true;
+    return dst;
+  };
+
+  const csOverlaps = (a, b) =>
+    ((a[0] & b[0]) | (a[1] & b[1]) | (a[2] & b[2]) | (a[3] & b[3])) !== 0 ||
+    (a[4] && b[4]) ||
+    (a[5] && b[5]);
+
+  const csEquals = (a, b) =>
+    a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3] && a[4] === b[4] && a[5] === b[5];
+
+  const csIsEmpty = (cs) => (cs[0] | cs[1] | cs[2] | cs[3]) === 0 && !cs[4] && !cs[5];
+
+  const buildRangeCs = (ranges, nonAsciiSpace = false, nonAsciiNonSpace = false) => {
+    const cs = csEmpty();
+    for (const [lo, hi] of ranges) {
+      for (let c = lo; c <= hi; c++) csAddCode(cs, c);
     }
-    const checkShorthandLit = (sh, lit) => {
-      if (sh === "\\d") return /[0-9]/.test(lit);
-      if (sh === "\\D") return !/[0-9]/.test(lit);
-      if (sh === "\\s") return /\s/.test(lit);
-      if (sh === "\\S") return !/\s/.test(lit);
-      if (sh === "\\w") return /[A-Za-z0-9_]/.test(lit);
-      if (sh === "\\W") return !/[A-Za-z0-9_]/.test(lit);
-      return true;
+    cs[4] = nonAsciiSpace;
+    cs[5] = nonAsciiNonSpace;
+    return cs;
+  };
+
+  const CS_DIGIT = buildRangeCs([[48, 57]], false, false);
+  const CS_NON_DIGIT = [~CS_DIGIT[0] >>> 0, ~CS_DIGIT[1] >>> 0, ~CS_DIGIT[2] >>> 0, ~CS_DIGIT[3] >>> 0, true, true];
+  const CS_WORD = buildRangeCs([[48, 57], [65, 90], [95, 95], [97, 122]], false, false);
+  const CS_NON_WORD = [~CS_WORD[0] >>> 0, ~CS_WORD[1] >>> 0, ~CS_WORD[2] >>> 0, ~CS_WORD[3] >>> 0, true, true];
+  const CS_SPACE = buildRangeCs([[9, 13], [32, 32]], true, false);
+  const CS_NON_SPACE = [~CS_SPACE[0] >>> 0, ~CS_SPACE[1] >>> 0, ~CS_SPACE[2] >>> 0, ~CS_SPACE[3] >>> 0, false, true];
+  const CS_ALL = csAll();
+  const CS_DOT = (() => {
+    const cs = csAll();
+    // Without `s` flag, `.` excludes \n (10) and \r (13)
+    cs[0] = (cs[0] & ~(1 << 10) & ~(1 << 13)) >>> 0;
+    return cs;
+  })();
+
+  const parseEscape = (pos, inClass) => {
+    if (pos + 1 >= source.length) return null;
+    const c = source[pos + 1];
+    if (!inClass && ((c >= "1" && c <= "9") || (c === "k" && source[pos + 2] === "<"))) {
+      // Numbered or named backreferences can trigger exponential backtracking
+      return null;
+    }
+    if (!inClass && (c === "b" || c === "B")) {
+      return { end: pos + 2, isZeroWidth: true, cs: null };
+    }
+    if (c === "d") return { end: pos + 2, kind: "set", cs: CS_DIGIT, coversSpace: false, coversNonSpace: false };
+    if (c === "D") return { end: pos + 2, kind: "set", cs: CS_NON_DIGIT, coversSpace: true, coversNonSpace: true };
+    if (c === "w") return { end: pos + 2, kind: "set", cs: CS_WORD, coversSpace: false, coversNonSpace: false };
+    if (c === "W") return { end: pos + 2, kind: "set", cs: CS_NON_WORD, coversSpace: true, coversNonSpace: true };
+    if (c === "s") return { end: pos + 2, kind: "set", cs: CS_SPACE, coversSpace: true, coversNonSpace: false };
+    if (c === "S") return { end: pos + 2, kind: "set", cs: CS_NON_SPACE, coversSpace: false, coversNonSpace: true };
+    if (c === "n") return { end: pos + 2, kind: "char", code: 10, cs: csFromCode(10) };
+    if (c === "r") return { end: pos + 2, kind: "char", code: 13, cs: csFromCode(13) };
+    if (c === "t") return { end: pos + 2, kind: "char", code: 9, cs: csFromCode(9) };
+    if (c === "f") return { end: pos + 2, kind: "char", code: 12, cs: csFromCode(12) };
+    if (c === "v") return { end: pos + 2, kind: "char", code: 11, cs: csFromCode(11) };
+    if (inClass && c === "b") return { end: pos + 2, kind: "char", code: 8, cs: csFromCode(8) };
+
+    if (c === "x" && pos + 3 < source.length && /^[0-9a-fA-F]{2}$/.test(source.slice(pos + 2, pos + 4))) {
+      const code = parseInt(source.slice(pos + 2, pos + 4), 16);
+      return { end: pos + 4, kind: "char", code, cs: csFromCode(code) };
+    }
+    if (c === "u" && pos + 5 < source.length && /^[0-9a-fA-F]{4}$/.test(source.slice(pos + 2, pos + 6))) {
+      const code = parseInt(source.slice(pos + 2, pos + 6), 16);
+      return { end: pos + 6, kind: "char", code, cs: csFromCode(code) };
+    }
+    if (c === "c") {
+      if (pos + 2 < source.length && (inClass ? /[0-9A-Za-z_]/.test(source[pos + 2]) : /[A-Za-z]/.test(source[pos + 2]))) {
+        const code = source.charCodeAt(pos + 2) % 32;
+        return { end: pos + 3, kind: "char", code, cs: csFromCode(code) };
+      }
+      return { end: pos + 2, kind: "set", cs: CS_ALL, coversSpace: false, coversNonSpace: false };
+    }
+    if (c === "0" || (inClass && c >= "1" && c <= "7")) {
+      let val = Number(c);
+      let end = pos + 2;
+      while (end < source.length && end < pos + 4 && source[end] >= "0" && source[end] <= "7") {
+        const nextVal = val * 8 + Number(source[end]);
+        if (nextVal > 255) break;
+        val = nextVal;
+        end++;
+      }
+      return { end, kind: "char", code: val, cs: csFromCode(val) };
+    }
+    if ((c === "p" || c === "P") && source[pos + 2] === "{") {
+      const closeBrace = source.indexOf("}", pos + 3);
+      if (closeBrace !== -1) {
+        return { end: closeBrace + 1, kind: "set", cs: CS_ALL, coversSpace: false, coversNonSpace: false };
+      }
+    }
+    const litCode = c.charCodeAt(0);
+    return { end: pos + 2, kind: "char", code: litCode, cs: csFromCode(litCode) };
+  };
+
+  const parseCharClass = (startPos) => {
+    let p = startPos + 1;
+    if (p >= source.length) return null;
+    let negated = false;
+    if (source[p] === "^") {
+      negated = true;
+      p++;
+    }
+    const cs = csEmpty();
+    let coversAllNonAsciiSpace = false;
+    let coversAllNonAsciiNonSpace = false;
+
+    const readClassItem = (idx) => {
+      if (source[idx] === "\\") {
+        return parseEscape(idx, true);
+      }
+      const code = source.charCodeAt(idx);
+      return { end: idx + 1, kind: "char", code, cs: csFromCode(code) };
     };
-    if (a.startsWith("\\") && litA === null && litB !== null) return checkShorthandLit(a, litB);
-    if (b.startsWith("\\") && litB === null && litA !== null) return checkShorthandLit(b, litA);
-    return true;
+
+    const mergeItem = (item) => {
+      csUnionInto(cs, item.cs);
+      if (item.coversSpace) coversAllNonAsciiSpace = true;
+      if (item.coversNonSpace) coversAllNonAsciiNonSpace = true;
+    };
+
+    while (p < source.length && source[p] !== "]") {
+      const first = readClassItem(p);
+      if (!first) return null;
+      p = first.end;
+      if (first.kind === "char" && p < source.length && source[p] === "-" && p + 1 < source.length && source[p + 1] !== "]") {
+        const second = readClassItem(p + 1);
+        if (!second) return null;
+        if (second.kind === "char") {
+          if (second.code < first.code) return null;
+          const asciiEnd = Math.min(second.code, 127);
+          for (let code = first.code; code <= asciiEnd; code++) {
+            csAddCode(cs, code);
+          }
+          if (second.code >= 128) {
+            cs[4] = true;
+            cs[5] = true;
+          }
+          p = second.end;
+          continue;
+        }
+        // Range against shorthand (Annex B): conservatively include endpoints, '-' and shorthand
+        mergeItem(first);
+        csAddCode(cs, 45);
+        mergeItem(second);
+        p = second.end;
+        continue;
+      }
+      mergeItem(first);
+    }
+
+    if (p >= source.length || source[p] !== "]") return null;
+
+    if (negated) {
+      return {
+        end: p + 1,
+        cs: [
+          ~cs[0] >>> 0,
+          ~cs[1] >>> 0,
+          ~cs[2] >>> 0,
+          ~cs[3] >>> 0,
+          !coversAllNonAsciiSpace,
+          !coversAllNonAsciiNonSpace
+        ]
+      };
+    }
+    return { end: p + 1, cs };
   };
 
-  const addAtomToSet = (set, atom) => {
-    if (!atom || set.has(".")) return;
-    if (atom === "." || set.size >= 16) {
-      set.clear();
-      set.add(".");
+  // List of active preceding variable-repeat CharSets (capped at 16 distinct entries)
+  const addPrevEntry = (list, cs) => {
+    if (!cs || csIsEmpty(cs)) return;
+    if (list.length === 1 && csEquals(list[0], CS_ALL)) return;
+    if (csEquals(cs, CS_ALL) || list.length >= 16) {
+      list.length = 0;
+      list.push(CS_ALL);
       return;
     }
-    set.add(atom);
+    for (const existing of list) {
+      if (csEquals(existing, cs)) return;
+    }
+    list.push(cs);
   };
 
-  const unionSets = (a, b) => {
-    if (!a || a.size === 0) return b && b.size > 0 ? new Set(b) : null;
-    if (!b || b.size === 0) return new Set(a);
-    const out = new Set(a);
-    for (const item of b) addAtomToSet(out, item);
+  const clonePrevList = (list) => (list && list.length > 0 ? list.slice() : null);
+
+  const unionPrevLists = (a, b) => {
+    if (!a || a.length === 0) return clonePrevList(b);
+    if (!b || b.length === 0) return clonePrevList(a);
+    const out = a.slice();
+    for (const item of b) addPrevEntry(out, item);
     return out;
   };
 
-  const setsCanOverlap = (a, b) => {
-    if (!a || !b || a.size === 0 || b.size === 0) return false;
-    for (const x of a) {
-      for (const y of b) {
-        if (atomsCanOverlap(x, y)) return true;
-      }
+  const prevOverlapsCs = (prevList, cs) => {
+    if (!prevList || prevList.length === 0 || !cs || csIsEmpty(cs)) return false;
+    for (const p of prevList) {
+      if (csOverlaps(p, cs)) return true;
     }
     return false;
   };
 
-  const filterOverlapping = (prevSet, atom) => {
-    if (!prevSet || prevSet.size === 0) return null;
+  const filterOverlappingPrev = (prevList, cs) => {
+    if (!prevList || prevList.length === 0) return null;
+    if (!cs || csIsEmpty(cs)) return null;
     let kept = null;
-    for (const prevAtom of prevSet) {
-      if (atomsCanOverlap(prevAtom, atom)) {
-        if (!kept) kept = new Set();
-        kept.add(prevAtom);
+    for (const p of prevList) {
+      if (csOverlaps(p, cs)) {
+        if (!kept) kept = [];
+        kept.push(p);
       }
     }
     return kept;
@@ -336,7 +497,7 @@ export function isSafeRegex(source) {
     if (branches.length < 2) return false;
     const seen = new Set();
     for (const raw of branches) {
-      const b = raw.trim().toLowerCase();
+      const b = raw.toLowerCase();
       if (!b) return true;
       // Wildcards / character classes / escapes / anchors / nested groups in quantified alternation risk exponential overlap
       if (/[.[\\+*?{(^$]/.test(b)) return true;
@@ -349,14 +510,17 @@ export function isSafeRegex(source) {
     return false;
   };
 
-  const makeFrame = (incomingPrev, isLookaround = false) => ({
+  const makeFrame = (incomingPrev, isLookaround = false, inMultiline = false, inDotAll = false) => ({
     isLookaround,
-    incomingPrev: incomingPrev ? new Set(incomingPrev) : null,
-    curPrev: incomingPrev ? new Set(incomingPrev) : null,
+    inMultiline,
+    inDotAll,
+    incomingPrev: clonePrevList(incomingPrev),
+    curPrev: clonePrevList(incomingPrev),
     curEmpty: true,
     branchEndPrevs: [],
     canMatchEmpty: false,
-    allAtoms: new Set(),
+    allChars: csEmpty(),
+    hasAtoms: false,
     hasQuantifier: false,
     hasAlternation: false,
     hasAmbiguousAlt: false,
@@ -364,34 +528,41 @@ export function isSafeRegex(source) {
     curBranch: ""
   });
 
-  const stack = [makeFrame(null, false)];
-  let inCharClass = false;
-  let charClassStart = -1;
-  let optionalQuantifierCount = 0;
+  const stack = [makeFrame(null, false, false, false)];
+  // Total non-deterministic branching budget (2^12 = 4096 max paths) covering `?`, `{0,1}`,
+  // nullable alternations `(a|)`, and chained non-quantified ambiguous alternations `(a|aa)...`.
+  const MAX_NONDET_CHOICE_BITS = 12;
+  let nonDetChoiceBits = 0;
 
-  const consumeAtom = (atom, q, isZeroWidth = false) => {
+  const consumeNonDetBits = (bits) => {
+    nonDetChoiceBits += bits;
+    return nonDetChoiceBits <= MAX_NONDET_CHOICE_BITS;
+  };
+
+  const consumeAtom = (atomCs, q, isZeroWidth = false) => {
     const top = stack[stack.length - 1];
     if (isZeroWidth) {
       if (q && q.isRepeating) return false;
       return true;
     }
-    addAtomToSet(top.allAtoms, atom);
+    top.hasAtoms = true;
+    csUnionInto(top.allChars, atomCs);
     if (q) {
       if (readQuantifier(source, q.end)) return false;
       top.hasQuantifier = true;
       if (q.isVariableRepeat) {
-        const atomSet = new Set([atom]);
-        if (setsCanOverlap(top.curPrev, atomSet)) return false;
-        top.curPrev = q.minZero ? unionSets(top.curPrev, atomSet) : atomSet;
+        if (prevOverlapsCs(top.curPrev, atomCs)) return false;
+        const nextList = csIsEmpty(atomCs) ? null : [atomCs];
+        top.curPrev = q.minZero ? unionPrevLists(top.curPrev, nextList) : nextList;
         if (!q.minZero) top.curEmpty = false;
       } else if (!q.minZero) {
-        top.curPrev = filterOverlapping(top.curPrev, atom);
+        top.curPrev = filterOverlappingPrev(top.curPrev, atomCs);
         top.curEmpty = false;
-      } else if (++optionalQuantifierCount > 16) {
+      } else if (!consumeNonDetBits(1)) {
         return false;
       }
     } else {
-      top.curPrev = filterOverlapping(top.curPrev, atom);
+      top.curPrev = filterOverlappingPrev(top.curPrev, atomCs);
       top.curEmpty = false;
     }
     return true;
@@ -402,54 +573,28 @@ export function isSafeRegex(source) {
     const top = stack[stack.length - 1];
 
     if (ch === "\\") {
-      if (i + 1 >= source.length) return false;
-      const next = source[i + 1];
-      if (!inCharClass && ((next >= "1" && next <= "9") || (next === "k" && source[i + 2] === "<"))) {
-        // Numbered or named backreferences can trigger exponential backtracking
-        return false;
+      const esc = parseEscape(i, false);
+      if (!esc) return false;
+      const q = readQuantifier(source, esc.end);
+      if (q?.invalid) return false;
+      if (stack.length > 1) {
+        top.curBranch += source.slice(i, q ? q.end : esc.end);
       }
-      if (!inCharClass) {
-        const atom = `\\${next}`;
-        const isZeroWidthAssertion = next === "b" || next === "B";
-        if (stack.length > 1) {
-          top.curBranch += atom;
-        }
-        const q = readQuantifier(source, i + 2);
-        if (q?.invalid) return false;
-        if (!consumeAtom(atom, q, isZeroWidthAssertion)) return false;
-        if (q) {
-          if (stack.length > 1) {
-            top.curBranch += source.slice(i + 2, q.end);
-          }
-          i = q.end - 1;
-          continue;
-        }
-      }
-      i += 1;
-      continue;
-    }
-
-    if (inCharClass) {
-      if (ch === "]") {
-        inCharClass = false;
-        const atom = source.slice(charClassStart, i + 1);
-        const q = readQuantifier(source, i + 1);
-        if (q?.invalid) return false;
-        if (!consumeAtom(atom, q, false)) return false;
-        if (q) {
-          if (stack.length > 1) {
-            top.curBranch += source.slice(i + 1, q.end);
-          }
-          i = q.end - 1;
-        }
-      }
+      if (!consumeAtom(esc.cs, q, Boolean(esc.isZeroWidth))) return false;
+      i = (q ? q.end : esc.end) - 1;
       continue;
     }
 
     if (ch === "[") {
-      inCharClass = true;
-      charClassStart = i;
-      if (stack.length > 1) top.curBranch += "[";
+      const cc = parseCharClass(i);
+      if (!cc) return false;
+      const q = readQuantifier(source, cc.end);
+      if (q?.invalid) return false;
+      if (stack.length > 1) {
+        top.curBranch += "[" + (q ? source.slice(cc.end, q.end) : "");
+      }
+      if (!consumeAtom(cc.cs, q, false)) return false;
+      i = (q ? q.end : cc.end) - 1;
       continue;
     }
 
@@ -457,6 +602,8 @@ export function isSafeRegex(source) {
       // Root frame occupies index 0 -> allow up to 6 nested groups
       if (stack.length >= 7) return false;
       let isLookaround = false;
+      let childMultiline = top.inMultiline;
+      let childDotAll = top.inDotAll;
       if (source[i + 1] === "?") {
         if (source[i + 2] === ":") {
           i += 2;
@@ -471,14 +618,20 @@ export function isSafeRegex(source) {
           if (closeAngle === -1) return false;
           i = closeAngle;
         } else {
-          // ES2025 inline modifier group (?i:...) / (?-i:...)
-          const modMatch = /^[ims-]+:/.exec(source.slice(i + 2));
+          // ES2025 inline modifier group (?ims-ims:...)
+          const modMatch = /^([ims]*)(?:-([ims]*))?:/.exec(source.slice(i + 2));
           if (modMatch) {
+            const enableFlags = modMatch[1] || "";
+            const disableFlags = modMatch[2] || "";
+            if (enableFlags.includes("m")) childMultiline = true;
+            if (disableFlags.includes("m")) childMultiline = false;
+            if (enableFlags.includes("s")) childDotAll = true;
+            if (disableFlags.includes("s")) childDotAll = false;
             i += 1 + modMatch[0].length;
           }
         }
       }
-      stack.push(makeFrame(isLookaround ? null : top.curPrev, isLookaround));
+      stack.push(makeFrame(isLookaround ? null : top.curPrev, isLookaround, childMultiline, childDotAll));
       continue;
     }
 
@@ -488,7 +641,7 @@ export function isSafeRegex(source) {
       top.curBranch = "";
       top.branchEndPrevs.push(top.curPrev);
       if (top.curEmpty) top.canMatchEmpty = true;
-      top.curPrev = top.incomingPrev ? new Set(top.incomingPrev) : null;
+      top.curPrev = clonePrevList(top.incomingPrev);
       top.curEmpty = true;
       continue;
     }
@@ -527,24 +680,32 @@ export function isSafeRegex(source) {
       }
 
       if (!frame.isLookaround) {
-        for (const atom of frame.allAtoms) {
-          addAtomToSet(parent.allAtoms, atom);
+        if (frame.hasAtoms) {
+          parent.hasAtoms = true;
+          csUnionInto(parent.allChars, frame.allChars);
         }
         if (q && q.isVariableRepeat) {
-          const groupAtoms = frame.allAtoms.size > 0 ? frame.allAtoms : new Set(["."]);
-          if (setsCanOverlap(frame.incomingPrev, groupAtoms)) return false;
-          parent.curPrev = q.minZero ? unionSets(frame.incomingPrev, groupAtoms) : groupAtoms;
+          const groupCs = frame.hasAtoms ? csClone(frame.allChars) : CS_ALL;
+          if (prevOverlapsCs(frame.incomingPrev, groupCs)) return false;
+          const nextList = csIsEmpty(groupCs) ? null : [groupCs];
+          parent.curPrev = q.minZero ? unionPrevLists(frame.incomingPrev, nextList) : nextList;
           if (!q.minZero && !frame.canMatchEmpty) {
             parent.curEmpty = false;
           }
         } else {
+          // Account for non-deterministic choice points in chained non-quantified alternations
+          // such as `(a|aa)(a|aa)...` or `(a|)(a|)...`
+          if (frame.hasAlternation && (selfAmbiguous || frame.canMatchEmpty)) {
+            const altBits = Math.max(1, Math.ceil(Math.log2(frame.branches.length)));
+            if (!consumeNonDetBits(altBits)) return false;
+          }
           let outgoingPrev = null;
           for (const branchPrev of frame.branchEndPrevs) {
-            outgoingPrev = unionSets(outgoingPrev, branchPrev);
+            outgoingPrev = unionPrevLists(outgoingPrev, branchPrev);
           }
           if (q && q.minZero) {
-            if (++optionalQuantifierCount > 16) return false;
-            outgoingPrev = unionSets(outgoingPrev, frame.incomingPrev);
+            if (!consumeNonDetBits(1)) return false;
+            outgoingPrev = unionPrevLists(outgoingPrev, frame.incomingPrev);
           } else if (!frame.canMatchEmpty) {
             parent.curEmpty = false;
           }
@@ -561,7 +722,8 @@ export function isSafeRegex(source) {
     if (ch === ".") {
       const q = readQuantifier(source, i + 1);
       if (q?.invalid) return false;
-      if (!consumeAtom(".", q, false)) return false;
+      const dotCs = top.inDotAll ? CS_ALL : CS_DOT;
+      if (!consumeAtom(dotCs, q, false)) return false;
       if (stack.length > 1) {
         top.curBranch += ".";
         if (q) top.curBranch += source.slice(i + 1, q.end);
@@ -586,7 +748,10 @@ export function isSafeRegex(source) {
       const anchorQ = readQuantifier(source, i + 1);
       if (anchorQ?.invalid || (anchorQ && anchorQ.isRepeating)) return false;
       if (stack.length > 1) top.curBranch += ch;
-      top.curPrev = null;
+      // Only reset overlap tracking when NOT in inline multiline mode (?m:...), where ^/$ match every newline
+      if (!top.inMultiline) {
+        top.curPrev = null;
+      }
       if (anchorQ) i = anchorQ.end - 1;
       continue;
     }
@@ -596,7 +761,7 @@ export function isSafeRegex(source) {
     }
     const litQ = readQuantifier(source, i + 1);
     if (litQ?.invalid) return false;
-    if (!consumeAtom(ch, litQ, false)) return false;
+    if (!consumeAtom(csFromCode(ch.charCodeAt(0)), litQ, false)) return false;
     if (litQ) {
       if (stack.length > 1) {
         top.curBranch += source.slice(i + 1, litQ.end);
@@ -605,7 +770,7 @@ export function isSafeRegex(source) {
     }
   }
 
-  if (inCharClass || stack.length !== 1) return false;
+  if (stack.length !== 1) return false;
 
   try {
     new RegExp(source, "i");

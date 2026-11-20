@@ -133,7 +133,7 @@ const CORE_LIB_ENTRIES = [
 const HOOK_ENTRIES = [
   ["hooks/filter-rules.mjs", "CLI 降噪规则库：安全拆解单层 `cd [/d] <path> && <cmd>` + `2>&1`、拦截 cmd/PS 危险语法（`%`/`!`/`{}`/`@`/非 git `^`）、11 类内置规则、`.agy-dart/filters.json` ReDoS 防护与大 JSON 粉碎"],
   ["hooks/pre-tool-use.mjs", "统一 `PreToolUse` 网关：0-SQLite 快路径 → 可选敏感文件守卫 → 16 KB/410 行大文件拦截 + Ghost → 三态读缓存（`diffRead` 默认关闭、按直接对话 ID 隔离且受轮次/时间新鲜度约束）→ `run_command` 透明 `overwrite`"],
-  ["hooks/pre-invocation.mjs", "零前缀污染 `PreInvocation` 守卫：尾读 `transcript.jsonl`，输出水位/热缓存延迟/TTL 预警/多模态悬崖/死循环告警（全部 `systemMessage: \"\"`）"],
+  ["hooks/pre-invocation.mjs", "零前缀污染 `PreInvocation` 守卫：尾读 `transcript.jsonl`，输出水位/热缓存延迟/TTL 预警/多模态悬崖/死循环告警（全部 `systemMessage: \"\"`），且在 `cacheWatch=false`/暂停下仍维持 `diffRead` 轮次递增"],
   ["hooks/post-tool-use.mjs", "编辑触发单文件 `file_reads` 失效（保快照）并记录 `modifiedFiles`；`ctx_resume` 同时清共享与直接对话快照；写入测试/构建结论到 `sessionCheckpoint`"],
   ["hooks/cli-filter.mjs", "`PreToolUse.overwrite` 执行代理：Windows `cmd.exe`/`powershell.exe` 精确透传退出码、密钥脱敏、原输出入 FTS5、降噪并死守 `<= 8.8 KB`"],
   ["hooks/session-start.mjs", "前缀稳定启动钩子：支持 `stablePrefixOnly` 与子 Agent 自动省略易变 Git 尾段（并在子进程隔离禁用 Git）"],
@@ -147,10 +147,10 @@ const ENGINE_ENTRIES = [
   ["context/server.js", "`agy-dart_context` MCP stdio 服务端：先激活 V8 编译缓存与 SQLite 告警静默再动态加载库模块；导出冻结规范排序 `TOOL_DEFINITIONS`"],
   ["scripts/cache-audit.mjs", "全域环境 Prompt Cache 体检 `npm run cache:audit`（devtools）：规则/技能 CJK 估 token、双次握手探测 MCP 确定性、静态分析中段 Hook"],
   ["scripts/install.mjs", "跨平台安装/卸载/模式切换/`doctor` 健康自检：拆分 `RUNTIME_FILES`（默认）与 `DEVTOOLS_FILES`（`--with-devtools`），`doctor` 输出生效配置"],
-  ["scripts/verify-package-graph.mjs", "静态 Import 图打包校验器（devtools）：完整解析含/无分号（ASI）与多行 ESM 导入/重导出，遍历所有运行时入口证明无漏打模块且 devtools 零泄漏"],
+  ["scripts/verify-package-graph.mjs", "静态 Import 图打包校验器（devtools）：线性 JS 词法解析器提取含/无分号（ASI）、多行、注释穿插与带属性动态导入的 ESM/CJS 依赖，证明无漏打模块且 devtools 零泄漏"],
   ["scripts/prefix-budget.mjs", "Turn-0 前缀预算、双 MCP 指纹与 `--calibrate` 跨语种 Token 估算误差校准审计（devtools，读取统一 `config.json`，超预算/非规范时非零退出码卡口 CI）"],
   ["scripts/gen-review-brief.mjs", "`AI_REVIEW_BRIEF.md` 代码行数/测试基线自动生成与 `--check` 漂移守卫（devtools）"],
-  ["sidecars/dashboard/server.mjs", "Sidecar HTTP / SidecarApp 服务：强制 `Host`/`Origin` 与 `Sec-Fetch-Site`（拦截 `cross-site` 与 `same-site`）校验、全部 `/api/*` 请求强制随机 `X-Agy-Dart-Token`、写接口仅 POST + `application/json` + 64 KB 请求体上限与 `featureRoi`"],
+  ["sidecars/dashboard/server.mjs", "Sidecar HTTP / SidecarApp 服务：严格 `Host`/同源 `Origin`/`Sec-Fetch-Site` 白名单（拦截 `cross-site`、`same-site` 及伪造头）、`X-Frame-Options: DENY`、每实例随机 `X-Agy-Dart-Token` 覆盖全部 `/api/*`、写接口仅 POST + `application/json` + 64 KB 请求体上限与 `featureRoi`"],
   ["sidecars/dashboard/index.html", "实时仪表盘前端：自动注入并携带 CSRF Token、全写操作 POST JSON、XSS 转义加固、1s 本地 TTL 进度条、Handoff 抽屉与上下文构成条"]
 ];
 

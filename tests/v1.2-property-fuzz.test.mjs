@@ -176,6 +176,17 @@ test("Property 2: ReDoS validator rejects catastrophic patterns, accepts safe pa
     "a+(?:a)a+",
     "a?".repeat(25) + "a".repeat(25) + "Z",
     "(?:a)?".repeat(20) + "a".repeat(20) + "Z",
+    "(a|aa)".repeat(25) + "Z",
+    "(a|)".repeat(25) + "a".repeat(25) + "Z",
+    "(a|aa|aaa)".repeat(18) + "Z",
+    "\\x61+\\x61+\\x61+\\x61+\\x61+b",
+    "a+\\x61+a+\\x61+a+b",
+    "\\u0061+\\u0061+\\u0061+\\u0061+\\u0061+b",
+    "(?m:\\s+^\\s+^\\s+^\\s+^\\s+!)",
+    "(?m:\\s+$\\s+$\\s+$\\s+$\\s+!)",
+    "(?s:.+\\n.+\\n.+\\n.+\\n.+!)",
+    "[a-z]+[A-Z]+[a-z]+[A-Z]+!",
+    "[^a]+[^b]+[^c]+[^d]+!",
     "unclosed(",
     "",
     "x".repeat(500)
@@ -200,7 +211,14 @@ test("Property 2: ReDoS validator rejects catastrophic patterns, accepts safe pa
     "\\w+:\\w+",
     "\\w+\\.\\w+",
     "ERROR.*timeout",
-    "a+b*ba+"
+    "a+b*ba+",
+    "[a-z]+-[a-z]+",
+    "[a-z]+\\s+[a-z]+",
+    "[0-9]+\\.[0-9]+\\.[0-9]+",
+    "[0-9]+:[0-9]+",
+    "[^\\s]+\\s+[^\\s]+",
+    "^(?:PASS|FAIL)\\s+[a-z0-9_./-]+\\.test\\.m?js$",
+    "(?:http|https)://[a-z0-9.-]+/[a-z0-9_./-]+"
   ];
   for (const p of mustAccept) {
     assert.equal(isSafeRegex(p), true, `Safe pattern MUST be accepted: ${p}`);

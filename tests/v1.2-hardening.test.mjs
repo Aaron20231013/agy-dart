@@ -69,6 +69,8 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
   assert.equal(isAllowedOriginHeader("http://127.0.0.1:8765"), true);
   assert.equal(isAllowedOriginHeader("http://localhost:8765"), true);
   assert.equal(isAllowedOriginHeader("http://127.0.0.1:8765", "127.0.0.1:8765"), true);
+  assert.equal(isAllowedOriginHeader("http://localhost:8765", "127.0.0.1:8765"), false);
+  assert.equal(isAllowedOriginHeader("https://127.0.0.1:8765", "127.0.0.1:8765"), false);
   assert.equal(isAllowedOriginHeader("http://localhost:3000", "127.0.0.1:8765"), false);
   assert.equal(isAllowedOriginHeader("https://evil.example"), false);
   assert.equal(isAllowedOriginHeader("null"), false);
@@ -76,6 +78,8 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
   assert.equal(isCrossSiteFetchHeader("cross-site"), true);
   assert.equal(isCrossSiteFetchHeader("same-site"), true);
   assert.equal(isCrossSiteFetchHeader("same-site", { allowSameSite: true }), false);
+  assert.equal(isCrossSiteFetchHeader("same-origin, cross-site"), true);
+  assert.equal(isCrossSiteFetchHeader("unknown-fetch-site"), true);
   assert.equal(isCrossSiteFetchHeader("same-origin"), false);
   assert.equal(isCrossSiteFetchHeader("none"), false);
   assert.equal(isCrossSiteFetchHeader(undefined), false);
@@ -160,6 +164,8 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
 
     const page = await rawReq("/");
     assert.equal(page.status, 200);
+    assert.equal(page.headers["x-frame-options"], "DENY");
+    assert.ok(String(page.headers["content-security-policy"] || "").includes("frame-ancestors 'none'"));
     const token = page.body.match(/<meta name="agy-dart-token" content="([a-f0-9]+)">/i)?.[1];
     assert.ok(token && token.length >= 32, "Must inject high-entropy CSRF token");
 
@@ -183,11 +189,14 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
     const rebind = await rawReq("/api/stats", { headers: { Host: `evil.attacker.test:${port}` } });
     assert.equal(rebind.status, 403);
 
-    // 3. Cross-origin / null Origin / cross-port Origin / Sec-Fetch-Site: cross-site & same-site -> 403
+    // 3. Cross-origin / null Origin / cross-host / cross-scheme / cross-port Origin / Sec-Fetch-Site: cross-site & same-site -> 403
     assert.equal((await rawReq("/api/stats", { headers: { Origin: "https://evil.example", "X-Agy-Dart-Token": token } })).status, 403);
     assert.equal((await rawReq("/api/stats", { headers: { Origin: "http://localhost:3000", "X-Agy-Dart-Token": token } })).status, 403);
+    assert.equal((await rawReq("/api/stats", { headers: { Origin: `http://localhost:${port}`, "X-Agy-Dart-Token": token } })).status, 403);
+    assert.equal((await rawReq("/api/stats", { headers: { Origin: `https://127.0.0.1:${port}`, "X-Agy-Dart-Token": token } })).status, 403);
     assert.equal((await rawReq("/api/stats", { headers: { Origin: "null", "X-Agy-Dart-Token": token } })).status, 403);
     assert.equal((await rawReq("/api/stats", { headers: { "Sec-Fetch-Site": "cross-site", "X-Agy-Dart-Token": token } })).status, 403);
+    assert.equal((await rawReq("/api/stats", { headers: { "Sec-Fetch-Site": "same-origin, cross-site", "X-Agy-Dart-Token": token } })).status, 403);
     assert.equal(
       (await rawReq("/api/stats", { headers: { "Sec-Fetch-Site": "same-site", "X-Agy-Dart-Token": token } })).status,
       403,
@@ -538,6 +547,8 @@ test("P0-Hardening 2: Diff-read is OFF by default, enforces direct conversation 
       }) + "\n",
       "utf8"
     );
+    const seqStoreCheck = new ContextModeStore({ dbPath: tmpDb });
+    const seqBeforeCwOff = seqStoreCheck.getConversationTurnSeq("parent-conv");
     const cwEnvDisabled = { ...cleanEnv, AGY_DART_DISABLE_CACHE_WATCH: "1" };
     for (let i = 0; i < 2; i++) {
       const piOff = runHookRaw(
@@ -550,6 +561,11 @@ test("P0-Hardening 2: Diff-read is OFF by default, enforces direct conversation 
       assert.equal(piOff.stderr, "");
       assert.equal(piOff.stdout.trim(), "{}", "cacheWatch=false must emit no KV-Cache Watch alerts");
     }
+    assert.equal(
+      seqStoreCheck.getConversationTurnSeq("parent-conv"),
+      seqBeforeCwOff + 2,
+      "AGY_DART_DISABLE_CACHE_WATCH=1 with diffRead=true must still increment conv_turn_seq on every turn"
+    );
     fs.writeFileSync(cfgPath, JSON.stringify({ diffRead: true, diffReadMaxTurns: 3, cacheWatch: false }), "utf8");
     for (let i = 0; i < 2; i++) {
       const piCfgOff = runHookRaw(
@@ -562,6 +578,28 @@ test("P0-Hardening 2: Diff-read is OFF by default, enforces direct conversation 
       assert.equal(piCfgOff.stderr, "");
       assert.equal(piCfgOff.stdout.trim(), "{}", "config.json cacheWatch=false must emit no KV-Cache Watch alerts");
     }
+    assert.equal(
+      seqStoreCheck.getConversationTurnSeq("parent-conv"),
+      seqBeforeCwOff + 4,
+      "config.json cacheWatch=false with diffRead=true must still increment conv_turn_seq on every turn"
+    );
+    // Even if alerts are paused for this session, diffRead turn aging still advances while suppressing alerts
+    seqStoreCheck.setPaused(true, "parent-conv");
+    const piPaused = runHookRaw(
+      "hooks/pre-invocation.mjs",
+      { conversationId: "parent-conv", cwd: tmpDir, transcriptPath: hotTranscript },
+      tmpDb,
+      { ...cleanEnv, AGY_DART_DISABLE_CACHE_WATCH: "0" }
+    );
+    assert.equal(piPaused.status, 0);
+    assert.equal(piPaused.stdout.trim(), "{}", "Paused session must emit no KV-Cache Watch alerts");
+    assert.equal(
+      seqStoreCheck.getConversationTurnSeq("parent-conv"),
+      seqBeforeCwOff + 5,
+      "Paused session with diffRead=true must still advance conv_turn_seq to prevent stale diffs after unpause"
+    );
+    seqStoreCheck.setPaused(false, "parent-conv");
+    seqStoreCheck.close();
     const v7 = [...v6];
     v7[80] = 'export const item_81 = "MODIFIED_AFTER_CACHEWATCH_OFF_PREINV";';
     writeAndBumpMtime(modFile, v7.join("\n") + "\n", 70);
@@ -699,6 +737,23 @@ test("P1-Hardening 3: Static import-graph verification proves RUNTIME_FILES comp
         tmpDir
       ),
       ["context/lib/config.js", "context/lib/store.js", "context/lib/tools.js"]
+    );
+    // Lexer hardening: comment markers inside strings, adjacent block comments, dynamic import attributes,
+    // template interpolation, and zero false positives from fake imports inside strings/template literals
+    assert.deepEqual(
+      extractLocalSpecifiers(
+        [
+          'const sep = "a//b"; import/*c*/cfg from "./config.js"',
+          'const open = "/*";',
+          'const d = await import("./tools.js", { with: { type: "json" } })',
+          'const close = "*/";',
+          'const fake1 = \'import { x } from "./store.js"\';',
+          'const fake2 = `export * from "./store.js"`;'
+        ].join("\n"),
+        libEntry,
+        tmpDir
+      ),
+      ["context/lib/config.js", "context/lib/tools.js"]
     );
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -1052,14 +1107,35 @@ test("P1-Hardening 7: Token estimator empirical calibration + per-feature ROI te
     assert.equal(cfgReport.blocks.startup.stablePct, 100);
 
     // Explicit env AGY_DART_STABLE_PREFIX_ONLY=0 overrides config.json stablePrefixOnly=true
+    // even when invoked inside a subagent shell with ANTIGRAVITY_PARENT_CONVERSATION_ID set
     const envOverrideCli = spawnSync(process.execPath, [path.join(ROOT, "scripts", "prefix-budget.mjs"), "--json"], {
       encoding: "utf8",
       windowsHide: true,
-      env: { ...baseEnv, AGY_DART_STABLE_PREFIX_ONLY: "0" }
+      env: { ...baseEnv, AGY_DART_STABLE_PREFIX_ONLY: "0", ANTIGRAVITY_PARENT_CONVERSATION_ID: "parent-sub-leak-check" }
     });
     assert.equal(envOverrideCli.status, 0, envOverrideCli.stderr);
     const envOverrideReport = JSON.parse(envOverrideCli.stdout);
     assert.equal(envOverrideReport.stablePrefixOnly, false, "AGY_DART_STABLE_PREFIX_ONLY=0 must override config.json");
+    assert.ok(
+      envOverrideReport.blocks.startup.volatileBytes > 0,
+      "prefix-budget.mjs must not let inherited ANTIGRAVITY_PARENT_CONVERSATION_ID silently strip volatile Git tail"
+    );
+
+    // Programmatic options.env forwarding (e.g. AGY_DART_DISABLE_REPO_HUBS=1) affects session-start child process
+    const noHubReport = await auditPrefixBudget(ROOT, {
+      configPath: pbCfg,
+      stableOnly: true,
+      env: { ...baseEnv, AGY_DART_DISABLE_REPO_HUBS: "1" }
+    });
+    const withHubReport = await auditPrefixBudget(ROOT, {
+      configPath: pbCfg,
+      stableOnly: true,
+      env: baseEnv
+    });
+    assert.ok(
+      noHubReport.blocks.startup.bytes < withHubReport.blocks.startup.bytes,
+      "auditPrefixBudget must forward options.env into runSessionStartHook"
+    );
 
     // Copy minimal plugin runtime into fakeRoot to test CI exit code 1 on:
     // (a) upper-bound / budget violation, and (b) non-canonical MCP tools/list violation

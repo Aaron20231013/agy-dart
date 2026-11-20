@@ -259,10 +259,6 @@ async function main() {
 
   const sessionId = resolveSessionId(payload);
   const directConvId = resolveDirectConversationId(payload);
-  if (!effectiveCfg.cacheWatch && !directConvId) {
-    process.stdout.write("{}\n");
-    return;
-  }
   enableVersionedCompileCache();
 
   let store = null;
@@ -282,21 +278,17 @@ async function main() {
     }
 
     store = new ContextModeStore();
-    if (store.isPaused(sessionId)) {
-      store.close();
-      process.stdout.write("{}\n");
-      return;
-    }
 
     // Advance per-conversation turn sequence on every LLM turn when opt-in diff-read is active
-    // so non-read turns (edits/commands/chat) accurately age diff-read baselines — even if cacheWatch is disabled.
+    // so non-read turns (edits/commands/chat) accurately age diff-read baselines — even if
+    // cacheWatch is disabled or alerts are paused (prevents stale diffs after unpause).
     if (effectiveCfg.diffRead && directConvId) {
       try {
         store.bumpConversationTurnSeq(directConvId);
       } catch {}
     }
 
-    if (!effectiveCfg.cacheWatch) {
+    if (!effectiveCfg.cacheWatch || store.isPaused(sessionId)) {
       store.close();
       store = null;
       process.stdout.write("{}\n");
@@ -316,6 +308,7 @@ async function main() {
     }
     if (!transcriptPath || !fs.existsSync(transcriptPath)) {
       store.close();
+      store = null;
       process.stdout.write("{}\n");
       return;
     }
@@ -323,6 +316,7 @@ async function main() {
     const steps = readTranscriptTail(transcriptPath, 131072);
     if (steps.length === 0) {
       store.close();
+      store = null;
       process.stdout.write("{}\n");
       return;
     }
