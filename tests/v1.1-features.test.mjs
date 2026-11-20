@@ -572,8 +572,9 @@ test("Sidecar standalone HTTP server exposes /api/cache-diag, /api/cli-filter, /
     // Unauthenticated / GET mutation attempts must be rejected
     assert.equal((await httpJson("/api/purge?scope=all", "GET")).status, 405);
     assert.equal((await httpJson("/api/cli-filter", "POST", { enabled: false })).status, 403);
+    assert.equal((await httpJson("/api/stats", "GET")).status, 403);
 
-    const stats = JSON.parse((await httpJson("/api/stats")).body);
+    const stats = JSON.parse((await httpJson("/api/stats", "GET", null, csrfHeaders)).body);
     assert.equal(stats.cliFilterEnabled, true);
     assert.equal(stats.readDedupEnabled, true);
 
@@ -583,11 +584,13 @@ test("Sidecar standalone HTTP server exposes /api/cache-diag, /api/cli-filter, /
     const dedupToggled = JSON.parse((await httpJson("/api/read-dedup", "POST", { enabled: false }, csrfHeaders)).body);
     assert.equal(dedupToggled.readDedupEnabled, false);
 
-    const kv = JSON.parse((await httpJson("/api/cache-diag")).body);
+    const kv = JSON.parse((await httpJson("/api/cache-diag", "GET", null, csrfHeaders)).body);
     assert.equal(kv.ok, true);
 
     // Brand-new specific conversation MUST NOT leak another conversation's transcript
-    const kvNew = JSON.parse((await httpJson("/api/cache-diag?scope=conversation&conversationId=brand-new-nonexistent-conv-xyz")).body);
+    const kvNew = JSON.parse(
+      (await httpJson("/api/cache-diag?scope=conversation&conversationId=brand-new-nonexistent-conv-xyz", "GET", null, csrfHeaders)).body
+    );
     assert.equal(kvNew.ok, true);
     assert.equal(kvNew.transcriptFound, false);
 

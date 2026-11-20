@@ -238,7 +238,7 @@ export function evaluateCacheAlerts(diag, { sessionId, store }) {
 
 async function main() {
   const effectiveCfg = getEffectiveConfig();
-  if (!effectiveCfg.cacheWatch) {
+  if (!effectiveCfg.cacheWatch && !effectiveCfg.diffRead) {
     process.stdout.write("{}\n");
     return;
   }
@@ -259,16 +259,27 @@ async function main() {
 
   const sessionId = resolveSessionId(payload);
   const directConvId = resolveDirectConversationId(payload);
+  if (!effectiveCfg.cacheWatch && !directConvId) {
+    process.stdout.write("{}\n");
+    return;
+  }
   enableVersionedCompileCache();
 
   let store = null;
 
   try {
-    const [{ ContextModeStore }, { analyzeTranscriptCache, DEFAULT_CACHE_TTL_SEC, findTranscriptForConversation, readTranscriptTail }] =
-      await Promise.all([
+    let ContextModeStore;
+    let cacheAnalyzerMod = null;
+    if (effectiveCfg.cacheWatch) {
+      const [storeMod, caMod] = await Promise.all([
         import("../context/lib/store.js"),
         import("../context/lib/cache-analyzer.js")
       ]);
+      ContextModeStore = storeMod.ContextModeStore;
+      cacheAnalyzerMod = caMod;
+    } else {
+      ({ ContextModeStore } = await import("../context/lib/store.js"));
+    }
 
     store = new ContextModeStore();
     if (store.isPaused(sessionId)) {
@@ -278,12 +289,21 @@ async function main() {
     }
 
     // Advance per-conversation turn sequence on every LLM turn when opt-in diff-read is active
-    // so non-read turns (edits/commands/chat) accurately age diff-read baselines.
+    // so non-read turns (edits/commands/chat) accurately age diff-read baselines — even if cacheWatch is disabled.
     if (effectiveCfg.diffRead && directConvId) {
       try {
         store.bumpConversationTurnSeq(directConvId);
       } catch {}
     }
+
+    if (!effectiveCfg.cacheWatch) {
+      store.close();
+      store = null;
+      process.stdout.write("{}\n");
+      return;
+    }
+
+    const { analyzeTranscriptCache, findTranscriptForConversation, readTranscriptTail } = cacheAnalyzerMod;
 
     let transcriptPath =
       typeof payload.transcriptPath === "string" && payload.transcriptPath.trim()

@@ -689,7 +689,13 @@ test("P0-2.6: Live PreInvocation hook, Sidecar dashboard (/api/cache-diag + inde
         });
       });
 
-      const kvResp = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`)).json();
+      // Dashboard HTML parses cleanly and exposes per-process CSRF token
+      const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+      const token = html.match(/<meta name="agy-dart-token" content="([a-f0-9]+)">/i)?.[1];
+      assert.ok(token, "Sidecar HTML must inject agy-dart-token meta");
+      const authHeaders = { headers: { "X-Agy-Dart-Token": token } };
+
+      const kvResp = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`, authHeaders)).json();
       assert.equal(kvResp.ok, true);
       assert.equal(kvResp.transcriptFound, true);
       assert.equal(kvResp.windowSource, "transcript");
@@ -705,20 +711,19 @@ test("P0-2.6: Live PreInvocation hook, Sidecar dashboard (/api/cache-diag + inde
       assert.equal(typeof kvResp.estimatedWastedUsd, "number");
 
       // Second request hits parsedDiagCache -> refreshWallClockTtl MUST preserve empirical 3600s TTL!
-      const kvCached = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`)).json();
+      const kvCached = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`, authHeaders)).json();
       assert.equal(kvCached.cacheTtlSec, 3600);
       assert.equal(kvCached.ttlSource, "empirical");
       assert.equal(kvCached.ttlStatus, "warm");
 
       // Missing conversation fallback also exposes upgraded schema fields
-      const kvMissing = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=missing-v12-conv`)).json();
+      const kvMissing = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=missing-v12-conv`, authHeaders)).json();
       assert.equal(kvMissing.transcriptFound, false);
       assert.equal(kvMissing.ttlSource, "profile");
       assert.equal(kvMissing.windowSource, "profile");
       assert.equal(kvMissing.estimatedInputCostUsd, 0);
 
       // Dashboard HTML parses cleanly and includes upgraded tooltip/USD display while preserving DOM IDs
-      const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
       for (const domId of [
         "kv-watermark-badge",
         "kv-temp-badge",

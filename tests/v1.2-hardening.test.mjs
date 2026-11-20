@@ -18,6 +18,7 @@ import { createTools } from "../context/lib/tools.js";
 import {
   isAllowedHostHeader,
   isAllowedOriginHeader,
+  isCrossSiteFetchHeader,
   isJsonContentType,
   timingSafeTokenMatch
 } from "../sidecars/dashboard/server.mjs";
@@ -71,6 +72,13 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
   assert.equal(isAllowedOriginHeader("http://localhost:3000", "127.0.0.1:8765"), false);
   assert.equal(isAllowedOriginHeader("https://evil.example"), false);
   assert.equal(isAllowedOriginHeader("null"), false);
+
+  assert.equal(isCrossSiteFetchHeader("cross-site"), true);
+  assert.equal(isCrossSiteFetchHeader("same-site"), true);
+  assert.equal(isCrossSiteFetchHeader("same-site", { allowSameSite: true }), false);
+  assert.equal(isCrossSiteFetchHeader("same-origin"), false);
+  assert.equal(isCrossSiteFetchHeader("none"), false);
+  assert.equal(isCrossSiteFetchHeader(undefined), false);
 
   assert.equal(isJsonContentType("application/json"), true);
   assert.equal(isJsonContentType("application/json; charset=utf-8"), true);
@@ -175,11 +183,55 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
     const rebind = await rawReq("/api/stats", { headers: { Host: `evil.attacker.test:${port}` } });
     assert.equal(rebind.status, 403);
 
-    // 3. Cross-origin / null Origin / cross-port Origin / Sec-Fetch-Site: cross-site -> 403
-    assert.equal((await rawReq("/api/stats", { headers: { Origin: "https://evil.example" } })).status, 403);
-    assert.equal((await rawReq("/api/stats", { headers: { Origin: "http://localhost:3000" } })).status, 403);
-    assert.equal((await rawReq("/api/stats", { headers: { Origin: "null" } })).status, 403);
-    assert.equal((await rawReq("/api/stats", { headers: { "Sec-Fetch-Site": "cross-site" } })).status, 403);
+    // 3. Cross-origin / null Origin / cross-port Origin / Sec-Fetch-Site: cross-site & same-site -> 403
+    assert.equal((await rawReq("/api/stats", { headers: { Origin: "https://evil.example", "X-Agy-Dart-Token": token } })).status, 403);
+    assert.equal((await rawReq("/api/stats", { headers: { Origin: "http://localhost:3000", "X-Agy-Dart-Token": token } })).status, 403);
+    assert.equal((await rawReq("/api/stats", { headers: { Origin: "null", "X-Agy-Dart-Token": token } })).status, 403);
+    assert.equal((await rawReq("/api/stats", { headers: { "Sec-Fetch-Site": "cross-site", "X-Agy-Dart-Token": token } })).status, 403);
+    assert.equal(
+      (await rawReq("/api/stats", { headers: { "Sec-Fetch-Site": "same-site", "X-Agy-Dart-Token": token } })).status,
+      403,
+      "Sec-Fetch-Site: same-site (e.g. another local port) must be blocked on GET /api/*"
+    );
+    assert.equal(
+      (
+        await rawReq("/api/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "same-site", "X-Agy-Dart-Token": token },
+          body: JSON.stringify({ query: "precious" })
+        })
+      ).status,
+      403,
+      "Sec-Fetch-Site: same-site must be blocked on POST /api/*"
+    );
+    assert.equal(
+      (await rawReq("/api/stats", { headers: { "Sec-Fetch-Site": "same-origin", "X-Agy-Dart-Token": token } })).status,
+      200,
+      "Sec-Fetch-Site: same-origin with valid token must succeed"
+    );
+
+    // 3b. Every standalone GET /api/* endpoint MUST require valid X-Agy-Dart-Token
+    const getApiPaths = [
+      "/api/stats?scope=lifetime",
+      "/api/doctor",
+      "/api/resume?scope=lifetime",
+      "/api/source-chunks?sourceId=nonexistent",
+      "/api/cache-diag?scope=lifetime",
+      "/api/handoff?scope=lifetime"
+    ];
+    for (const ep of getApiPaths) {
+      assert.equal((await rawReq(ep)).status, 403, `GET ${ep} without token must return 403`);
+      assert.equal(
+        (await rawReq(ep, { headers: { "X-Agy-Dart-Token": "0".repeat(token.length) } })).status,
+        403,
+        `GET ${ep} with wrong token must return 403`
+      );
+      assert.equal(
+        (await rawReq(ep, { headers: { "X-Agy-Dart-Token": token } })).status,
+        200,
+        `GET ${ep} with valid token must return 200`
+      );
+    }
 
     // 4. POST /api/search and mutating endpoints without token or wrong token -> 403
     const searchNoTok = await rawReq("/api/search", {
@@ -228,7 +280,7 @@ test("P0-Hardening 1: Sidecar CSRF, DNS-rebinding Host/Origin guards, POST-only 
     assert.equal(tooBig.status, 413);
 
     // Verify none of the blocked attacks wiped our DB!
-    const statsBefore = JSON.parse((await rawReq("/api/stats?scope=lifetime")).body);
+    const statsBefore = JSON.parse((await rawReq("/api/stats?scope=lifetime", { headers: { "X-Agy-Dart-Token": token } })).body);
     assert.equal(statsBefore.sourcesCount, 1, "Blocked CSRF attacks must NOT mutate database");
 
     // 7. Legitimate authenticated JSON POST succeeds & XSS custom extension payload is rejected by store sanitizer
@@ -470,6 +522,71 @@ test("P0-Hardening 2: Diff-read is OFF by default, enforces direct conversation 
     );
     assert.equal(pStalePreInv.decision, "allow", "PreInvocation turns must advance conv_turn_seq and expire stale diff baselines");
 
+    // 6b. Even when cacheWatch is disabled (env OR config.json), PreInvocation MUST still bump conv_turn_seq while diffRead is enabled
+    //     and MUST suppress KV-Cache Watch alerts (even if a critical-watermark transcript is provided).
+    const hotTranscript = path.join(tmpDir, "hot_transcript.jsonl");
+    fs.writeFileSync(
+      hotTranscript,
+      JSON.stringify({
+        type: "PLANNER_RESPONSE",
+        step_index: 1,
+        created_at: new Date().toISOString(),
+        model: "claude-sonnet-4",
+        input_tokens: 175000,
+        cache_read_tokens: 0,
+        output_tokens: 100
+      }) + "\n",
+      "utf8"
+    );
+    const cwEnvDisabled = { ...cleanEnv, AGY_DART_DISABLE_CACHE_WATCH: "1" };
+    for (let i = 0; i < 2; i++) {
+      const piOff = runHookRaw(
+        "hooks/pre-invocation.mjs",
+        { conversationId: "parent-conv", cwd: tmpDir, transcriptPath: hotTranscript },
+        tmpDb,
+        cwEnvDisabled
+      );
+      assert.equal(piOff.status, 0);
+      assert.equal(piOff.stderr, "");
+      assert.equal(piOff.stdout.trim(), "{}", "cacheWatch=false must emit no KV-Cache Watch alerts");
+    }
+    fs.writeFileSync(cfgPath, JSON.stringify({ diffRead: true, diffReadMaxTurns: 3, cacheWatch: false }), "utf8");
+    for (let i = 0; i < 2; i++) {
+      const piCfgOff = runHookRaw(
+        "hooks/pre-invocation.mjs",
+        { conversationId: "parent-conv", cwd: tmpDir, transcriptPath: hotTranscript },
+        tmpDb,
+        cleanEnv
+      );
+      assert.equal(piCfgOff.status, 0);
+      assert.equal(piCfgOff.stderr, "");
+      assert.equal(piCfgOff.stdout.trim(), "{}", "config.json cacheWatch=false must emit no KV-Cache Watch alerts");
+    }
+    const v7 = [...v6];
+    v7[80] = 'export const item_81 = "MODIFIED_AFTER_CACHEWATCH_OFF_PREINV";';
+    writeAndBumpMtime(modFile, v7.join("\n") + "\n", 70);
+    const pStaleCacheWatchOff = JSON.parse(
+      runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "parent-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: modFile } } }, tmpDb, cleanEnv).stdout
+    );
+    assert.equal(
+      pStaleCacheWatchOff.decision,
+      "allow",
+      "PreInvocation with cacheWatch=false & diffRead=true must still age conv_turn_seq and expire stale diff baselines"
+    );
+    // When BOTH cacheWatch=false and diffRead=false, PreInvocation exits without creating a new DB file
+    const untouchedDb = path.join(tmpDir, "untouched-preinv.db");
+    const piBothOff = runHookRaw(
+      "hooks/pre-invocation.mjs",
+      { conversationId: "noop-conv", cwd: tmpDir, transcriptPath: hotTranscript },
+      untouchedDb,
+      { ...cleanEnv, AGY_DART_DISABLE_CACHE_WATCH: "1", AGY_DART_DISABLE_DIFF_READ: "1" }
+    );
+    assert.equal(piBothOff.status, 0);
+    assert.equal(piBothOff.stdout.trim(), "{}");
+    assert.equal(fs.existsSync(untouchedDb), false, "cacheWatch=false & diffRead=false must not open/create SQLite DB");
+    // Restore config.json for step 7
+    fs.writeFileSync(cfgPath, JSON.stringify({ diffRead: true, diffReadMaxTurns: 3 }), "utf8");
+
     // 7. Concurrent multi-process conv_turn_seq atomicity (10 parallel pre-tool-use hooks, zero lost updates)
     const parallelProcs = [];
     for (let i = 0; i < 10; i++) {
@@ -528,16 +645,61 @@ test("P1-Hardening 3: Static import-graph verification proves RUNTIME_FILES comp
   assert.ok(report.runtimeEntrypoints.length >= 8);
   assert.ok(report.runtimeReachableCount >= 25);
 
-  // Regression: `export const ...;` must NOT swallow a following side-effect `import "./side-effect.js";`
+  // Regression: semicolon-ed AND semicolon-less (ASI) ESM imports/exports must never drop specifiers
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-vpg-"));
   try {
-    fs.writeFileSync(path.join(tmpDir, "side-effect.js"), "", "utf8");
-    fs.writeFileSync(path.join(tmpDir, "alpha.js"), "", "utf8");
-    fs.writeFileSync(path.join(tmpDir, "asset.json"), "{}", "utf8");
+    fs.mkdirSync(path.join(tmpDir, "context", "lib"), { recursive: true });
+    for (const rel of [
+      "side-effect.js",
+      "alpha.js",
+      "asset.json",
+      "context/lib/config.js",
+      "context/lib/tools.js",
+      "context/lib/store.js"
+    ]) {
+      fs.writeFileSync(path.join(tmpDir, rel), "", "utf8");
+    }
     const entry = path.join(tmpDir, "entry.js");
     const src = `export const X = 1;\nimport "./side-effect.js";\nimport { a } from "./alpha.js";\nconst u = new URL("./asset.json", import.meta.url);\n`;
-    const deps = extractLocalSpecifiers(src, entry, tmpDir);
-    assert.deepEqual(deps, ["alpha.js", "asset.json", "side-effect.js"]);
+    assert.deepEqual(extractLocalSpecifiers(src, entry, tmpDir), ["alpha.js", "asset.json", "side-effect.js"]);
+
+    // ASI repros (no semicolons)
+    const libEntry = path.join(tmpDir, "context", "lib", "index.js");
+    assert.deepEqual(
+      extractLocalSpecifiers('import { a } from "./config.js"\nimport { b } from "./tools.js"\n', libEntry, tmpDir),
+      ["context/lib/config.js", "context/lib/tools.js"]
+    );
+    assert.deepEqual(
+      extractLocalSpecifiers(
+        'export const X = 1\nimport { a } from "./config.js"\nexport { b } from "./tools.js"\n',
+        libEntry,
+        tmpDir
+      ),
+      ["context/lib/config.js", "context/lib/tools.js"]
+    );
+    assert.deepEqual(
+      extractLocalSpecifiers(
+        'import fs from "node:fs"\nexport function f() {\n  const s = "a"\n}\nimport { a } from "./config.js"\nimport "./store.js"\nexport { b } from "./tools.js"\n',
+        libEntry,
+        tmpDir
+      ),
+      ["context/lib/config.js", "context/lib/store.js", "context/lib/tools.js"]
+    );
+    // Multiline ASI, namespace/star re-exports, minified no-space, and non-reexport `export { x }` followed by `import`
+    assert.deepEqual(
+      extractLocalSpecifiers(
+        [
+          "const localVal = 1",
+          "export { localVal }",
+          'import def, {\n  a,\n  "b-c" as bc\n} from "./config.js"',
+          'import*as toolsNs from"./tools.js"',
+          'export * as storeNs from "./store.js"'
+        ].join("\n"),
+        libEntry,
+        tmpDir
+      ),
+      ["context/lib/config.js", "context/lib/store.js", "context/lib/tools.js"]
+    );
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -867,5 +1029,106 @@ test("P1-Hardening 7: Token estimator empirical calibration + per-feature ROI te
     store.close();
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+
+  // 3. prefix-budget.mjs honors config.json stablePrefixOnly + env override AND exits non-zero on budget/determinism violations
+  const pbTmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-pb-ci-"));
+  const pbCfg = path.join(pbTmp, "config.json");
+  const fakeRoot = path.join(pbTmp, "fake-repo");
+  try {
+    fs.writeFileSync(pbCfg, JSON.stringify({ stablePrefixOnly: true }), "utf8");
+    const baseEnv = { ...process.env, AGY_DART_CONFIG_PATH: pbCfg, AGY_DART_DISABLE_COMPILE_CACHE: "1" };
+    delete baseEnv.AGY_DART_STABLE_PREFIX_ONLY;
+
+    const cfgCli = spawnSync(process.execPath, [path.join(ROOT, "scripts", "prefix-budget.mjs"), "--json"], {
+      encoding: "utf8",
+      windowsHide: true,
+      env: baseEnv
+    });
+    assert.equal(cfgCli.status, 0, cfgCli.stderr);
+    const cfgReport = JSON.parse(cfgCli.stdout);
+    assert.equal(cfgReport.stablePrefixOnly, true, "prefix-budget.mjs must honor config.json stablePrefixOnly=true");
+    assert.equal(cfgReport.blocks.startup.volatileBytes, 0);
+    assert.equal(cfgReport.blocks.startup.stablePct, 100);
+
+    // Explicit env AGY_DART_STABLE_PREFIX_ONLY=0 overrides config.json stablePrefixOnly=true
+    const envOverrideCli = spawnSync(process.execPath, [path.join(ROOT, "scripts", "prefix-budget.mjs"), "--json"], {
+      encoding: "utf8",
+      windowsHide: true,
+      env: { ...baseEnv, AGY_DART_STABLE_PREFIX_ONLY: "0" }
+    });
+    assert.equal(envOverrideCli.status, 0, envOverrideCli.stderr);
+    const envOverrideReport = JSON.parse(envOverrideCli.stdout);
+    assert.equal(envOverrideReport.stablePrefixOnly, false, "AGY_DART_STABLE_PREFIX_ONLY=0 must override config.json");
+
+    // Copy minimal plugin runtime into fakeRoot to test CI exit code 1 on:
+    // (a) upper-bound / budget violation, and (b) non-canonical MCP tools/list violation
+    for (const rel of [
+      "package.json",
+      "rules/AGENTS.md",
+      "skills/agy-dart/SKILL.md",
+      "fast/mcp-server.mjs",
+      "fast/session-start.mjs",
+      "context/server.js",
+      "context/lib/config.js",
+      "context/lib/store.js",
+      "context/lib/store/schema.js",
+      "context/lib/store/fts.js",
+      "context/lib/store/checkpoints.js",
+      "context/lib/store/reads.js",
+      "context/lib/store/settings-maintenance.js",
+      "context/lib/executor.js",
+      "context/lib/tools.js",
+      "context/lib/repo-skeleton.js",
+      "context/lib/stable-json.js",
+      "context/lib/security.js",
+      "hooks/compile-cache.mjs",
+      "hooks/session-start.mjs"
+    ]) {
+      const dst = path.join(fakeRoot, rel);
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.copyFileSync(path.join(ROOT, rel), dst);
+    }
+
+    // (a) Bloated AGENTS.md exceeds upper bound -> CLI MUST exit 1
+    const origAgents = fs.readFileSync(path.join(fakeRoot, "rules", "AGENTS.md"), "utf8");
+    fs.writeFileSync(path.join(fakeRoot, "rules", "AGENTS.md"), origAgents + "\n" + "规则测试内容说明".repeat(220) + "\n", "utf8");
+    const overBudgetCli = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "scripts", "prefix-budget.mjs"), "--target", fakeRoot, "--json"],
+      { encoding: "utf8", windowsHide: true, env: baseEnv }
+    );
+    assert.equal(overBudgetCli.status, 1, "prefix-budget.mjs MUST exit 1 when Turn-0 budget/upper bound is exceeded");
+    const overBudgetReport = JSON.parse(overBudgetCli.stdout);
+    assert.ok(overBudgetReport.exceedsBudget || overBudgetReport.exceedsUpperBound);
+    assert.ok(overBudgetReport.warning);
+
+    // (b) Restore AGENTS.md but inject unsorted tools/list into fake fast/mcp-server.mjs -> CLI MUST exit 1
+    fs.writeFileSync(path.join(fakeRoot, "rules", "AGENTS.md"), origAgents, "utf8");
+    const stubFast = `
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "stub", version: "1.0" } } }) + "\\n");
+  } else if (msg.method === "tools/list") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "z_tool", inputSchema: { type: "object" } }, { name: "a_tool", inputSchema: { type: "object" } }] } }) + "\\n");
+  }
+});
+`;
+    fs.writeFileSync(path.join(fakeRoot, "fast", "mcp-server.mjs"), stubFast, "utf8");
+    const nonCanonicalCli = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "scripts", "prefix-budget.mjs"), "--target", fakeRoot, "--json"],
+      { encoding: "utf8", windowsHide: true, env: baseEnv }
+    );
+    assert.equal(nonCanonicalCli.status, 1, "prefix-budget.mjs MUST exit 1 when MCP tools/list is non-canonical");
+    const nonCanonicalReport = JSON.parse(nonCanonicalCli.stdout);
+    assert.equal(nonCanonicalReport.blocks.tools.canonical, false);
+    assert.ok(nonCanonicalReport.warning && nonCanonicalReport.warning.includes("canonical"));
+  } finally {
+    fs.rmSync(pbTmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });

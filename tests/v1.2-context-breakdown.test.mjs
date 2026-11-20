@@ -605,9 +605,15 @@ test("P2-9.4: Sidecar /api/cache-diag exposes contextComposition & subagentBreak
       });
     });
 
+    // Fetch HTML first to extract injected per-process CSRF token
+    const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+    const token = html.match(/<meta name="agy-dart-token" content="([a-f0-9]+)">/i)?.[1];
+    assert.ok(token, "Sidecar HTML must inject agy-dart-token meta");
+    const authHeaders = { headers: { "X-Agy-Dart-Token": token } };
+
     // 1. Live transcript /api/cache-diag exposes contextComposition & subagentBreakdown (cold + cached)
     const kvLive = await (
-      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`)
+      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`, authHeaders)
     ).json();
     assert.equal(kvLive.ok, true);
     assert.equal(kvLive.transcriptFound, true);
@@ -621,14 +627,14 @@ test("P2-9.4: Sidecar /api/cache-diag exposes contextComposition & subagentBreak
 
     // Second request hits parsedDiagCache -> must preserve both structures
     const kvCached = await (
-      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`)
+      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`, authHeaders)
     ).json();
     assert.deepEqual(kvCached.contextComposition, kvLive.contextComposition);
     assert.deepEqual(kvCached.subagentBreakdown, kvLive.subagentBreakdown);
 
     // 2. Missing transcript fallback exposes consistent zeroed defaults
     const kvMissing = await (
-      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=missing-p29-conv`)
+      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=missing-p29-conv`, authHeaders)
     ).json();
     assert.equal(kvMissing.ok, true);
     assert.equal(kvMissing.transcriptFound, false);
@@ -636,7 +642,6 @@ test("P2-9.4: Sidecar /api/cache-diag exposes contextComposition & subagentBreak
     assert.deepEqual(kvMissing.subagentBreakdown, createEmptySubagentBreakdown());
 
     // 3. Dashboard HTML preserves ALL existing DOM IDs, adds P2-9 DOM IDs, and passes new Function + vm.Script
-    const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
     for (const domId of [
       "kv-cache-card",
       "kv-watermark-badge",

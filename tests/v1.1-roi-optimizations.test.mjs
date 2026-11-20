@@ -942,14 +942,20 @@ test("Opt 6: read_slices({ slices }) bounded 4MB/256KB cache + apply_edits inval
         });
       });
 
-      const kvJson = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`)).json();
+      const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+      const token = html.match(/<meta name="agy-dart-token" content="([a-f0-9]+)">/i)?.[1];
+      assert.ok(token, "Sidecar HTML must inject agy-dart-token meta");
+      const authHeaders = { headers: { "X-Agy-Dart-Token": token } };
+
+      const kvJson = await (
+        await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`, authHeaders)
+      ).json();
       assert.equal(kvJson.transcriptFound, true);
       assert.equal(kvJson.recentTurns.length, 15);
       assert.equal(kvJson.topContextDeltas.length, 3);
       assert.equal(kvJson.modelProfile.id, "claude-200k");
       assert.equal(kvJson.loopWatch.status, "ok");
 
-      const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
       assert.ok(html.includes('id="kv-turns-chart-row"'));
       assert.ok(html.includes('id="kv-turns-bars"'));
       assert.ok(html.includes('id="kv-top-deltas-row"'));

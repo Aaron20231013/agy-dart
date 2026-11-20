@@ -48,18 +48,32 @@ export function extractLocalSpecifiers(source, fileAbsPath, rootDir = REPO_ROOT)
     }
   };
 
-  // 1. Static ESM import/export statements (bounded within a single statement so `export const ...;` never swallows a following `import`)
-  const staticFromRe = /\b(?:import|export)\s+[^;\r\n]*(?:\r?\n[^;\r\n]*)*?\bfrom\s*["'](\.\.?\/[^"']+)["']/g;
-  for (const m of cleaned.matchAll(staticFromRe)) {
+  // 1. Static ESM import/export statements (handles ASI semicolon-less, multiline, minified,
+  //    default/named/namespace, and string-literal export names without bleeding across statements)
+  const IDENT = "[\\p{ID_Start}$_][\\p{ID_Continue}$]*";
+  const STR_LIT = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
+  const NAMED_LIST = `\\{(?:[^}"'\\\\]|\\\\.|${STR_LIT})*\\}`;
+  const staticImportFromRe = new RegExp(
+    `(?<!\\.)\\bimport(?:\\s*\\*\\s*as\\s+${IDENT}\\s+|\\s*${NAMED_LIST}\\s*|\\s+${IDENT}(?:\\s*,\\s*(?:\\*\\s*as\\s+${IDENT}\\s+|${NAMED_LIST}\\s*)|\\s+))from\\s*["'](\\.\\.?\\/[^"']+)["']`,
+    "gu"
+  );
+  for (const m of cleaned.matchAll(staticImportFromRe)) {
     addRel(m[1]);
   }
-  const sideEffectImportRe = /\bimport\s*["'](\.\.?\/[^"']+)["']/g;
+  const staticExportFromRe = new RegExp(
+    `(?<!\\.)\\bexport(?:\\s*\\*(?:\\s*as\\s+(?:${IDENT}\\s+|${STR_LIT}\\s*)|\\s*)|\\s*${NAMED_LIST}\\s*)from\\s*["'](\\.\\.?\\/[^"']+)["']`,
+    "gu"
+  );
+  for (const m of cleaned.matchAll(staticExportFromRe)) {
+    addRel(m[1]);
+  }
+  const sideEffectImportRe = /(?<!\.)\bimport\s*["'](\.\.?\/[^"']+)["']/g;
   for (const m of cleaned.matchAll(sideEffectImportRe)) {
     addRel(m[1]);
   }
 
   // 2. Dynamic import("./...") and require("./...")
-  const dynRe = /\b(?:import|require)\s*\(\s*["'](\.\.?\/[^"']+)["']\s*\)/g;
+  const dynRe = /(?<!\.)\b(?:import|require)\s*\(\s*["'](\.\.?\/[^"']+)["']\s*\)/g;
   for (const m of cleaned.matchAll(dynRe)) {
     addRel(m[1]);
   }

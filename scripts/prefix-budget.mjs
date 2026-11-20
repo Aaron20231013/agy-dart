@@ -18,6 +18,7 @@ import {
   parseTranscriptLines
 } from "../context/lib/cache-analyzer.js";
 import { sha256Hex, stableSortObject, stableStringify } from "../context/lib/stable-json.js";
+import { getEffectiveConfig } from "../context/lib/config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -369,10 +370,13 @@ function fetchMcpTools(scriptPath, extraEnv = {}) {
 function runSessionStartHook(rootDir, dbPath, options = {}) {
   const hookScript = path.join(rootDir, "hooks", "session-start.mjs");
   const childEnv = { ...process.env, AGY_DART_DB_PATH: dbPath };
+  if (options.configPath) {
+    childEnv.AGY_DART_CONFIG_PATH = options.configPath;
+  }
   if (options.stableOnly === true) {
     childEnv.AGY_DART_STABLE_PREFIX_ONLY = "1";
   } else if (options.stableOnly === false) {
-    delete childEnv.AGY_DART_STABLE_PREFIX_ONLY;
+    childEnv.AGY_DART_STABLE_PREFIX_ONLY = "0";
   }
   const res = spawnSync(process.execPath, [hookScript], {
     input: JSON.stringify({
@@ -395,10 +399,14 @@ function runSessionStartHook(rootDir, dbPath, options = {}) {
 export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-prefix-budget-"));
   const tmpDb = path.join(tmpDir, "prefix-budget.db");
+  const cfgOpts = {};
+  if (options.configPath) cfgOpts.configPath = options.configPath;
+  if (options.env) cfgOpts.env = options.env;
+  const effectiveCfg = getEffectiveConfig(cfgOpts);
   const stablePrefixOnly =
     options.stableOnly !== undefined
       ? Boolean(options.stableOnly)
-      : process.env.AGY_DART_STABLE_PREFIX_ONLY === "1";
+      : Boolean(effectiveCfg.stablePrefixOnly);
 
   try {
     // 1. brake: rules/AGENTS.md
@@ -485,7 +493,10 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
     };
 
     // 4. startup: live hooks/session-start.mjs output split into stable vs volatile Git tail
-    const startupText = runSessionStartHook(rootDir, tmpDb, { stableOnly: stablePrefixOnly });
+    const startupText = runSessionStartHook(rootDir, tmpDb, {
+      stableOnly: stablePrefixOnly,
+      configPath: options.configPath
+    });
     const { stableText, volatileText } = splitStartupStability(startupText);
     const startupTotalBytes = Buffer.byteLength(startupText, "utf8");
     const stableBytes = Buffer.byteLength(stableText, "utf8");
@@ -517,11 +528,16 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
     const upperBoundTokens = Math.ceil(totalTokens * (1 + errorBandPct / 100));
     const exceedsBudget = totalTokens > TOKEN_WARN_LIMIT;
     const exceedsUpperBound = upperBoundTokens > TOKEN_WARN_LIMIT;
-    const warning = exceedsBudget
-      ? `Turn-0 resident prefix (${totalTokens} est. tokens) exceeds recommended ${TOKEN_WARN_LIMIT}-token budget.`
-      : exceedsUpperBound
-        ? `Turn-0 resident prefix upper bound (${upperBoundTokens} tok at +${errorBandPct}%) exceeds ${TOKEN_WARN_LIMIT}-token budget.`
-        : null;
+    const warnings = [];
+    if (exceedsBudget) {
+      warnings.push(`Turn-0 resident prefix (${totalTokens} est. tokens) exceeds recommended ${TOKEN_WARN_LIMIT}-token budget.`);
+    } else if (exceedsUpperBound) {
+      warnings.push(`Turn-0 resident prefix upper bound (${upperBoundTokens} tok at +${errorBandPct}%) exceeds ${TOKEN_WARN_LIMIT}-token budget.`);
+    }
+    if (!tools.canonical) {
+      warnings.push("MCP tools/list output is not canonically sorted/serialized.");
+    }
+    const warning = warnings.length > 0 ? warnings.join(" ") : null;
 
     return stableSortObject({
       rootDir,
@@ -619,6 +635,9 @@ async function main() {
     process.stdout.write(JSON.stringify(report, null, 2) + "\n");
   } else {
     process.stdout.write(formatHumanReport(report) + "\n");
+  }
+  if (report.exceedsBudget || report.exceedsUpperBound || !report.blocks?.tools?.canonical) {
+    process.exitCode = 1;
   }
 }
 

@@ -349,10 +349,16 @@ test("P1-7.3: Standalone Sidecar HTTP /api/handoff + /api/cache-diag (serverNowM
       });
     });
 
+    // Fetch HTML first to extract injected per-process CSRF token
+    const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+    const token = html.match(/<meta name="agy-dart-token" content="([a-f0-9]+)">/i)?.[1];
+    assert.ok(token, "Sidecar HTML must inject agy-dart-token meta");
+    const authHeaders = { headers: { "X-Agy-Dart-Token": token } };
+
     // 1. /api/cache-diag returns serverNowMs on miss, cached refreshWallClockTtl hit, and missing-transcript fallback
     const tBefore1 = Date.now();
     const diag1 = await (
-      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`)
+      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`, authHeaders)
     ).json();
     assert.equal(diag1.ok, true);
     assert.equal(diag1.transcriptFound, true);
@@ -362,13 +368,13 @@ test("P1-7.3: Standalone Sidecar HTTP /api/handoff + /api/cache-diag (serverNowM
 
     await new Promise((r) => setTimeout(r, 60));
     const diag2 = await (
-      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`)
+      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convId}`, authHeaders)
     ).json();
     assert.equal(typeof diag2.serverNowMs, "number");
     assert.ok(diag2.serverNowMs >= diag1.serverNowMs, "refreshWallClockTtl must emit fresh serverNowMs");
 
     const diagMissing = await (
-      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=no-such-conv-p17`)
+      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=no-such-conv-p17`, authHeaders)
     ).json();
     assert.equal(diagMissing.transcriptFound, false);
     assert.equal(typeof diagMissing.serverNowMs, "number");
@@ -376,7 +382,7 @@ test("P1-7.3: Standalone Sidecar HTTP /api/handoff + /api/cache-diag (serverNowM
 
     // 2. /api/handoff infers workspace from checkpoint/sources and includes git + checkpoint + FTS5 + cacheDiag
     const handoff1 = await (
-      await fetch(`http://127.0.0.1:${port}/api/handoff?scope=conversation&conversationId=${convId}`)
+      await fetch(`http://127.0.0.1:${port}/api/handoff?scope=conversation&conversationId=${convId}`, authHeaders)
     ).json();
     assert.equal(handoff1.ok, true);
     assert.equal(handoff1.sessionId, convId);
@@ -392,7 +398,8 @@ test("P1-7.3: Standalone Sidecar HTTP /api/handoff + /api/cache-diag (serverNowM
     // 3. /api/handoff respects explicit non-git cwd query and maxBytes cap
     const handoffExplicit = await (
       await fetch(
-        `http://127.0.0.1:${port}/api/handoff?scope=conversation&conversationId=${convId}&cwd=${encodeURIComponent(nonGitDir)}&maxBytes=420`
+        `http://127.0.0.1:${port}/api/handoff?scope=conversation&conversationId=${convId}&cwd=${encodeURIComponent(nonGitDir)}&maxBytes=420`,
+        authHeaders
       )
     ).json();
     assert.equal(handoffExplicit.ok, true);
@@ -400,7 +407,6 @@ test("P1-7.3: Standalone Sidecar HTTP /api/handoff + /api/cache-diag (serverNowM
     assert.ok(handoffExplicit.bytes <= 420);
 
     // 4. Dashboard index.html syntax validation (both new Function & vm.Script) + DOM IDs + XSS-safe rendering + countdown math
-    const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
     for (const preservedId of [
       "kv-cache-card",
       "kv-hit-rate",
@@ -846,14 +852,19 @@ test("P1-7.5: install.mjs packages runtime-only by default and all v1.2 devtools
       });
     });
 
+    const instHtml = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+    const instToken = instHtml.match(/<meta name="agy-dart-token" content="([a-f0-9]+)">/i)?.[1];
+    assert.ok(instToken, "Installed Sidecar HTML must inject agy-dart-token meta");
+    const instAuth = { headers: { "X-Agy-Dart-Token": instToken } };
+
     const diagResp = await (
-      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=inst-v12-sess`)
+      await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=inst-v12-sess`, instAuth)
     ).json();
     assert.equal(diagResp.ok, true);
     assert.equal(typeof diagResp.serverNowMs, "number");
 
     const handoffResp = await (
-      await fetch(`http://127.0.0.1:${port}/api/handoff?scope=conversation&conversationId=inst-v12-sess`)
+      await fetch(`http://127.0.0.1:${port}/api/handoff?scope=conversation&conversationId=inst-v12-sess`, instAuth)
     ).json();
     assert.equal(handoffResp.ok, true);
     assert.ok(handoffResp.markdown.includes("Call ctx_resume({}) after /compact"));

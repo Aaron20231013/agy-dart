@@ -59,8 +59,12 @@ export function isAllowedOriginHeader(originHeader, hostHeader = null) {
   return true;
 }
 
-export function isCrossSiteFetchHeader(secFetchSite) {
-  return typeof secFetchSite === "string" && secFetchSite.trim().toLowerCase() === "cross-site";
+export function isCrossSiteFetchHeader(secFetchSite, { allowSameSite = false } = {}) {
+  if (typeof secFetchSite !== "string") return false;
+  const normalized = secFetchSite.trim().toLowerCase();
+  if (normalized === "cross-site") return true;
+  if (!allowSameSite && normalized === "same-site") return true;
+  return false;
 }
 
 export function isJsonContentType(contentType) {
@@ -605,14 +609,25 @@ export function createStandaloneServer({ csrfToken = SIDECAR_CSRF_TOKEN, maxBody
       sendJson(res, 403, { error: "Forbidden host header" });
       return;
     }
-    if (!isAllowedOriginHeader(req.headers.origin, req.headers.host) || isCrossSiteFetchHeader(req.headers["sec-fetch-site"])) {
+
+    let url;
+    try {
+      url = new URL(req.url, `http://${req.headers.host}`);
+    } catch {
+      sendJson(res, 400, { error: "Invalid request URL" });
+      return;
+    }
+
+    const isHtmlEntry = req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html");
+    if (
+      !isAllowedOriginHeader(req.headers.origin, req.headers.host) ||
+      isCrossSiteFetchHeader(req.headers["sec-fetch-site"], { allowSameSite: isHtmlEntry })
+    ) {
       sendJson(res, 403, { error: "Cross-origin request blocked" });
       return;
     }
 
-    const url = new URL(req.url, `http://${req.headers.host}`);
-
-    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+    if (isHtmlEntry) {
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         "X-Content-Type-Options": "nosniff",
@@ -622,7 +637,32 @@ export function createStandaloneServer({ csrfToken = SIDECAR_CSRF_TOKEN, maxBody
       return;
     }
 
-    // 2. Read-only GET API endpoints
+    // 2. Enforce POST-only method semantics on /api/search and mutating endpoints first
+    //    so cross-site <img> GET attacks explicitly return 405 Method Not Allowed (Allow: POST).
+    if ((url.pathname === "/api/search" || MUTATING_ENDPOINTS.has(url.pathname)) && req.method !== "POST") {
+      sendJson(
+        res,
+        405,
+        {
+          error:
+            url.pathname === "/api/search"
+              ? "Method Not Allowed: use POST with application/json"
+              : "Method Not Allowed: mutating endpoints require POST"
+        },
+        { Allow: "POST" }
+      );
+      return;
+    }
+
+    // 3. Require per-process random X-Agy-Dart-Token on EVERY standalone /api/* endpoint (GET and POST)
+    if (url.pathname.startsWith("/api/")) {
+      if (!timingSafeTokenMatch(req.headers["x-agy-dart-token"], csrfToken)) {
+        sendJson(res, 403, { error: "Invalid or missing X-Agy-Dart-Token" });
+        return;
+      }
+    }
+
+    // 4. Authenticated read-only GET API endpoints
     if (req.method === "GET" && url.pathname === "/api/stats") {
       const data = Object.fromEntries(url.searchParams.entries());
       sendJson(res, 200, getStatsPayload(data));
@@ -668,16 +708,8 @@ export function createStandaloneServer({ csrfToken = SIDECAR_CSRF_TOKEN, maxBody
       return;
     }
 
-    // 3. POST-only /api/search (authenticated read-only FTS5 query, bounded JSON body)
+    // 5. POST-only /api/search (authenticated read-only FTS5 query, bounded JSON body)
     if (url.pathname === "/api/search") {
-      if (req.method !== "POST") {
-        sendJson(res, 405, { error: "Method Not Allowed: use POST with application/json" }, { Allow: "POST" });
-        return;
-      }
-      if (!timingSafeTokenMatch(req.headers["x-agy-dart-token"], csrfToken)) {
-        sendJson(res, 403, { error: "Invalid or missing X-Agy-Dart-Token" });
-        return;
-      }
       if (!isJsonContentType(req.headers["content-type"])) {
         sendJson(res, 415, { error: "Content-Type must be application/json" });
         return;
@@ -692,16 +724,8 @@ export function createStandaloneServer({ csrfToken = SIDECAR_CSRF_TOKEN, maxBody
       return;
     }
 
-    // 4. Mutating endpoints: strictly POST + application/json + per-process CSRF token + <= 64 KB body
+    // 6. Mutating endpoints: strictly POST + application/json + per-process CSRF token + <= 64 KB body
     if (MUTATING_ENDPOINTS.has(url.pathname)) {
-      if (req.method !== "POST") {
-        sendJson(res, 405, { error: "Method Not Allowed: mutating endpoints require POST" }, { Allow: "POST" });
-        return;
-      }
-      if (!timingSafeTokenMatch(req.headers["x-agy-dart-token"], csrfToken)) {
-        sendJson(res, 403, { error: "Invalid or missing X-Agy-Dart-Token" });
-        return;
-      }
       if (!isJsonContentType(req.headers["content-type"])) {
         sendJson(res, 415, { error: "Content-Type must be application/json" });
         return;

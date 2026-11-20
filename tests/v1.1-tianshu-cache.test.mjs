@@ -809,21 +809,25 @@ test("Hardening: Ghost recall still tracks when read-dedup is off, pruneByTtl cl
         });
       });
 
-      const statsResp = await fetch(`http://127.0.0.1:${port}/api/stats?scope=conversation&conversationId=sidecar-ghost-sess`);
+      const htmlResp = await fetch(`http://127.0.0.1:${port}/`);
+      const html = await htmlResp.text();
+      const token = html.match(/<meta name="agy-dart-token" content="([a-f0-9]+)">/i)?.[1];
+      assert.ok(token, "Sidecar HTML must inject agy-dart-token meta");
+      const authHeaders = { headers: { "X-Agy-Dart-Token": token } };
+
+      const statsResp = await fetch(`http://127.0.0.1:${port}/api/stats?scope=conversation&conversationId=sidecar-ghost-sess`, authHeaders);
       assert.equal(statsResp.status, 200);
       const statsJson = await statsResp.json();
       assert.equal(statsJson.ghost.totalBlocked, 1);
       assert.equal(statsJson.ghost.evictionEfficiency, 1);
 
-      const kvResp = await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=nonexistent-conv-id-xyz`);
+      const kvResp = await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=nonexistent-conv-id-xyz`, authHeaders);
       assert.equal(kvResp.status, 200);
       const kvJson = await kvResp.json();
       assert.equal(kvJson.cacheTemperature, "cold");
       assert.equal(kvJson.compactAdvice, "none");
       assert.equal(kvJson.estimatedCostSavingsPct, 0);
 
-      const htmlResp = await fetch(`http://127.0.0.1:${port}/`);
-      const html = await htmlResp.text();
       assert.ok(html.includes('id="kv-temp-badge"'));
       assert.ok(html.includes('id="kv-cost-savings"'));
       assert.ok(html.includes('id="kv-ghost-row"'));
@@ -1112,6 +1116,11 @@ test("Review hardening: live V8 compile-cache artifacts, Windows case-safe pruni
         });
       });
 
+      const html = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+      const token = html.match(/<meta name="agy-dart-token" content="([a-f0-9]+)">/i)?.[1];
+      assert.ok(token, "Sidecar HTML must inject agy-dart-token meta");
+      const authHeaders = { headers: { "X-Agy-Dart-Token": token } };
+
       // Write transcripts AFTER Sidecar is ready so startup latency cannot distort short TTL windows
       const nowLive = Date.now();
       fs.writeFileSync(
@@ -1142,8 +1151,8 @@ test("Review hardening: live V8 compile-cache artifacts, Windows case-safe pruni
       );
 
       // Negative TTL must sanitize consistently on BOTH cache miss and cache hit
-      const neg1 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotCold}&ttl=-5`)).json();
-      const neg2 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotCold}&ttl=-5`)).json();
+      const neg1 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotCold}&ttl=-5`, authHeaders)).json();
+      const neg2 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotCold}&ttl=-5`, authHeaders)).json();
       assert.equal(neg1.transcriptFound, true);
       assert.equal(neg1.cacheTtlSec, 300);
       assert.equal(neg1.cacheTemperature, "hot");
@@ -1152,11 +1161,11 @@ test("Review hardening: live V8 compile-cache artifacts, Windows case-safe pruni
       assert.equal(neg2.compactAdvice, "delay_hot_cache");
 
       // Initial cached reads: both transcripts start HOT
-      const short1 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotCold}&ttl=2`)).json();
+      const short1 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotCold}&ttl=2`, authHeaders)).json();
       assert.equal(short1.cacheTemperature, "hot");
       assert.equal(short1.compactAdvice, "delay_hot_cache");
 
-      const warm1 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotWarm}&ttl=300`)).json();
+      const warm1 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotWarm}&ttl=300`, authHeaders)).json();
       assert.equal(warm1.cacheTemperature, "hot");
       assert.equal(warm1.compactAdvice, "delay_hot_cache");
 
@@ -1165,12 +1174,12 @@ test("Review hardening: live V8 compile-cache artifacts, Windows case-safe pruni
       // After 2.3s on unchanged files (pure refreshWallClockTtl cache hits):
       // - convHotCold (ttl=2) transitions hot -> cold & opportunistic_cold_compact
       // - convHotWarm (58.5s + 2.3s > 60s, ttl=300) transitions hot -> warm & keeps delay_hot_cache
-      const short2 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotCold}&ttl=2`)).json();
+      const short2 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotCold}&ttl=2`, authHeaders)).json();
       assert.equal(short2.ttlStatus, "expired");
       assert.equal(short2.cacheTemperature, "cold", "refreshWallClockTtl must age cached entry to cold");
       assert.equal(short2.compactAdvice, "opportunistic_cold_compact");
 
-      const warm2 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotWarm}&ttl=300`)).json();
+      const warm2 = await (await fetch(`http://127.0.0.1:${port}/api/cache-diag?scope=conversation&conversationId=${convHotWarm}&ttl=300`, authHeaders)).json();
       assert.equal(warm2.cacheTemperature, "warm", "refreshWallClockTtl must age cached entry from hot to warm");
       assert.equal(warm2.compactAdvice, "delay_hot_cache");
     } finally {

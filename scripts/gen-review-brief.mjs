@@ -147,10 +147,10 @@ const ENGINE_ENTRIES = [
   ["context/server.js", "`agy-dart_context` MCP stdio 服务端：先激活 V8 编译缓存与 SQLite 告警静默再动态加载库模块；导出冻结规范排序 `TOOL_DEFINITIONS`"],
   ["scripts/cache-audit.mjs", "全域环境 Prompt Cache 体检 `npm run cache:audit`（devtools）：规则/技能 CJK 估 token、双次握手探测 MCP 确定性、静态分析中段 Hook"],
   ["scripts/install.mjs", "跨平台安装/卸载/模式切换/`doctor` 健康自检：拆分 `RUNTIME_FILES`（默认）与 `DEVTOOLS_FILES`（`--with-devtools`），`doctor` 输出生效配置"],
-  ["scripts/verify-package-graph.mjs", "静态 Import 图打包校验器（devtools）：遍历所有运行时入口证明无漏打模块且 devtools 零泄漏"],
-  ["scripts/prefix-budget.mjs", "Turn-0 前缀预算、双 MCP 指纹与 `--calibrate` 跨语种 Token 估算误差校准审计（devtools）"],
+  ["scripts/verify-package-graph.mjs", "静态 Import 图打包校验器（devtools）：完整解析含/无分号（ASI）与多行 ESM 导入/重导出，遍历所有运行时入口证明无漏打模块且 devtools 零泄漏"],
+  ["scripts/prefix-budget.mjs", "Turn-0 前缀预算、双 MCP 指纹与 `--calibrate` 跨语种 Token 估算误差校准审计（devtools，读取统一 `config.json`，超预算/非规范时非零退出码卡口 CI）"],
   ["scripts/gen-review-brief.mjs", "`AI_REVIEW_BRIEF.md` 代码行数/测试基线自动生成与 `--check` 漂移守卫（devtools）"],
-  ["sidecars/dashboard/server.mjs", "Sidecar HTTP / SidecarApp 服务：强制 `Host`/`Origin` 校验、写接口仅 POST + `application/json` + 随机 `X-Agy-Dart-Token`、64 KB 请求体上限与 `featureRoi`"],
+  ["sidecars/dashboard/server.mjs", "Sidecar HTTP / SidecarApp 服务：强制 `Host`/`Origin` 与 `Sec-Fetch-Site`（拦截 `cross-site` 与 `same-site`）校验、全部 `/api/*` 请求强制随机 `X-Agy-Dart-Token`、写接口仅 POST + `application/json` + 64 KB 请求体上限与 `featureRoi`"],
   ["sidecars/dashboard/index.html", "实时仪表盘前端：自动注入并携带 CSRF Token、全写操作 POST JSON、XSS 转义加固、1s 本地 TTL 进度条、Handoff 抽屉与上下文构成条"]
 ];
 
