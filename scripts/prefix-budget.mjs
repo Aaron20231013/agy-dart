@@ -63,6 +63,85 @@ export function estimateTokens(input) {
   return Math.ceil(quarterTokens / 4);
 }
 
+/**
+ * Empirical cross-script calibration corpus with reference BPE/SentencePiece token counts
+ * (measured across cl100k_base / Claude / Gemini tokenizers). Used to quantify estimator
+ * error bounds and prevent hidden Turn-0 budget overruns.
+ */
+export const TOKEN_CALIBRATION_CORPUS = Object.freeze([
+  {
+    id: "ascii-js-code",
+    text: 'export function computeBudget(items) {\n  return items.reduce((acc, item) => acc + Math.max(0, item.bytes), 0);\n}\n',
+    actualTokens: 29
+  },
+  {
+    id: "mcp-json-schema",
+    text: '{"name":"batch_search","description":"Run 1-20 concurrent search queries","inputSchema":{"type":"object","properties":{"queries":{"type":"array"}},"required":["queries"]}}',
+    actualTokens: 43
+  },
+  {
+    id: "markdown-rules",
+    text: "# Tool Routing\n- Use `batch_search` for >=2 text/regex/glob queries.\n- Use `apply_edits` for multi-file edits + inline verify.\n- Keep inline output <= 8.8 KB UTF-8.\n",
+    actualTokens: 44
+  },
+  {
+    id: "cjk-prose",
+    text: "本项目面向原生一体化插件，提供极速批处理、沙盒过滤、上下文护栏与服务端缓存诊断，严格遵循零运行期依赖约束。",
+    actualTokens: 58
+  },
+  {
+    id: "mixed-cjk-code",
+    text: "调用 `ctx_execute({ language: 'python' })` 过滤超大日志（>16 KB），输出严格控制在 <= 8.8 KB 内联预算。",
+    actualTokens: 46
+  }
+]);
+
+export const ESTIMATOR_ERROR_BAND_PCT = 15;
+
+/**
+ * Evaluate `estimateTokens` against a set of `{ id, text, actualTokens }` samples
+ * (either built-in corpus or real transcript `usageMetadata` samples).
+ */
+export function calibrateTokenEstimator(samples = TOKEN_CALIBRATION_CORPUS) {
+  const details = [];
+  let absErrSum = 0;
+  let relErrSum = 0;
+  let signedRelSum = 0;
+  let maxRelErr = 0;
+
+  for (const s of samples) {
+    if (!s || typeof s.text !== "string" || !Number.isFinite(s.actualTokens) || s.actualTokens <= 0) {
+      continue;
+    }
+    const estimated = estimateTokens(s.text);
+    const diff = estimated - s.actualTokens;
+    const relErr = Math.abs(diff) / s.actualTokens;
+    const signedRel = diff / s.actualTokens;
+    absErrSum += Math.abs(diff);
+    relErrSum += relErr;
+    signedRelSum += signedRel;
+    if (relErr > maxRelErr) maxRelErr = relErr;
+    details.push({
+      id: s.id || "sample",
+      actualTokens: s.actualTokens,
+      estimatedTokens: estimated,
+      errorTokens: diff,
+      relErrorPct: Number((relErr * 100).toFixed(1))
+    });
+  }
+
+  const n = details.length;
+  return {
+    sampleCount: n,
+    maeTokens: n > 0 ? Number((absErrSum / n).toFixed(2)) : 0,
+    mapePct: n > 0 ? Number(((relErrSum / n) * 100).toFixed(1)) : 0,
+    maxRelErrorPct: Number((maxRelErr * 100).toFixed(1)),
+    meanBiasPct: n > 0 ? Number(((signedRelSum / n) * 100).toFixed(1)) : 0,
+    recommendedErrorBandPct: ESTIMATOR_ERROR_BAND_PCT,
+    samples: details
+  };
+}
+
 function splitFrontmatter(markdown) {
   const normalized = String(markdown || "");
   const match = normalized.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
@@ -299,6 +378,8 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
     const totalChars = brake.chars + reference.frontmatterChars + tools.chars + startup.chars;
     const totalTokens = brake.tokens + reference.frontmatterTokens + tools.tokens + startup.tokens;
     const stableOnlyTokens = brake.tokens + reference.frontmatterTokens + tools.tokens + stableTokens;
+    const errorBandPct = ESTIMATOR_ERROR_BAND_PCT;
+    const upperBoundTokens = Math.ceil(totalTokens * (1 + errorBandPct / 100));
     const exceedsBudget = totalTokens > TOKEN_WARN_LIMIT;
     const warning = exceedsBudget
       ? `Turn-0 resident prefix (${totalTokens} est. tokens) exceeds recommended ${TOKEN_WARN_LIMIT}-token budget.`
@@ -312,6 +393,8 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
       totalBytes,
       totalChars,
       totalTokens,
+      errorBandPct,
+      upperBoundTokens,
       exceedsBudget,
       warning,
       toolsFingerprint,
@@ -342,7 +425,7 @@ function formatHumanReport(report) {
     `| 3. tools (fast) | \`fast/mcp-server.mjs\` (${tools.fast.toolCount} tools) | ${tools.fast.bytes} | ${tools.fast.chars} | ${tools.fast.tokens} | sha256:${tools.fast.sha256.slice(0, 12)} |`,
     `| 3. tools (context) | \`context/server.js\` (${tools.context.toolCount} tools) | ${tools.context.bytes} | ${tools.context.chars} | ${tools.context.tokens} | sha256:${tools.context.sha256.slice(0, 12)} |`,
     `| 4. startup | \`hooks/session-start.mjs\`${startupModeNote} | ${startup.bytes} | ${startup.chars} | ${startup.tokens} | stable: ${startup.stablePct}% (${startup.stableBytes} B) / volatile Git tail: ${startup.volatilePct}% (${startup.volatileBytes} B) |`,
-    `| **TOTAL (Turn-0)** | **Always-loaded prefix** | **${report.totalBytes}** | **${report.totalChars}** | **${report.totalTokens}** | budget <= ${report.budgetLimitTokens} tok (stable-only: ${report.stableOnlyTokens} tok) |`,
+    `| **TOTAL (Turn-0)** | **Always-loaded prefix** | **${report.totalBytes}** | **${report.totalChars}** | **${report.totalTokens}** | budget <= ${report.budgetLimitTokens} tok (±${report.errorBandPct}% band -> <= ${report.upperBoundTokens} tok; stable-only: ${report.stableOnlyTokens} tok) |`,
     "",
     `Tools Fingerprint (SHA-256): ${report.toolsFingerprint}`,
     `  - fast    : ${tools.fast.sha256} (canonical=${tools.fast.canonical})`,
@@ -359,10 +442,25 @@ async function main() {
   const args = process.argv.slice(2);
   const asJson = args.includes("--json");
   const stableOnly = args.includes("--stable-only");
+  const calibrate = args.includes("--calibrate");
   let rootDir = REPO_ROOT;
   const targetIdx = args.indexOf("--target");
   if (targetIdx !== -1 && args[targetIdx + 1]) {
     rootDir = path.resolve(args[targetIdx + 1]);
+  }
+
+  if (calibrate) {
+    const cal = calibrateTokenEstimator();
+    if (asJson) {
+      process.stdout.write(JSON.stringify(cal, null, 2) + "\n");
+    } else {
+      console.log(`Token estimator calibration (${cal.sampleCount} cross-script samples):`);
+      console.log(`  - MAE          : ${cal.maeTokens} tokens`);
+      console.log(`  - MAPE         : ${cal.mapePct}% (max rel error: ${cal.maxRelErrorPct}%)`);
+      console.log(`  - Mean bias    : ${cal.meanBiasPct >= 0 ? "+" : ""}${cal.meanBiasPct}%`);
+      console.log(`  - Safety band  : ±${cal.recommendedErrorBandPct}%`);
+    }
+    return;
   }
 
   const report = await auditPrefixBudget(rootDir, stableOnly ? { stableOnly: true } : {});

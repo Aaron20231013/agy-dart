@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const __selfPath = path.resolve(fileURLToPath(import.meta.url));
+const __dirname = path.dirname(__selfPath);
 const REPO_ROOT = path.resolve(__dirname, "..");
 const PLUGIN_NAME = "agy-dart";
 
@@ -16,7 +17,7 @@ const MODES = {
   "no-read-hook": { cutoffBytes: 16384, readHook: false, label: "Ultra-fast Scheme B (command guard only, no read_file hook)" }
 };
 
-const FILES_TO_COPY = [
+export const RUNTIME_FILES = Object.freeze([
   "plugin.json",
   "mcp_config.json",
   "hooks.json",
@@ -30,13 +31,18 @@ const FILES_TO_COPY = [
   "skills/agy-dart/SKILL.md",
   "fast/mcp-server.mjs",
   "fast/session-start.mjs",
-  "fast/benchmark.mjs",
   "context/server.js",
+  "context/lib/config.js",
   "context/lib/store.js",
+  "context/lib/store/schema.js",
+  "context/lib/store/fts.js",
+  "context/lib/store/checkpoints.js",
+  "context/lib/store/reads.js",
+  "context/lib/store/settings-maintenance.js",
   "context/lib/executor.js",
   "context/lib/tools.js",
+  "context/lib/cache/profiles.js",
   "context/lib/cache-analyzer.js",
-  "context/lib/cache-simulator.js",
   "context/lib/repo-skeleton.js",
   "context/lib/stable-json.js",
   "context/lib/security.js",
@@ -53,10 +59,19 @@ const FILES_TO_COPY = [
   "sidecars/dashboard/sidecar.json",
   "sidecars/dashboard/server.mjs",
   "sidecars/dashboard/index.html",
-  "scripts/install.mjs",
+  "scripts/install.mjs"
+]);
+
+export const DEVTOOLS_FILES = Object.freeze([
+  "fast/benchmark.mjs",
+  "context/lib/cache-simulator.js",
+  "scripts/cache-audit.mjs",
   "scripts/prefix-budget.mjs",
-  "scripts/cache-audit.mjs"
-];
+  "scripts/verify-package-graph.mjs",
+  "scripts/gen-review-brief.mjs"
+]);
+
+export const FILES_TO_COPY = Object.freeze([...RUNTIME_FILES, ...DEVTOOLS_FILES]);
 
 function getHomeDir() {
   return process.platform === "win32"
@@ -97,6 +112,7 @@ function parseArgs(argv) {
   let projectDir = "";
   let mode = "balanced-16k";
   let installRg = false;
+  let withDevtools = false;
   let showHelp = false;
   const positional = [];
 
@@ -106,6 +122,10 @@ function parseArgs(argv) {
       showHelp = true;
     } else if (a === "--install-rg") {
       installRg = true;
+    } else if (a === "--with-devtools") {
+      withDevtools = true;
+    } else if (a === "--runtime-only") {
+      withDevtools = false;
     } else if (a === "--mode") {
       const next = args[++i];
       if (!next || !MODES[next]) {
@@ -145,7 +165,7 @@ function parseArgs(argv) {
       : path.join(getGlobalPluginsRoot(), PLUGIN_NAME);
   }
 
-  return { command, targetDir, isProject: Boolean(projectDir), isCustomTarget, mode, installRg, showHelp };
+  return { command, targetDir, isProject: Boolean(projectDir), isCustomTarget, mode, installRg, withDevtools, showHelp };
 }
 
 function printHelp() {
@@ -153,7 +173,7 @@ function printHelp() {
 
 Usage:
   node scripts/install.mjs install [options]     Install agy-dart globally (default) or to a project
-  node scripts/install.mjs doctor [options]      Verify both MCP servers, hooks, SQLite, Sidecar & rg
+  node scripts/install.mjs doctor [options]      Verify both MCP servers, hooks, SQLite, Sidecar, config & rg
   node scripts/install.mjs mode <mode> [opts]    Switch protection mode (${Object.keys(MODES).join(" | ")})
   node scripts/install.mjs uninstall [options]   Remove installed agy-dart plugin
 
@@ -161,6 +181,8 @@ Options:
   --project [dir]        Install into <dir>/.agents/plugins/agy-dart
   --target <dir>         Install into a custom directory
   --mode <mode>          balanced-16k (default) | fast-32k | strict-8k | no-read-hook
+  --with-devtools        Also copy offline CLI devtools (benchmark, cache-simulator, cache-audit, prefix-budget)
+  --runtime-only         Install runtime files only (default)
   --install-rg           On Windows x64, download official ripgrep (rg.exe) to ~/.local/bin and add to PATH
   -h, --help             Show this help
 `);
@@ -363,9 +385,17 @@ async function runDoctor(targetDir) {
     const hasPostHook = await pathExists(path.join(targetDir, "hooks", "post-tool-use.mjs"));
     const hasPreInvHook = await pathExists(path.join(targetDir, "hooks", "pre-invocation.mjs"));
     const hasCompileCacheHelper = await pathExists(path.join(targetDir, "hooks", "compile-cache.mjs"));
+    const hasDevtools = await pathExists(path.join(targetDir, "fast", "benchmark.mjs"));
     const hasRg = hasCommand("rg", ["--version"]);
     const nodeModule = await import("node:module");
     const hasCompileCache = typeof nodeModule?.enableCompileCache === "function";
+
+    let configLines = [];
+    try {
+      const cfgModPath = path.join(targetDir, "context", "lib", "config.js");
+      const cfgMod = await import(pathToFileURL((await pathExists(cfgModPath)) ? cfgModPath : path.join(REPO_ROOT, "context", "lib", "config.js")).href);
+      configLines = cfgMod.formatEffectiveConfigLines(cfgMod.getConfigSnapshot());
+    } catch {}
 
     const hooksRaw = JSON.parse(await fs.readFile(path.join(targetDir, "hooks.json"), "utf8"));
     const matcher = hooksRaw?.["agy-dart-lifecycle"]?.PreToolUse?.[0]?.matcher || "";
@@ -374,6 +404,7 @@ async function runDoctor(targetDir) {
 
     console.log("agy-dart health check:");
     console.log(`  - Plugin path   : ${targetDir}`);
+    console.log(`  - Profile       : ${hasDevtools ? "runtime + devtools" : "runtime-only (use --with-devtools for offline audit/benchmark CLIs)"}`);
     console.log(`  - Node / SQLite : v${nodeVer} (OK)`);
     console.log(`  - V8 CompileCache : ${hasCompileCache ? "available" : "unavailable"}${hasCompileCache && hasCompileCacheHelper ? " (versioned hook cache active)" : ""}`);
     console.log(`  - ripgrep (rg)  : ${hasRg ? "available (fast search active)" : "not found (Node.js fallback active; rerun with --install-rg on Windows)"}`);
@@ -384,6 +415,9 @@ async function runDoctor(targetDir) {
     console.log(`  - PostToolUse   : ${hasPostHook && hasPostCfg ? "OK (edit/compaction read-dedup invalidation)" : "MISSING"}`);
     console.log(`  - PreInvocation : ${hasPreInvHook && hasPreInvCfg ? "OK (UI-only KV-cache watermark/TTL watch)" : "MISSING"}`);
     console.log(`  - Sidecar UI    : ${hasSidecar ? "OK (sidecars/dashboard present)" : "MISSING"}`);
+    for (const line of configLines) {
+      console.log(line);
+    }
 
     // Friendly warning if standalone legacy plugins coexist globally
     const globalRoot = getGlobalPluginsRoot();
@@ -408,13 +442,14 @@ async function runInstall(opts) {
 
   const srcRoot = path.resolve(REPO_ROOT);
   const dstRoot = path.resolve(opts.targetDir);
+  const manifest = opts.withDevtools ? FILES_TO_COPY : RUNTIME_FILES;
 
   if (srcRoot !== dstRoot) {
     if (await pathExists(dstRoot)) {
       await fs.rm(dstRoot, { recursive: true, force: true });
     }
     await fs.mkdir(dstRoot, { recursive: true });
-    for (const rel of FILES_TO_COPY) {
+    for (const rel of manifest) {
       const src = path.join(srcRoot, rel);
       const dst = path.join(dstRoot, rel);
       if (!(await pathExists(src))) {
@@ -423,7 +458,7 @@ async function runInstall(opts) {
       await fs.mkdir(path.dirname(dst), { recursive: true });
       await fs.copyFile(src, dst);
     }
-    console.log(`Installed agy-dart to ${dstRoot}`);
+    console.log(`Installed agy-dart (${opts.withDevtools ? "runtime+devtools" : "runtime-only"}, ${manifest.length} files) to ${dstRoot}`);
   }
 
   const modeCfg = await applyMode(dstRoot, opts.mode, opts.isCustomTarget);
@@ -480,7 +515,16 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-});
+const isDirectRun = Boolean(
+  process.argv[1] &&
+    (process.platform === "win32"
+      ? path.resolve(process.argv[1]).toLowerCase() === __selfPath.toLowerCase()
+      : path.resolve(process.argv[1]) === __selfPath)
+);
+
+if (isDirectRun) {
+  main().catch((err) => {
+    console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  });
+}
