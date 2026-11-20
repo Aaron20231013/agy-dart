@@ -660,10 +660,12 @@ test("T5 & T6: SessionWarmth / compactAdvice / cost savings, PreInvocation hot-c
   }
 });
 
-test("T6: Installer dry-run copies all newly added T1-T6 files and passes doctor with V8 CompileCache report", () => {
+test("T6: Installer copies runtime-only by default and devtools with --with-devtools, passing doctor with V8 CompileCache & config report", () => {
   const tmpTarget = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-t6-install-"));
   const installDir = path.join(tmpTarget, "agy-dart");
+  const fullDir = path.join(tmpTarget, "agy-dart-full");
   try {
+    // 1. Default runtime-only install omits offline devtools CLIs
     const res = spawnSync(
       process.execPath,
       [path.join(ROOT, "scripts", "install.mjs"), "install", "--target", installDir, "--mode", "balanced-16k"],
@@ -676,10 +678,26 @@ test("T6: Installer dry-run copies all newly added T1-T6 files and passes doctor
     assert.equal(res.status, 0, `${res.stdout}\n${res.stderr}`);
     assert.ok(fs.existsSync(path.join(installDir, "hooks", "compile-cache.mjs")));
     assert.ok(fs.existsSync(path.join(installDir, "context", "lib", "stable-json.js")));
-    assert.ok(fs.existsSync(path.join(installDir, "scripts", "prefix-budget.mjs")));
+    assert.ok(fs.existsSync(path.join(installDir, "context", "lib", "config.js")));
+    assert.equal(fs.existsSync(path.join(installDir, "scripts", "prefix-budget.mjs")), false, "Default runtime install must omit devtools");
     assert.ok(res.stdout.includes("V8 CompileCache :"));
+    assert.ok(res.stdout.includes("Config file   :"));
     assert.ok(res.stdout.includes("MCP [fast]    : OK (4 tools"));
     assert.ok(res.stdout.includes("MCP [context] : OK (8 tools"));
+
+    // 2. --with-devtools includes offline audit/benchmark/prefix-budget CLIs
+    const resFull = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "scripts", "install.mjs"), "install", "--target", fullDir, "--mode", "balanced-16k", "--with-devtools"],
+      {
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, AGY_DART_DISABLE_COMPILE_CACHE: "1" }
+      }
+    );
+    assert.equal(resFull.status, 0, `${resFull.stdout}\n${resFull.stderr}`);
+    assert.ok(fs.existsSync(path.join(fullDir, "scripts", "prefix-budget.mjs")));
+    assert.ok(resFull.stdout.includes("runtime + devtools"));
   } finally {
     fs.rmSync(tmpTarget, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }

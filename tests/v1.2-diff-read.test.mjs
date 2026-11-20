@@ -24,6 +24,7 @@ function runHook(scriptRel, payload, dbPath, extraEnv = {}) {
       ...process.env,
       AGY_DART_DB_PATH: dbPath,
       AGY_DART_DISABLE_COMPILE_CACHE: "1",
+      AGY_DART_ENABLE_DIFF_READ: "1",
       ...extraEnv
     }
   });

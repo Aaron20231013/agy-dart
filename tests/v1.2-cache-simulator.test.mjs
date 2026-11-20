@@ -550,7 +550,7 @@ test("P2-10.7: Isolated install.mjs install --target copies cache-simulator.js a
   try {
     const instRes = spawnSync(
       process.execPath,
-      [path.join(ROOT, "scripts", "install.mjs"), "install", "--target", installDir, "--mode", "balanced-16k"],
+      [path.join(ROOT, "scripts", "install.mjs"), "install", "--target", installDir, "--mode", "balanced-16k", "--with-devtools"],
       {
         encoding: "utf8",
         windowsHide: true,
@@ -560,7 +560,7 @@ test("P2-10.7: Isolated install.mjs install --target copies cache-simulator.js a
     assert.equal(instRes.status, 0, `${instRes.stdout}\n${instRes.stderr}`);
 
     const copiedSim = path.join(installDir, "context", "lib", "cache-simulator.js");
-    assert.ok(fs.existsSync(copiedSim), "install.mjs must copy context/lib/cache-simulator.js");
+    assert.ok(fs.existsSync(copiedSim), "install.mjs --with-devtools must copy context/lib/cache-simulator.js");
 
     // Run the INSTALLED copy of benchmark.mjs cache simulate to guarantee zero missing modules
     const simRes = spawnSync(

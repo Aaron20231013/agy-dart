@@ -726,19 +726,36 @@ test("P1-7.4: PreInvocation proactive expiring TTL alert (deduped >=60k, silent 
   }
 });
 
-test("P1-7.5: install.mjs packages all v1.2 modules (handoff, text-diff, json-crusher, cache-audit) and installed Sidecar/hooks/tools run cleanly", async () => {
+test("P1-7.5: install.mjs packages runtime-only by default and all v1.2 devtools with --with-devtools cleanly", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-install-v12-"));
-  const installDir = path.join(tmpDir, "installed");
+  const runtimeDir = path.join(tmpDir, "installed-runtime");
+  const installDir = path.join(tmpDir, "installed-full");
   const tmpDb = path.join(tmpDir, "context.db");
   const sampleFile = path.join(tmpDir, "sample.js");
   fs.writeFileSync(sampleFile, "export const v = 1;\n", "utf8");
 
   let serverProc = null;
   try {
-    // 1. install + doctor to isolated target
+    // 1a. Default runtime-only install omits devtools and passes doctor
+    const instRt = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "scripts", "install.mjs"), "install", "--target", runtimeDir, "--mode", "balanced-16k"],
+      {
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, AGY_DART_DISABLE_COMPILE_CACHE: "1" }
+      }
+    );
+    assert.equal(instRt.status, 0, `runtime install failed:\n${instRt.stdout}\n${instRt.stderr}`);
+    assert.equal(fs.existsSync(path.join(runtimeDir, "scripts", "cache-audit.mjs")), false, "Runtime-only install must omit cache-audit.mjs");
+    assert.equal(fs.existsSync(path.join(runtimeDir, "fast", "benchmark.mjs")), false, "Runtime-only install must omit benchmark.mjs");
+    assert.ok(fs.existsSync(path.join(runtimeDir, "context", "lib", "handoff.js")));
+    assert.ok(fs.existsSync(path.join(runtimeDir, "context", "lib", "config.js")));
+
+    // 1b. --with-devtools install + doctor to isolated target
     const inst = spawnSync(
       process.execPath,
-      [path.join(ROOT, "scripts", "install.mjs"), "install", "--target", installDir, "--mode", "balanced-16k"],
+      [path.join(ROOT, "scripts", "install.mjs"), "install", "--target", installDir, "--mode", "balanced-16k", "--with-devtools"],
       {
         encoding: "utf8",
         windowsHide: true,

@@ -542,14 +542,21 @@ test("Sidecar standalone HTTP server exposes /api/cache-diag, /api/cli-filter, /
       });
     });
 
-  const httpJson = (urlPath, method = "GET") =>
+  const httpJson = (urlPath, method = "GET", bodyObj = null, extraHeaders = {}) =>
     new Promise((resolve, reject) => {
-      const req = http.request({ hostname: "127.0.0.1", port, path: urlPath, method }, (res) => {
+      const payload = bodyObj !== null ? JSON.stringify(bodyObj) : null;
+      const headers = { ...extraHeaders };
+      if (payload !== null) {
+        headers["Content-Type"] = "application/json";
+        headers["Content-Length"] = Buffer.byteLength(payload, "utf8");
+      }
+      const req = http.request({ hostname: "127.0.0.1", port, path: urlPath, method, headers }, (res) => {
         let body = "";
         res.on("data", (c) => (body += c));
         res.on("end", () => resolve({ status: res.statusCode, body }));
       });
       req.on("error", reject);
+      if (payload !== null) req.write(payload);
       req.end();
     });
 
@@ -558,15 +565,22 @@ test("Sidecar standalone HTTP server exposes /api/cache-diag, /api/cli-filter, /
     const html = await httpJson("/");
     assert.equal(html.status, 200);
     assert.ok(html.body.includes("KV-Cache &amp; Context Watermark"));
+    const tokenMatch = html.body.match(/<meta name="agy-dart-token" content="([a-f0-9]+)">/i);
+    assert.ok(tokenMatch && tokenMatch[1], "Sidecar HTML must inject per-process CSRF token meta tag");
+    const csrfHeaders = { "X-Agy-Dart-Token": tokenMatch[1] };
+
+    // Unauthenticated / GET mutation attempts must be rejected
+    assert.equal((await httpJson("/api/purge?scope=all", "GET")).status, 405);
+    assert.equal((await httpJson("/api/cli-filter", "POST", { enabled: false })).status, 403);
 
     const stats = JSON.parse((await httpJson("/api/stats")).body);
     assert.equal(stats.cliFilterEnabled, true);
     assert.equal(stats.readDedupEnabled, true);
 
-    const toggled = JSON.parse((await httpJson("/api/cli-filter?enabled=false", "POST")).body);
+    const toggled = JSON.parse((await httpJson("/api/cli-filter", "POST", { enabled: false }, csrfHeaders)).body);
     assert.equal(toggled.cliFilterEnabled, false);
 
-    const dedupToggled = JSON.parse((await httpJson("/api/read-dedup?enabled=false", "POST")).body);
+    const dedupToggled = JSON.parse((await httpJson("/api/read-dedup", "POST", { enabled: false }, csrfHeaders)).body);
     assert.equal(dedupToggled.readDedupEnabled, false);
 
     const kv = JSON.parse((await httpJson("/api/cache-diag")).body);
@@ -581,11 +595,11 @@ test("Sidecar standalone HTTP server exposes /api/cache-diag, /api/cli-filter, /
     const seedStore = new ContextModeStore({ dbPath: tmpDb });
     seedStore.indexContent({ sessionId: "sidecar-keep", worktree: tmpDir, kind: "file", label: "keep.txt", content: "keep me alive" });
     seedStore.close();
-    const maintEmpty = JSON.parse((await httpJson("/api/maintenance?action=vacuum&maxAgeDays=", "POST")).body);
+    const maintEmpty = JSON.parse((await httpJson("/api/maintenance", "POST", { action: "vacuum", maxAgeDays: "" }, csrfHeaders)).body);
     assert.equal(maintEmpty.ok, true);
     assert.equal(maintEmpty.deletedSources, 0);
 
-    const maint = JSON.parse((await httpJson("/api/maintenance?action=vacuum&maxAgeDays=14", "POST")).body);
+    const maint = JSON.parse((await httpJson("/api/maintenance", "POST", { action: "vacuum", maxAgeDays: 14 }, csrfHeaders)).body);
     assert.equal(maint.ok, true);
     assert.equal(maint.vacuumed, true);
   } finally {
