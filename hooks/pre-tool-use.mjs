@@ -1,17 +1,80 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ContextModeStore } from "../context/lib/store.js";
+import { fileURLToPath } from "node:url";
+import { enableVersionedCompileCache } from "./compile-cache.mjs";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const CLI_FILTER_SCRIPT = path.resolve(__dirname, "cli-filter.mjs");
+
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  const a = path.resolve(process.argv[1]);
+  const b = path.resolve(__filename);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+const isDirectRun = isMainModule();
+
+// Dynamically loaded AFTER enableVersionedCompileCache() in CLI runs so Node's V8 compile cache
+// actually caches store.js & filter-rules.mjs AND 0-SQLite fast paths skip loading them entirely.
+let ContextModeStoreClass = null;
+let matchFilterRuleFn = null;
+let securityModule = null;
+let textDiffModule = null;
+
+async function ensureStoreClass() {
+  if (!ContextModeStoreClass) {
+    ({ ContextModeStore: ContextModeStoreClass } = await import("../context/lib/store.js"));
+  }
+  return ContextModeStoreClass;
+}
+
+async function ensureFilterRules() {
+  if (!matchFilterRuleFn) {
+    ({ matchFilterRule: matchFilterRuleFn } = await import("./filter-rules.mjs"));
+  }
+  return matchFilterRuleFn;
+}
+
+async function ensureSecurityModule() {
+  if (!securityModule) {
+    securityModule = await import("../context/lib/security.js");
+  }
+  return securityModule;
+}
+
+async function ensureTextDiffModule() {
+  if (!textDiffModule) {
+    textDiffModule = await import("../context/lib/text-diff.js");
+  }
+  return textDiffModule;
+}
+
+if (!isDirectRun) {
+  await Promise.all([ensureStoreClass(), ensureFilterRules(), ensureSecurityModule(), ensureTextDiffModule()]);
+}
 
 export const DEFAULT_MAX_READ_BYTES = 16384; // 16 KB balanced default (~410 lines)
 export const DEFAULT_MAX_LINE_RANGE = 410;
+export const MIN_DEDUP_FILE_BYTES = 1024;
+export const MAX_SNAPSHOT_FILE_BYTES = 256 * 1024;
+export const MIN_DIFF_READ_BYTES = 1536;
+export const MAX_DIFF_READ_BYTES = 6500;
+export const MAX_DIFF_READ_RATIO = 0.4;
+const MAX_SLICE_MEASURE_BYTES = 2 * 1024 * 1024;
 const CTX_SERVER = "agy-dart_context";
 const FAST_SERVER = "agy-dart_fast";
 
 let sharedStore = null;
 function getSharedStore() {
   if (!sharedStore) {
-    sharedStore = new ContextModeStore();
+    if (!ContextModeStoreClass) {
+      throw new Error("ContextModeStore not initialized");
+    }
+    sharedStore = new ContextModeStoreClass();
   }
   return sharedStore;
 }
@@ -77,11 +140,16 @@ function formatBytes(bytes) {
 export function cleanStringArg(val) {
   if (val === undefined || val === null) return "";
   let str = String(val).trim();
-  while (
-    (str.startsWith('"') && str.endsWith('"') && str.length >= 2) ||
-    (str.startsWith("'") && str.endsWith("'") && str.length >= 2)
-  ) {
-    str = str.slice(1, -1).trim();
+  while (str.length >= 2) {
+    const q = str[0];
+    if ((q === '"' || q === "'") && str[str.length - 1] === q) {
+      const inner = str.slice(1, -1);
+      // Only unwrap if the entire value was wrapped in a single matching pair (never break `"exe" "arg"`)
+      if (inner.includes(q)) break;
+      str = inner.trim();
+      continue;
+    }
+    break;
   }
   return str;
 }
@@ -190,13 +258,13 @@ export function resolveSharedSessionId(payload = {}) {
     payload.root_conversation_id ||
     payload.parentConversationId ||
     payload.parent_conversation_id ||
-    process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
-    process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID ||
-    process.env.ANTIGRAVITY_CONVERSATION_ID ||
     payload.conversationId ||
     payload.conversation_id ||
     payload.sessionId ||
     payload.session_id ||
+    process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
+    process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID ||
+    process.env.ANTIGRAVITY_CONVERSATION_ID ||
     "default"
   );
 }
@@ -213,24 +281,105 @@ export function resolveAgentName(payload = {}) {
   );
 }
 
-function recordInterception({ sessionId, agent, cwd, toolName, path: targetPath, size, reason }) {
+function recordInterception({
+  sessionId,
+  agent,
+  cwd,
+  toolName,
+  path: targetPath,
+  size,
+  reason,
+  kind = "interception",
+  key = "blocked",
+  returnedBytes = 0
+}) {
   try {
     getSharedStore().recordEvent({
       sessionId: sessionId || "default",
       worktree: cwd || process.cwd(),
       agent: agent || "antigravity",
-      kind: "interception",
+      kind,
       tool: toolName,
-      key: "blocked",
+      key,
       path: targetPath || null,
-      ok: 0,
-      exitCode: 1,
+      ok: kind === "dedup" ? 1 : 0,
+      exitCode: kind === "dedup" ? 0 : 1,
       bytes: size || 0,
       body: reason,
       sandboxBytes: size || 0,
-      returnedBytes: 0
+      returnedBytes: returnedBytes || 0
     });
   } catch {}
+}
+
+function readUtf8TextSafe(absPath) {
+  try {
+    const buf = fs.readFileSync(absPath);
+    if (buf.length >= 2 && ((buf[0] === 0xff && buf[1] === 0xfe) || (buf[0] === 0xfe && buf[1] === 0xff))) {
+      return null;
+    }
+    return buf.toString("utf8");
+  } catch {
+    return null;
+  }
+}
+
+function sha256Text(text) {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+/** Measure exact UTF-8 byte length of 1-based inclusive line range [startLine..endLine] */
+function measureLineRangeBytes(absPath, startLine, endLine, fileSize, fallbackBytes) {
+  if (endLine === null || endLine === undefined) return fallbackBytes;
+  const sLine = Math.max(1, Number(startLine) || 1);
+  const eLine = Number(endLine);
+  if (!Number.isFinite(eLine) || eLine < sLine) return 0;
+  if (fileSize > MAX_SLICE_MEASURE_BYTES) return fallbackBytes;
+  try {
+    const buf = fs.readFileSync(absPath);
+    if (buf.length === 0) return 0;
+    let lineNum = 1;
+    let rangeStart = sLine === 1 ? 0 : null;
+    let rangeEnd = buf.length;
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i] === 0x0a) {
+        if (lineNum === eLine) {
+          rangeEnd = i + 1;
+          break;
+        }
+        lineNum++;
+        if (lineNum === sLine) {
+          rangeStart = i + 1;
+        }
+      }
+    }
+    if (rangeStart === null) return 0;
+    return Math.max(0, rangeEnd - rangeStart);
+  } catch {
+    return fallbackBytes;
+  }
+}
+
+/** Build a shell-safe PreToolUse.overwrite command wrapping a noisy CLI command via cli-filter.mjs */
+export function buildCliFilterRewrite(commandLine, sessionId = "default", cwd = process.cwd()) {
+  if (!matchFilterRuleFn) return null;
+  const matched = matchFilterRuleFn(commandLine, { cwd });
+  if (!matched) return null;
+  const scriptPosix = CLI_FILTER_SCRIPT.replace(/\\/g, "/");
+  // Bail out if plugin install path itself has shell-special characters
+  if (/["$`\r\n]/.test(scriptPosix)) return null;
+
+  const enc = (s) => `b:${Buffer.from(s, "utf8").toString("base64url")}`;
+  const b64 = enc(matched.effectiveCommand);
+  const origB64 = enc(commandLine.trim());
+  const sessB64 = enc(sessionId || "default");
+  const noteFlag = matched.note ? ` --note ${enc(matched.note)}` : "";
+
+  return {
+    ruleId: matched.rule.id,
+    rewrittenCommand: `node "${scriptPosix}" --rule ${matched.rule.id} --b64 ${b64} --orig-b64 ${origB64} --session ${sessB64}${noteFlag}`,
+    note: matched.note
+  };
 }
 
 function readStdin() {
@@ -363,6 +512,8 @@ function finishAllow() {
 }
 
 async function main() {
+  enableVersionedCompileCache();
+
   const rawInput = await readStdin();
   if (!rawInput.trim()) return finishAllow();
 
@@ -380,70 +531,394 @@ async function main() {
   const sessionId = resolveSharedSessionId(payload);
   const agentName = resolveAgentName(payload);
 
+  // 0-SQLite fast path: bypass DB & heavy module loading entirely for unconditionally allowed tools/files
+  if (toolName !== "read_file" && toolName !== "view_file" && toolName !== "run_command") {
+    return finishAllow();
+  }
+
+  let preParsedRead = null;
+  if (toolName === "read_file" || toolName === "view_file") {
+    if (process.env.AGY_DART_DISABLE_READ_HOOK === "1") {
+      return finishAllow();
+    }
+    const rawFilePath = args.Path || args.path || args.filePath || args.AbsolutePath || args.absolutePath || "";
+    const filePath = cleanFilePath(rawFilePath);
+    if (!filePath) {
+      return finishAllow();
+    }
+    const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
+    const ext = path.extname(absPath).toLowerCase();
+    if (
+      isUserAttachedFile(rawFilePath, absPath) ||
+      isAgentInstructionFile(rawFilePath, absPath) ||
+      BINARY_EXTENSIONS.has(ext)
+    ) {
+      return finishAllow();
+    }
+    preParsedRead = { rawFilePath, filePath, absPath, ext };
+  }
+
+  // Load ContextModeStore (and filter-rules for run_command) AFTER enableVersionedCompileCache()
+  // so V8 bytecode caching captures these heavy modules on every guarded invocation.
+  await ensureStoreClass();
+  if (toolName === "run_command") {
+    await ensureFilterRules();
+  }
+
   if (isProtectionPaused(sessionId)) {
     return finishAllow();
   }
 
   // 1. Guard read_file / view_file (unless disabled via env for ultra-low-latency mode B)
-  if ((toolName === "read_file" || toolName === "view_file") && process.env.AGY_DART_DISABLE_READ_HOOK !== "1") {
-    const rawFilePath = args.Path || args.path || args.filePath || "";
-    const filePath = cleanFilePath(rawFilePath);
-    const startLine = parseLineArg(args.StartLine ?? args.startLine) ?? 1;
-    const endLine = parseLineArg(args.EndLine ?? args.endLine);
+  if (preParsedRead) {
+    const { filePath, absPath, ext } = preParsedRead;
+    const startLine = parseLineArg(args.StartLine ?? args.startLine ?? args.start_line) ?? 1;
+    const endLine = parseLineArg(args.EndLine ?? args.endLine ?? args.end_line);
     const maxReadBytes = getMaxReadBytes(sessionId);
     const maxLineRange = getMaxLineRange(maxReadBytes);
 
-    if (filePath) {
-      const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-      try {
-        if (fs.existsSync(absPath)) {
-          const ext = path.extname(absPath).toLowerCase();
-          const isUserAttachment = isUserAttachedFile(rawFilePath, absPath);
-          const isAgentDoc = isAgentInstructionFile(rawFilePath, absPath);
-          const exemptExtensions = getExemptExtensions(sessionId);
-          const isExemptExt = exemptExtensions.includes(ext);
-          const isBinary = isBinaryFile(absPath, ext);
+    try {
+      if (fs.existsSync(absPath)) {
+        const stat = fs.statSync(absPath);
+        if (!stat.isFile()) {
+          return finishAllow();
+        }
 
-          if (isUserAttachment || isAgentDoc || isExemptExt || isBinary) {
-            return finishAllow();
+        // Optional sensitive credential file read guard (opt-in via AGY_DART_SENSITIVE_FILE_GUARD=warn|deny)
+        const rawSensMode = (process.env.AGY_DART_SENSITIVE_FILE_GUARD || "").trim().toLowerCase();
+        if (rawSensMode && rawSensMode !== "off" && rawSensMode !== "0" && rawSensMode !== "false") {
+          const sec = await ensureSecurityModule();
+          const guardMode = sec.getSensitiveFileGuardMode();
+          if (guardMode === "warn" || guardMode === "deny") {
+            const sens = sec.detectSensitiveFile(absPath);
+            if (sens.sensitive) {
+              const normKey = process.platform === "win32" ? absPath.toLowerCase() : absPath;
+              const confirmKey = `sensitive_read_confirm:${sessionId}:${normKey}`;
+              if (guardMode === "deny") {
+                const reason =
+                  `[agy-dart sensitive-file] Reading '${filePath}' (${sens.reason}) is blocked by AGY_DART_SENSITIVE_FILE_GUARD=deny to keep raw secrets out of LLM context.`;
+                recordInterception({
+                  sessionId,
+                  agent: agentName,
+                  cwd,
+                  toolName,
+                  path: filePath,
+                  size: stat.size,
+                  reason,
+                  key: "sensitive_file"
+                });
+                closeSharedStore();
+                process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
+                process.exit(0);
+              }
+              const confirmed = getSharedStore().getTimedMeta(confirmKey, "");
+              if (!confirmed) {
+                getSharedStore().setTimedMeta(confirmKey, "1");
+                const reason =
+                  `[agy-dart sensitive-file] '${filePath}' looks like a sensitive file (${sens.reason}). Avoid pulling raw credentials into LLM context (or use ctx_index which redacts common secrets). Call ${toolName} once more if you intentionally need to inspect it.`;
+                recordInterception({
+                  sessionId,
+                  agent: agentName,
+                  cwd,
+                  toolName,
+                  path: filePath,
+                  size: stat.size,
+                  reason,
+                  key: "sensitive_file_warn"
+                });
+                closeSharedStore();
+                process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
+                process.exit(0);
+              }
+            }
           }
+        }
 
-          const stat = fs.statSync(absPath);
+        const exemptExtensions = getExemptExtensions(sessionId);
+        const isExemptExt = exemptExtensions.includes(ext);
+        const isBinary = isBinaryFile(absPath, ext);
+
+        if (isExemptExt || isBinary) {
+          return finishAllow();
+        }
+
           const isLargeFile = maxReadBytes > 0 && stat.size > maxReadBytes;
           const isWideRange = maxLineRange > 0 && (endLine === null || (endLine - startLine) > maxLineRange);
 
-          if (isLargeFile && isWideRange) {
-            const lineInstruction =
-              maxLineRange > 0
-                ? ` or outline via ${FAST_SERVER} read_slices({ outlines }) then pass StartLine/EndLine (<= ${maxLineRange} lines).`
-                : "";
-            const reason =
-              `[agy-dart protection] File is ${formatBytes(stat.size)} (~${Math.round(stat.size / 4).toLocaleString()} tokens), exceeding the ${formatBytes(maxReadBytes)} context limit. ` +
-              `Reading the entire file risks severe context bloat. ` +
-              `For logs/docs/data use call_mcp_tool(ServerName:"${CTX_SERVER}", ToolName:"ctx_index" or "ctx_execute", path:"${filePath}")${lineInstruction}`;
+        if (isLargeFile && isWideRange) {
+          const lineInstruction =
+            maxLineRange > 0
+              ? ` or outline via ${FAST_SERVER} read_slices({ outlines }) then pass StartLine/EndLine (<= ${maxLineRange} lines).`
+              : "";
+          const reason =
+            `[agy-dart protection] File is ${formatBytes(stat.size)} (~${Math.round(stat.size / 4).toLocaleString()} tokens), exceeding the ${formatBytes(maxReadBytes)} context limit. ` +
+            `Reading the entire file risks severe context bloat. ` +
+            `For logs/docs/data use call_mcp_tool(ServerName:"${CTX_SERVER}", ToolName:"ctx_index" or "ctx_execute", path:"${filePath}")${lineInstruction}`;
 
-            recordInterception({
+          recordInterception({
+            sessionId,
+            agent: agentName,
+            cwd,
+            toolName,
+            path: filePath,
+            size: stat.size,
+            reason
+          });
+
+          try {
+            getSharedStore().recordGhostInterception({
               sessionId,
-              agent: agentName,
-              cwd,
-              toolName,
-              path: filePath,
-              size: stat.size,
-              reason
+              filePath: absPath,
+              fileSize: stat.size,
+              cutoffBytes: maxReadBytes
+            });
+          } catch {}
+
+          closeSharedStore();
+          process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
+          process.exit(0);
+        }
+
+        // 1b. Three-State Session File Read Cache: Full -> Unchanged Dedup -> Compact Unified Diff on Modified
+        const byteOffset = parseLineArg(args.ByteOffset ?? args.byteOffset) ?? 0;
+        const estBytes =
+          endLine !== null
+            ? Math.min(stat.size, Math.max(MIN_DEDUP_FILE_BYTES, Math.max(1, endLine - startLine + 1) * 45))
+            : stat.size;
+        let dedupEnabled = true;
+        try {
+          dedupEnabled = getSharedStore().isReadDedupEnabled(sessionId);
+        } catch {}
+
+        const diffReadEnabled =
+          dedupEnabled &&
+          process.env.AGY_DART_DISABLE_DIFF_READ !== "1" &&
+          stat.size <= MAX_SNAPSHOT_FILE_BYTES;
+
+        if (dedupEnabled && stat.size >= MIN_DEDUP_FILE_BYTES && byteOffset <= 0) {
+          try {
+            const store = getSharedStore();
+            const dup = store.findDuplicateRead({
+              sessionId,
+              filePath: absPath,
+              startLine,
+              endLine,
+              mtimeMs: stat.mtimeMs,
+              fileSize: stat.size
             });
 
-            closeSharedStore();
-            process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
-            process.exit(0);
+            // State 2 (Unchanged covering read): 2-strike bypass
+            if (dup && Number(dup.bypass_armed) === 0) {
+              store.armReadBypass({
+                sessionId,
+                filePath: absPath,
+                startLine: dup.start_line,
+                endLine: dup.end_line
+              });
+              const rangeLabel = endLine !== null ? `lines ${startLine}-${endLine}` : "full file";
+              const dedupReason =
+                `[agy-dart read-dedup] '${filePath}' (${rangeLabel}, ~${formatBytes(estBytes)}) was already read unchanged earlier in this session ` +
+                `(mtime & size identical). Reuse the copy already in context to save tokens; if context was compacted and you truly need a fresh copy, call ${toolName} once more to bypass.`;
+
+              recordInterception({
+                sessionId,
+                agent: agentName,
+                cwd,
+                toolName,
+                path: filePath,
+                size: estBytes,
+                reason: dedupReason,
+                kind: "dedup",
+                key: "unchanged_reread"
+              });
+
+              closeSharedStore();
+              process.stdout.write(JSON.stringify({ decision: "deny", reason: dedupReason }) + "\n");
+              process.exit(0);
+            }
+
+            let currentRangeText = null;
+            let currentSha256 = null;
+            let currentRangeBytes = 0;
+
+            const loadCurrentRange = async () => {
+              if (currentRangeText !== null) return true;
+              const rawDisk = readUtf8TextSafe(absPath);
+              if (rawDisk === null) return false;
+              const { extractLineSlice } = await ensureTextDiffModule();
+              currentRangeText = extractLineSlice(rawDisk, startLine, endLine, 1);
+              const sliceBytes = Buffer.byteLength(currentRangeText, "utf8");
+              currentRangeBytes = endLine === null && startLine === 1 ? Math.max(sliceBytes, stat.size) : sliceBytes;
+              currentSha256 = sha256Text(currentRangeText);
+              return true;
+            };
+
+            // State 3 (Modified file previously snapshotted covering [startLine..endLine])
+            if (!dup && diffReadEnabled) {
+              const snapshot = store.findFileSnapshot({
+                sessionId,
+                filePath: absPath,
+                startLine,
+                endLine
+              });
+
+              if (snapshot && (await loadCurrentRange())) {
+                const { computeUnifiedDiff, extractLineSlice } = await ensureTextDiffModule();
+                const baselineText = snapshot.isExactRange
+                  ? snapshot.content
+                  : extractLineSlice(snapshot.content, startLine, endLine, snapshot.start_line);
+                const baselineSha256 = snapshot.isExactRange ? snapshot.sha256 : sha256Text(baselineText);
+
+                if (currentSha256 === baselineSha256) {
+                  // Strike 2 retry after diff delivery (bypass_armed === 1) OR PostToolUse edit
+                  // invalidation with unchanged disk bytes (v1.1 compatibility) -> allow full verbatim.
+                  if (Number(snapshot.bypass_armed) === 1) {
+                    store.armSnapshotBypass({
+                      sessionId,
+                      filePath: absPath,
+                      startLine: snapshot.start_line,
+                      endLine: snapshot.end_line,
+                      armed: 0
+                    });
+                  }
+                } else if (currentRangeBytes >= MIN_DIFF_READ_BYTES) {
+                  const diff = computeUnifiedDiff(baselineText, currentRangeText, {
+                    fileLabel: path.basename(filePath),
+                    startLine,
+                    maxDiffBytes: MAX_DIFF_READ_BYTES
+                  });
+
+                  if (
+                    diff.changed &&
+                    !diff.truncated &&
+                    diff.diffBytes > 0 &&
+                    diff.diffBytes <= MAX_DIFF_READ_BYTES &&
+                    diff.diffBytes < currentRangeBytes * MAX_DIFF_READ_RATIO
+                  ) {
+                    store.saveFileSnapshot({
+                      sessionId,
+                      filePath: absPath,
+                      startLine,
+                      endLine,
+                      sha256: currentSha256,
+                      mtimeMs: stat.mtimeMs,
+                      fileSize: stat.size,
+                      content: currentRangeText,
+                      bypassArmed: 1
+                    });
+
+                    const rangeLabel = endLine !== null ? `lines ${startLine}-${endLine}` : "full file";
+                    const pctSaved = Math.max(1, Math.round((1 - diff.diffBytes / currentRangeBytes) * 100));
+                    const diffReason =
+                      `[agy-dart diff-read] '${filePath}' (${rangeLabel}) changed since last read ` +
+                      `(+${diff.addedLines}/-${diff.removedLines} lines, diff ${formatBytes(diff.diffBytes)} vs full ${formatBytes(currentRangeBytes)}, -${pctSaved}%):\n` +
+                      `\`\`\`diff\n${diff.diff}\n\`\`\`\n` +
+                      `Reuse the prior copy in context + diff above; if you need the full file verbatim (e.g. after /compact), call ${toolName} once more to bypass.`;
+
+                    recordInterception({
+                      sessionId,
+                      agent: agentName,
+                      cwd,
+                      toolName,
+                      path: filePath,
+                      size: currentRangeBytes,
+                      returnedBytes: diff.diffBytes,
+                      reason: diffReason,
+                      kind: "dedup",
+                      key: "modified_diff"
+                    });
+
+                    closeSharedStore();
+                    process.stdout.write(JSON.stringify({ decision: "deny", reason: diffReason }) + "\n");
+                    process.exit(0);
+                  }
+                }
+              }
+            }
+
+            // State 1 (First read) / Strike 2 bypass / large rewrite fallback:
+            // Record this allowed read (resets bypass_armed = 0) and save compressed snapshot baseline.
+            store.recordFileRead({
+              sessionId,
+              filePath: absPath,
+              startLine,
+              endLine,
+              mtimeMs: stat.mtimeMs,
+              fileSize: stat.size,
+              byteEst: estBytes
+            });
+
+            if (diffReadEnabled && (await loadCurrentRange())) {
+              store.saveFileSnapshot({
+                sessionId,
+                filePath: absPath,
+                startLine,
+                endLine,
+                sha256: currentSha256,
+                mtimeMs: stat.mtimeMs,
+                fileSize: stat.size,
+                content: currentRangeText,
+                bypassArmed: 0
+              });
+            }
+          } catch {
+            // Fail-open on DB/diff errors
           }
         }
-      } catch {}
-    }
+
+        // 1c. Track allowed paged recalls against any prior Ghost Registry interception (even if dedup is off)
+        if (endLine !== null) {
+          try {
+            const store = getSharedStore();
+            if (store.hasGhostInterception(sessionId, absPath)) {
+              const actualBytes = measureLineRangeBytes(absPath, startLine, endLine, stat.size, estBytes);
+              store.recordGhostRecall({
+                sessionId,
+                filePath: absPath,
+                bytesRead: actualBytes
+              });
+            }
+          } catch {}
+        }
+      }
+    } catch {}
   }
 
-  // 2. Guard run_command
+  // 2. Guard run_command (transparent PreToolUse.overwrite CLI filter + unbounded dump protection)
   if (toolName === "run_command") {
-    const rawCommandLine = args.CommandLine || args.commandLine || args.command || "";
+    const cmdKey =
+      "CommandLine" in args
+        ? "CommandLine"
+        : "commandLine" in args
+          ? "commandLine"
+          : "command";
+    const rawCommandLine = args[cmdKey] || "";
+    const isDaemon = Boolean(args.IsDaemon || args.isDaemon);
+
+    // 2a. Transparent CLI output filtering via PreToolUse.overwrite (zero extra LLM turn!)
+    let cliFilterEnabled = true;
+    try {
+      cliFilterEnabled = getSharedStore().isCliFilterEnabled(sessionId);
+    } catch {}
+
+    if (cliFilterEnabled && !isDaemon && rawCommandLine) {
+      const trimmedCmd = String(rawCommandLine).trim();
+      const rewrite = buildCliFilterRewrite(trimmedCmd, sessionId, cwd);
+      if (rewrite) {
+        closeSharedStore();
+        process.stdout.write(
+          JSON.stringify({
+            decision: "allow",
+            overwrite: {
+              [cmdKey]: rewrite.rewrittenCommand
+            }
+          }) + "\n"
+        );
+        process.exit(0);
+      }
+    }
+
+    // 2b. Hard-deny unbounded raw file dumps / stdout downloads / unbounded git log (when CLI filter off)
     const inspection = inspectCommand({ commandLine: rawCommandLine, cwd, sessionId });
 
     if (inspection.shouldDeny) {
@@ -466,6 +941,8 @@ async function main() {
   return finishAllow();
 }
 
-main().catch(() => {
-  finishAllow();
-});
+if (isDirectRun) {
+  main().catch(() => {
+    finishAllow();
+  });
+}
