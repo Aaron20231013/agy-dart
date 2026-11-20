@@ -6,6 +6,17 @@
 import { promises as fs2 } from "node:fs";
 import os from "node:os";
 import path2 from "node:path";
+// [agy-dart KV-cache extension]
+import {
+  analyzeMultipleSessionsCache,
+  DEFAULT_CACHE_TTL_SEC,
+  extractStepTokenUsage,
+  formatCacheDiagMarkdown
+} from "../context/lib/cache-analyzer.js";
+import {
+  formatSimulationMarkdown,
+  simulateCachePolicies
+} from "../context/lib/cache-simulator.js";
 
 // src/benchmark-core.ts
 import { promises as fs } from "node:fs";
@@ -737,13 +748,12 @@ function analyzeTranscriptSessions(sessions) {
       }
       prevTurnHadUserInputBetween = false;
       if (tPlanner !== null) prevPlannerMs = tPlanner;
-      const outTok = Number(step.output_tokens ?? 0);
-      if (Number.isFinite(outTok) && outTok > 0) {
-        totalOutputTokens += outTok;
+      const stepUsage = extractStepTokenUsage(step);
+      if (stepUsage.outputTokens > 0) {
+        totalOutputTokens += stepUsage.outputTokens;
       }
-      const inTok = Number(step.input_tokens ?? 0);
-      const cacheTok = Number(step.cache_read_tokens ?? 0);
-      const ctxTok = (Number.isFinite(inTok) ? inTok : 0) + (Number.isFinite(cacheTok) ? cacheTok : 0);
+      const cacheTok = stepUsage.cacheReadTokens;
+      const ctxTok = stepUsage.contextTokens;
       if (ctxTok > 0) {
         contextSum += ctxTok;
         contextCount += 1;
@@ -877,6 +887,7 @@ function analyzeTranscriptSessions(sessions) {
       if (sessionHasStartupSnapshot(steps)) sessionsWithSnapshot += 1;
     }
   }
+  const cacheAttribution = analyzeMultipleSessionsCache(sessions);
   return {
     sessions: validSessions,
     sessionsWithAgyFast,
@@ -907,7 +918,8 @@ function analyzeTranscriptSessions(sessions) {
     avgContextTokens: contextCount > 0 ? Math.round(contextSum / contextCount) : 0,
     over150kContextRatio: contextCount > 0 ? over150kCount / contextCount : 0,
     avgCacheHitRate: cacheHitCount > 0 ? cacheHitSum / cacheHitCount : 0,
-    over60sGapRatio: turnGapsTotal > 0 ? turnGapsOver60s / turnGapsTotal : 0
+    over60sGapRatio: turnGapsTotal > 0 ? turnGapsOver60s / turnGapsTotal : 0,
+    cacheAttribution
   };
 }
 function round2(n) {
@@ -1115,10 +1127,18 @@ async function analyzePathsByUsage(inputs, options = {}) {
     withoutAgyFast: analyzeTranscriptSessions(withoutFastSessions)
   };
 }
+function fmtUsdBench(val) {
+  const n = Number(val || 0);
+  if (!Number.isFinite(n) || n === 0) return "$0.00";
+  const abs = Math.abs(n);
+  const sign = n < 0 ? "-" : "";
+  return abs < 0.01 ? `${sign}$${abs.toFixed(4)}` : `${sign}$${abs.toFixed(2)}`;
+}
 function formatMetricsMarkdown(m) {
   const fastTotal = Object.values(m.agyFastToolCalls).reduce((a, b) => a + b, 0);
   const editRedundancy = m.editFileCalls > 0 ? pct(m.redundantSameTurnEditFileCalls / m.editFileCalls) : "0.0%";
   const readonlyShellRatio = m.runCommandCalls > 0 ? pct(m.readonlySearchRunCommandCalls / m.runCommandCalls) : "0.0%";
+  const ca = m.cacheAttribution;
   return [
     "# agy-fast Transcript Benchmark",
     "",
@@ -1144,7 +1164,24 @@ function formatMetricsMarkdown(m) {
     `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, check:${m.agyFastToolCalls.run_checks}) |`,
     `| agy-fast health (spills / truncs / errs) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyErrorCalls} |`,
     `| Parallel batching leaks (multi-MCP / multi-run_command turns) | ${m.multiMcpTurns} / ${m.multiRunCommandTurns} |`,
-    `| Multimodal >=180k turns (media loaded) | ${m.multimodalHighCtxTurns} (${m.mediaLoadedCount} media) |`
+    `| Multimodal >=180k turns (media loaded) | ${m.multimodalHighCtxTurns} (${m.mediaLoadedCount} media) |`,
+    ...(ca
+      ? [
+          `| Prompt Cache busts (TTL/compact/model/sys/media/drift) | ${ca.bustCount} (${ca.bustsByCause.ttl_idle_expiry}/${ca.bustsByCause.compaction_or_truncation}/${ca.bustsByCause.model_switch}/${ca.bustsByCause.system_injection}/${ca.bustsByCause.multimodal_media}/${ca.bustsByCause.prefix_drift}) |`,
+          `| Wasted re-prefill tokens from busts | ${(ca.wastedTokensTotal || 0).toLocaleString("en-US")}${ca.estimatedWastedUsd > 0 ? ` (~${fmtUsdBench(ca.estimatedWastedUsd)})` : ""} |`,
+          ...(ca.turnsWithUsage > 0
+            ? [
+                `| Est. Prompt Cache cost savings | ${Number(ca.estimatedCostSavingsPct || 0).toFixed(1)}% (${fmtUsdBench(ca.estimatedSavedUsd)} ${ca.estimatedSavedUsd >= 0 ? "saved" : "net"} / ${fmtUsdBench(ca.estimatedInputCostUsd)} input) |`
+              ]
+            : []),
+          ...(ca.cacheCreationTokensTotal > 0
+            ? [
+                `| Prompt Cache write (creation) tokens | ${ca.cacheCreationTokensTotal.toLocaleString("en-US")} (${Number(ca.cacheWriteMultiplier || 1).toFixed(2)}x write) |`
+              ]
+            : []),
+          `| Duplicate identical read_file calls | ${ca.duplicateReadCount || 0} |`
+        ]
+      : [])
   ].join("\n");
 }
 function formatDelta(before, after) {
@@ -1233,15 +1270,18 @@ function printUsage() {
   process.stdout.write(
     [
       "Usage:",
-      "  node dist/benchmark.mjs analyze <path...> [--recent <N>] [--since <ISO>] [--until <ISO>] [--split-usage] [--json]",
-      "  node dist/benchmark.mjs analyze --local [--recent <N>] [--since <ISO>] [--until <ISO>] [--split-usage] [--json]",
-      "  node dist/benchmark.mjs compare --before <path> --after <path> [--json]",
+      "  node fast/benchmark.mjs analyze <path...> [--recent <N>] [--since <ISO>] [--until <ISO>] [--split-usage] [--json]",
+      "  node fast/benchmark.mjs analyze --local [--recent <N>] [--since <ISO>] [--until <ISO>] [--split-usage] [--json]",
+      "  node fast/benchmark.mjs cache [--local | <path...>] [--recent <N>] [--since <ISO>] [--until <ISO>] [--ttl <sec>] [--json]",
+      "  node fast/benchmark.mjs cache simulate [--local | <path...>] [--recent <N>] [--since <ISO>] [--until <ISO>] [--json]",
+      "  node fast/benchmark.mjs compare --before <path> --after <path> [--json]",
       "",
       "Options:",
       "  --local        Scan ~/.gemini/antigravity/brain and ~/.gemini/antigravity-cli/brain",
       "  --recent <N>   Analyze only the N most recently modified transcripts",
       "  --since <ISO>  Include only steps at or after an ISO-8601 timestamp (e.g. 2026-11-19T12:51:00+08:00)",
       "  --until <ISO>  Include only steps at or before an ISO-8601 timestamp",
+      "  --ttl <sec>    Prompt-cache idle TTL override in seconds for 'cache' command (default: auto/profile)",
       "  --split-usage  Split metrics into sessions with vs. without agy-fast tool calls",
       "  --json         Output raw JSON metrics"
     ].join("\n") + "\n"
@@ -1254,6 +1294,104 @@ async function main(argv) {
     return;
   }
   const cmd = args[0];
+  if (cmd === "cache") {
+    const isSimulate = args[1] === "simulate";
+    const targets = [];
+    const explicitTargets = [];
+    let recent;
+    let sinceMs;
+    let untilMs;
+    let ttlSec;
+    let asJson = false;
+    for (let i = isSimulate ? 2 : 1; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--json") {
+        asJson = true;
+      } else if (a === "--local") {
+        targets.push(
+          path2.join(os.homedir(), ".gemini", "antigravity", "brain"),
+          path2.join(os.homedir(), ".gemini", "antigravity-ide", "brain"),
+          path2.join(os.homedir(), ".gemini", "antigravity-cli", "brain")
+        );
+      } else if (a === "--recent" || a.startsWith("--recent=")) {
+        const raw = a === "--recent" ? args[++i] : a.slice("--recent=".length);
+        const parsed = raw !== void 0 ? parsePositiveInt(raw) : null;
+        if (parsed === null) {
+          process.stderr.write("Error: --recent must be a positive integer\n");
+          process.exitCode = 1;
+          return;
+        }
+        recent = parsed;
+      } else if (a === "--ttl" || a.startsWith("--ttl=")) {
+        const raw = a === "--ttl" ? args[++i] : a.slice("--ttl=".length);
+        const parsed = raw !== void 0 ? parsePositiveInt(raw) : null;
+        if (parsed === null) {
+          process.stderr.write("Error: --ttl must be a positive integer (seconds)\n");
+          process.exitCode = 1;
+          return;
+        }
+        ttlSec = parsed;
+      } else if (a === "--since" || a.startsWith("--since=")) {
+        const raw = a === "--since" ? args[++i] : a.slice("--since=".length);
+        const parsed = raw !== void 0 ? parseIsoTimestamp(raw) : null;
+        if (parsed === null) {
+          process.stderr.write("Error: --since must be a valid ISO-8601 date or timestamp\n");
+          process.exitCode = 1;
+          return;
+        }
+        sinceMs = parsed;
+      } else if (a === "--until" || a.startsWith("--until=")) {
+        const raw = a === "--until" ? args[++i] : a.slice("--until=".length);
+        const parsed = raw !== void 0 ? parseIsoTimestamp(raw, true) : null;
+        if (parsed === null) {
+          process.stderr.write("Error: --until must be a valid ISO-8601 date or timestamp\n");
+          process.exitCode = 1;
+          return;
+        }
+        untilMs = parsed;
+      } else if (a.startsWith("-")) {
+        process.stderr.write(`Error: unknown option: ${a}\n`);
+        process.exitCode = 1;
+        return;
+      } else {
+        targets.push(a);
+        explicitTargets.push(a);
+      }
+    }
+    if (sinceMs !== void 0 && untilMs !== void 0 && sinceMs > untilMs) {
+      process.stderr.write("Error: --since must be earlier than or equal to --until\n");
+      process.exitCode = 1;
+      return;
+    }
+    if (targets.length === 0) {
+      targets.push(
+        path2.join(os.homedir(), ".gemini", "antigravity", "brain"),
+        path2.join(os.homedir(), ".gemini", "antigravity-ide", "brain"),
+        path2.join(os.homedir(), ".gemini", "antigravity-cli", "brain")
+      );
+    }
+    if (explicitTargets.length > 0 && !await assertPathsExist(explicitTargets)) {
+      process.exitCode = 1;
+      return;
+    }
+    const opts = {};
+    if (recent !== void 0) opts.recent = recent;
+    if (sinceMs !== void 0) opts.sinceMs = sinceMs;
+    if (untilMs !== void 0) opts.untilMs = untilMs;
+    const sessions = await loadFilteredSessions(targets, opts);
+    if (isSimulate) {
+      const sim = simulateCachePolicies(sessions, ttlSec !== void 0 ? { ttlSec } : {});
+      process.stdout.write(
+        asJson ? `${JSON.stringify(sim, null, 2)}\n` : `${formatSimulationMarkdown(sim)}\n`
+      );
+      return;
+    }
+    const diag = analyzeMultipleSessionsCache(sessions, ttlSec !== void 0 ? { ttlSec } : {});
+    process.stdout.write(
+      asJson ? `${JSON.stringify(diag, null, 2)}\n` : `${formatCacheDiagMarkdown(diag)}\n`
+    );
+    return;
+  }
   if (cmd === "analyze") {
     const targets = [];
     const explicitTargets = [];
