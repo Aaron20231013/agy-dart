@@ -4,49 +4,227 @@ import http from "node:http";
 import https from "node:https";
 import { executeCode, runProcess, OUTPUT_CAP } from "./executor.js";
 import { SNIPPET_MAX_BYTES } from "./store.js";
+import {
+  detectSensitiveFile,
+  getSensitiveFileGuardMode,
+  isSecretRedactionEnabled,
+  redactSecrets,
+  sanitizeUrlForDisplay,
+  validateFetchTarget
+} from "./security.js";
 
 const EXEC_PREVIEW_BYTES = 4096;
 const MAX_INLINE_PREVIEW_BYTES = 8100; // Keep total MCP JSON response <= 8.8 KB to avoid Antigravity output.txt disk spills
+const MAX_MCP_JSON_BYTES = 8700;
+const MAX_FETCH_REDIRECTS = 5;
+const MAX_FETCH_BODY_BYTES = 10 * 1024 * 1024;
+
+let jsonCrusherMod = undefined;
+async function getJsonCrusher() {
+  if (jsonCrusherMod === undefined) {
+    try {
+      jsonCrusherMod = await import("./json-crusher.js");
+    } catch {
+      jsonCrusherMod = null;
+    }
+  }
+  return jsonCrusherMod;
+}
 
 /** Truncate string strictly by UTF-8 byte length without breaking surrogate/multi-byte chars */
 function truncateUtf8(text, maxBytes) {
+  if (maxBytes <= 0) return "";
   if (!text || Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   const sliced = Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
   return sliced.replace(/\uFFFD+$/, "");
 }
 
-/** Fetch URL text content */
-function fetchUrlText(urlStr, timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    try {
-      const parsed = new URL(urlStr);
-      const client = parsed.protocol === "https:" ? https : http;
-      const req = client.get(parsed, { timeout: timeoutMs }, (res) => {
-        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          return fetchUrlText(res.headers.location, timeoutMs).then(resolve, reject);
-        }
-        if (res.statusCode && res.statusCode >= 400) {
-          return reject(new Error(`HTTP ${res.statusCode} ${res.statusMessage}`));
-        }
-        const chunks = [];
-        let total = 0;
-        res.on("data", (c) => {
-          total += c.byteLength;
-          if (total <= 10 * 1024 * 1024) {
-            chunks.push(c);
-          }
-        });
-        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-      });
-      req.on("error", reject);
-      req.on("timeout", () => {
-        req.destroy();
-        reject(new Error("Request timed out"));
-      });
-    } catch (e) {
-      reject(e);
+/**
+ * Guarantee that JSON.stringify(obj, null, 2) stays strictly <= maxJsonBytes UTF-8 bytes
+ * even after JSON escaping (e.g. thousands of \n -> \\n or quotes) expands string fields.
+ */
+function capSerializedJsonField(obj, fieldName, rawBody, suffix = "", maxJsonBytes = MAX_MCP_JSON_BYTES) {
+  obj[fieldName] = `${rawBody}${suffix}`;
+  const measure = () => Buffer.byteLength(JSON.stringify(obj, null, 2), "utf8");
+  if (measure() <= maxJsonBytes) {
+    return { truncatedForJson: false, keptBody: rawBody };
+  }
+  const rawBytes = Buffer.byteLength(rawBody, "utf8");
+  let lo = 0;
+  let hi = rawBytes;
+  let best = "";
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const candidate = truncateUtf8(rawBody, mid);
+    obj[fieldName] = `${candidate}${suffix}`;
+    if (measure() <= maxJsonBytes) {
+      best = candidate;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
     }
-  });
+  }
+  obj[fieldName] = `${best}${suffix}`;
+  return { truncatedForJson: true, keptBody: best };
+}
+
+/**
+ * Fetch URL text content with SSRF hardening:
+ *  - Enforces http:/https: protocol whitelist
+ *  - Resolves relative Location redirects up to maxRedirects (default 5)
+ *  - Validates DNS per hop against private/loopback/link-local IPs & pins resolved IP
+ */
+export async function fetchUrlText(urlStr, timeoutOrOptions = 15000) {
+  const opts =
+    typeof timeoutOrOptions === "number"
+      ? { timeoutMs: timeoutOrOptions }
+      : timeoutOrOptions && typeof timeoutOrOptions === "object"
+        ? timeoutOrOptions
+        : {};
+  const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : 15000;
+  const maxRedirects =
+    Number.isInteger(opts.maxRedirects) && opts.maxRedirects >= 0 ? opts.maxRedirects : MAX_FETCH_REDIRECTS;
+  const maxBodyBytes =
+    Number.isFinite(opts.maxBodyBytes) && opts.maxBodyBytes > 0 ? opts.maxBodyBytes : MAX_FETCH_BODY_BYTES;
+
+  const deadline = Date.now() + timeoutMs;
+  let currentUrl = String(urlStr || "").trim();
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    const remainingBeforeDns = deadline - Date.now();
+    if (remainingBeforeDns <= 0) {
+      throw new Error("Request timed out");
+    }
+
+    const { parsed, pinned, pinnedRecords } = await validateFetchTarget(currentUrl, {
+      allowPrivate: Boolean(opts.allowPrivate),
+      lookupFn: opts.lookupFn
+    });
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new Error("Request timed out");
+    }
+
+    const outcome = await new Promise((resolve, reject) => {
+      let settled = false;
+      const client = parsed.protocol === "https:" ? https : http;
+      const validated = Array.isArray(pinnedRecords) && pinnedRecords.length > 0 ? pinnedRecords : [pinned];
+      const pinnedLookup = (_hostname, lookupOpts, cb) => {
+        const callback = typeof lookupOpts === "function" ? lookupOpts : cb;
+        const wantAll = typeof lookupOpts === "object" && lookupOpts && lookupOpts.all;
+        const reqFamily = typeof lookupOpts === "object" && lookupOpts ? lookupOpts.family : 0;
+        const filtered =
+          reqFamily === 4 || reqFamily === 6 ? validated.filter((r) => r.family === reqFamily) : validated;
+        const chosen = filtered.length > 0 ? filtered : validated;
+        if (wantAll) {
+          callback(
+            null,
+            chosen.map((r) => ({ address: r.address, family: r.family }))
+          );
+        } else {
+          callback(null, chosen[0].address, chosen[0].family);
+        }
+      };
+
+      let req = null;
+      const finishResolve = (val) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadlineTimer);
+        resolve(val);
+      };
+      const finishReject = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadlineTimer);
+        reject(err);
+      };
+
+      const deadlineTimer = setTimeout(() => {
+        if (!settled) {
+          finishReject(new Error("Request timed out"));
+          if (req) req.destroy();
+        }
+      }, remainingMs);
+      deadlineTimer.unref();
+
+      req = client.get(
+        parsed,
+        {
+          timeout: remainingMs,
+          lookup: pinnedLookup,
+          headers: { "User-Agent": "agy-dart/1.1" }
+        },
+        (res) => {
+          const code = res.statusCode || 0;
+          if (code >= 300 && code < 400) {
+            const loc = Array.isArray(res.headers.location) ? res.headers.location[0] : res.headers.location;
+            if (!loc) {
+              finishReject(new Error(`HTTP ${code} redirect missing Location header`));
+              res.destroy();
+              req.destroy();
+              return;
+            }
+            let nextUrl;
+            try {
+              nextUrl = new URL(loc, parsed).toString();
+            } catch {
+              finishReject(new Error(`Invalid redirect Location header: ${loc}`));
+              res.destroy();
+              req.destroy();
+              return;
+            }
+            finishResolve({ redirectTo: nextUrl });
+            res.destroy();
+            req.destroy();
+            return;
+          }
+          if (code >= 400) {
+            finishReject(new Error(`HTTP ${code} ${res.statusMessage || ""}`.trim()));
+            res.destroy();
+            req.destroy();
+            return;
+          }
+          const chunks = [];
+          let total = 0;
+          const doneBody = () => {
+            finishResolve({ body: Buffer.concat(chunks).toString("utf8") });
+          };
+          res.on("data", (c) => {
+            if (settled) return;
+            if (total < maxBodyBytes) {
+              const remain = maxBodyBytes - total;
+              chunks.push(c.byteLength <= remain ? c : c.subarray(0, remain));
+              total += Math.min(c.byteLength, remain);
+            }
+            if (total >= maxBodyBytes) {
+              doneBody();
+              res.destroy();
+              req.destroy();
+            }
+          });
+          res.on("end", doneBody);
+          res.on("error", (err) => finishReject(err));
+        }
+      );
+      req.on("error", (err) => finishReject(err));
+      req.on("timeout", () => {
+        finishReject(new Error("Request timed out"));
+        req.destroy();
+      });
+    });
+
+    if (outcome.redirectTo) {
+      if (hop >= maxRedirects) {
+        throw new Error(`Too many redirects (exceeded max ${maxRedirects} hops)`);
+      }
+      currentUrl = outcome.redirectTo;
+      continue;
+    }
+    return outcome.body || "";
+  }
+
+  throw new Error(`Too many redirects (exceeded max ${maxRedirects} hops)`);
 }
 
 /** Render helper for ASCII bar chart */
@@ -81,10 +259,13 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
       });
 
       const elapsedMs = Date.now() - startTime;
-      const fullOutput = (result.stdout ? result.stdout : "") + (result.stderr ? "\n" + result.stderr : "");
+      const rawCombined = (result.stdout ? result.stdout : "") + (result.stderr ? "\n" + result.stderr : "");
+      const redacted = redactSecrets(rawCombined);
+      const fullOutput = redacted.text;
       const fullBytes = Buffer.byteLength(fullOutput, "utf8");
 
       let sourceId = null;
+      let deduplicated = false;
       if (fullBytes > 0) {
         const indexed = store.indexContent({
           sessionId,
@@ -92,9 +273,11 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
           agent: "antigravity",
           kind: "execution",
           label: intent || `${language} script (${elapsedMs}ms)`,
-          content: fullOutput
+          content: fullOutput,
+          dedup: true
         });
         sourceId = indexed.sourceId;
+        deduplicated = Boolean(indexed.deduplicated);
       }
 
       const cutoffBytes = store.getCutoff(sessionId);
@@ -106,12 +289,95 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
 
       let returnedText = fullOutput;
       let truncated = false;
+      let crushedJson = false;
       if (fullBytes > previewCapBytes) {
-        returnedText = truncateUtf8(fullOutput, previewCapBytes);
+        const crusher = await getJsonCrusher();
+        if (crusher && crusher.isJsonLike(fullOutput)) {
+          const initialBudget = Math.min(previewCapBytes, 6800);
+          let crushed = crusher.smartCrushJson(fullOutput, {
+            maxBytes: initialBudget,
+            sourceId
+          });
+          if (crushed.crushed) {
+            // Check JSON-in-JSON escaping overhead so capSerializedJsonField doesn't chop valid crushed JSON
+            const probeObj = {
+              ok: result.ok,
+              exitCode: result.exitCode,
+              elapsedMs,
+              language,
+              intent: intent || null,
+              sourceId,
+              deduplicated,
+              crushedJson: true,
+              rawBytes: fullBytes,
+              returnedBytes: crushed.crushedBytes,
+              ...(redacted.redactedCount > 0 ? { redactedSecrets: redacted.redactedCount } : {}),
+              output: crushed.text
+            };
+            const probeBytes = Buffer.byteLength(JSON.stringify(probeObj, null, 2), "utf8");
+            if (probeBytes > MAX_MCP_JSON_BYTES) {
+              const targetBudget = Math.max(
+                512,
+                Math.floor((initialBudget * (MAX_MCP_JSON_BYTES - 450)) / probeBytes)
+              );
+              const reCrushed = crusher.smartCrushJson(fullOutput, {
+                maxBytes: targetBudget,
+                sourceId
+              });
+              if (reCrushed.crushed) crushed = reCrushed;
+            }
+            returnedText = crushed.text;
+            crushedJson = true;
+          }
+        }
+        if (!crushedJson) {
+          returnedText = truncateUtf8(fullOutput, previewCapBytes);
+          truncated = true;
+        }
+      }
+
+      const truncSuffix = sourceId
+        ? `\n\n... [truncated to protect context window; full output indexed into ${sourceId}. Use ctx_search(queries: [...], sourceId: "${sourceId}") to query it]`
+        : "\n\n... [truncated to protect context window]";
+
+      const responseObj = {
+        ok: result.ok,
+        exitCode: result.exitCode,
+        elapsedMs,
+        language,
+        intent: intent || null,
+        sourceId,
+        deduplicated,
+        ...(crushedJson ? { crushedJson: true } : {}),
+        rawBytes: fullBytes,
+        returnedBytes: Buffer.byteLength(returnedText, "utf8"),
+        ...(redacted.redactedCount > 0 ? { redactedSecrets: redacted.redactedCount } : {}),
+        output: ""
+      };
+
+      const cappedExec = capSerializedJsonField(
+        responseObj,
+        "output",
+        returnedText,
+        truncated ? truncSuffix : "",
+        MAX_MCP_JSON_BYTES
+      );
+      if (cappedExec.truncatedForJson && !truncated) {
+        const reCapped = capSerializedJsonField(
+          responseObj,
+          "output",
+          returnedText,
+          truncSuffix,
+          MAX_MCP_JSON_BYTES
+        );
+        returnedText = reCapped.keptBody;
         truncated = true;
+      } else {
+        returnedText = cappedExec.keptBody;
       }
 
       const returnedBytes = Buffer.byteLength(returnedText, "utf8");
+      responseObj.returnedBytes = returnedBytes;
 
       store.recordEvent({
         sessionId,
@@ -129,22 +395,7 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
         returnedBytes
       });
 
-      let responseText = returnedText;
-      if (truncated) {
-        responseText += `\n\n... [${formatBytes(fullBytes - returnedBytes)} truncated to protect context window; full output indexed into ${sourceId}. Use ctx_search(queries: [...], sourceId: "${sourceId}") to query it]`;
-      }
-
-      return {
-        ok: result.ok,
-        exitCode: result.exitCode,
-        elapsedMs,
-        language,
-        intent: intent || null,
-        sourceId,
-        rawBytes: fullBytes,
-        returnedBytes,
-        output: responseText
-      };
+      return responseObj;
     },
 
     // 2. ctx_batch
@@ -163,17 +414,22 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
         outputs.push(text);
       }
 
-      const combined = outputs.join("\n");
+      const redactedBatch = redactSecrets(outputs.join("\n"));
+      const combined = redactedBatch.text;
+      totalRawBytes = Buffer.byteLength(combined, "utf8");
       const indexed = store.indexContent({
         sessionId,
         worktree: cwd,
         agent: "antigravity",
         kind: "batch",
         label: `batch: ${cmdList.length} commands`,
-        content: combined
+        content: combined,
+        dedup: true
       });
+      const deduplicated = Boolean(indexed.deduplicated);
 
       let returnedContent = "";
+      let batchTruncated = false;
       if (queries && queries.length > 0) {
         const searchRes = store.search({
           queries,
@@ -183,18 +439,48 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
         });
         returnedContent = searchRes.hits.map((h) => `[ord ${h.ord}] ${h.snippet}`).join("\n\n---\n\n");
         if (Buffer.byteLength(returnedContent, "utf8") > MAX_INLINE_PREVIEW_BYTES) {
-          returnedContent =
-            truncateUtf8(returnedContent, MAX_INLINE_PREVIEW_BYTES - 160) +
-            `\n\n... [truncated to stay <=8.8 KB inline; use ctx_search(queries: [...], sourceId: "${indexed.sourceId}")]`;
+          returnedContent = truncateUtf8(returnedContent, MAX_INLINE_PREVIEW_BYTES - 160);
+          batchTruncated = true;
         }
       } else {
         returnedContent = truncateUtf8(combined, EXEC_PREVIEW_BYTES);
         if (totalRawBytes > EXEC_PREVIEW_BYTES) {
-          returnedContent += `\n\n... [truncated. Use ctx_search(queries: [...], sourceId: "${indexed.sourceId}") to search full batch output]`;
+          batchTruncated = true;
         }
       }
 
-      const returnedBytes = Buffer.byteLength(returnedContent, "utf8");
+      const batchSuffix = `\n\n... [truncated to stay <=8.8 KB inline; use ctx_search(queries: [...], sourceId: "${indexed.sourceId}")]`;
+      const batchResp = {
+        commandsRun: cmdList.length,
+        sourceId: indexed.sourceId,
+        deduplicated,
+        rawBytes: totalRawBytes,
+        returnedBytes: 0,
+        ...(redactedBatch.redactedCount > 0 ? { redactedSecrets: redactedBatch.redactedCount } : {}),
+        content: ""
+      };
+      const cappedBatch = capSerializedJsonField(
+        batchResp,
+        "content",
+        returnedContent,
+        batchTruncated ? batchSuffix : "",
+        MAX_MCP_JSON_BYTES
+      );
+      if (cappedBatch.truncatedForJson && !batchTruncated) {
+        const reCapped = capSerializedJsonField(
+          batchResp,
+          "content",
+          returnedContent,
+          batchSuffix,
+          MAX_MCP_JSON_BYTES
+        );
+        returnedContent = reCapped.keptBody;
+      } else {
+        returnedContent = cappedBatch.keptBody;
+      }
+
+      const returnedBytes = Buffer.byteLength(batchResp.content, "utf8");
+      batchResp.returnedBytes = returnedBytes;
       store.recordEvent({
         sessionId,
         worktree: cwd,
@@ -208,13 +494,7 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
         returnedBytes
       });
 
-      return {
-        commandsRun: cmdList.length,
-        sourceId: indexed.sourceId,
-        rawBytes: totalRawBytes,
-        returnedBytes,
-        content: returnedContent
-      };
+      return batchResp;
     },
 
     // 3. ctx_index
@@ -223,15 +503,24 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
       const sessionId = getSessionId();
       let rawText = content || "";
       let resolvedLabel = label;
+      let sensitiveFileWarning = null;
 
+      let safeUrlForMeta = "";
       if (url) {
-        resolvedLabel = resolvedLabel || url;
+        safeUrlForMeta = sanitizeUrlForDisplay(url);
+        resolvedLabel = resolvedLabel || safeUrlForMeta;
         rawText = await fetchUrlText(url);
       } else if (filePath) {
         resolvedLabel = resolvedLabel || filePath;
         const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
         if (!fs.existsSync(absPath)) {
           throw new Error(`File not found: ${filePath}`);
+        }
+        const sens = detectSensitiveFile(absPath);
+        if (sens.sensitive) {
+          sensitiveFileWarning = isSecretRedactionEnabled()
+            ? `Indexed file '${path.basename(absPath)}' matches sensitive pattern (${sens.reason}); detected credentials were redacted before indexing.`
+            : `Indexed file '${path.basename(absPath)}' matches sensitive pattern (${sens.reason}); warning: secret redaction is currently disabled.`;
         }
         rawText = fs.readFileSync(absPath, "utf8");
       }
@@ -240,21 +529,31 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
         throw new Error("No content, file path, or url provided to index");
       }
 
+      const redacted = redactSecrets(rawText);
+      const safeText = redacted.text;
+
       const indexed = store.indexContent({
         sessionId,
         worktree: cwd,
         agent: "antigravity",
         kind: url ? "web" : filePath ? "file" : "text",
         label: resolvedLabel || "manual_index",
-        content: rawText
+        content: safeText,
+        dedup: true
       });
 
+      const deduplicated = Boolean(indexed.deduplicated);
       const returnObj = {
         sourceId: indexed.sourceId,
         label: indexed.label,
         bytesTotal: indexed.bytesTotal,
         chunkCount: indexed.chunkCount,
-        message: `Indexed ${formatBytes(indexed.bytesTotal)} into ${indexed.chunkCount} chunks. Query with ctx_search.`
+        deduplicated,
+        ...(redacted.redactedCount > 0 ? { redactedSecrets: redacted.redactedCount } : {}),
+        ...(sensitiveFileWarning ? { sensitiveFileWarning } : {}),
+        message: deduplicated
+          ? `Reused existing indexed source ${indexed.sourceId} (${formatBytes(indexed.bytesTotal)}, ${indexed.chunkCount} chunks, unchanged content). Query with ctx_search.`
+          : `Indexed ${formatBytes(indexed.bytesTotal)} into ${indexed.chunkCount} chunks. Query with ctx_search.`
       };
 
       const returnedBytes = Buffer.byteLength(JSON.stringify(returnObj), "utf8");
@@ -265,11 +564,11 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
         agent: "antigravity",
         kind: "index",
         tool: "ctx_index",
-        path: filePath || url || null,
+        path: filePath || safeUrlForMeta || null,
         ok: 1,
-        bytes: indexed.bytesTotal,
+        bytes: deduplicated ? 0 : indexed.bytesTotal,
         body: returnObj.message,
-        sandboxBytes: indexed.bytesTotal,
+        sandboxBytes: deduplicated ? 0 : indexed.bytesTotal,
         returnedBytes
       });
 
@@ -291,12 +590,33 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
         offset
       });
 
+      // Enforce <= 8.8 KB total JSON response UTF-8 cap (prevents Antigravity disk spills on large/CJK hits)
+      const MAX_SEARCH_JSON_BYTES = 8600;
+      const boundedHits = [];
+      let totalBytes = Buffer.byteLength(
+        JSON.stringify({ queries, totalMatches: res.totalMatches, returned: 0, offset: res.offset, hits: [] }, null, 2),
+        "utf8"
+      );
+      for (const hit of res.hits) {
+        const entry = { ...hit };
+        let entryBytes = Buffer.byteLength(JSON.stringify(entry, null, 2), "utf8") + 4;
+        if (totalBytes + entryBytes > MAX_SEARCH_JSON_BYTES) {
+          const remaining = MAX_SEARCH_JSON_BYTES - totalBytes - 180;
+          if (remaining < 160) break;
+          entry.snippet = truncateUtf8(entry.snippet, remaining) + "\n... [capped <=8.8KB]";
+          entryBytes = Buffer.byteLength(JSON.stringify(entry, null, 2), "utf8") + 4;
+          if (totalBytes + entryBytes > MAX_SEARCH_JSON_BYTES) break;
+        }
+        boundedHits.push(entry);
+        totalBytes += entryBytes;
+      }
+
       return {
         queries,
         totalMatches: res.totalMatches,
-        returned: res.returned,
+        returned: boundedHits.length,
         offset: res.offset,
-        hits: res.hits
+        hits: boundedHits
       };
     },
 
@@ -306,13 +626,40 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
       if (seq !== null && seq !== undefined) {
         const ev = store.getEventBySeq(seq);
         if (!ev) throw new Error(`Event sequence #${seq} not found`);
-        return { event: ev };
+        const boundedEv = { ...ev };
+        if (typeof boundedEv.body === "string") {
+          const wrap = { event: boundedEv };
+          if (Buffer.byteLength(JSON.stringify(wrap, null, 2), "utf8") > MAX_MCP_JSON_BYTES) {
+            capSerializedJsonField(
+              boundedEv,
+              "body",
+              boundedEv.body,
+              "\n... [capped <=8.8KB]",
+              MAX_MCP_JSON_BYTES - 64
+            );
+          }
+        }
+        return { event: boundedEv };
       }
+
+      // Calling ctx_resume signals compaction recovery: clear session read-dedup table so fresh reads work immediately
+      try {
+        store.invalidateFileReads(sessionId, null);
+      } catch {}
 
       const state = store.getResumeState(sessionId, 5);
       const stats = store.getStats(sessionId);
+      const rawCp = state.sessionCheckpoint || store.getSessionCheckpoint(sessionId);
+      const checkpoint = rawCp
+        ? {
+            ...rawCp,
+            modifiedFiles: Array.isArray(rawCp.modifiedFiles) ? [...rawCp.modifiedFiles] : [],
+            lastTest: rawCp.lastTest ? { ...rawCp.lastTest } : null,
+            lastBuild: rawCp.lastBuild ? { ...rawCp.lastBuild } : null
+          }
+        : null;
 
-      return {
+      const resumePayload = {
         sessionId,
         stats: {
           calls: stats.calls,
@@ -320,9 +667,58 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
           savingsPercent: `${stats.savingsPercent}%`,
           tokensSaved: stats.tokensKeptOut
         },
-        recentSources: state.recentSources,
-        recentEvents: state.recentEvents
+        sessionCheckpoint: checkpoint,
+        recentSources: Array.isArray(state.recentSources) ? [...state.recentSources] : [],
+        recentEvents: Array.isArray(state.recentEvents) ? [...state.recentEvents] : []
       };
+
+      // Strictly guarantee <= 8.8 KB UTF-8 inline cap even with adversarial CJK paths/commands
+      const MAX_RESUME_JSON_BYTES = 8500;
+      const jsonBytes = () => Buffer.byteLength(JSON.stringify(resumePayload, null, 2), "utf8");
+      const shortenTailPath = (p, maxBytes = 120) => {
+        const s = String(p || "");
+        if (Buffer.byteLength(s, "utf8") <= maxBytes) return s;
+        const buf = Buffer.from(s, "utf8");
+        const tail = buf.subarray(Math.max(0, buf.length - (maxBytes - 3))).toString("utf8").replace(/^\uFFFD+/, "");
+        return `...${tail}`;
+      };
+
+      while (jsonBytes() > MAX_RESUME_JSON_BYTES && resumePayload.recentEvents.length > 0) {
+        resumePayload.recentEvents.pop();
+      }
+      while (jsonBytes() > MAX_RESUME_JSON_BYTES && resumePayload.recentSources.length > 0) {
+        resumePayload.recentSources.pop();
+      }
+      if (jsonBytes() > MAX_RESUME_JSON_BYTES && Array.isArray(resumePayload.sessionCheckpoint?.modifiedFiles)) {
+        resumePayload.sessionCheckpoint.modifiedFiles = resumePayload.sessionCheckpoint.modifiedFiles.map((p) =>
+          shortenTailPath(p, 120)
+        );
+      }
+      while (
+        jsonBytes() > MAX_RESUME_JSON_BYTES &&
+        Array.isArray(resumePayload.sessionCheckpoint?.modifiedFiles) &&
+        resumePayload.sessionCheckpoint.modifiedFiles.length > 0
+      ) {
+        resumePayload.sessionCheckpoint.modifiedFiles.pop();
+      }
+      if (jsonBytes() > MAX_RESUME_JSON_BYTES && resumePayload.sessionCheckpoint) {
+        for (const k of ["lastTest", "lastBuild"]) {
+          const item = resumePayload.sessionCheckpoint[k];
+          if (!item) continue;
+          if (typeof item.summary === "string") item.summary = truncateUtf8(item.summary, 180);
+          if (typeof item.command === "string") item.command = truncateUtf8(item.command, 120);
+        }
+      }
+      if (jsonBytes() > MAX_RESUME_JSON_BYTES && resumePayload.sessionCheckpoint) {
+        for (const k of ["lastTest", "lastBuild"]) {
+          const item = resumePayload.sessionCheckpoint[k];
+          if (!item) continue;
+          if (typeof item.summary === "string") item.summary = truncateUtf8(item.summary, 64);
+          if (typeof item.command === "string") item.command = truncateUtf8(item.command, 64);
+        }
+      }
+
+      return resumePayload;
     },
 
     // 6. ctx_stats
@@ -333,23 +729,34 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
       }
 
       const s = store.getStats(sessionId);
-      const report = [
+      const ghost = store.getGhostStats(sessionId);
+      const bd = s.breakdown || {};
+      const reportLines = [
         "────────────────────────────────────────────────────────────────────────────────",
         ` agy-dart context stats [session: ${sessionId}]`,
         "────────────────────────────────────────────────────────────────────────────────",
-        `  Total Operations:      ${s.calls}`,
+        `  Total Operations:      ${s.calls} (exec:${bd.executions || 0}, idx:${bd.indexes || 0}, cli-filter:${bd.cliFilters || 0}, dedup:${bd.dedups || 0}, blocked:${bd.interceptions || 0})`,
         `  Raw Data Handled:      ${formatBytes(s.totalRawBytes)}`,
         `  Data Fed into LLM:     ${formatBytes(s.totalReturnedBytes)}`,
         `  Tokens Kept Out:       ~${s.tokensKeptOut.toLocaleString()} tokens (${formatBytes(s.keptOutBytes)})`,
-        `  Reduction Rate:        ${s.savingsPercent}% saved`,
+        `  Reduction Rate:        ${s.savingsPercent}% saved`
+      ];
+      if (ghost.totalBlocked > 0) {
+        reportLines.push(
+          `  Ghost Efficiency:      ${Math.round(ghost.evictionEfficiency * 100)}% (ghost recalls: ${ghost.ghostRecalls}/${ghost.totalBlocked})`
+        );
+      }
+      reportLines.push(
         "",
-        `  Without context-mode   ${renderBar(1.0)}  ${formatBytes(s.totalRawBytes)}`,
-        `  With context-mode      ${renderBar(s.totalRawBytes > 0 ? s.totalReturnedBytes / s.totalRawBytes : 0)}  ${formatBytes(s.totalReturnedBytes)}`,
+        `  Without agy-dart       ${renderBar(1.0)}  ${formatBytes(s.totalRawBytes)}`,
+        `  With agy-dart          ${renderBar(s.totalRawBytes > 0 ? s.totalReturnedBytes / s.totalRawBytes : 0)}  ${formatBytes(s.totalReturnedBytes)}`,
         "────────────────────────────────────────────────────────────────────────────────"
-      ].join("\n");
+      );
+      const report = reportLines.join("\n");
 
       return {
         stats: s,
+        ghost,
         report
       };
     },
@@ -359,6 +766,13 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
       const doc = store.doctor();
       return {
         doctor: doc,
+        features: {
+          cliFilterEnabled: store.isCliFilterEnabled(getSessionId()),
+          readDedupEnabled: store.isReadDedupEnabled(getSessionId()),
+          headingAwareMarkdownChunking: true,
+          secretRedactionEnabled: isSecretRedactionEnabled(),
+          sensitiveFileGuardMode: getSensitiveFileGuardMode()
+        },
         runtimes: {
           node: process.version,
           platform: process.platform,
@@ -368,10 +782,10 @@ export function createTools({ store, getCwd = () => process.cwd(), getSessionId 
     },
 
     // 8. ctx_purge
-    async ctx_purge({ scope = "session" } = {}) {
+    async ctx_purge({ scope = "session", olderThanDays = 14, vacuum = false } = {}) {
       const sessionId = getSessionId();
       const cwd = getCwd();
-      return store.purge({ scope, sessionId, worktree: cwd });
+      return store.purge({ scope, sessionId, worktree: cwd, olderThanDays, vacuum });
     }
   };
 }
