@@ -1,9 +1,9 @@
 # `agy-dart` — AI 审阅技术简报（AI Review Brief）
 
-> **本文档用途**：面向代码审阅 AI / 架构审计 AI / 安全审查 AI 的高密度项目总览与审阅路线图。对应代码与测试基线提交：`1aec046`（发布候选标签 `v1.2.0-rc`）。代码行数、模块映射与测试数量由 `scripts/gen-review-brief.mjs` 自动同步并受 `--check` 漂移守卫保护。
+> **本文档用途**：面向代码审阅 AI / 架构审计 AI / 安全审查 AI 的高密度项目总览与审阅路线图。对应代码与测试基线提交：`4e3d103`（发布候选标签 `v1.2.0-rc`）。代码行数、模块映射与测试数量由 `scripts/gen-review-brief.mjs` 自动同步并受 `--check` 漂移守卫保护。
 
 <!-- AUTO:META:START -->
-> **同步快照（由 `scripts/gen-review-brief.mjs` 自动维护）**：版本 `v1.2.0` · 核心追踪文件 36 个（合计 30,149 行） · 测试套件 15 个 / 99 个用例 · 可运行 `node scripts/gen-review-brief.mjs --check` 检验零漂移。
+> **同步快照（由 `scripts/gen-review-brief.mjs` 自动维护）**：版本 `v1.2.0` · 核心追踪文件 36 个（合计 32,199 行） · 测试套件 15 个 / 104 个用例 · 可运行 `node scripts/gen-review-brief.mjs --check` 检验零漂移。
 <!-- AUTO:META:END -->
 
 ---
@@ -23,7 +23,7 @@
 | 5 | **Turn-0 前缀确定性与预算封顶**：双 MCP `tools/list` 按键名与工具名规范排序（`canonical = true`）、两次握手 SHA-256 一致；常驻 Turn-0 总估算 `<= 4,000` tokens（含跨语种校准 `±15%` 误差上界） | `scripts/prefix-budget.mjs`、`scripts/cache-audit.mjs`、`context/lib/stable-json.js` |
 | 6 | **中段 Hook 零前缀污染**：`PreInvocation` 告警必须输出 `systemMessage: ""` + `metadata.user_markdown`，严禁向模型注入动态文本破坏服务端 KV-Cache | `hooks/pre-invocation.mjs` |
 | 7 | **钩子严格 Fail-Open 与 0-SQLite 快路径**：任何 Hook 遇到 DB 锁/权限/异常都必须放行；`read_file` 对 `SKILL.md`/`AGENTS.md`/附件/二进制及未受管工具不得打开或创建 SQLite DB，并受 p50/p95 延迟预算约束 | `hooks/pre-tool-use.mjs`、`hooks/post-tool-use.mjs`、`hooks/session-start.mjs` |
-| 8 | **端到端安全边界**：`ctx_index(url)` 强制 SSRF 逐跳 DNS（含 IPv4 映射 IPv6）与 IP Pinning；CLI 过滤严禁放行未授权 Shell 注入或 cmd/PS 跨 Shell 语义漂移元字符；`.agy-dart/filters.json` 拒收指数/分组多项式 ReDoS 正则；Sidecar 强制 `Host`/`Origin`/`Sec-Fetch-Site`（含 `same-site`）防 DNS Rebinding 与跨端口 CSRF、全部 `/api/*`（GET/POST）强制随机 `X-Agy-Dart-Token`、写接口仅 `POST` + `application/json` + `64 KB` 请求体上限，前端防 XSS | `context/lib/security.js`、`hooks/filter-rules.mjs`、`sidecars/dashboard/{server.mjs,index.html}` |
+| 8 | **端到端安全边界**：`ctx_index(url)` 强制 SSRF 逐跳 DNS（含 IPv4 映射 IPv6）与 IP Pinning；CLI 过滤严禁放行未授权 Shell 注入或 cmd/PS 跨 Shell 语义漂移元字符；`.agy-dart/filters.json` 拒收指数/分组多项式 ReDoS 正则；Sidecar 强制 `Host`/`Origin`/`Sec-Fetch-Site`（含 `same-site`）防 DNS Rebinding 与跨端口 CSRF、全部独立 HTTP `/api/*`（GET/POST）强制随机 `X-Agy-Dart-Token`、`SidecarApp` 模式全部 `/api/*` 路由仅限 `POST`（强制 `X-Sidecar-Token`）、写接口与 `/api/search` 仅 `POST` + `application/json` + `64 KB` 请求体上限，前端防 XSS | `context/lib/security.js`、`hooks/filter-rules.mjs`、`sidecars/dashboard/{server.mjs,index.html}` |
 
 ### 1.2 威胁模型（Threat Model）
 
@@ -32,7 +32,7 @@
 | **本地用户与 `~/.agy-dart/config.json`** | 可信 | 拥有本机权限与配置控制权；配置解析仍采用 fail-open，畸形 JSON 不会导致 Hook 崩溃 |
 | **LLM 模型生成的工具参数** | 半可信（可能幻觉/受间接提示注入） | `ctx_index(url)` 强制 SSRF 与私网/回环/元数据拦截；`run_command` 仅对白名单单条安全命令透明改写，拒绝管道/重定向/子 Shell/cmd&PS 元字符；`diffRead` 默认关闭并严格绑定直接对话 ID 与新鲜度窗口 |
 | **工作区仓库内的 `.agy-dart/filters.json`** | 不可信（可能来自第三方恶意仓库） | 所有自定义正则先过零依赖 `isSafeRegex` ReDoS 检测（拒收嵌套量词、分组/非相邻可重叠循环、歧义分支、反向引用与超大重复界），非法规则静默降级跳过 |
-| **本机任意浏览器标签页 / 恶意网页** | 不可信 | 攻击者可能通过 `<img src="http://127.0.0.1:8765/api/purge?scope=all">`、同机跨端口请求（`Sec-Fetch-Site: same-site`）、CORS 简单 POST 或 DNS Rebinding 访问 Sidecar。防护：写操作禁止 GET、校验 `Host` 仅限 loopback、拦截 `cross-site` 与 `/api/*` 上的 `same-site`、全部 `/api/*` 请求强制随机 `X-Agy-Dart-Token`、写接口强制 `Content-Type: application/json` 与 `64 KB` 请求体封顶；SidecarApp 模式同样禁 GET 写接口以确保 `sidecar_sdk` 强制校验 `X-Sidecar-Token` |
+| **本机任意浏览器标签页 / 恶意网页** | 不可信 | 攻击者可能通过 `<img src="http://127.0.0.1:8765/api/purge?scope=all">`、同机跨端口请求（`Sec-Fetch-Site: same-site`）、CORS 简单 POST 或 DNS Rebinding 访问 Sidecar。防护：写操作与 `/api/search` 禁止 GET、校验 `Host` 仅限 loopback、拦截 `cross-site` 与 `/api/*` 上的 `same-site`、全部独立 HTTP `/api/*` 请求强制随机 `X-Agy-Dart-Token`、写接口强制 `Content-Type: application/json` 与 `64 KB` 请求体封顶；SidecarApp 模式对全部 `/api/*` 路由（含只读与写接口）均强制仅限 POST（禁止 GET），以确保 `sidecar_sdk` 强制校验 `X-Sidecar-Token` |
 | **远端 HTTP(S) 响应与本地大文件/日志** | 不可信（可能含密钥、恶意重定向或超长多字节载荷） | `fetchUrlText` 限制协议/重定向次数/总字节与超时并做 DNS Pinning；入库与回传前执行 `redactSecrets`；输出经 UTF-8 安全截断不产生 `\uFFFD` 或孤立代理项 |
 
 ### 1.3 硬不变量 → 测试用例对照表
@@ -101,21 +101,21 @@ flowchart TB
 
 | 文件 | 行数 | 核心职责与关键导出 |
 | :--- | ---: | :--- |
-| `context/lib/store.js` | 123 | `ContextModeStore` 门面类：统一导出与原型聚合（下拆 `context/lib/store/` 5 个职责子模块） |
-| `context/lib/store/schema.js` | 293 | SQLite WAL + FTS5 DDL、幂等列迁移（`content_hash`/`full_read_ts`/`full_read_seq`）、常量与路径解析 |
+| `context/lib/store.js` | 183 | `ContextModeStore` 门面类：统一导出与原型聚合（下拆 `context/lib/store/` 5 个职责子模块） |
+| `context/lib/store/schema.js` | 323 | SQLite WAL + FTS5 DDL、幂等列迁移（`content_hash`/`full_read_ts`/`full_read_seq`）、常量与路径解析 |
 | `context/lib/store/fts.js` | 607 | 标题感知 Markdown 分块、SHA-256 去重索引、Porter BM25 + Trigram RRF 检索与事件流 |
-| `context/lib/store/reads.js` | 532 | 会话未变更读去重（`file_reads`）、gzip 文本快照（`file_snapshots`）、会话轮次序与 Ghost Registry |
+| `context/lib/store/reads.js` | 604 | 会话未变更读去重（`file_reads`）、gzip 文本快照（`file_snapshots`）、会话轮次序与 Ghost Registry |
 | `context/lib/store/checkpoints.js` | 379 | 结构化会话恢复卡（`session_checkpoints`）、持久化符号大纲（`outline_cache`）与 `repo_cache` |
 | `context/lib/store/settings-maintenance.js` | 987 | `meta` 配置、阈值/豁免管理、`getStats`、`getFeatureRoi` 遥测 ROI 量化、TTL 清理与 `VACUUM` |
 | `context/lib/config.js` | 306 | 统一配置加载器（`~/.agy-dart/config.json` + `AGY_DART_*` 环境变量覆盖 + 生效来源追踪） |
 | `context/lib/cache/profiles.js` | 303 | `MODEL_CACHE_PROFILES`（含 Gemini 4/Neon/Carbon/Argon/Hydrogen、Claude 4 系列）、`resolveModelProfile`、`computeCacheWarmth` 与写溢价成本数学 |
-| `context/lib/cache-analyzer.js` | 2,164 | Transcript KV-Cache 诊断引擎：多厂商 Token 提取（防重计）、实证 TTL 校准、7 桶 `contextComposition`、`subagentBreakdown`、死循环 `loopWatch`、6 类 Bust 归因 |
+| `context/lib/cache-analyzer.js` | 2,202 | Transcript KV-Cache 诊断引擎：多厂商 Token 提取（防重计）、实证 TTL 校准、7 桶 `contextComposition`、`subagentBreakdown`、死循环 `loopWatch`、6 类 Bust 归因 |
 | `context/lib/cache-simulator.js` | 1,185 | 离线策略回放引擎（devtools）：对比 7 套策略（`observed`、`ttl-5m`、`ttl-1h`、`cold-boundary-compact`、`cutoff-strict/balanced/relaxed`） |
 | `context/lib/repo-skeleton.js` | 1,036 | `git HEAD` 缓存的核心依赖枢纽扫描（JS/TS + JSONC `tsconfig` `paths`、Python、Rust、Go `go.mod`、Vue/Svelte、Dart、Java） |
 | `context/lib/json-crusher.js` | 852 | 零依赖可逆 JSON/JSONL 结构化粉碎器：提取 Schema/空值统计 + 首尾样本 + 异常项，附带 FTS5 `sourceId` |
-| `context/lib/tools.js` | 820 | `agy-dart_context` 8 个 MCP 工具实现；`dedup: true`、`smartCrushJson`、`featureRoi`、生效配置诊断与 `<= 8.8 KB` UTF-8 封顶 |
+| `context/lib/tools.js` | 857 | `agy-dart_context` 8 个 MCP 工具实现；`dedup: true`、`smartCrushJson`、`featureRoi`、生效配置诊断与 `<= 8.8 KB` UTF-8 封顶 |
 | `context/lib/security.js` | 521 | `validateFetchTarget`（SSRF 逐跳 DNS + IPv4/IPv6 + IP Pinning）、`redactSecrets`、`detectSensitiveFile` |
-| `context/lib/handoff.js` | 494 | 缓存友好交接摘要生成器：`buildHandoffBrief`（分支 + `git diff --stat`、`sessionCheckpoint`、FTS5 句柄、脱敏与 UTF-8 封顶） |
+| `context/lib/handoff.js` | 525 | 缓存友好交接摘要生成器：`buildHandoffBrief`（分支 + `git diff --stat`、`sessionCheckpoint`、FTS5 句柄、脱敏与 UTF-8 封顶） |
 | `context/lib/text-diff.js` | 442 | 零依赖行级 Unified Diff 引擎：首尾裁剪 + 有界 Myers + 线性降级保护 + 1-based `startLine` 偏移 |
 | `context/lib/executor.js` | 222 | 本地沙盒脚本执行器（JS/Node/Python/Shell/PowerShell/CMD，带输出封顶与超时清理） |
 | `context/lib/stable-json.js` | 42 | `stableSortObject`、`stableStringify`、`sha256Hex`（保证 MCP Schema 与指纹 100% 字节确定性） |
@@ -124,12 +124,12 @@ flowchart TB
 
 | 文件 | 行数 | 核心职责与关键导出 |
 | :--- | ---: | :--- |
-| `hooks/filter-rules.mjs` | 1,576 | CLI 降噪规则库：安全拆解单层 `cd [/d] <path> && <cmd>` + `2>&1`、拦截 cmd/PS 危险语法（`%`/`!`/`{}`/`@`/非 git `^`）、11 类内置规则、`.agy-dart/filters.json` ReDoS 防护与大 JSON 粉碎 |
-| `hooks/pre-tool-use.mjs` | 995 | 统一 `PreToolUse` 网关：0-SQLite 快路径 → 可选敏感文件守卫 → 16 KB/410 行大文件拦截 + Ghost → 三态读缓存（`diffRead` 默认关闭、按直接对话 ID 隔离且受轮次/时间新鲜度约束）→ `run_command` 透明 `overwrite` |
-| `hooks/pre-invocation.mjs` | 393 | 零前缀污染 `PreInvocation` 守卫：尾读 `transcript.jsonl`，输出水位/热缓存延迟/TTL 预警/多模态悬崖/死循环告警（全部 `systemMessage: ""`），且在 `cacheWatch=false`/暂停下仍维持 `diffRead` 轮次递增 |
-| `hooks/post-tool-use.mjs` | 376 | 编辑触发单文件 `file_reads` 失效（保快照）并记录 `modifiedFiles`；`ctx_resume` 同时清共享与直接对话快照；写入测试/构建结论到 `sessionCheckpoint` |
-| `hooks/cli-filter.mjs` | 317 | `PreToolUse.overwrite` 执行代理：Windows `cmd.exe`/`powershell.exe` 精确透传退出码、密钥脱敏、原输出入 FTS5、降噪并死守 `<= 8.8 KB` |
-| `hooks/session-start.mjs` | 295 | 前缀稳定启动钩子：支持 `stablePrefixOnly` 与子 Agent 自动省略易变 Git 尾段（并在子进程隔离禁用 Git） |
+| `hooks/filter-rules.mjs` | 2,133 | CLI 降噪规则库：安全拆解单层 `cd [/d] <path> && <cmd>` + `2>&1`、拦截 cmd/PS 危险语法（`%`/`!`/`{}`/`@`/非 git `^`）、11 类内置规则、`.agy-dart/filters.json` ReDoS 防护与大 JSON 粉碎 |
+| `hooks/pre-tool-use.mjs` | 1,160 | 统一 `PreToolUse` 网关：0-SQLite 快路径 → 可选敏感文件守卫 → 16 KB/410 行大文件拦截 + Ghost → 三态读缓存（`diffRead` 默认关闭、按直接对话 ID 隔离且受轮次/时间新鲜度约束）→ `run_command` 透明 `overwrite` |
+| `hooks/pre-invocation.mjs` | 389 | 零前缀污染 `PreInvocation` 守卫：尾读 `transcript.jsonl`，输出水位/热缓存延迟/TTL 预警/多模态悬崖/死循环告警（全部 `systemMessage: ""`），且在 `cacheWatch=false`/暂停下仍维持 `diffRead` 轮次递增 |
+| `hooks/post-tool-use.mjs` | 384 | 编辑触发单文件 `file_reads` 失效（保快照）并记录 `modifiedFiles`；`ctx_resume` 同时清共享与直接对话快照；写入测试/构建结论到 `sessionCheckpoint` |
+| `hooks/cli-filter.mjs` | 331 | `PreToolUse.overwrite` 执行代理：Windows `cmd.exe`/`powershell.exe` 精确透传退出码、密钥脱敏、原输出入 FTS5、降噪并死守 `<= 8.8 KB` |
+| `hooks/session-start.mjs` | 303 | 前缀稳定启动钩子：支持 `stablePrefixOnly` 与子 Agent 自动省略易变 Git 尾段（并在子进程隔离禁用 Git） |
 | `hooks/compile-cache.mjs` | 206 | 版本化 V8 编译缓存管理（保留最近 3 个版本）与跨 Node 22/24 的 `suppressSqliteExperimentalWarning()` 零 stderr 护栏 |
 
 ### 3.3 双 MCP 引擎、Sidecar 面板与审计脚本
@@ -141,12 +141,12 @@ flowchart TB
 | `fast/session-start.mjs` | 889 | 上游工作区结构与 Git 状态快照生成器（由 `hooks/session-start.mjs` 封装调用，已禁自动更新） |
 | `context/server.js` | 269 | `agy-dart_context` MCP stdio 服务端：先激活 V8 编译缓存与 SQLite 告警静默再动态加载库模块；导出冻结规范排序 `TOOL_DEFINITIONS` |
 | `scripts/cache-audit.mjs` | 2,486 | 全域环境 Prompt Cache 体检 `npm run cache:audit`（devtools）：规则/技能 CJK 估 token、双次握手探测 MCP 确定性、静态分析中段 Hook |
-| `scripts/install.mjs` | 532 | 跨平台安装/卸载/模式切换/`doctor` 健康自检：拆分 `RUNTIME_FILES`（默认）与 `DEVTOOLS_FILES`（`--with-devtools`），`doctor` 输出生效配置 |
-| `scripts/verify-package-graph.mjs` | 615 | 静态 Import 图打包校验器（devtools）：线性 JS 词法解析器提取含/无分号（ASI）、多行、注释穿插与带属性动态导入的 ESM/CJS 依赖，证明无漏打模块且 devtools 零泄漏 |
-| `scripts/prefix-budget.mjs` | 669 | Turn-0 前缀预算、双 MCP 指纹与 `--calibrate` 跨语种 Token 估算误差校准审计（devtools，读取统一 `config.json`，超预算/非规范时非零退出码卡口 CI） |
-| `scripts/gen-review-brief.mjs` | 257 | `AI_REVIEW_BRIEF.md` 代码行数/测试基线自动生成与 `--check` 漂移守卫（devtools） |
-| `sidecars/dashboard/server.mjs` | 858 | Sidecar HTTP / SidecarApp 服务：严格 `Host`/同源 `Origin`/`Sec-Fetch-Site` 白名单（拦截 `cross-site`、`same-site` 及伪造头）、`X-Frame-Options: DENY`、每实例随机 `X-Agy-Dart-Token` 覆盖全部 `/api/*`、写接口仅 POST + `application/json` + 64 KB 请求体上限与 `featureRoi` |
-| `sidecars/dashboard/index.html` | 2,083 | 实时仪表盘前端：自动注入并携带 CSRF Token、全写操作 POST JSON、XSS 转义加固、1s 本地 TTL 进度条、Handoff 抽屉与上下文构成条 |
+| `scripts/install.mjs` | 570 | 跨平台安装/卸载/模式切换/`doctor` 健康自检：拆分 `RUNTIME_FILES`（默认）与 `DEVTOOLS_FILES`（`--with-devtools`），`doctor` 输出生效配置 |
+| `scripts/verify-package-graph.mjs` | 1,130 | 静态 Import 图打包校验器（devtools）：线性 JS 词法解析器提取含/无分号（ASI）、多行、注释穿插与带属性动态导入的 ESM/CJS 依赖，证明无漏打模块且 devtools 零泄漏 |
+| `scripts/prefix-budget.mjs` | 915 | Turn-0 前缀预算、双 MCP 指纹与 `--calibrate` 跨语种 Token 估算误差校准审计（devtools，读取统一 `config.json`，超预算/非规范时非零退出码卡口 CI） |
+| `scripts/gen-review-brief.mjs` | 246 | `AI_REVIEW_BRIEF.md` 代码行数/测试基线自动生成与 `--check` 漂移守卫（devtools） |
+| `sidecars/dashboard/server.mjs` | 1,097 | Sidecar HTTP / SidecarApp 服务：严格 `Host`/同源 `Origin`/`Sec-Fetch-Site` 白名单（拦截 `cross-site`、`same-site` 及伪造头）、`X-Frame-Options: DENY`、独立 HTTP 全部 `/api/*` 强制随机 `X-Agy-Dart-Token`、SidecarApp 模式全部 `/api/*` 仅限 POST（强制 `X-Sidecar-Token`）、写接口与 `/api/search` 仅 POST + `application/json` + 64 KB 请求体上限与 `featureRoi` |
+| `sidecars/dashboard/index.html` | 2,090 | 实时仪表盘前端：自动注入并携带 CSRF Token、全部 `/api/*` 调用统一 POST JSON、XSS 转义加固、1s 本地 TTL 进度条、Handoff 抽屉与上下文构成条 |
 <!-- AUTO:CODE_MAP:END -->
 
 ---
@@ -193,7 +193,7 @@ WAL 模式 + `busy_timeout = 5000` + `synchronous = NORMAL` + `_withBusyRetry` �
 
 ## 6. 给审阅 AI 的重点攻防检查清单（High-Risk Review Focus）
 
-1. **Sidecar 鉴权、CSRF 与 DNS Rebinding**：审查 `sidecars/dashboard/server.mjs` 与 `index.html`：确认全部独立 HTTP `/api/*` 端点（含 GET 与 POST）均强制校验随机 `X-Agy-Dart-Token`（`timingSafeEqual`）、拦截 `/api/*` 上的 `Sec-Fetch-Site: cross-site` 与 `same-site`、所有写端点与 `/api/search` 仅限 `POST` + `application/json`、全站校验 `Host` 仅限 loopback 且 `Origin` 同端口防跨端口与 DNS Rebinding、`64 KB` 请求体硬上限（含 `Content-Length` 前置拒绝与 `Connection: close`）、自定义扩展名入库净化与前端全量 `escapeHtml`（含 `scopeLabel`），并在 `SidecarApp` 模式下实测 `X-Sidecar-Token` 鉴权。
+1. **Sidecar 鉴权、CSRF 与 DNS Rebinding**：审查 `sidecars/dashboard/server.mjs` 与 `index.html`：确认全部独立 HTTP `/api/*` 端点（含 GET 与 POST）均强制校验随机 `X-Agy-Dart-Token`（`timingSafeEqual`）、拦截 `/api/*` 上的 `Sec-Fetch-Site: cross-site` 与 `same-site`、所有写端点与 `/api/search` 仅限 `POST` + `application/json`、全站校验 `Host` 仅限 loopback 且 `Origin` 同端口防跨端口与 DNS Rebinding、`64 KB` 请求体硬上限（含 `Content-Length` 前置拒绝与 `Connection: close`）、自定义扩展名入库净化与前端全量 `escapeHtml`（含 `scopeLabel`），并确认 `SidecarApp` 模式下全部 `/api/*` 路由（含只读与写接口）均注册为仅限 `POST`（禁止 `GET`）、`index.html` 对全部 `/api/*` 调用统一发 `POST`，以确保 `sidecar_sdk` 强制执行 `X-Sidecar-Token` 鉴权。
 2. **三态文件读缓存基线归属与新鲜度**：审查 `hooks/pre-tool-use.mjs` + `hooks/post-tool-use.mjs` + `hooks/pre-invocation.mjs` + `context/lib/store/reads.js`：验证 `diffRead` 默认关闭、按直接 `conversationId` 隔离（子 Agent/fork 永不串读父快照或污染父 `file_reads`）、`bumpConversationTurnSeq` 多进程 `BEGIN IMMEDIATE` 原子递增、非读轮次由 `PreInvocation` 同步推进（即使 `cacheWatch: false` 时仍正常推进 `conv_turn_seq`）、`ctx_resume` 同时清空共享与直接对话快照，以及 Myers Diff 往返正确性（`apply(diff(a,b), a) === b`）。
 3. **Shell 注入、跨 Shell 语义漂移与退出码一致性**：审查 `hooks/filter-rules.mjs` 的 `hasUnsafeShellSyntax`（拦截管道/重定向/子 Shell/NUL/`%`/`!`/`{}`/`@`/非 git `^`）与 `unwrapSafeCompoundCommand`（含单/双引号与无引号 `cd` 路径全量拒绝 `!`/`^`/`{}`/`@`/`\0`）、`isSafeRegex` 指数与分组/非相邻多项式 ReDoS 防护，以及 `hooks/cli-filter.mjs` 在 `cmd.exe` vs `powershell.exe` 下的退出码透传。
 4. **Hook 冷/热启动延迟预算与零 stderr 约束**：审查 `hooks/pre-tool-use.mjs` 0-SQLite 快路径与 SQLite 读缓存路径的 p50/p95 延迟断言，以及 `hooks/compile-cache.mjs` 顶层立即挂载 `suppressSqliteExperimentalWarning()` 解决静态 ESM import 提升顺序问题，在 Node 22.x/24.x CI 矩阵下保证 0 字节 `stderr`。
