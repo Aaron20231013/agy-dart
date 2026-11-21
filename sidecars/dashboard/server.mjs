@@ -213,6 +213,17 @@ export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
   });
 }
 
+function scheduleOversizedSocketClose(req, res) {
+  res.once("finish", () => {
+    const closeTimer = setTimeout(() => {
+      try {
+        req.destroy();
+      } catch {}
+    }, 150);
+    closeTimer.unref?.();
+  });
+}
+
 function getPackageVersion() {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../../package.json"), "utf8"));
@@ -1112,11 +1123,7 @@ export function createStandaloneServer({
           const parsed = await readBoundedJsonBody(req, maxBodyBytes);
           if (!parsed.ok) {
             if (parsed.status === 413) {
-              res.once("finish", () => {
-                try {
-                  req.destroy();
-                } catch {}
-              });
+              scheduleOversizedSocketClose(req, res);
             }
             sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
             return;
@@ -1162,6 +1169,9 @@ export function createStandaloneServer({
         }
         const parsed = await readBoundedJsonBody(req, maxBodyBytes);
         if (!parsed.ok) {
+          if (parsed.status === 413) {
+            scheduleOversizedSocketClose(req, res);
+          }
           sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
           return;
         }
@@ -1188,11 +1198,7 @@ export function createStandaloneServer({
         const parsed = await readBoundedJsonBody(req, maxBodyBytes);
         if (!parsed.ok) {
           if (parsed.status === 413) {
-            res.once("finish", () => {
-              try {
-                req.destroy();
-              } catch {}
-            });
+            scheduleOversizedSocketClose(req, res);
           }
           sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
           return;

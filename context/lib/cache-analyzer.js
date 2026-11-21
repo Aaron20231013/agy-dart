@@ -1052,6 +1052,15 @@ export function analyzeTranscriptCache(steps, options = {}) {
     }
 
     if (step.type !== "PLANNER_RESPONSE") {
+      if (
+        !stepIsSubagent &&
+        (step.aborted === true ||
+          step.cancelled === true ||
+          step.canceled === true ||
+          /^(?:CANCELLED|CANCELED|ABORTED|TURN_ABORTED|TURN_END|USER_CANCEL)$/i.test(String(step.type || "")))
+      ) {
+        inToolLoop = false;
+      }
       if (stepIsSubagent) {
         const isSubResponse =
           step.type === "SUBAGENT_RESPONSE" || step.type === "SUBAGENT_TURN" || step.type === "ASSISTANT";
@@ -1280,7 +1289,15 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
     // Update edit<->fail oscillation state and active tool-loop state from primary conversation turns only
     if (!stepIsSubagent) {
-      inToolLoop = (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) || followingResults.length > 0;
+      const isTurnAborted =
+        step.aborted === true ||
+        step.cancelled === true ||
+        step.canceled === true ||
+        /^(?:cancelled|canceled|aborted|interrupted)$/i.test(
+          String(step.stop_reason ?? step.stopReason ?? step.status ?? "")
+        );
+      const hasActiveToolCalls = callBareTools.some((t) => t && t !== "finish");
+      inToolLoop = !isTurnAborted && (hasActiveToolCalls || followingResults.length > 0);
       const turnFailed = followingResults.some((r, rIdx) => {
         const rid = r?.tool_call_id ?? r?.call_id ?? r?.toolCallId ?? null;
         const bareTool =

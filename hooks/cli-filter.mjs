@@ -155,6 +155,7 @@ function runCommandCaptured(command, unwrapFn = null, helpers = {}) {
           })
         : spawn(execCmd, {
             shell: true,
+            detached: process.platform !== "win32",
             cwd: execCwd,
             env: process.env,
             windowsHide: true,
@@ -247,6 +248,11 @@ function runCommandCaptured(command, unwrapFn = null, helpers = {}) {
       const sigExitCode = sig === "SIGINT" ? 130 : sig === "SIGTERM" ? 143 : 1;
       killChildProcessTree(sig);
       const forceExitTimer = setTimeout(() => {
+        if (process.platform !== "win32" && child.pid) {
+          try {
+            process.kill(-child.pid, "SIGKILL");
+          } catch {}
+        }
         try {
           child.stdout?.destroy();
           child.stderr?.destroy();

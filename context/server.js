@@ -244,6 +244,17 @@ const rl = readline.createInterface({
   terminal: false
 });
 
+let inFlightCalls = 0;
+let stdinClosed = false;
+
+function maybeCloseStoreOnDrain() {
+  if (stdinClosed && inFlightCalls === 0) {
+    try {
+      store.close();
+    } catch {}
+  }
+}
+
 rl.on("line", async (line) => {
   const trimmed = line.trim();
   if (!trimmed) return;
@@ -264,6 +275,7 @@ rl.on("line", async (line) => {
   const { id, method, params } = msg;
   if (id === undefined || id === null) return;
 
+  inFlightCalls += 1;
   try {
     switch (method) {
       case "initialize": {
@@ -366,13 +378,15 @@ rl.on("line", async (line) => {
     }
   } catch (handlerErr) {
     sendError(id, -32603, "Internal server error", String(handlerErr));
+  } finally {
+    inFlightCalls = Math.max(0, inFlightCalls - 1);
+    maybeCloseStoreOnDrain();
   }
 });
 
 rl.on("close", () => {
-  try {
-    store.close();
-  } catch {}
+  stdinClosed = true;
+  maybeCloseStoreOnDrain();
 });
 
 process.on("SIGINT", () => {

@@ -5,11 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import vm from "node:vm";
 
 import { analyzeTranscriptCache } from "../context/lib/cache-analyzer.js";
 import { simulateCachePolicies } from "../context/lib/cache-simulator.js";
 import { getEffectiveConfig } from "../context/lib/config.js";
-import { executeCode, resolveExecTimeoutMs, runProcess } from "../context/lib/executor.js";
+import { executeCode, isLikelyEsmCode, resolveExecTimeoutMs, runProcess } from "../context/lib/executor.js";
 import { buildRepoHotspots } from "../context/lib/repo-skeleton.js";
 import { detectSensitiveFile, sanitizeUrlForDisplay } from "../context/lib/security.js";
 import { ContextModeStore } from "../context/lib/store.js";
@@ -103,20 +104,32 @@ function createNdjsonMcpClient(scriptPath, { cwd = ROOT, env = {} } = {}) {
       });
     },
     async close() {
+      if (child.exitCode !== null || child.signalCode !== null) return;
       try {
         child.stdin.end();
       } catch {}
       await new Promise((r) => {
-        const t = setTimeout(() => {
-          try {
-            child.kill();
-          } catch {}
+        let killTimer = null;
+        const hardTimer = setTimeout(() => {
           r();
+        }, 3500);
+        const onClose = () => {
+          if (killTimer) clearTimeout(killTimer);
+          clearTimeout(hardTimer);
+          r();
+        };
+        child.once("close", onClose);
+        killTimer = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            try {
+              child.kill();
+            } catch {
+              child.off("close", onClose);
+              clearTimeout(hardTimer);
+              r();
+            }
+          }
         }, 500);
-        child.once("close", () => {
-          clearTimeout(t);
-          r();
-        });
       });
     }
   };
@@ -224,6 +237,55 @@ test("Long-Task 2: ctx_execute 120s default, timeoutSec 1..300 clamping, timedOu
     );
     assert.equal(esmRes.ok, true, `ESM ctx_execute failed: ${esmRes.output}`);
     assert.match(esmRes.output, /ESM_CWD=real-workspace/);
+
+    // 2b. Adversarial CJS scripts with regex quotes & nested/multiline templates containing `import ...` at col 0
+    assert.equal(isLikelyEsmCode("const fs = require('node:fs'); const re = /'/; console.log('import x from \"y\"');"), false);
+    assert.equal(isLikelyEsmCode("const fs = require('node:fs'); const s = `a ${\"`\"}\nimport x from 'y'`;"), false);
+    assert.equal(isLikelyEsmCode("const fs = require('node:fs'); const tpl = `\nimport foo from 'bar'\nexport default 1\n`;"), false);
+    assert.equal(isLikelyEsmCode("\uFEFF#!/usr/bin/env node\nimport path from 'node:path';"), true);
+
+    const cjsTplRes = JSON.parse(
+      (
+        await client.request("tools/call", {
+          name: "ctx_execute",
+          arguments: {
+            language: "nodejs",
+            code: "const fs = require('node:fs'); const re = /'/; const tpl = `a ${\"`\"}\\nimport foo from 'bar'`; console.log('CJS_OK=' + typeof fs.readFileSync + ':' + re.test(\"'\") + ':' + tpl.length);"
+          }
+        })
+      ).msg.result.content[0].text
+    );
+    assert.equal(cjsTplRes.ok, true, `CJS with regex/template must not inject --input-type=module: ${cjsTplRes.output}`);
+    assert.match(cjsTplRes.output, /CJS_OK=function:true:/);
+
+    // 2c. Pipelined NDJSON tools/call + immediate stdin EOF drains cleanly before store.close()
+    const pipeRes = await new Promise((resolve, reject) => {
+      const p = spawn(process.execPath, [path.join(ROOT, "context", "server.js")], {
+        cwd: workspaceDir,
+        env: { ...process.env, AGY_DART_DB_PATH: dbPath },
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true
+      });
+      let out = "";
+      let err = "";
+      p.stdout.on("data", (c) => { out += c.toString("utf8"); });
+      p.stderr.on("data", (c) => { err += c.toString("utf8"); });
+      p.on("error", reject);
+      p.on("close", (code) => resolve({ code, out, err }));
+      p.stdin.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 77,
+          method: "tools/call",
+          params: {
+            name: "ctx_execute",
+            arguments: { language: "nodejs", code: "setTimeout(() => console.log('EOF_DRAIN_OK'), 60);" }
+          }
+        }) + "\n"
+      );
+    });
+    assert.equal(pipeRes.err, "");
+    assert.match(pipeRes.out, /EOF_DRAIN_OK/);
 
     // 3. Explicit timeoutSec=1 terminates child + grandchild tree and returns timedOut: true + run_command hint
     const pidFile = path.join(tmpDir, "grandchild.pid");
@@ -412,9 +474,10 @@ test("Long-Task 3: PreToolUse skips cli-filter on WaitMsBeforeAsync <= 2000, att
       "utf8"
     );
     const cmdB64 = Buffer.from(`"${process.execPath}" "${slowNodeScript}"`, "utf8").toString("base64");
+    const sessB64 = `b:${Buffer.from("s-sig", "utf8").toString("base64url")}`;
     const filterProc = spawn(
       process.execPath,
-      [path.join(ROOT, "hooks", "cli-filter.mjs"), "--rule", "test", "--sid", "s-sig", "--b64", cmdB64],
+      [path.join(ROOT, "hooks", "cli-filter.mjs"), "--rule", "test", "--session", sessB64, "--b64", cmdB64],
       {
         cwd: tmpDir,
         env: { ...process.env, AGY_DART_DB_PATH: dbPath },
@@ -550,6 +613,40 @@ test("Long-Task 4: PreInvocation silences TTL & cold-compact banners during mid-
       const alerts320k = evaluateCacheAlerts(diag320k, { sessionId: "m1-320k", store, invocationNum: 0 });
       assert.equal(alerts320k.length, 1);
       assert.match(alerts320k[0], /KV-cache TTL/);
+
+      // 3. Aborted/cancelled turn or finish-only tool_calls sets inToolLoop=false so cumulative invocationNum >= 1 still alerts on next turn
+      const diagFinish = analyzeTranscriptCache([
+        {
+          type: "PLANNER_RESPONSE",
+          created_at: expiredAt,
+          model: "claude-sonnet-4-6",
+          input_tokens: 90000,
+          cache_read_tokens: 0,
+          output_tokens: 150,
+          tool_calls: [{ name: "finish", args: {} }]
+        }
+      ]);
+      assert.equal(diagFinish.inToolLoop, false, "finish pseudo-tool must not leave inToolLoop=true");
+      const finishAlerts = evaluateCacheAlerts(diagFinish, { sessionId: "m-finish", store, invocationNum: 5 });
+      assert.equal(finishAlerts.length, 1);
+      assert.match(finishAlerts[0], /KV-cache TTL/);
+
+      const diagCancelled = analyzeTranscriptCache([
+        {
+          type: "PLANNER_RESPONSE",
+          created_at: expiredAt,
+          model: "claude-sonnet-4-6",
+          input_tokens: 90000,
+          cache_read_tokens: 0,
+          output_tokens: 150,
+          tool_calls: [{ name: "run_command", args: { CommandLine: "npm test" } }]
+        },
+        { type: "CANCELLED", content: "User cancelled mid-tool" }
+      ]);
+      assert.equal(diagCancelled.inToolLoop, false, "CANCELLED step must reset inToolLoop=false");
+      const cancelAlerts = evaluateCacheAlerts(diagCancelled, { sessionId: "m-cancel", store, invocationNum: 8 });
+      assert.equal(cancelAlerts.length, 1);
+      assert.match(cancelAlerts[0], /KV-cache TTL/);
     } finally {
       store.close();
     }
@@ -731,6 +828,44 @@ test("Audit Red-Team 6: Sensitive-file guard across symlinks/.envrc/*.env/ADS, g
       { AGY_DART_SENSITIVE_FILE_GUARD: "deny" }
     );
     assert.equal(catEnvRes.decision, "deny");
+
+    // Adversarial command bypasses under sensitiveFileGuard=deny: Windows trailing path `\`, inline powershell/bash, & `$(...)` subshells
+    const dirWithTrailingWinSlash = process.platform === "win32" ? `${tmpDir.replace(/[/\\]+$/, "")}\\` : tmpDir;
+    const adversarialSecretCmds = [
+      ...(process.platform === "win32"
+        ? [
+            `cd "${dirWithTrailingWinSlash}" ; Get-Content .env`,
+            `cd "${dirWithTrailingWinSlash}" ; Get-Content ".env"`,
+            'cmd /d /s /c "type .env"'
+          ]
+        : []),
+      'powershell -NoProfile -Command "Write-Host `"a`"; Get-Content .env"',
+      'powershell -Command "Get-Content .env"',
+      "bash -c 'cat .env'",
+      "echo $(cat .env)",
+      'echo "$(cat .env)"',
+      "Write-Output (Get-Content .env)"
+    ];
+    for (const advCmd of adversarialSecretCmds) {
+      const rAdv = runHook(
+        "hooks/pre-tool-use.mjs",
+        { conversationId: "s-sec-adv", cwd: tmpDir, toolCall: { name: "run_command", args: { CommandLine: advCmd } } },
+        dbPath,
+        { AGY_DART_SENSITIVE_FILE_GUARD: "deny" }
+      );
+      assert.equal(rAdv.decision, "deny", `Adversarial secret dump MUST be denied: ${advCmd}`);
+    }
+
+    // Literal quoted text (no command substitution / no separate command segment) MUST NOT false-positive
+    for (const safeLiteralCmd of ['powershell -Command "Write-Host `"a; cat .env`""', "echo '$(cat .env)'"]) {
+      const rSafeLit = runHook(
+        "hooks/pre-tool-use.mjs",
+        { conversationId: "s-sec-safe", cwd: tmpDir, toolCall: { name: "run_command", args: { CommandLine: safeLiteralCmd } } },
+        dbPath,
+        { AGY_DART_SENSITIVE_FILE_GUARD: "deny" }
+      );
+      assert.equal(rSafeLit.decision, "allow", `Safe literal echo must not false-positive: ${safeLiteralCmd}`);
+    }
 
     // ctx_execute({ file: ".env" }) blocked under sensitiveFileGuard=deny
     const store = new ContextModeStore({ dbPath });
@@ -916,6 +1051,201 @@ test("Audit Red-Team 7: Cross-session isolation in MCP (ctx_search scope:null, s
     const preloadResp = await fetch(`${baseUrl}/preload.js`);
     assert.equal(preloadResp.status, 200);
     assert.match(preloadResp.headers.get("content-type") || "", /javascript/);
+
+    // /api/search, /api/stats, and /api/cutoff oversized >64 KB bodies return 413 cleanly via fetch() without ECONNRESET
+    for (const ep of ["/api/search", "/api/stats", "/api/cutoff"]) {
+      const hugeRes = await fetch(`${baseUrl}${ep}`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ query: "x".repeat(70000) })
+      });
+      assert.equal(hugeRes.status, 413, `${ep} must return HTTP 413 without TCP RST`);
+    }
+
+    // 4. Frontend DOM & out-of-order polling/scope-switch race guards in sidecars/dashboard/index.html
+    const htmlSource = fs.readFileSync(path.join(ROOT, "sidecars", "dashboard", "index.html"), "utf8");
+    const scriptBlocks = [...htmlSource.matchAll(/<script>([\s\S]*?)<\/script>/gi)];
+    assert.ok(scriptBlocks.length >= 1, "index.html must contain main inline script");
+    const mainUiScript = scriptBlocks[scriptBlocks.length - 1][1];
+
+    const elements = new Map();
+    const makeEl = (id) => ({
+      id,
+      value: id === "cutoff-select" ? "16384" : "",
+      innerText: "",
+      textContent: "",
+      innerHTML: "",
+      className: "",
+      title: "",
+      style: {},
+      dataset: {},
+      options:
+        id === "cutoff-select"
+          ? [{ value: "0" }, { value: "8192" }, { value: "16384" }, { value: "32768" }]
+          : [],
+      classList: {
+        _s: new Set(),
+        add(c) { this._s.add(c); },
+        remove(c) { this._s.delete(c); },
+        contains(c) { return this._s.has(c); }
+      },
+      getAttribute(attr) {
+        return attr === "content" ? csrfToken : "";
+      },
+      scrollIntoView() {}
+    });
+    const getEl = (id) => {
+      if (!elements.has(id)) elements.set(id, makeEl(id));
+      return elements.get(id);
+    };
+
+    const alertsSeen = [];
+    const fetchLog = [];
+    let customFetchHandler = null;
+    const defaultStats = {
+      isPaused: false,
+      cutoffBytes: 0,
+      conversationCutoffBytes: 0,
+      appCutoffBytes: 16384,
+      globalCutoffBytes: 16384,
+      exemptCategories: ["images"],
+      conversationExemptCategories: ["images"],
+      appExemptCategories: ["images", "documents"],
+      globalExemptCategories: ["images", "documents"],
+      cliFilterEnabled: true,
+      readDedupEnabled: true
+    };
+    const mockFetch = async (urlPath, opts = {}) => {
+      fetchLog.push({ urlPath, opts });
+      if (customFetchHandler) {
+        const custom = await customFetchHandler(urlPath, opts);
+        if (custom) return custom;
+      }
+      const mkJson = (obj, status = 200) => ({
+        ok: status >= 200 && status < 300,
+        status,
+        json: async () => structuredClone(obj)
+      });
+      if (urlPath === "/api/stats") return mkJson(defaultStats);
+      if (urlPath === "/api/doctor") return mkJson({ status: "HEALTHY", dbSizeBytes: 4096, walSizeBytes: 0 });
+      if (urlPath === "/api/cache-diag") return mkJson({ transcriptFound: false, turnsWithUsage: 0 });
+      if (urlPath === "/api/resume") return mkJson({ recentEvents: [], recentSources: [] });
+      if (urlPath === "/api/search") return mkJson({ hits: [] });
+      return mkJson({ ok: true });
+    };
+
+    const mockWin = {
+      location: { search: "?conversationId=sess-ui-race" },
+      addEventListener() {},
+      sidecar: null
+    };
+    const sandbox = {
+      window: mockWin,
+      document: {
+        title: "",
+        documentElement: { lang: "en" },
+        getElementById: getEl,
+        querySelector: () => getEl("meta-csrf"),
+        querySelectorAll: () => []
+      },
+      navigator: { language: "en-US", clipboard: { writeText: async () => {} } },
+      localStorage: { getItem: () => "en", setItem: () => {} },
+      URLSearchParams,
+      Headers,
+      fetch: mockFetch,
+      alert: (m) => alertsSeen.push(m),
+      confirm: () => true,
+      setInterval: () => 1,
+      clearInterval: () => {},
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+      console: { log() {}, warn() {}, error() {} }
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(
+      `${mainUiScript}\nglobalThis.__uiTest = { refreshData, setScope, toggleActiveState, toggleCategory, addExemption, executeSearch, getState: () => ({ currentScope, refreshSeq, isProtectionPaused, cachedStats }) };`,
+      sandbox
+    );
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Zero cutoff (0) must NOT fall back to 16384 in dropdown
+    assert.equal(getEl("cutoff-select").value, "0", "Zero cutoff must render as '0', not fallback to '16384'");
+
+    // Out-of-order stale poll started BEFORE toggleActiveState must NOT overwrite optimistic/confirmed pause state
+    let resolveSlowStats = null;
+    customFetchHandler = (urlPath) => {
+      if (urlPath === "/api/stats" && !resolveSlowStats) {
+        return new Promise((res) => {
+          resolveSlowStats = () =>
+            res({ ok: true, status: 200, json: async () => ({ ...defaultStats, isPaused: false }) });
+        });
+      }
+      if (urlPath === "/api/toggle-active") {
+        return { ok: true, status: 200, json: async () => ({ ok: true, isPaused: true }) };
+      }
+      return null;
+    };
+    const stalePollPromise = sandbox.__uiTest.refreshData(false);
+    await new Promise((r) => setTimeout(r, 10));
+    await sandbox.__uiTest.toggleActiveState();
+    assert.equal(sandbox.__uiTest.getState().isProtectionPaused, true);
+    resolveSlowStats();
+    await stalePollPromise;
+    assert.equal(
+      sandbox.__uiTest.getState().isProtectionPaused,
+      true,
+      "Stale refreshData poll must be discarded when refreshSeq advanced during toggleActiveState"
+    );
+    customFetchHandler = null;
+
+    // Cross-scope rollback isolation: toggleCategory('code') in 'lifetime' fails AFTER user switches to 'conversation'
+    sandbox.__uiTest.setScope("lifetime");
+    await new Promise((r) => setTimeout(r, 20));
+    let rejectToggleCat = null;
+    customFetchHandler = (urlPath) => {
+      if (urlPath === "/api/exemptions") {
+        return new Promise((_res, rej) => {
+          rejectToggleCat = () => rej(new Error("Simulated 500 failure"));
+        });
+      }
+      return null;
+    };
+    const toggleCatPromise = sandbox.__uiTest.toggleCategory("code");
+    await new Promise((r) => setTimeout(r, 10));
+    sandbox.__uiTest.setScope("conversation");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(getEl("kv-handoff-meta").textContent, "--", "Closed handoff drawer resets meta to '--' on scope switch");
+    rejectToggleCat();
+    await toggleCatPromise;
+    const afterRollbackStats = sandbox.__uiTest.getState().cachedStats;
+    assert.deepEqual(
+      afterRollbackStats.globalExemptCategories,
+      ["images", "documents"],
+      "Failed 'lifetime' toggleCategory must roll back globalExemptCategories"
+    );
+    assert.deepEqual(
+      afterRollbackStats.conversationExemptCategories,
+      ["images"],
+      "Failed 'lifetime' rollback must NOT overwrite active 'conversation' scope categories"
+    );
+    customFetchHandler = null;
+
+    // executeSearch sends { query, scope, conversationId } & addExemption rejects malformed extension
+    getEl("search-input").value = "rate limit";
+    fetchLog.length = 0;
+    await sandbox.__uiTest.executeSearch();
+    const searchCall = fetchLog.find((c) => c.urlPath === "/api/search");
+    assert.ok(searchCall);
+    assert.deepEqual(JSON.parse(searchCall.opts.body), {
+      query: "rate limit",
+      scope: "conversation",
+      conversationId: "sess-ui-race"
+    });
+
+    getEl("new-exempt-input").value = "../evil/path";
+    alertsSeen.length = 0;
+    await sandbox.__uiTest.addExemption();
+    assert.equal(alertsSeen.length, 1, "Invalid custom extension must trigger validation alert");
   } finally {
     if (standaloneSrv) {
       await new Promise((r) => standaloneSrv.close(() => r()));
@@ -1058,9 +1388,24 @@ test("Audit Red-Team 8: fast/mcp-server.mjs <= 8,800 B escaped JSON-RPC cap, mix
     assert.ok(collected.includes('"id":101') && collected.includes('"id":102'));
   } finally {
     try {
-      rawProc.kill();
+      rawProc.stdin?.end();
     } catch {}
-    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    if (rawProc.exitCode === null && rawProc.signalCode === null) {
+      await new Promise((resolve) => {
+        const t = setTimeout(resolve, 3500);
+        rawProc.once("close", () => {
+          clearTimeout(t);
+          resolve();
+        });
+        try {
+          rawProc.kill();
+        } catch {
+          clearTimeout(t);
+          resolve();
+        }
+      });
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 80 });
   }
 });
 

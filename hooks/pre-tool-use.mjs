@@ -681,6 +681,59 @@ function extractFileDumpTargets(cmdAfterVerb) {
   return targets;
 }
 
+function scanDoubleQuotedEnd(cmd, openIdx) {
+  const len = cmd.length;
+  let k = openIdx + 1;
+  while (k < len) {
+    const c = cmd[k];
+    if (c === "`" && k + 1 < len) {
+      k += 2;
+      continue;
+    }
+    if (c === "\\" && k + 1 < len) {
+      if (cmd[k + 1] === "\\" && k + 2 < len && cmd[k + 2] === '"') {
+        return k + 3;
+      }
+      if (cmd[k + 1] === '"') {
+        const innerSoFar = cmd.slice(openIdx + 1, k + 1);
+        const isWinDirPath = /^(?:[A-Za-z]:\\|\\\\|\.\.?\\)[^"<>|*?]*$/.test(innerSoFar);
+        if (isWinDirPath || cmd.indexOf('"', k + 2) === -1) {
+          return k + 2;
+        }
+        k += 2;
+        continue;
+      }
+      k += 2;
+      continue;
+    }
+    if (c === '"') {
+      if (k > openIdx + 1 && k + 1 < len && cmd[k + 1] === '"') {
+        k += 2;
+        continue;
+      }
+      return k + 1;
+    }
+    k += 1;
+  }
+  return len;
+}
+
+function scanSingleQuotedEnd(cmd, openIdx) {
+  const len = cmd.length;
+  let k = openIdx + 1;
+  while (k < len) {
+    if (cmd[k] === "'") {
+      if (k > openIdx + 1 && k + 1 < len && cmd[k + 1] === "'") {
+        k += 2;
+        continue;
+      }
+      return k + 1;
+    }
+    k += 1;
+  }
+  return len;
+}
+
 function stripQuotedCommandLiterals(cmd) {
   if (!cmd) return "";
   let out = "";
@@ -688,25 +741,14 @@ function stripQuotedCommandLiterals(cmd) {
   const len = cmd.length;
   while (i < len) {
     const ch = cmd[i];
-    if (ch === "'" || ch === '"') {
-      const q = ch;
+    if (ch === '"') {
       out += '""';
-      i++;
-      while (i < len) {
-        if (q === '"' && cmd[i] === "\\" && i + 1 < len) {
-          i += 2;
-          continue;
-        }
-        if (q === "'" && cmd[i] === "'" && i + 1 < len && cmd[i + 1] === "'") {
-          i += 2;
-          continue;
-        }
-        if (cmd[i] === q) {
-          i++;
-          break;
-        }
-        i++;
-      }
+      i = scanDoubleQuotedEnd(cmd, i);
+      continue;
+    }
+    if (ch === "'") {
+      out += '""';
+      i = scanSingleQuotedEnd(cmd, i);
       continue;
     }
     out += ch;
@@ -723,23 +765,29 @@ function splitTopLevelCommandSegments(cmd) {
   const len = cmd.length;
   while (i < len) {
     const ch = cmd[i];
-    if (ch === "'" || ch === '"') {
-      const q = ch;
-      i++;
-      while (i < len) {
-        if (q === '"' && cmd[i] === "\\" && i + 1 < len) {
-          i += 2;
+    if (ch === '"') {
+      i = scanDoubleQuotedEnd(cmd, i);
+      continue;
+    }
+    if (ch === "'") {
+      i = scanSingleQuotedEnd(cmd, i);
+      continue;
+    }
+    if (ch === "(") {
+      let depth = 1;
+      i += 1;
+      while (i < len && depth > 0) {
+        if (cmd[i] === '"') {
+          i = scanDoubleQuotedEnd(cmd, i);
           continue;
         }
-        if (q === "'" && cmd[i] === "'" && i + 1 < len && cmd[i + 1] === "'") {
-          i += 2;
+        if (cmd[i] === "'") {
+          i = scanSingleQuotedEnd(cmd, i);
           continue;
         }
-        if (cmd[i] === q) {
-          i++;
-          break;
-        }
-        i++;
+        if (cmd[i] === "(") depth += 1;
+        else if (cmd[i] === ")") depth -= 1;
+        i += 1;
       }
       continue;
     }
@@ -981,17 +1029,155 @@ function inspectSingleCommandSegment({ commandLine, cwd, sessionId, maxReadBytes
   return { shouldDeny: false };
 }
 
-export function inspectCommand({ commandLine, cwd, sessionId, sensitiveGuardMode = null }) {
-  if (!commandLine || typeof commandLine !== "string") {
-    return { shouldDeny: false };
+function unquoteShellScriptArg(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (s.startsWith("'") && s.endsWith("'") && scanSingleQuotedEnd(s, 0) === s.length) {
+    return s.slice(1, -1).replace(/''/g, "'");
+  }
+  if (s.startsWith('"') && s.endsWith('"') && scanDoubleQuotedEnd(s, 0) === s.length) {
+    return s
+      .slice(1, -1)
+      .replace(/`(["`$])/g, "$1")
+      .replace(/\\(["\\])/g, "$1")
+      .replace(/""/g, '"');
+  }
+  return s;
+}
+
+function extractBalancedParens(str, openParenIdx) {
+  const len = str.length;
+  let depth = 1;
+  let k = openParenIdx + 1;
+  while (k < len && depth > 0) {
+    const ch = str[k];
+    if (ch === '"') {
+      k = scanDoubleQuotedEnd(str, k);
+      continue;
+    }
+    if (ch === "'") {
+      k = scanSingleQuotedEnd(str, k);
+      continue;
+    }
+    if (ch === "(") depth += 1;
+    else if (ch === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return { inner: str.slice(openParenIdx + 1, k).trim(), endIdx: k + 1 };
+      }
+    }
+    k += 1;
+  }
+  return null;
+}
+
+function extractNestedShellCommands(seg) {
+  const nested = [];
+  if (!seg || typeof seg !== "string") return nested;
+
+  // 1. Inline cmd.exe `/c ...`
+  const cmdMatch = /^(?:.*[\\/])?cmd(?:\.exe)?\s+(?:\/[dDsSqQ]\s+)*\/[cC]\s+([\s\S]+)$/i.exec(seg);
+  if (cmdMatch && cmdMatch[1]) {
+    const inner = unquoteShellScriptArg(cmdMatch[1]);
+    if (inner && inner !== seg) nested.push(inner);
   }
 
-  const cleanCmd = cleanStringArg(commandLine);
-  const maxReadBytes = getMaxReadBytes(sessionId);
-  const exemptExtensions = getExemptExtensions(sessionId);
-  const effSensMode = sensitiveGuardMode || getEffectiveConfig().sensitiveFileGuard || "off";
-  const secMod = effSensMode === "deny" ? securityModule : null;
+  // 2. Inline PowerShell / POSIX shell `-Command` / `-c`
+  const shLead = /^(?:(?:"[^"]+"|'[^']+'|\S+)[\\/])?(powershell|pwsh|bash|sh|zsh|dash)(?:\.exe)?(?=["']?\s)/i.exec(seg);
+  if (shLead) {
+    const isPs = /^p(?:owershell|wsh)$/i.test(shLead[1]);
+    const psValFlags = new Set(["-executionpolicy", "-ep", "-windowstyle", "-w", "-outputformat", "-of", "-inputformat", "-if"]);
+    let pos = shLead[0].length;
+    if (seg[pos] === '"' || seg[pos] === "'") pos += 1;
+    const len = seg.length;
+    while (pos < len) {
+      while (pos < len && /\s/.test(seg[pos])) pos += 1;
+      if (pos >= len) break;
+      const tokStart = pos;
+      while (pos < len && !/\s/.test(seg[pos])) {
+        if (seg[pos] === '"') pos = scanDoubleQuotedEnd(seg, pos);
+        else if (seg[pos] === "'") pos = scanSingleQuotedEnd(seg, pos);
+        else pos += 1;
+      }
+      const tok = seg.slice(tokStart, pos);
+      const lowerTok = tok.toLowerCase();
+      if ((isPs && (lowerTok === "-command" || lowerTok === "-c")) || (!isPs && tok === "-c")) {
+        const rawRest = seg.slice(pos).trim();
+        const inner = unquoteShellScriptArg(rawRest);
+        if (inner && inner !== seg) nested.push(inner);
+        break;
+      }
+      if (isPs && psValFlags.has(lowerTok)) {
+        while (pos < len && /\s/.test(seg[pos])) pos += 1;
+        while (pos < len && !/\s/.test(seg[pos])) {
+          if (seg[pos] === '"') pos = scanDoubleQuotedEnd(seg, pos);
+          else if (seg[pos] === "'") pos = scanSingleQuotedEnd(seg, pos);
+          else pos += 1;
+        }
+        continue;
+      }
+      if (!tok.startsWith("-")) break;
+    }
+  }
 
+  // 3. Command substitutions `$(...)` (outside single quotes, including inside `"..."`) and unquoted `(...)`
+  const len = seg.length;
+  let i = 0;
+  while (i < len) {
+    const ch = seg[i];
+    if (ch === "'") {
+      i = scanSingleQuotedEnd(seg, i);
+      continue;
+    }
+    if (ch === '"') {
+      const closeIdx = scanDoubleQuotedEnd(seg, i);
+      let j = i + 1;
+      const innerEnd = closeIdx > i + 1 && seg[closeIdx - 1] === '"' ? closeIdx - 1 : closeIdx;
+      while (j < innerEnd) {
+        if ((seg[j] === "\\" || seg[j] === "`") && j + 1 < innerEnd) {
+          j += 2;
+          continue;
+        }
+        if (seg[j] === "$" && seg[j + 1] === "(") {
+          const sub = extractBalancedParens(seg, j + 1);
+          if (sub) {
+            if (sub.inner) nested.push(sub.inner);
+            j = sub.endIdx;
+            continue;
+          }
+        }
+        j += 1;
+      }
+      i = closeIdx;
+      continue;
+    }
+    if (ch === "$" && seg[i + 1] === "(") {
+      const sub = extractBalancedParens(seg, i + 1);
+      if (sub) {
+        if (sub.inner) nested.push(sub.inner);
+        i = sub.endIdx;
+        continue;
+      }
+    }
+    if (ch === "(") {
+      const sub = extractBalancedParens(seg, i);
+      if (sub) {
+        if (sub.inner) nested.push(sub.inner);
+        i = sub.endIdx;
+        continue;
+      }
+    }
+    i += 1;
+  }
+
+  return nested;
+}
+
+function inspectCommandRecursive({ commandLine, cwd, sessionId, maxReadBytes, exemptExtensions, effSensMode, secMod, depth }) {
+  if (!commandLine || typeof commandLine !== "string" || depth > 3) {
+    return { shouldDeny: false };
+  }
+  const cleanCmd = cleanStringArg(commandLine);
   const segments = splitTopLevelCommandSegments(cleanCmd);
   if (segments.length === 0) return { shouldDeny: false };
 
@@ -1018,9 +1204,48 @@ export function inspectCommand({ commandLine, cwd, sessionId, sensitiveGuardMode
       secMod
     });
     if (res.shouldDeny) return res;
+
+    if (depth < 3) {
+      const nestedCmds = extractNestedShellCommands(seg);
+      for (const nestedCmd of nestedCmds) {
+        const nestedRes = inspectCommandRecursive({
+          commandLine: nestedCmd,
+          cwd: activeCwd,
+          sessionId,
+          maxReadBytes,
+          exemptExtensions,
+          effSensMode,
+          secMod,
+          depth: depth + 1
+        });
+        if (nestedRes.shouldDeny) return nestedRes;
+      }
+    }
   }
 
   return { shouldDeny: false };
+}
+
+export function inspectCommand({ commandLine, cwd, sessionId, sensitiveGuardMode = null }) {
+  if (!commandLine || typeof commandLine !== "string") {
+    return { shouldDeny: false };
+  }
+
+  const maxReadBytes = getMaxReadBytes(sessionId);
+  const exemptExtensions = getExemptExtensions(sessionId);
+  const effSensMode = sensitiveGuardMode || getEffectiveConfig().sensitiveFileGuard || "off";
+  const secMod = effSensMode === "deny" ? securityModule : null;
+
+  return inspectCommandRecursive({
+    commandLine,
+    cwd,
+    sessionId,
+    maxReadBytes,
+    exemptExtensions,
+    effSensMode,
+    secMod,
+    depth: 0
+  });
 }
 
 function finishAllow() {

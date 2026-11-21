@@ -2444,8 +2444,8 @@
       } else {
         const previewEl = document.getElementById('kv-handoff-preview');
         const metaEl = document.getElementById('kv-handoff-meta');
-        if (previewEl) previewEl.textContent = '';
-        if (metaEl) metaEl.textContent = '';
+        if (previewEl) previewEl.textContent = t('handoffPlaceholder');
+        if (metaEl) metaEl.textContent = '--';
       }
 
       refreshData(true);
@@ -2641,12 +2641,12 @@
       return Array.isArray(list) ? list : [...DEFAULT_ACTIVE_CATEGORIES];
     }
 
-    function setActiveCategories(s, cats) {
+    function setActiveCategories(s, cats, scope = currentScope) {
       if (!s) return;
-      s.exemptCategories = cats;
-      if (currentScope === 'lifetime') {
+      if (scope === currentScope) s.exemptCategories = cats;
+      if (scope === 'lifetime') {
         s.globalExemptCategories = cats;
-      } else if (currentScope === 'app') {
+      } else if (scope === 'app') {
         s.appExemptCategories = cats;
       } else {
         s.conversationExemptCategories = cats;
@@ -2734,7 +2734,7 @@
         ? activeCats.filter(c => c !== categoryId)
         : [...activeCats, categoryId];
 
-      setActiveCategories(cachedStats, nextActive);
+      setActiveCategories(cachedStats, nextActive, mutScope);
       updateExemptionsList(cachedStats);
 
       const params = new URLSearchParams(window.location.search);
@@ -2747,14 +2747,14 @@
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        if (currentScope === mutScope && data && data.exemptCategories) {
-          setActiveCategories(cachedStats, data.exemptCategories);
-          updateExemptionsList(cachedStats);
+        if (data && data.exemptCategories) {
+          setActiveCategories(cachedStats, data.exemptCategories, mutScope);
+          if (currentScope === mutScope) updateExemptionsList(cachedStats);
         }
       } catch (err) {
         console.error("Failed to toggle category:", err);
+        setActiveCategories(cachedStats, activeCats, mutScope);
         if (currentScope === mutScope) {
-          setActiveCategories(cachedStats, activeCats);
           updateExemptionsList(cachedStats);
         }
       }
@@ -2789,6 +2789,7 @@
     }
 
     async function removeExemption(ext) {
+      ++refreshSeq;
       const params = new URLSearchParams(window.location.search);
       const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
 
@@ -2807,6 +2808,7 @@
 
     async function resetExemptions() {
       if (!confirm(t('confirmResetExempt'))) return;
+      ++refreshSeq;
       const params = new URLSearchParams(window.location.search);
       const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
 
@@ -3949,6 +3951,7 @@
       }
 
       if (!confirm(confirmMsg)) return;
+      ++refreshSeq;
 
       try {
         const res = await apiFetch('/api/purge', {

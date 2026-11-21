@@ -41,18 +41,65 @@ function trimIncompleteUtf8Tail(buf) {
   return buf;
 }
 
-/** Detect top-level ESM syntax (static import/export or import.meta) linearly without regex backtracking */
+const ESM_REGEX_PREFIX_KW = new Set([
+  "return",
+  "case",
+  "throw",
+  "in",
+  "of",
+  "typeof",
+  "void",
+  "delete",
+  "new",
+  "yield",
+  "await",
+  "else",
+  "do"
+]);
+
+/** Detect top-level ESM syntax (static import/export or import.meta) linearly without regex/template false positives */
 export function isLikelyEsmCode(src) {
   if (!src || typeof src !== "string") return false;
-  let i = 0;
+  let i = src.charCodeAt(0) === 0xfeff ? 1 : 0;
   const len = src.length;
-  if (src.startsWith("#!")) {
-    const nl = src.indexOf("\n");
+  if (src.startsWith("#!", i)) {
+    const nl = src.indexOf("\n", i);
     if (nl === -1) return false;
     i = nl + 1;
   }
   let braceDepth = 0;
-  let prevIdent = "";
+  let parenDepth = 0;
+  const templateReturnDepths = [];
+  let lastSigChar = "";
+  let lastIdent = "";
+
+  const consumeTemplateBody = () => {
+    while (i < len) {
+      const c = src[i];
+      if (c === "\\") {
+        i += 2;
+        continue;
+      }
+      if (c === "`") {
+        i += 1;
+        lastSigChar = "`";
+        lastIdent = "";
+        return;
+      }
+      if (c === "$" && src[i + 1] === "{") {
+        templateReturnDepths.push(braceDepth);
+        braceDepth += 1;
+        lastSigChar = "{";
+        lastIdent = "";
+        i += 2;
+        return;
+      }
+      i += 1;
+    }
+    lastSigChar = "`";
+    lastIdent = "";
+  };
+
   while (i < len) {
     const ch = src[i];
     if (ch <= " ") {
@@ -71,7 +118,7 @@ export function isLikelyEsmCode(src) {
       i = end + 2;
       continue;
     }
-    if (ch === "'" || ch === '"' || ch === "`") {
+    if (ch === "'" || ch === '"') {
       const q = ch;
       i += 1;
       while (i < len) {
@@ -85,18 +132,76 @@ export function isLikelyEsmCode(src) {
         }
         i += 1;
       }
-      prevIdent = "";
+      lastSigChar = q;
+      lastIdent = "";
       continue;
+    }
+    if (ch === "`") {
+      i += 1;
+      consumeTemplateBody();
+      continue;
+    }
+    if (ch === "/") {
+      const canStartRegex =
+        lastSigChar === "" ||
+        "=(,:![&|?{};~+-*%^<>".includes(lastSigChar) ||
+        (lastIdent !== "" && ESM_REGEX_PREFIX_KW.has(lastIdent));
+      if (canStartRegex) {
+        i += 1;
+        let inClass = false;
+        while (i < len) {
+          const rc = src[i];
+          if (rc === "\\") {
+            i += 2;
+            continue;
+          }
+          if (rc === "\n" || rc === "\r") break;
+          if (rc === "[") inClass = true;
+          else if (rc === "]") inClass = false;
+          else if (!inClass && rc === "/") {
+            i += 1;
+            while (i < len && ((src[i] >= "a" && src[i] <= "z") || (src[i] >= "A" && src[i] <= "Z"))) {
+              i += 1;
+            }
+            break;
+          }
+          i += 1;
+        }
+        lastSigChar = "/";
+        lastIdent = "";
+        continue;
+      }
     }
     if (ch === "{") {
       braceDepth += 1;
-      prevIdent = "";
+      lastSigChar = "{";
+      lastIdent = "";
       i += 1;
       continue;
     }
     if (ch === "}") {
       braceDepth = Math.max(0, braceDepth - 1);
-      prevIdent = "";
+      i += 1;
+      if (templateReturnDepths.length > 0 && braceDepth === templateReturnDepths[templateReturnDepths.length - 1]) {
+        templateReturnDepths.pop();
+        consumeTemplateBody();
+        continue;
+      }
+      lastSigChar = "}";
+      lastIdent = "";
+      continue;
+    }
+    if (ch === "(") {
+      parenDepth += 1;
+      lastSigChar = "(";
+      lastIdent = "";
+      i += 1;
+      continue;
+    }
+    if (ch === ")") {
+      parenDepth = Math.max(0, parenDepth - 1);
+      lastSigChar = ")";
+      lastIdent = "";
       i += 1;
       continue;
     }
@@ -113,20 +218,22 @@ export function isLikelyEsmCode(src) {
       }
       const word = src.slice(start, i);
       const beforeChar = start > 0 ? src[start - 1] : "";
-      if (beforeChar !== ".") {
+      if (beforeChar !== "." && lastSigChar !== ".") {
         if (word === "import") {
           let k = i;
           while (k < len && src[k] <= " ") k += 1;
           if (src[k] === ".") return true; // import.meta
-          if (braceDepth === 0 && src[k] !== "(") return true; // top-level static import
-        } else if (word === "export" && braceDepth === 0 && prevIdent !== ".") {
+          if (braceDepth === 0 && parenDepth === 0 && src[k] !== "(") return true; // top-level static import
+        } else if (word === "export" && braceDepth === 0 && parenDepth === 0) {
           return true;
         }
       }
-      prevIdent = word;
+      lastSigChar = word[word.length - 1];
+      lastIdent = word;
       continue;
     }
-    prevIdent = ch;
+    lastSigChar = ch;
+    lastIdent = "";
     i += 1;
   }
   return false;
