@@ -26,6 +26,13 @@
 
 ---
 
+## v1.2.1 核心加固与修复
+
+1. **全仓库安全与稳定性深度加固（修复全部 76 项审计缺陷）**：
+   - **原子落盘与进程稳定**：拆分 `apply_edits` 临时文件写入与 `rename` 降级回退并确保失败全量回滚（`C-1`）；为 `context/lib/executor.js` 补齐 `stdin`/`stdout`/`stderr` 错误监听与 `close` 完整排空（`C-2`/`H-10`），PowerShell `-Command` 改用环境变量间接传参防命令注入（`M-21`），并加固 Windows `taskkill.exe` 异步错误回退与 POSIX `-pid` 进程组强杀（`H-9`）。
+   - **安全边界与 Windows 路径规范化**：修复 `batch_search` 只读 `git branch`/`tag` `OPTARG` 参数绕过（`H-1`）；`install.mjs` 的 `install`/`uninstall` 全面拦截源码库及其祖先/子目录、盘符根、用户主目录、插件根目录、符号链接、Windows `\\?\`/`\\.\`/`\\?\UNC\`/`GLOBALROOT`/`Volume` 命名空间与 8.3 短路径（`H-2`）；封堵 Sidecar/Handoff 混斜杠 UNC 与 8.3 短名逃逸（`H-3`），为 `ctx_index` 强制接入 `sensitiveFileGuard=deny` 与 NTFS/驱动器相对路径敏感检测（`H-4`/`H-5`），消除 CSS/SFC 大纲提取 $O(N^4)$ ReDoS（`H-7`），并统一替换全仓 `startsWith("..")` 路径包含检查。
+   - **会话隔离、SQLite 事务与 Node 22/24 全绿兼容**：修复跨会话检索/事件泄漏（`H-16`）、`indexContent` 覆盖旧分块与按 `worktree` 去重（`H-17`）、`chunks_tri` 孤儿清理（`H-18`）、`diffRead` 原子编辑 `ino` 独立性（`H-19`）、子 Agent 状态隔离（`H-20`）、SQLite 多语句事务与并发重试（`M-22`–`M-25`）、Sidecar 乐观更新回滚与入参校验（`H-23`/`M-29`/`M-30`）、OpenAI Responses `cached_tokens` 与 Claude 写溢价口径对齐（`H-24`/`H-25`）、静态 Hook 词法扫描（`H-26`），以及 Node 22 Sidecar 零 `stderr` 动态导入修复（Linux/Windows × Node 22/24 四路 CI 117/117 全绿）。
+
 ## v1.2.0 核心新增能力
 
 1. **Sidecar 安全加固与统一配置（`~/.agy-dart/config.json`）**：

@@ -26,6 +26,13 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 
 ---
 
+## What's New in v1.2.1
+
+1. **Full-Repository Security & Stability Hardening (76 Audited Fixes)**:
+   - **Atomic Edits & Process Stability**: Split `apply_edits` temp-file write from `rename` fallback with guaranteed rollback (`C-1`), attached `child.stdin`/`stdout`/`stderr` error handlers and `close`-drained capture in `context/lib/executor.js` (`C-2`/`H-10`), hardened PowerShell `-Command` argument passing via env-var indirection (`M-21`), and added async `taskkill.exe` error fallbacks plus POSIX `-pid` process-group termination (`H-9`).
+   - **Access-Control & Path Canonicalization**: Closed read-only `git branch`/`tag` `OPTARG` write/delete bypasses (`H-1`); hardened `install.mjs` `install`/`uninstall` against `REPO_ROOT` ancestors/subdirs, filesystem roots, home/plugin dirs, symlinks, Windows `\\?\`/`\\.\`/`\\?\UNC\`/`GLOBALROOT`/`Volume` namespaces, and 8.3 short aliases (`H-2`); blocked mixed-slash UNC & 8.3 escapes in Sidecar/Handoff (`H-3`), enforced `ctx_index` `sensitiveFileGuard=deny` & NTFS/drive-relative checks (`H-4`/`H-5`), eliminated $O(N^4)$ CSS/SFC outline ReDoS (`H-7`), and replaced all `startsWith("..")` path checks with exact segment-boundary guards.
+   - **Session Isolation, SQLite Transactions & Node 22/24 Parity**: Fixed cross-session `ctx_search`/`getEventBySeq` leaks (`H-16`), `indexContent` overwrite cleanup & worktree dedup (`H-17`), `chunks_tri` worktree purge (`H-18`), atomic-edit `diffRead` `ino` independence (`H-19`), subagent state isolation (`H-20`), transactional multi-statement SQLite writes (`M-22`–`M-25`), Sidecar optimistic-UI rollbacks & request validation (`H-23`/`M-29`/`M-30`), OpenAI Responses `cached_tokens` & Claude write-surcharge parity (`H-24`/`H-25`), static hook lexer accuracy (`H-26`), and clean Node 22 zero-`stderr` Sidecar imports (117/117 tests across Linux & Windows on Node 22/24).
+
 ## What's New in v1.2.0
 
 1. **Sidecar Security Hardening & Unified Config (`~/.agy-dart/config.json`)**:
