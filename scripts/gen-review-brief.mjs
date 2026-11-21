@@ -113,6 +113,24 @@ export function countTestCasesInSource(src) {
     }
   };
 
+  const markControlFlowBodyBraces = (openParenIdx) => {
+    let pDepth = 0;
+    for (let k = openParenIdx; k < tokens.length; k++) {
+      const t = tokens[k];
+      if (t.type === "punct" && t.value === "(") {
+        pDepth += 1;
+      } else if (t.type === "punct" && t.value === ")") {
+        pDepth -= 1;
+        if (pDepth === 0) {
+          if (tokens[k + 1]?.type === "punct" && tokens[k + 1].value === "{") {
+            suiteBodyOpenIndices.add(k + 1);
+          }
+          return;
+        }
+      }
+    }
+  };
+
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i];
     if (tok.type === "punct" && tok.value === "{") {
@@ -120,12 +138,26 @@ export function countTestCasesInSource(src) {
       continue;
     }
     if (tok.type === "punct" && tok.value === "}") {
-      suiteBraceStack.pop();
+      const wasSuiteOrControlBlock = suiteBraceStack.pop();
+      if (
+        wasSuiteOrControlBlock &&
+        tokens[i + 1]?.type === "ident" &&
+        tokens[i + 1].value === "else" &&
+        tokens[i + 2]?.type === "punct" &&
+        tokens[i + 2].value === "{"
+      ) {
+        suiteBodyOpenIndices.add(i + 2);
+      }
       continue;
     }
     if (tok.type !== "ident" || tok.isMemberProp) continue;
     const inSuiteScope = suiteBraceStack.length === 0 || suiteBraceStack.every(Boolean);
     if (!inSuiteScope) continue;
+
+    if ((tok.value === "for" || tok.value === "if") && tokens[i + 1]?.type === "punct" && tokens[i + 1].value === "(") {
+      markControlFlowBodyBraces(i + 1);
+      continue;
+    }
 
     const prev = i > 0 ? tokens[i - 1] : null;
     const prev2 = i > 1 ? tokens[i - 2] : null;
@@ -296,7 +328,15 @@ const isDirectRun = Boolean(
 
 if (isDirectRun) {
   const args = process.argv.slice(2);
-  if (args.includes("--json")) {
+  const ALLOWED_FLAGS = new Set(["--json", "--write", "--check", "-h", "--help"]);
+  const unknown = args.find((a) => !ALLOWED_FLAGS.has(a));
+  if (unknown) {
+    console.error(`gen-review-brief error: unknown option '${unknown}'. Expected --check, --write, or --json.`);
+    process.exit(1);
+  }
+  if (args.includes("-h") || args.includes("--help")) {
+    console.log("Usage: node scripts/gen-review-brief.mjs [--check | --write | --json]");
+  } else if (args.includes("--json")) {
     process.stdout.write(JSON.stringify(computeBriefMetrics(REPO_ROOT), null, 2) + "\n");
   } else if (args.includes("--write")) {
     const res = syncBriefFile(REPO_ROOT, { write: true });

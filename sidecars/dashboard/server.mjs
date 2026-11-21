@@ -45,8 +45,8 @@ function getAppStartTime() {
   if (process.platform === "win32") {
     try {
       const out = execSync(
-        'powershell -NoProfile -Command "(Get-Process -Name language_server, Antigravity | Measure-Object -Property StartTime -Minimum).Minimum.ToUniversalTime().ToString(\'yyyy-MM-ddTHH:mm:ss.fffZ\')"',
-        { encoding: "utf8", timeout: 3000, windowsHide: true }
+        'powershell -NoProfile -Command "(Get-Process -Name language_server*, Antigravity -ErrorAction SilentlyContinue | Measure-Object -Property StartTime -Minimum).Minimum.ToUniversalTime().ToString(\'yyyy-MM-ddTHH:mm:ss.fffZ\')"',
+        { encoding: "utf8", timeout: 3000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }
       );
       const parsed = new Date(out.trim()).getTime();
       if (!Number.isNaN(parsed) && parsed > 0) ts = parsed;
@@ -54,6 +54,16 @@ function getAppStartTime() {
   }
   _appStartTime = ts || (Date.now() - Math.round(process.uptime() * 1000));
   return _appStartTime;
+}
+
+export function closeRuntimeStore() {
+  if (_runtimeStore) {
+    try {
+      _runtimeStore.close();
+    } catch {}
+    _runtimeStore = null;
+  }
+  _runtimeInitialized = false;
 }
 
 function getRuntimeStore() {
@@ -134,7 +144,9 @@ export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
       const declaredLen = Number(rawContentLen);
       if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
         req.on("error", () => {});
-        req.resume();
+        try {
+          req.pause();
+        } catch {}
         resolve({ ok: false, status: 413, error: `Request body exceeds ${Math.round(maxBytes / 1024)} KB limit` });
         return;
       }
@@ -157,7 +169,9 @@ export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
       if (totalBytes > maxBytes) {
         overflowed = true;
         chunks.length = 0;
-        req.resume();
+        try {
+          req.pause();
+        } catch {}
         finish({ ok: false, status: 413, error: `Request body exceeds ${Math.round(maxBytes / 1024)} KB limit` });
         return;
       }
@@ -223,7 +237,7 @@ function isUncPath(p) {
 }
 
 function validateStringFields(data, fields) {
-  if (!data || typeof data !== "object") return { ok: true };
+  if (!data || typeof data !== "object" || Array.isArray(data)) return { ok: true };
   for (const field of fields) {
     const val = data[field];
     if (val !== undefined && val !== null && typeof val !== "string") {
@@ -234,7 +248,7 @@ function validateStringFields(data, fields) {
 }
 
 function validateAndNormalizeSearchInput(data) {
-  if (!data || typeof data !== "object") {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
     return { ok: false, error: "Request body must be a JSON object" };
   }
   if (data.queries !== undefined) {
@@ -828,10 +842,30 @@ export function resolveStandalonePort(env = process.env) {
 
 const isDirectRun = Boolean(process.argv[1] && isSameFilePath(process.argv[1], __selfPath));
 
+function parseStrictCutoffBytes(raw) {
+  if (raw === "none" || raw === 0 || raw === "0") return 0;
+  if (typeof raw === "number") {
+    if (Number.isInteger(raw) && raw >= 0 && raw <= 64 * 1024 * 1024) return raw;
+    return null;
+  }
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (/^\d{1,9}$/.test(trimmed)) {
+      const n = Number(trimmed);
+      if (Number.isSafeInteger(n) && n >= 0 && n <= 64 * 1024 * 1024) return n;
+    }
+    return null;
+  }
+  return null;
+}
+
 function handleCutoffMutation(data, defaultConvId = "default") {
   const store = getRuntimeStore();
   const { scope, targetSid, convId } = resolveTargetSession(data, defaultConvId);
-  const cutoffBytes = data.cutoff === "none" || data.cutoff === 0 || data.cutoff === "0" ? 0 : parseInt(data.cutoff, 10);
+  const cutoffBytes = parseStrictCutoffBytes(data?.cutoff);
+  if (cutoffBytes === null) {
+    return { ok: false, status: 400, error: "Invalid 'cutoff' value: must be a non-negative integer or 'none'" };
+  }
   const saved = store.setCutoff(cutoffBytes, targetSid);
   return {
     ok: true,
@@ -842,6 +876,46 @@ function handleCutoffMutation(data, defaultConvId = "default") {
     appCutoffBytes: store.getCutoff("app"),
     conversationCutoffBytes: store.getCutoff(convId)
   };
+}
+
+function handleSearchPayload(data, queries, defaultConvId = "default") {
+  const store = getRuntimeStore();
+  const rawSourceId = typeof data?.sourceId === "string" && data.sourceId.trim() ? data.sourceId.trim() : null;
+  const { scope, convId } = resolveTargetSession(data, defaultConvId);
+  if (scope === "lifetime" || scope === "all") {
+    return store.search({ queries, sourceId: rawSourceId, scope: "all", limit: 5 });
+  }
+  if (scope === "app" || scope === "session") {
+    const appStart = getAppStartTime();
+    const res = store.search({ queries, sourceId: rawSourceId, scope: "all", limit: 20 });
+    if (!Array.isArray(res.hits) || res.hits.length === 0) return res;
+    const allowedHits = [];
+    for (const h of res.hits) {
+      try {
+        const row = store.db.prepare("SELECT created_ts FROM sources WHERE id = ? LIMIT 1").get(h.sourceId);
+        if (!row || Number(row.created_ts) >= appStart) {
+          allowedHits.push(h);
+        }
+      } catch {
+        allowedHits.push(h);
+      }
+    }
+    const sliced = allowedHits.slice(0, 5);
+    return {
+      ...res,
+      hits: sliced,
+      totalMatches: allowedHits.length,
+      returned: sliced.length,
+      limit: 5
+    };
+  }
+  return store.search({
+    queries,
+    sourceId: rawSourceId,
+    sessionId: convId,
+    scope: "session",
+    limit: 5
+  });
 }
 
 function handleExemptionsMutation(data, defaultConvId = "default") {
@@ -950,7 +1024,7 @@ export function createStandaloneServer({
   maxBodyBytes = MAX_REQUEST_BODY_BYTES
 } = {}) {
   getRuntimeStore();
-  return http.createServer(async (req, res) => {
+  const srv = http.createServer(async (req, res) => {
     try {
       // 1. Anti-DNS-rebinding Host validation & anti-CSRF Origin/Sec-Fetch-Site validation
       if (!isAllowedHostHeader(req.headers.host)) {
@@ -967,11 +1041,22 @@ export function createStandaloneServer({
       }
 
       const isHtmlEntry = req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html");
+      const isPreloadStub = req.method === "GET" && url.pathname === "/preload.js";
       if (
         !isAllowedOriginHeader(req.headers.origin, req.headers.host) ||
-        isCrossSiteFetchHeader(req.headers["sec-fetch-site"], { allowSameSite: isHtmlEntry })
+        isCrossSiteFetchHeader(req.headers["sec-fetch-site"], { allowSameSite: isHtmlEntry || isPreloadStub })
       ) {
         sendJson(res, 403, { error: "Cross-origin request blocked" });
+        return;
+      }
+
+      if (isPreloadStub) {
+        res.writeHead(200, {
+          "Content-Type": "application/javascript; charset=utf-8",
+          "X-Content-Type-Options": "nosniff",
+          "Cache-Control": "no-store"
+        });
+        res.end("/* standalone http mode */\n");
         return;
       }
 
@@ -1026,6 +1111,13 @@ export function createStandaloneServer({
           }
           const parsed = await readBoundedJsonBody(req, maxBodyBytes);
           if (!parsed.ok) {
+            if (parsed.status === 413) {
+              res.once("finish", () => {
+                try {
+                  req.destroy();
+                } catch {}
+              });
+            }
             sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
             return;
           }
@@ -1083,7 +1175,7 @@ export function createStandaloneServer({
           sendJson(res, 400, { error: searchFieldCheck.error });
           return;
         }
-        sendJson(res, 200, getRuntimeStore().search({ queries: searchCheck.queries, limit: 5 }));
+        sendJson(res, 200, handleSearchPayload(parsed.data, searchCheck.queries));
         return;
       }
 
@@ -1095,6 +1187,13 @@ export function createStandaloneServer({
         }
         const parsed = await readBoundedJsonBody(req, maxBodyBytes);
         if (!parsed.ok) {
+          if (parsed.status === 413) {
+            res.once("finish", () => {
+              try {
+                req.destroy();
+              } catch {}
+            });
+          }
           sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
           return;
         }
@@ -1105,7 +1204,12 @@ export function createStandaloneServer({
           return;
         }
         if (url.pathname === "/api/cutoff") {
-          sendJson(res, 200, handleCutoffMutation(data));
+          const cutoffRes = handleCutoffMutation(data);
+          if (cutoffRes.ok === false && cutoffRes.status) {
+            sendJson(res, cutoffRes.status, { error: cutoffRes.error });
+          } else {
+            sendJson(res, 200, cutoffRes);
+          }
         } else if (url.pathname === "/api/toggle-active" || url.pathname === "/api/paused") {
           sendJson(res, 200, handleToggleActiveMutation(data));
         } else if (url.pathname === "/api/exemptions") {
@@ -1130,6 +1234,10 @@ export function createStandaloneServer({
       }
     }
   });
+  srv.on("close", () => {
+    closeRuntimeStore();
+  });
+  return srv;
 }
 
 if (isDirectRun) {
@@ -1191,78 +1299,7 @@ if (isDirectRun) {
       return html;
     });
 
-    // ALL /api/* routes are POST-only in SidecarApp mode because sidecar_sdk only enforces
-    // X-Sidecar-Token validation for non-GET requests (blocks unauthenticated GET / DNS-rebinding reads).
-    app.api("/api/stats", (data) => {
-      const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return getStatsPayload(data, app.config.conversationId);
-    }, "POST");
-    app.api("/api/doctor", () => getRuntimeStore().doctor(), "POST");
-    app.api("/api/resume", (data) => {
-      const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return getResumePayload(data, app.config.conversationId);
-    }, "POST");
-    app.api("/api/source-chunks", (data) => {
-      const check = validateStringFields(data, ["sourceId"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return getSourceChunksPayload(data);
-    }, "POST");
-    app.api("/api/cache-diag", (data) => {
-      const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return getCacheDiagPayload(data, app.config.conversationId);
-    }, "POST");
-    app.api("/api/handoff", (data) => {
-      const check = validateStringFields(data, ["scope", "conversationId", "sessionId", "cwd"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return getHandoffPayload(data, app.config.conversationId);
-    }, "POST");
-
-    app.api("/api/search", (data) => {
-      const searchCheck = validateAndNormalizeSearchInput(data);
-      if (!searchCheck.ok) return makeBadRequest(searchCheck.error);
-      const fieldCheck = validateStringFields(data, ["sourceId", "conversationId", "sessionId", "scope"]);
-      if (!fieldCheck.ok) return makeBadRequest(fieldCheck.error);
-      return getRuntimeStore().search({ queries: searchCheck.queries, limit: 5 });
-    }, "POST");
-    app.api("/api/cutoff", (data) => {
-      const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return handleCutoffMutation(data, app.config.conversationId);
-    }, "POST");
-    app.api("/api/exemptions", (data) => {
-      const check = validateStringFields(data, ["scope", "conversationId", "sessionId", "action", "category", "ext"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return handleExemptionsMutation(data, app.config.conversationId);
-    }, "POST");
-    app.api("/api/toggle-active", (data) => {
-      const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return handleToggleActiveMutation(data, app.config.conversationId);
-    }, "POST");
-    app.api("/api/paused", (data) => {
-      const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return handleToggleActiveMutation(data, app.config.conversationId);
-    }, "POST");
-    app.api("/api/purge", (data) => {
-      const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return handlePurgeMutation(data, app.config.conversationId);
-    }, "POST");
-    app.api("/api/maintenance", (data) => handleMaintenanceMutation(data), "POST");
-    app.api("/api/cli-filter", (data) => {
-      const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return handleFeatureToggleMutation(true, data, app.config.conversationId);
-    }, "POST");
-    app.api("/api/read-dedup", (data) => {
-      const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
-      if (!check.ok) return makeBadRequest(check.error);
-      return handleFeatureToggleMutation(false, data, app.config.conversationId);
-    }, "POST");
+    registerSidecarRoutes(app);
 
     await app.run();
     console.log(`[agy-dart sidecar] registered and running`);
@@ -1275,4 +1312,126 @@ if (isDirectRun) {
       console.log(`[agy-dart dashboard] standalone server listening at http://127.0.0.1:${boundPort}`);
     });
   }
+}
+
+export function registerSidecarRoutes(app) {
+  const makeBadRequest = (msg) => {
+    const err = new Error(msg);
+    err.statusCode = 400;
+    return { ok: false, status: 400, error: msg };
+  };
+  const normalizeSidecarBody = (raw) => {
+    if (raw === undefined) return {};
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    return raw;
+  };
+
+  // ALL /api/* routes are POST-only in SidecarApp mode because sidecar_sdk only enforces
+  // X-Sidecar-Token validation for non-GET requests (blocks unauthenticated GET / DNS-rebinding reads).
+  app.api("/api/stats", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return getStatsPayload(data, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/doctor", (rawData) => {
+    if (rawData !== undefined && normalizeSidecarBody(rawData) === null) {
+      return makeBadRequest("Request body must be a JSON object");
+    }
+    return getRuntimeStore().doctor();
+  }, "POST");
+  app.api("/api/resume", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return getResumePayload(data, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/source-chunks", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["sourceId"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return getSourceChunksPayload(data);
+  }, "POST");
+  app.api("/api/cache-diag", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return getCacheDiagPayload(data, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/handoff", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId", "cwd"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return getHandoffPayload(data, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/search", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const searchCheck = validateAndNormalizeSearchInput(data);
+    if (!searchCheck.ok) return makeBadRequest(searchCheck.error);
+    const fieldCheck = validateStringFields(data, ["sourceId", "conversationId", "sessionId", "scope"]);
+    if (!fieldCheck.ok) return makeBadRequest(fieldCheck.error);
+    return handleSearchPayload(data, searchCheck.queries, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/cutoff", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    const res = handleCutoffMutation(data, app.config?.conversationId);
+    if (res.ok === false) return makeBadRequest(res.error);
+    return res;
+  }, "POST");
+  app.api("/api/exemptions", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId", "action", "category", "ext"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return handleExemptionsMutation(data, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/toggle-active", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return handleToggleActiveMutation(data, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/paused", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return handleToggleActiveMutation(data, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/purge", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return handlePurgeMutation(data, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/maintenance", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    return handleMaintenanceMutation(data);
+  }, "POST");
+  app.api("/api/cli-filter", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return handleFeatureToggleMutation(true, data, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/read-dedup", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return handleFeatureToggleMutation(false, data, app.config?.conversationId);
+  }, "POST");
 }

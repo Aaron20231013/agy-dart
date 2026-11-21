@@ -6,6 +6,7 @@
 import { promises as fs2 } from "node:fs";
 import os from "node:os";
 import path2 from "node:path";
+import { fileURLToPath as __fileURLToPath } from "node:url";
 // [agy-dart KV-cache extension]
 import {
   analyzeMultipleSessionsCache,
@@ -830,7 +831,7 @@ function analyzeTranscriptSessions(sessions) {
           nextPlannerMs = parseTimeMs(nxt.created_at);
           break;
         }
-        if (nxt.type === "GENERIC") {
+        if (nxt.type === "GENERIC" || nxt.type === "TOOL_RESULT" || nxt.type === "TOOL_OUTPUT") {
           genericSteps.push(nxt);
           const gt = parseTimeMs(nxt.created_at);
           if (gt !== null) genericTimes.push(gt);
@@ -839,7 +840,14 @@ function analyzeTranscriptSessions(sessions) {
       for (const callIdx of agyCallIndices) {
         const resStep = genericSteps[callIdx];
         if (!resStep) continue;
-        const resText = typeof resStep.content === "string" ? resStep.content : "";
+        const resText =
+          typeof resStep.content === "string"
+            ? resStep.content
+            : typeof resStep.output === "string"
+              ? resStep.output
+              : typeof resStep.tool_result === "string"
+                ? resStep.tool_result
+                : "";
         const isSpill = resText.includes("The output was large and was saved to:") || /output was truncated/i.test(resText) && resText.includes("output.txt");
         if (isSpill) {
           mcpSpillCalls += 1;
@@ -1551,4 +1559,15 @@ async function main(argv) {
   printUsage();
   process.exitCode = 1;
 }
-void main(process.argv);
+export { analyzePaths, analyzePathsByUsage, analyzeTranscriptSessions, main };
+
+const __selfBenchmarkPath = path2.resolve(__fileURLToPath(import.meta.url));
+const __isDirectBenchmarkRun = Boolean(
+  process.argv[1] &&
+    (process.platform === "win32"
+      ? path2.resolve(process.argv[1]).toLowerCase() === __selfBenchmarkPath.toLowerCase()
+      : path2.resolve(process.argv[1]) === __selfBenchmarkPath)
+);
+if (__isDirectBenchmarkRun) {
+  void main(process.argv);
+}

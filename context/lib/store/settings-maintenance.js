@@ -898,47 +898,63 @@ export class SettingsMaintenanceMethods {
     };
 
     const bytesBefore = getDiskSize();
-    const staleSources = this.db
-      .prepare("SELECT id FROM sources WHERE accessed_ts < ?")
-      .all(cutoffTs)
-      .map((r) => r.id);
+    const txStats = this._withWriteTx(() => {
+      const staleSources = this.db
+        .prepare("SELECT id FROM sources WHERE accessed_ts < ?")
+        .all(cutoffTs)
+        .map((r) => r.id);
 
-    // Batch deletes in groups of 400 to stay safely below SQLite's SQLITE_MAX_VARIABLE_NUMBER limit
-    for (let i = 0; i < staleSources.length; i += 400) {
-      const batch = staleSources.slice(i, i + 400);
-      const placeholders = batch.map(() => "?").join(",");
-      this.db.prepare(`DELETE FROM chunks WHERE source_id IN (${placeholders})`).run(...batch);
-      this.db.prepare(`DELETE FROM chunks_tri WHERE source_id IN (${placeholders})`).run(...batch);
-      this.db.prepare(`DELETE FROM sources WHERE id IN (${placeholders})`).run(...batch);
-    }
-
-    const evRes = this.db.prepare("DELETE FROM events WHERE created_at < ?").run(cutoffIso);
-    const readRes = this.db.prepare("DELETE FROM file_reads WHERE read_ts < ?").run(readsCutoffTs);
-    const snapRes = this.db.prepare("DELETE FROM file_snapshots WHERE updated_ts < ?").run(readsCutoffTs);
-    const ghostRes = this.db.prepare("DELETE FROM ghost_interceptions WHERE blocked_ts < ?").run(cutoffTs);
-    const cpRes = this.db.prepare("DELETE FROM session_checkpoints WHERE updated_ts < ?").run(cutoffTs);
-    const outlineRes = this.db.prepare("DELETE FROM outline_cache WHERE updated_ts < ?").run(cutoffTs);
-    this.db.prepare("DELETE FROM repo_cache WHERE updated_ts < ?").run(repoCacheCutoffTs);
-
-    // Prune stale per-session PreInvocation alert/compaction/sensitive-file meta keys so meta stays bounded
-    try {
-      const metaRows = this.db
-        .prepare("SELECT key, value FROM meta WHERE key LIKE 'cache_alert:%' OR key LIKE 'compact_invalidated:%' OR key LIKE 'sensitive_read_confirm:%' OR key LIKE 'conv_turn_seq:%'")
-        .all();
-      const delMetaStmt = this.db.prepare("DELETE FROM meta WHERE key = ?");
-      for (const row of metaRows) {
-        let entryTs = 0;
-        if (typeof row.value === "string" && row.value.startsWith("{")) {
-          try {
-            const p = JSON.parse(row.value);
-            if (p && Number.isFinite(p.ts)) entryTs = p.ts;
-          } catch {}
-        }
-        if (entryTs > 0 && entryTs < cutoffTs) {
-          delMetaStmt.run(row.key);
-        }
+      // Batch deletes in groups of 400 to stay safely below SQLite's SQLITE_MAX_VARIABLE_NUMBER limit
+      for (let i = 0; i < staleSources.length; i += 400) {
+        const batch = staleSources.slice(i, i + 400);
+        const placeholders = batch.map(() => "?").join(",");
+        this.db.prepare(`DELETE FROM chunks WHERE source_id IN (${placeholders})`).run(...batch);
+        this.db.prepare(`DELETE FROM chunks_tri WHERE source_id IN (${placeholders})`).run(...batch);
+        this.db.prepare(`DELETE FROM sources WHERE id IN (${placeholders})`).run(...batch);
       }
-    } catch {}
+
+      const evRes = this.db.prepare("DELETE FROM events WHERE created_at < ?").run(cutoffIso);
+      const readRes = this.db.prepare("DELETE FROM file_reads WHERE read_ts < ?").run(readsCutoffTs);
+      const snapRes = this.db.prepare("DELETE FROM file_snapshots WHERE updated_ts < ?").run(readsCutoffTs);
+      const ghostRes = this.db.prepare("DELETE FROM ghost_interceptions WHERE blocked_ts < ?").run(cutoffTs);
+      const cpRes = this.db.prepare("DELETE FROM session_checkpoints WHERE updated_ts < ?").run(cutoffTs);
+      const outlineRes = this.db.prepare("DELETE FROM outline_cache WHERE updated_ts < ?").run(cutoffTs);
+      this.db.prepare("DELETE FROM repo_cache WHERE updated_ts < ?").run(repoCacheCutoffTs);
+
+      // Prune stale per-session PreInvocation alert/compaction/sensitive-file meta keys so meta stays bounded
+      try {
+        const metaRows = this.db
+          .prepare("SELECT key, value FROM meta WHERE key LIKE 'cache_alert:%' OR key LIKE 'compact_invalidated:%' OR key LIKE 'sensitive_read_confirm:%' OR key LIKE 'conv_turn_seq:%'")
+          .all();
+        const delMetaStmt = this.db.prepare("DELETE FROM meta WHERE key = ?");
+        for (const row of metaRows) {
+          let entryTs = 0;
+          if (typeof row.value === "string" && row.value.startsWith("{")) {
+            try {
+              const p = JSON.parse(row.value);
+              if (p && Number.isFinite(p.ts)) entryTs = p.ts;
+            } catch {}
+          }
+          if (entryTs > 0 && entryTs < cutoffTs) {
+            delMetaStmt.run(row.key);
+          }
+        }
+      } catch {}
+
+      this.db
+        .prepare("INSERT INTO meta(key, value) VALUES ('last_maintenance_ts', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+        .run(String(now));
+
+      return {
+        deletedSources: staleSources.length,
+        deletedEvents: evRes.changes || 0,
+        deletedFileReads: readRes.changes || 0,
+        deletedFileSnapshots: snapRes.changes || 0,
+        deletedGhostInterceptions: ghostRes.changes || 0,
+        deletedCheckpoints: cpRes.changes || 0,
+        deletedOutlineCache: outlineRes.changes || 0
+      };
+    });
 
     try {
       this.db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -953,20 +969,13 @@ export class SettingsMaintenanceMethods {
       } catch {}
     }
 
-    this.setMeta("last_maintenance_ts", String(now));
     const bytesAfter = getDiskSize();
 
     return {
       ok: true,
       purged: "stale",
       maxAgeDays: days,
-      deletedSources: staleSources.length,
-      deletedEvents: evRes.changes || 0,
-      deletedFileReads: readRes.changes || 0,
-      deletedFileSnapshots: snapRes.changes || 0,
-      deletedGhostInterceptions: ghostRes.changes || 0,
-      deletedCheckpoints: cpRes.changes || 0,
-      deletedOutlineCache: outlineRes.changes || 0,
+      ...txStats,
       bytesBefore,
       bytesAfter,
       reclaimedBytes: Math.max(0, bytesBefore - bytesAfter),

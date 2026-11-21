@@ -236,14 +236,35 @@ export function collectSourceFiles(workspaceDir, maxFiles = 120, maxDepth = 8) {
   return files;
 }
 
+const JS_REGEX_PREFIX_KW = new Set([
+  "return",
+  "case",
+  "throw",
+  "in",
+  "of",
+  "typeof",
+  "void",
+  "delete",
+  "new",
+  "yield",
+  "await",
+  "else",
+  "do"
+]);
+
 /**
- * Strip // and /* *\/ comments while preserving string literals verbatim.
- * Safe for JSONC (preserves `"@/*"`), Go (including backtick raw strings), Java, and Dart.
+ * Strip // and /* *\/ comments while preserving string & optional JS regex literals verbatim.
+ * Safe for JSONC (preserves `"@/*"`), JS/TS (preserves `/[/*]/`), Go, Java, and Dart.
  */
-function stripCLikeComments(content, { allowSingleQuotes = true, allowBackticks = false, backtickEscapes = false } = {}) {
+function stripCLikeComments(
+  content,
+  { allowSingleQuotes = true, allowBackticks = false, backtickEscapes = false, allowRegexLiterals = false } = {}
+) {
   let out = "";
   let i = 0;
   const len = content.length;
+  let lastSigChar = "";
+  let lastIdent = "";
   while (i < len) {
     const ch = content[i];
     const next = i + 1 < len ? content[i + 1] : "";
@@ -263,6 +284,8 @@ function stripCLikeComments(content, { allowSingleQuotes = true, allowBackticks 
           break;
         }
       }
+      lastSigChar = '"';
+      lastIdent = "";
       continue;
     }
 
@@ -281,6 +304,8 @@ function stripCLikeComments(content, { allowSingleQuotes = true, allowBackticks 
           break;
         }
       }
+      lastSigChar = "'";
+      lastIdent = "";
       continue;
     }
 
@@ -299,6 +324,8 @@ function stripCLikeComments(content, { allowSingleQuotes = true, allowBackticks 
           break;
         }
       }
+      lastSigChar = "`";
+      lastIdent = "";
       continue;
     }
 
@@ -324,7 +351,58 @@ function stripCLikeComments(content, { allowSingleQuotes = true, allowBackticks 
       continue;
     }
 
+    // JS/TS regex literal (preserves `/*` or `//` inside `/[/*]/` character classes or regex bodies)
+    if (allowRegexLiterals && ch === "/") {
+      const canStartRegex =
+        lastSigChar === "" ||
+        "=(,:![&|?{};~+-*%^<>".includes(lastSigChar) ||
+        (lastIdent !== "" && JS_REGEX_PREFIX_KW.has(lastIdent));
+      if (canStartRegex) {
+        out += ch;
+        i++;
+        let inCharClass = false;
+        while (i < len) {
+          const c = content[i];
+          if (c === "\n" || c === "\r") break;
+          out += c;
+          i++;
+          if (c === "\\" && i < len && content[i] !== "\n" && content[i] !== "\r") {
+            out += content[i];
+            i++;
+          } else if (c === "[") {
+            inCharClass = true;
+          } else if (c === "]" && inCharClass) {
+            inCharClass = false;
+          } else if (c === "/" && !inCharClass) {
+            while (i < len && /[a-zA-Z]/.test(content[i])) {
+              out += content[i];
+              i++;
+            }
+            break;
+          }
+        }
+        lastSigChar = "/";
+        lastIdent = "";
+        continue;
+      }
+    }
+
+    if (/[A-Za-z0-9_$]/.test(ch)) {
+      const start = i;
+      while (i < len && /[A-Za-z0-9_$]/.test(content[i])) {
+        out += content[i];
+        i++;
+      }
+      lastIdent = content.slice(start, i);
+      lastSigChar = content[i - 1];
+      continue;
+    }
+
     out += ch;
+    if (!/\s/.test(ch)) {
+      lastSigChar = ch;
+      lastIdent = "";
+    }
     i++;
   }
   return out;
@@ -380,11 +458,12 @@ function parseJsonc(rawText) {
 }
 
 function stripJsComments(content) {
-  // String-aware comment stripping so '/*' or '//' inside string/template literals never eats subsequent imports
+  // String- & regex-aware comment stripping so '/*' or '//' inside strings/templates/regexes never eats subsequent imports
   return stripCLikeComments(content, {
     allowSingleQuotes: true,
     allowBackticks: true,
-    backtickEscapes: true
+    backtickEscapes: true,
+    allowRegexLiterals: true
   });
 }
 

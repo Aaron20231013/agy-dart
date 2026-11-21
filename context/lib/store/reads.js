@@ -80,7 +80,9 @@ export class ReadMethods {
     fileSize,
     ctimeMs = null,
     ino = null,
-    maxAgeMs = DEFAULT_FILE_READ_MAX_AGE_MS
+    maxAgeMs = DEFAULT_FILE_READ_MAX_AGE_MS,
+    currentStepIdx = null,
+    maxStepGap = 0
   }) {
     this.open();
     const sid = sessionId || "default";
@@ -94,10 +96,19 @@ export class ReadMethods {
     const hasCtime = ctimeMs !== null && ctimeMs !== undefined && Number.isFinite(Number(ctimeMs));
     const normCtime = hasCtime ? Number(ctimeMs) : null;
     const normIno = ino !== null && ino !== undefined && String(ino) !== "" ? String(ino) : null;
+    const hasStepCheck =
+      currentStepIdx !== null &&
+      currentStepIdx !== undefined &&
+      Number.isFinite(Number(currentStepIdx)) &&
+      Number(currentStepIdx) >= 0 &&
+      Number.isFinite(Number(maxStepGap)) &&
+      Number(maxStepGap) > 0;
+    const normCurrStep = hasStepCheck ? Math.floor(Number(currentStepIdx)) : null;
+    const normMaxGap = hasStepCheck ? Math.floor(Number(maxStepGap)) : 0;
 
     const rows = this.db
       .prepare(`
-        SELECT start_line, end_line, mtime_ms, file_size, ctime_ms, ino, byte_est, read_ts, bypass_armed
+        SELECT start_line, end_line, mtime_ms, file_size, ctime_ms, ino, byte_est, read_ts, bypass_armed, read_step
         FROM file_reads
         WHERE session_id = ? AND file_path = ?
       `)
@@ -119,6 +130,16 @@ export class ReadMethods {
         }
       }
       if (hasCutoff && Number(row.read_ts) < minTs) continue;
+      if (
+        hasStepCheck &&
+        Number(row.bypass_armed) !== 1 &&
+        row.read_step !== null &&
+        row.read_step !== undefined &&
+        Number.isFinite(Number(row.read_step)) &&
+        normCurrStep - Number(row.read_step) > normMaxGap
+      ) {
+        continue;
+      }
       const coversStart = Number(row.start_line) <= reqStart;
       const coversEnd = Number(row.end_line) === -1 || (reqEnd !== -1 && Number(row.end_line) >= reqEnd);
       if (coversStart && coversEnd) {
@@ -162,7 +183,8 @@ export class ReadMethods {
     fileSize,
     ctimeMs = null,
     ino = null,
-    byteEst = 0
+    byteEst = 0,
+    stepIdx = null
   }) {
     this.open();
     const sid = sessionId || "default";
@@ -173,6 +195,10 @@ export class ReadMethods {
     const hasCtime = ctimeMs !== null && ctimeMs !== undefined && Number.isFinite(Number(ctimeMs));
     const normCtime = hasCtime ? Number(ctimeMs) : null;
     const normIno = ino !== null && ino !== undefined && String(ino) !== "" ? String(ino) : null;
+    const normStep =
+      stepIdx !== null && stepIdx !== undefined && Number.isFinite(Number(stepIdx)) && Number(stepIdx) >= 0
+        ? Math.floor(Number(stepIdx))
+        : null;
     const now = Date.now();
 
     this._withWriteTx(() => {
@@ -227,8 +253,8 @@ export class ReadMethods {
 
       this.db
         .prepare(`
-          INSERT INTO file_reads (session_id, file_path, start_line, end_line, mtime_ms, file_size, ctime_ms, ino, byte_est, read_ts, bypass_armed)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+          INSERT INTO file_reads (session_id, file_path, start_line, end_line, mtime_ms, file_size, ctime_ms, ino, byte_est, read_ts, bypass_armed, read_step)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
           ON CONFLICT(session_id, file_path, start_line, end_line) DO UPDATE SET
             mtime_ms = excluded.mtime_ms,
             file_size = excluded.file_size,
@@ -236,9 +262,21 @@ export class ReadMethods {
             ino = excluded.ino,
             byte_est = excluded.byte_est,
             read_ts = excluded.read_ts,
-            bypass_armed = 0
+            bypass_armed = 0,
+            read_step = excluded.read_step
         `)
-        .run(sid, norm, reqStart, reqEnd, mtimeMs, fileSize, normCtime, normIno, byteEst, now);
+        .run(sid, norm, reqStart, reqEnd, mtimeMs, fileSize, normCtime, normIno, byteEst, now, normStep);
+    });
+  }
+
+  /** Invalidate cached unchanged file_reads for a canonical path across ALL sessions (preserving per-session file_snapshots) */
+  invalidateFileReadsByPath(filePath) {
+    this.open();
+    const norm = this._normalizeTrackPath(filePath);
+    if (!norm) return 0;
+    return this._withWriteTx(() => {
+      const res = this.db.prepare("DELETE FROM file_reads WHERE file_path = ?").run(norm);
+      return res.changes || 0;
     });
   }
 
@@ -432,7 +470,7 @@ export class ReadMethods {
 
     for (const row of candidates) {
       try {
-        const content = gunzipSync(row.content_gz).toString("utf8");
+        const content = gunzipSync(row.content_gz, { maxOutputLength: MAX_SNAPSHOT_BYTES * 8 }).toString("utf8");
         return {
           start_line: Number(row.start_line),
           end_line: Number(row.end_line),

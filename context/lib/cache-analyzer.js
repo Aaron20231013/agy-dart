@@ -146,10 +146,26 @@ export function extractStepTokenUsage(step) {
     (step.usage_metadata && typeof step.usage_metadata === "object" ? step.usage_metadata : null) ||
     {};
 
-  const hasOpenAiResponsesDetails =
-    usage.input_tokens_details !== null &&
-    typeof usage.input_tokens_details === "object" &&
-    toNonNegNum(usage.input_tokens_details.cached_tokens) !== null;
+  const hasAnthropicCacheFields =
+    toNonNegNum(step.cache_read_input_tokens) !== null ||
+    toNonNegNum(usage.cache_read_input_tokens) !== null ||
+    toNonNegNum(step.cache_creation_input_tokens) !== null ||
+    toNonNegNum(usage.cache_creation_input_tokens) !== null ||
+    (usage.cache_creation !== null && typeof usage.cache_creation === "object");
+
+  const hasInclusiveGatewayCacheDetails =
+    !hasAnthropicCacheFields &&
+    (
+      (usage.input_tokens_details !== null &&
+        typeof usage.input_tokens_details === "object" &&
+        toNonNegNum(usage.input_tokens_details.cached_tokens) !== null) ||
+      (usage.prompt_tokens_details !== null &&
+        typeof usage.prompt_tokens_details === "object" &&
+        toNonNegNum(usage.prompt_tokens_details.cached_tokens) !== null) ||
+      toNonNegNum(usage.cachedContentTokenCount) !== null ||
+      toNonNegNum(usage.cached_content_token_count) !== null ||
+      toNonNegNum(usage.prompt_cache_hit_tokens) !== null
+    );
 
   const cacheReadTokens =
     firstPosOrNonNeg(
@@ -181,16 +197,16 @@ export function extractStepTokenUsage(step) {
     rawCacheCreate !== null ? rawCacheCreate : cacheCreation5mTokens + cacheCreation1hTokens;
 
   // Disjoint uncached input tokens (Antigravity top-level or Anthropic usage.input_tokens)
-  // Note: OpenAI Responses API usage.input_tokens is INCLUSIVE of input_tokens_details.cached_tokens
-  const disjointIn = hasOpenAiResponsesDetails
+  // Note: OpenAI Responses / OpenAI-compatible gateways / Gemini / DeepSeek report usage.input_tokens INCLUSIVE of cached tokens
+  const disjointIn = hasInclusiveGatewayCacheDetails
     ? firstPosOrNonNeg(step.input_tokens)
     : firstPosOrNonNeg(step.input_tokens, usage.input_tokens);
-  // Inclusive total prompt tokens (OpenAI prompt_tokens / Responses usage.input_tokens / Gemini promptTokenCount)
+  // Inclusive total prompt tokens (OpenAI prompt_tokens / gateway usage.input_tokens / Gemini promptTokenCount)
   const inclusivePrompt = firstPosOrNonNeg(
     step.prompt_tokens,
     step.promptTokenCount,
     usage.prompt_tokens,
-    hasOpenAiResponsesDetails ? usage.input_tokens : null,
+    hasInclusiveGatewayCacheDetails ? usage.input_tokens : null,
     usage.promptTokenCount,
     usage.prompt_token_count
   );
@@ -552,18 +568,19 @@ function extractCallEditPaths(call) {
   return paths;
 }
 
+const REAL_VERIFY_CMD_RE =
+  /\b(?:test|vitest|jest|pytest|mocha|ava|playwright|cypress|cargo\s+(?:test|check|build|clippy)|go\s+(?:test|build|vet)|tsc|typecheck|lint|eslint|biome|ruff|flake8|mypy|gradle|mvn|dotnet\s+(?:test|build)|make|cmake|npm\s+(?:test|t|run\s+(?:build|check|verify|lint|test|typecheck|prefix:budget|verify:pkg|brief:check))|pnpm\s+(?:build|check|verify|lint|test|typecheck)|yarn\s+(?:build|check|verify|lint|test|typecheck)|bun\s+(?:test|build)|node\s+--test)\b/i;
+
 function isCheckOrVerifyCall(call) {
   const { bareTool, args } = unwrapEffectiveTool(call);
-  if (
-    bareTool === "run_command" ||
-    bareTool === "run_checks" ||
-    /(?:^|_)run_checks$/.test(bareTool) ||
-    bareTool === "ctx_execute" ||
-    bareTool === "ctx_batch"
-  ) {
+  if (bareTool === "run_checks" || /(?:^|_)run_checks$/.test(bareTool)) {
     return true;
   }
-  if ((bareTool === "apply_edits" || /(?:^|_)apply_edits$/.test(bareTool)) && args.verify) {
+  if (bareTool === "run_command" && args && typeof args === "object") {
+    const cmdStr = String(args.CommandLine ?? args.commandLine ?? args.command ?? "");
+    return REAL_VERIFY_CMD_RE.test(cmdStr);
+  }
+  if ((bareTool === "apply_edits" || /(?:^|_)apply_edits$/.test(bareTool)) && args && args.verify) {
     return true;
   }
   return false;
@@ -853,6 +870,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
   };
   const recentBusts = [];
   const allTurns = [];
+  const turnBillingItems = [];
   const deltaAttributions = [];
 
   let turnsWithUsage = 0;
@@ -885,6 +903,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
   let mediaLoadedSincePrev = false;
   let systemMsgSincePrev = false;
   let hasSeenPlanner = false;
+  let inToolLoop = false;
   let prevTurnTools = [];
 
   const seenReadSignatures = new Set();
@@ -960,6 +979,9 @@ export function analyzeTranscriptCache(steps, options = {}) {
         subRaw.subagentTrafficEstTokens += userMeasure.estTokens;
       }
       // New user turn starts: clear previous turn's tool attribution so user prompt growth isn't misattributed
+      if (!stepIsSubagent) {
+        inToolLoop = false;
+      }
       prevTurnTools = [];
       pendingToolCalls = [];
       pendingCallCursor = 0;
@@ -1179,11 +1201,13 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
         const edited = extractCallEditPaths(call);
         const isCheckCall = isCheckOrVerifyCall(call);
-        for (const ep of edited) turnEditedFiles.push(ep);
-        if (edited.length > 0 && !callFailed) editEpoch += 1;
-        if (isCheckCall) turnRanCheck = true;
+        if (!stepIsSubagent) {
+          for (const ep of edited) turnEditedFiles.push(ep);
+          if (edited.length > 0 && !callFailed) editEpoch += 1;
+          if (isCheckCall) turnRanCheck = true;
+        }
 
-        if (!IGNORED_LOOP_TOOLS.has(desc.bareTool)) {
+        if (!stepIsSubagent && !IGNORED_LOOP_TOOLS.has(desc.bareTool)) {
           let effectiveFp = desc.fingerprint;
           // Passing verification after a fresh edit is healthy TDD progress, not a doom loop
           if (
@@ -1254,42 +1278,42 @@ export function analyzeTranscriptCache(steps, options = {}) {
       }
     }
 
-    // Update edit<->fail oscillation state from this turn's calls + following result steps
-    const turnFailed = followingResults.some((r, rIdx) => {
-      const rid = r?.tool_call_id ?? r?.call_id ?? r?.toolCallId ?? null;
-      const bareTool =
-        (rid !== null && rid !== undefined && bareToolByCallId.get(String(rid))) || callBareTools[rIdx] || "";
-      return isStepFailureResult(r, bareTool);
-    });
-    if (turnEditedFiles.length > 0 && turnFailed) {
-      editFailOscillations += 1;
-      for (const f of turnEditedFiles) {
-        const shortF = shortTargetLabel(f, 36);
-        oscillatingFilesCount.set(shortF, (oscillatingFilesCount.get(shortF) || 0) + 1);
-      }
-      // Clear pending edits since this edit's failure has already been counted as an oscillation
-      pendingEditFiles.clear();
-    } else if (turnEditedFiles.length > 0 && turnRanCheck && !turnFailed && followingResults.length > 0) {
-      // Edit + inline verify succeeded -> converged!
-      editFailOscillations = 0;
-      pendingEditFiles.clear();
-      oscillatingFilesCount.clear();
-    } else if (turnEditedFiles.length > 0) {
-      for (const f of turnEditedFiles) pendingEditFiles.add(f);
-    } else if (turnRanCheck && turnFailed) {
-      if (pendingEditFiles.size > 0) {
+    // Update edit<->fail oscillation state and active tool-loop state from primary conversation turns only
+    if (!stepIsSubagent) {
+      inToolLoop = (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) || followingResults.length > 0;
+      const turnFailed = followingResults.some((r, rIdx) => {
+        const rid = r?.tool_call_id ?? r?.call_id ?? r?.toolCallId ?? null;
+        const bareTool =
+          (rid !== null && rid !== undefined && bareToolByCallId.get(String(rid))) || callBareTools[rIdx] || "";
+        return isStepFailureResult(r, bareTool);
+      });
+      if (turnEditedFiles.length > 0 && turnFailed) {
         editFailOscillations += 1;
-        for (const f of pendingEditFiles) {
+        for (const f of turnEditedFiles) {
           const shortF = shortTargetLabel(f, 36);
           oscillatingFilesCount.set(shortF, (oscillatingFilesCount.get(shortF) || 0) + 1);
         }
         pendingEditFiles.clear();
+      } else if (turnEditedFiles.length > 0 && turnRanCheck && !turnFailed && followingResults.length > 0) {
+        editFailOscillations = 0;
+        pendingEditFiles.clear();
+        oscillatingFilesCount.clear();
+      } else if (turnEditedFiles.length > 0) {
+        for (const f of turnEditedFiles) pendingEditFiles.add(f);
+      } else if (turnRanCheck && turnFailed) {
+        if (pendingEditFiles.size > 0) {
+          editFailOscillations += 1;
+          for (const f of pendingEditFiles) {
+            const shortF = shortTargetLabel(f, 36);
+            oscillatingFilesCount.set(shortF, (oscillatingFilesCount.get(shortF) || 0) + 1);
+          }
+          pendingEditFiles.clear();
+        }
+      } else if (turnRanCheck && !turnFailed && followingResults.length > 0) {
+        editFailOscillations = 0;
+        pendingEditFiles.clear();
+        oscillatingFilesCount.clear();
       }
-    } else if (turnRanCheck && !turnFailed && followingResults.length > 0) {
-      // Verification succeeded -> clear active oscillation streak
-      editFailOscillations = 0;
-      pendingEditFiles.clear();
-      oscillatingFilesCount.clear();
     }
 
     const turnUsage = extractStepTokenUsage(step);
@@ -1374,6 +1398,8 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
       let turnWasBust = false;
       let turnBustCause = null;
+      let turnWastedTokens = 0;
+      let turnWastedRewritten = 0;
 
       // Check for cache bust relative to previous warm turn's prefix size
       if (hasSeenPlanner && prevCtxTokens >= MIN_CACHEABLE_CONTEXT_TOKENS) {
@@ -1426,9 +1452,11 @@ export function analyzeTranscriptCache(steps, options = {}) {
           turnBustCause = cause;
           const expectedReusable = Math.min(prevCtxTokens, ctxTok);
           const wastedTokens = Math.max(0, expectedReusable - safeCache);
+          turnWastedTokens = wastedTokens;
+          turnWastedRewritten = Math.min(wastedTokens, safeCacheCreate);
           bustsByCause[cause] += 1;
           wastedTokensTotal += wastedTokens;
-          wastedRewrittenTokens += Math.min(wastedTokens, safeCacheCreate);
+          wastedRewrittenTokens += turnWastedRewritten;
 
           recentBusts.push({
             stepIndex: step.step_index ?? i,
@@ -1444,6 +1472,16 @@ export function analyzeTranscriptCache(steps, options = {}) {
           });
         }
       }
+
+      turnBillingItems.push({
+        profile: activeTurnProfile,
+        safeIn,
+        safeCache,
+        safeCacheCreate,
+        safeCacheCreate1h,
+        turnWastedTokens,
+        turnWastedRewritten
+      });
 
       allTurns.push({
         turn: turnsWithUsage,
@@ -1577,27 +1615,57 @@ export function analyzeTranscriptCache(steps, options = {}) {
     coldCompactTokens,
     delayHotMinTokens
   });
-  const estimatedCostSavingsPct = estimateCostSavingsPct(
-    cachedTokensTotal,
-    uncachedInputTokensTotal,
-    cacheDiscountRate,
-    cacheCreationTokensTotal,
-    cacheWriteMultiplier
-  );
+  // Sum USD costs per-turn using each turn's active model profile (prevents 10x-50x skew across model_switch)
+  let actualUsdRaw = 0;
+  let baselineUncachedUsdRaw = 0;
+  let wastedUsdRaw = 0;
+  for (const item of turnBillingItems) {
+    const p = item.profile;
+    const tDiscount = explicitDiscountRate ?? p.cacheDiscountRate;
+    const tBaseWrite = p.cacheWriteMultiplier ?? DEFAULT_CACHE_WRITE_MULTIPLIER;
+    const tLongWrite = p.cacheWrite1hMultiplier ?? tBaseWrite;
+    const pMaxGap = maxWarmGapByProfile.get(p.id) ?? null;
+    const pHas1h = Boolean(seen1hWriteByProfile.get(p.id));
+    const pCalTtl = explicitTtlSec === null ? calibrateEmpiricalTtl(p, pMaxGap, pHas1h) : null;
+    const pTtlSec = explicitTtlSec ?? pCalTtl ?? p.ttlSec;
+    let tWriteMult;
+    if (explicitWriteMultiplier !== null) {
+      tWriteMult = explicitWriteMultiplier;
+    } else if (item.safeCacheCreate1h > 0 && item.safeCacheCreate > 0) {
+      const c1h = Math.min(item.safeCacheCreate1h, item.safeCacheCreate);
+      const c5m = item.safeCacheCreate - c1h;
+      tWriteMult = (c5m * tBaseWrite + c1h * tLongWrite) / item.safeCacheCreate;
+    } else if (pTtlSec >= 3600) {
+      tWriteMult = tLongWrite;
+    } else {
+      tWriteMult = tBaseWrite;
+    }
+    const tPricePerToken = (explicitInputPricePer1M ?? p.inputPer1M ?? DEFAULT_INPUT_PRICE_PER_1M) / 1e6;
+    const tAll = item.safeIn + item.safeCache + item.safeCacheCreate;
+    const tEquiv = item.safeIn + (1 - tDiscount) * item.safeCache + tWriteMult * item.safeCacheCreate;
+    actualUsdRaw += tEquiv * tPricePerToken;
+    baselineUncachedUsdRaw += tAll * tPricePerToken;
+    if (item.turnWastedTokens > 0) {
+      const tUncachedWaste = Math.max(0, item.turnWastedTokens - item.turnWastedRewritten);
+      wastedUsdRaw +=
+        (tUncachedWaste * tDiscount + item.turnWastedRewritten * (tWriteMult - (1 - tDiscount))) * tPricePerToken;
+    }
+  }
 
-  const pricePerToken = inputPricePer1M / 1e6;
-  const actualCostTokenEquiv =
-    uncachedInputTokensTotal +
-    (1 - cacheDiscountRate) * cachedTokensTotal +
-    cacheWriteMultiplier * cacheCreationTokensTotal;
-  const estimatedInputCostUsd = roundUsd(actualCostTokenEquiv * pricePerToken);
-  const estimatedSavedUsd = roundUsd((totalInputAll - actualCostTokenEquiv) * pricePerToken);
-  const uncachedWastedTokens = Math.max(0, wastedTokensTotal - wastedRewrittenTokens);
-  const estimatedWastedUsd = roundUsd(
-    (uncachedWastedTokens * cacheDiscountRate +
-      wastedRewrittenTokens * (cacheWriteMultiplier - (1 - cacheDiscountRate))) *
-      pricePerToken
-  );
+  const estimatedCostSavingsPct =
+    baselineUncachedUsdRaw > 0
+      ? Number((((baselineUncachedUsdRaw - actualUsdRaw) / baselineUncachedUsdRaw) * 100).toFixed(1))
+      : estimateCostSavingsPct(
+          cachedTokensTotal,
+          uncachedInputTokensTotal,
+          cacheDiscountRate,
+          cacheCreationTokensTotal,
+          cacheWriteMultiplier
+        );
+
+  const estimatedInputCostUsd = roundUsd(actualUsdRaw);
+  const estimatedSavedUsd = roundUsd(baselineUncachedUsdRaw - actualUsdRaw);
+  const estimatedWastedUsd = roundUsd(wastedUsdRaw);
 
   // Evaluate doom-loop / oscillation watch from trailing tool window
   const windowSize = recentCallWindow.length;
@@ -1656,6 +1724,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
   return {
     turnsWithUsage,
+    inToolLoop,
     warmTurns,
     cacheableTurns: hitRateCount,
     cachedTokensTotal,
@@ -1751,8 +1820,9 @@ export function analyzeMultipleSessionsCache(sessions, options = {}) {
   const aggCompRaw = createRawCompositionBuckets();
   const aggSubRaw = createRawSubagentCounters();
 
-  for (const steps of sessions || []) {
-    if (!Array.isArray(steps) || steps.length === 0) continue;
+  for (const rawSess of sessions || []) {
+    const steps = Array.isArray(rawSess) ? rawSess : Array.isArray(rawSess?.steps) ? rawSess.steps : null;
+    if (!steps || steps.length === 0) continue;
     const res = analyzeTranscriptCache(steps, options);
     if (res.contextComposition) {
       for (const key of COMPOSITION_KEYS) {

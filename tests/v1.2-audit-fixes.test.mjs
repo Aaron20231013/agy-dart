@@ -1365,6 +1365,7 @@ test("Audit P1/P2/P3 (H-24, H-25, M-17, M-28, P3-12, P3-13): cache analyzer, sim
     { step_index: 3, type: "PLANNER_RESPONSE", created_at: new Date(tBase + 30000).toISOString(), model: "claude-sonnet-4", input_tokens: 4000, cache_read_tokens: 24000, output_tokens: 200 }
   ];
   const sim = simulateCachePolicies([{ sessionId: "s-h25", steps: claudeSteps }]);
+  assert.equal(sim.sessions, 1, "H-25: must simulate 1 non-empty session");
   const ttl5m = sim.policies.find((s) => s.id === "ttl-5m");
   assert.ok(ttl5m, "ttl-5m policy missing");
   assert.equal(ttl5m.deltaPctVsObserved, 0, `H-25: expected 0% delta for equivalent ttl-5m, got ${ttl5m.deltaPctVsObserved}%`);

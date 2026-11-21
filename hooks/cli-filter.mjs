@@ -75,78 +75,9 @@ function decodeUtf8TrimIncomplete(chunks, trimTrailingIncomplete = false) {
   return buf.toString("utf8");
 }
 
-function resolveWindowsExeOnPath(cmdName, cwd) {
-  if (!cmdName || /[\r\n\0]/.test(cmdName)) return null;
-  const hasSep = cmdName.includes("/") || cmdName.includes("\\");
-  const hasExe = /\.exe$/i.test(cmdName);
-  const tryFile = (p) => {
-    try {
-      return fs.existsSync(p) && fs.statSync(p).isFile() ? p : null;
-    } catch {
-      return null;
-    }
-  };
-  if (hasSep) {
-    const resolved = path.resolve(cwd, cmdName);
-    return hasExe ? tryFile(resolved) : tryFile(`${resolved}.exe`);
-  }
-  const pathEnv = process.env.PATH || process.env.Path || "";
-  const candidateName = hasExe ? cmdName : `${cmdName}.exe`;
-  for (const dir of pathEnv.split(";")) {
-    const cleanDir = dir.trim().replace(/^"|"$/g, "");
-    if (!cleanDir) continue;
-    const hit = tryFile(path.join(cleanDir, candidateName));
-    if (hit) return hit;
-  }
-  return null;
-}
-
-function tryParseSimpleCommand(cmd) {
-  if (!cmd || typeof cmd !== "string") return null;
-  const tokens = [];
-  let i = 0;
-  const len = cmd.length;
-  while (i < len) {
-    while (i < len && /\s/.test(cmd[i])) i++;
-    if (i >= len) break;
-    let tok = "";
-    let hasContent = false;
-    while (i < len && !/\s/.test(cmd[i])) {
-      const ch = cmd[i];
-      if (ch === "'" || ch === '"') {
-        hasContent = true;
-        const q = ch;
-        i++;
-        let closed = false;
-        while (i < len) {
-          if (q === '"' && cmd[i] === "\\" && i + 1 < len && (cmd[i + 1] === '"' || cmd[i + 1] === "\\")) {
-            tok += cmd[i + 1];
-            i += 2;
-            continue;
-          }
-          if (cmd[i] === q) {
-            i++;
-            closed = true;
-            break;
-          }
-          tok += cmd[i];
-          i++;
-        }
-        if (!closed) return null;
-      } else {
-        if (/[|;&<>`$()%!{}#\r\n\0]/.test(ch)) return null;
-        tok += ch;
-        hasContent = true;
-        i++;
-      }
-    }
-    if (hasContent) tokens.push(tok);
-  }
-  if (tokens.length === 0) return null;
-  return { bin: tokens[0], args: tokens.slice(1) };
-}
-
-function runCommandCaptured(command, unwrapFn = null) {
+function runCommandCaptured(command, unwrapFn = null, helpers = {}) {
+  const resolveWinExe = helpers.resolveWindowsExeOnPath;
+  const parseSimple = helpers.tryParseSimpleCommand;
   return new Promise((resolve) => {
     const parts = typeof unwrapFn === "function" ? unwrapFn(command) : null;
     let execCwd = process.cwd();
@@ -191,10 +122,10 @@ function runCommandCaptured(command, unwrapFn = null) {
     const usePowerShell = process.platform === "win32" && /['^%]/.test(execCmd) && !/&&/.test(execCmd);
     let directWinExe = null;
     let directWinArgs = null;
-    if (process.platform === "win32" && usePowerShell) {
-      const parsedSimple = tryParseSimpleCommand(execCmd);
+    if (process.platform === "win32" && usePowerShell && typeof parseSimple === "function" && typeof resolveWinExe === "function") {
+      const parsedSimple = parseSimple(execCmd);
       if (parsedSimple) {
-        const exePath = resolveWindowsExeOnPath(parsedSimple.bin, execCwd);
+        const exePath = resolveWinExe(parsedSimple.bin, execCwd, process.env);
         if (exePath) {
           directWinExe = exePath;
           directWinArgs = parsedSimple.args;
@@ -273,15 +204,66 @@ function runCommandCaptured(command, unwrapFn = null) {
       }
     });
 
+    let childClosed = false;
+    let terminatingSignal = null;
+    const killChildProcessTree = (sig) => {
+      const pid = child.pid;
+      const fallback = () => {
+        try {
+          child.kill(sig);
+        } catch {}
+      };
+      if (!pid) {
+        fallback();
+        return;
+      }
+      if (process.platform === "win32") {
+        try {
+          const sysRoot = process.env.SystemRoot || process.env.WINDIR;
+          const taskkillBin = sysRoot ? path.join(sysRoot, "System32", "taskkill.exe") : "taskkill";
+          const killer = spawn(taskkillBin, ["/F", "/T", "/PID", String(pid)], {
+            stdio: "ignore",
+            windowsHide: true
+          });
+          killer.on("error", fallback);
+          killer.on("close", (kCode) => {
+            if (kCode !== 0 && !childClosed) fallback();
+          });
+          killer.unref();
+        } catch {
+          fallback();
+        }
+      } else {
+        try {
+          process.kill(-pid, sig);
+        } catch {
+          fallback();
+        }
+      }
+    };
     const onSignal = (sig) => {
-      try {
-        child.kill(sig);
-      } catch {}
+      if (terminatingSignal) return;
+      terminatingSignal = sig;
+      const sigExitCode = sig === "SIGINT" ? 130 : sig === "SIGTERM" ? 143 : 1;
+      killChildProcessTree(sig);
+      const forceExitTimer = setTimeout(() => {
+        try {
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        } catch {}
+        process.exit(sigExitCode);
+      }, 400);
+      forceExitTimer.unref?.();
+      child.once("close", () => {
+        clearTimeout(forceExitTimer);
+        process.exit(sigExitCode);
+      });
     };
     process.once("SIGINT", onSignal);
     process.once("SIGTERM", onSignal);
 
     child.on("error", (err) => {
+      childClosed = true;
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
       resolve({
@@ -295,6 +277,7 @@ function runCommandCaptured(command, unwrapFn = null) {
     });
 
     child.on("close", (code, signal) => {
+      childClosed = true;
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
       const stderrText = decodeUtf8TrimIncomplete(errChunks, errTruncated);
@@ -336,17 +319,22 @@ async function main() {
     process.exit(2);
   }
 
-  const { applyFilterRule, MAX_FILTERED_OUTPUT_BYTES, unwrapSafeCompoundCommand } = await import(
-    "./filter-rules.mjs"
-  );
+  const {
+    applyFilterRule,
+    MAX_FILTERED_OUTPUT_BYTES,
+    unwrapSafeCompoundCommand,
+    resolveWindowsExeOnPath,
+    tryParseSimpleCommand
+  } = await import("./filter-rules.mjs");
   const [res, { ContextModeStore }, { redactSecrets }] = await Promise.all([
-    runCommandCaptured(command, unwrapSafeCompoundCommand),
+    runCommandCaptured(command, unwrapSafeCompoundCommand, { resolveWindowsExeOnPath, tryParseSimpleCommand }),
     import("../context/lib/store.js"),
     import("../context/lib/security.js")
   ]);
 
   const redOut = redactSecrets(res.stdout || "");
   const redErr = redactSecrets(res.stderr || "");
+  const safeOriginalCommand = redactSecrets(originalCommand || "").text;
   const safeStdout = redOut.text;
   const safeStderr = redErr.text;
   const safeCapturedStderr = res.capturedStderr ? redactSecrets(res.capturedStderr).text : "";
@@ -369,7 +357,7 @@ async function main() {
         worktree: effectiveCwd,
         agent: "antigravity",
         kind: "tool_output",
-        label: `cli:${ruleId || "cmd"} ${originalCommand.slice(0, 60)}`,
+        label: `cli:${ruleId || "cmd"} ${safeOriginalCommand.slice(0, 60)}`,
         content: rawCombined,
         dedup: true
       });
@@ -409,7 +397,7 @@ async function main() {
         kind: "cli_filter",
         tool: "run_command",
         key: ruleId || "generic",
-        path: originalCommand.slice(0, 120),
+        path: safeOriginalCommand.slice(0, 120),
         ok: res.exitCode === 0 ? 1 : 0,
         exitCode: res.exitCode,
         bytes: filtered.rawBytes,
@@ -421,7 +409,7 @@ async function main() {
     if (ruleId === "test-runner" || ruleId === "playwright" || ruleId === "build-lint" || ruleId === "docker-build") {
       store.recordVerificationResult(sessionId, {
         kind: ruleId === "test-runner" || ruleId === "playwright" ? "test" : "build",
-        command: originalCommand,
+        command: safeOriginalCommand,
         ruleId,
         exitCode: res.exitCode,
         passed: res.exitCode === 0,

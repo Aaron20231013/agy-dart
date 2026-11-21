@@ -9,6 +9,7 @@ import { getEffectiveConfig } from "../context/lib/config.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CLI_FILTER_SCRIPT = path.resolve(__dirname, "cli-filter.mjs");
+const PLUGIN_ROOT_POSIX = path.resolve(__dirname, "..").replace(/\\/g, "/");
 
 function isMainModule() {
   if (!process.argv[1]) return false;
@@ -310,18 +311,52 @@ export function hasExplicitConversationId(payload = {}, env = process.env) {
   return typeof raw === "string" && raw.trim().length > 0 && raw.trim() !== "default";
 }
 
+const SUBAGENT_ROLE_GUARD_RE = /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier)(?:$|[-_\s/])/i;
+
 export function isSubagentReadPayload(payload = {}, env = process.env) {
   if (env?.ANTIGRAVITY_PARENT_CONVERSATION_ID) return true;
   const envSub = String(env?.ANTIGRAVITY_SUBAGENT || "").trim().toLowerCase();
   if (envSub === "1" || envSub === "true") return true;
   if (!payload || typeof payload !== "object") return false;
   if (payload.subagent === true || payload.isSubagent === true || payload.is_subagent === true) return true;
+  if (payload.metadata && typeof payload.metadata === "object") {
+    if (
+      payload.metadata.subagent === true ||
+      payload.metadata.isSubagent === true ||
+      payload.metadata.is_subagent === true ||
+      payload.metadata.parentConversationId ||
+      payload.metadata.parent_conversation_id ||
+      payload.metadata.parentSessionId ||
+      payload.metadata.parent_session_id
+    ) {
+      return true;
+    }
+  }
   if (payload.parentConversationId || payload.parent_conversation_id || payload.parentSessionId || payload.parent_session_id) {
     return true;
   }
-  const rootId = payload.rootConversationId || payload.root_conversation_id || "";
+  const rootId = payload.rootConversationId || payload.root_conversation_id || payload.metadata?.rootConversationId || "";
   const convId = payload.conversationId || payload.conversation_id || payload.sessionId || payload.session_id || "";
   if (rootId && convId && rootId !== convId) return true;
+  const roleCandidates = [
+    payload.role,
+    payload.agentRole,
+    payload.agent_role,
+    payload.agentType,
+    payload.agent_type,
+    payload.sessionType,
+    payload.session_type,
+    payload.sessionKind,
+    payload.session_kind,
+    payload.metadata?.role,
+    payload.metadata?.agentRole,
+    payload.metadata?.agent_role
+  ];
+  for (const candidate of roleCandidates) {
+    if (typeof candidate === "string" && candidate.trim() && SUBAGENT_ROLE_GUARD_RE.test(candidate.trim())) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -390,9 +425,22 @@ function measureLineRangeBytes(absPath, startLine, endLine, fileSize, fallbackBy
   const sLine = Math.max(1, Number(startLine) || 1);
   const eLine = Number(endLine);
   if (!Number.isFinite(eLine) || eLine < sLine) return 0;
-  if (fileSize > MAX_SLICE_MEASURE_BYTES) return fallbackBytes;
   try {
-    const buf = fs.readFileSync(absPath);
+    let buf;
+    if (fileSize > MAX_SLICE_MEASURE_BYTES) {
+      if (sLine > 1) return fallbackBytes;
+      const capLen = Math.min(fileSize, 65536);
+      buf = Buffer.allocUnsafe(capLen);
+      const fd = fs.openSync(absPath, "r");
+      try {
+        const bytesRead = fs.readSync(fd, buf, 0, capLen, 0);
+        buf = buf.subarray(0, bytesRead);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      buf = fs.readFileSync(absPath);
+    }
     if (buf.length === 0) return 0;
     let lineNum = 1;
     let rangeStart = sLine === 1 ? 0 : null;
@@ -604,11 +652,13 @@ function extractFileDumpTargets(cmdAfterVerb) {
         i++;
       }
     }
-    if (!tok) continue;
     if (skipNextValue) {
-      skipNextValue = false;
-      continue;
+      if (tok || wasQuoted) {
+        skipNextValue = false;
+        continue;
+      }
     }
+    if (!tok) continue;
     if (!afterDoubleDash && !wasQuoted) {
       if (tok === "--") {
         afterDoubleDash = true;
@@ -631,26 +681,156 @@ function extractFileDumpTargets(cmdAfterVerb) {
   return targets;
 }
 
-export function inspectCommand({ commandLine, cwd, sessionId }) {
-  if (!commandLine || typeof commandLine !== "string") {
-    return { shouldDeny: false };
+function stripQuotedCommandLiterals(cmd) {
+  if (!cmd) return "";
+  let out = "";
+  let i = 0;
+  const len = cmd.length;
+  while (i < len) {
+    const ch = cmd[i];
+    if (ch === "'" || ch === '"') {
+      const q = ch;
+      out += '""';
+      i++;
+      while (i < len) {
+        if (q === '"' && cmd[i] === "\\" && i + 1 < len) {
+          i += 2;
+          continue;
+        }
+        if (q === "'" && cmd[i] === "'" && i + 1 < len && cmd[i + 1] === "'") {
+          i += 2;
+          continue;
+        }
+        if (cmd[i] === q) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    out += ch;
+    i++;
   }
+  return out;
+}
 
+function splitTopLevelCommandSegments(cmd) {
+  if (!cmd || typeof cmd !== "string") return [];
+  const segments = [];
+  let start = 0;
+  let i = 0;
+  const len = cmd.length;
+  while (i < len) {
+    const ch = cmd[i];
+    if (ch === "'" || ch === '"') {
+      const q = ch;
+      i++;
+      while (i < len) {
+        if (q === '"' && cmd[i] === "\\" && i + 1 < len) {
+          i += 2;
+          continue;
+        }
+        if (q === "'" && cmd[i] === "'" && i + 1 < len && cmd[i + 1] === "'") {
+          i += 2;
+          continue;
+        }
+        if (cmd[i] === q) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === ";" || ch === "\n" || ch === "\r") {
+      const seg = cmd.slice(start, i).trim();
+      if (seg) segments.push(seg);
+      i++;
+      start = i;
+      continue;
+    }
+    if ((ch === "&" && cmd[i + 1] === "&") || (ch === "|" && cmd[i + 1] === "|")) {
+      const seg = cmd.slice(start, i).trim();
+      if (seg) segments.push(seg);
+      i += 2;
+      start = i;
+      continue;
+    }
+    i++;
+  }
+  const tail = cmd.slice(start).trim();
+  if (tail) segments.push(tail);
+  return segments;
+}
+
+function parseLeadingLooseGitSubcommand(cmd) {
+  if (!cmd || typeof cmd !== "string") return null;
+  let i = 0;
+  const len = cmd.length;
+  const nextTok = () => {
+    while (i < len && /\s/.test(cmd[i])) i++;
+    if (i >= len) return null;
+    const start = i;
+    let val = "";
+    while (i < len && !/\s/.test(cmd[i])) {
+      const ch = cmd[i];
+      if (ch === "|" || ch === ";" || ch === "&") {
+        if (i === start) return null;
+        break;
+      }
+      if (ch === "'" || ch === '"') {
+        const q = ch;
+        i++;
+        while (i < len && cmd[i] !== q) {
+          if (q === '"' && cmd[i] === "\\" && i + 1 < len) {
+            val += cmd[i + 1];
+            i += 2;
+            continue;
+          }
+          val += cmd[i];
+          i++;
+        }
+        if (i < len && cmd[i] === q) i++;
+      } else {
+        val += ch;
+        i++;
+      }
+    }
+    return { val, end: i };
+  };
+  const first = nextTok();
+  if (!first || !/^(?:.*[\\/])?git(?:\.exe)?$/i.test(first.val)) return null;
+  const valueFlags = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env", "--super-prefix"]);
+  for (let step = 0; step < 24; step++) {
+    const t = nextTok();
+    if (!t) return null;
+    if (valueFlags.has(t.val)) {
+      if (!nextTok()) return null;
+      continue;
+    }
+    if (t.val.startsWith("-")) {
+      continue;
+    }
+    return { subcommand: t.val.toLowerCase(), rest: cmd.slice(t.end) };
+  }
+  return null;
+}
+
+function inspectSingleCommandSegment({ commandLine, cwd, sessionId, maxReadBytes, exemptExtensions, sensitiveGuardMode, secMod }) {
   const cleanCmd = cleanStringArg(commandLine);
-  const maxReadBytes = getMaxReadBytes(sessionId);
-  const exemptExtensions = getExemptExtensions(sessionId);
+  if (!cleanCmd) return { shouldDeny: false };
 
-  // 1. Unbounded git log (supports safe leading global git options like `-C <path>`, `--no-pager`, `-P`, `--git-dir`, `--work-tree`)
-  const gitParsed = parseGitSubcommandFn ? parseGitSubcommandFn(cleanCmd) : null;
-  const isGitLog =
-    (gitParsed && gitParsed.subcommand === "log") ||
-    (!parseGitSubcommandFn && /^\s*git(?:\.exe)?\s+log\b/i.test(cleanCmd));
+  // 1. Unbounded git log (catches arbitrary global options like `git -c core.pager=cat log` or `git --no-optional-locks log`)
+  const gitParsed = (parseGitSubcommandFn ? parseGitSubcommandFn(cleanCmd) : null) || parseLeadingLooseGitSubcommand(cleanCmd);
+  const isGitLog = Boolean(gitParsed && gitParsed.subcommand === "log");
   if (isGitLog) {
-    const gitLogArgs = gitParsed ? gitParsed.rest : cleanCmd;
+    const gitLogArgs = gitParsed.rest;
+    const unquotedGitRest = stripQuotedCommandLiterals(gitLogArgs);
     const isLimited =
-      /(?:^|\s)(?:-n\s*\d+|-\d+|--max-count(?:=|\s)\d+|--since(?:=|\s)\S+|--after(?:=|\s)\S+|\S+\.\.\S+)(?=\s|$)|\s*\|\s*(?:head|Select-Object|select|more)\b/i.test(
+      /(?:^|\s)(?:-n\s*\d+|-\d+|--max-count(?:=|\s)\d+|--since(?:=|\s)\S+|--after(?:=|\s)\S+|\S+\.\.\S+)(?=\s|$)/i.test(
         gitLogArgs
-      );
+      ) || /\s*\|\s*(?:head|Select-Object|select|more)\b/i.test(unquotedGitRest);
     if (!isLimited) {
       return {
         shouldDeny: true,
@@ -668,18 +848,19 @@ export function inspectCommand({ commandLine, cwd, sessionId }) {
     /(?:^|\s)2>>?\s*(?:&\d+|"[^"]*"|'[^']*'|[^\s;|&]+)(?=\s|$|[;|&])/g,
     " "
   );
+  const unquotedNoStderr = stripQuotedCommandLiterals(cmdNoStderrRedir);
 
   // 2. Direct curl / wget to stdout
   const fetchMatch = cleanCmd.match(/^\s*(curl|wget)(?:\.exe)?\b/i);
   if (fetchMatch) {
     const isCurl = fetchMatch[1].toLowerCase() === "curl";
     const writesToFile =
-      />\s*[^>]/i.test(cmdNoStderrRedir) ||
+      />\s*[^>]/i.test(unquotedNoStderr) ||
       /(?:^|\s)(?:-o|-O|--output|--output-document)(?:=|\s+)(?!["']?-(?:["']?)(?:\s|$|[;|&]))(?:"[^"]+"|'[^']+'|\S+)/.test(
         cmdNoStderrRedir
       ) ||
-      (isCurl && /(?:^|\s)(?:-O|--remote-name)(?=\s|$|[;|&])/.test(cmdNoStderrRedir));
-    const hasLimiter = /\|\s*(head|Select-Object|select|more)/i.test(cmdNoStderrRedir);
+      (isCurl && /(?:^|\s)(?:-O|--remote-name)(?=\s|$|[;|&])/.test(unquotedNoStderr));
+    const hasLimiter = /\|\s*(head|Select-Object|select|more)\b/i.test(unquotedNoStderr);
     if (!writesToFile && !hasLimiter) {
       const urlMatch = cleanCmd.match(/https?:\/\/[^\s"']+/i);
       if (urlMatch) {
@@ -710,15 +891,40 @@ export function inspectCommand({ commandLine, cwd, sessionId }) {
       return { shouldDeny: false };
     }
 
-    const hasLimiter =
-      /(-Head|-TotalCount|-First|-Tail)\s+\d+/i.test(cmdNoStderrRedir) ||
-      /\|\s*(head|Select-Object|select\s+(-[a-zA-Z]+\s+)*-First|more|Out-Null|Set-Content|Out-File)/i.test(cmdNoStderrRedir) ||
-      />\s*[^>]/i.test(cmdNoStderrRedir);
-
-    if (hasLimiter) return { shouldDeny: false };
-
     const restAfterVerb = cmdNoStderrRedir.slice(printMatch[0].length);
     const rawTargets = extractFileDumpTargets(restAfterVerb);
+
+    if (sensitiveGuardMode === "deny" && secMod) {
+      for (const rawTarget of rawTargets) {
+        if (!rawTarget || rawTarget.includes("*") || rawTarget.includes("?")) continue;
+        const cleanTarget = cleanFilePath(rawTarget);
+        if (!cleanTarget) continue;
+        const absPath = path.isAbsolute(cleanTarget) ? cleanTarget : path.resolve(cwd, cleanTarget);
+        let realAbsPath = absPath;
+        try {
+          realAbsPath = fs.realpathSync(absPath);
+        } catch {}
+        const sensDirect = secMod.detectSensitiveFile(absPath);
+        const sensReal = realAbsPath !== absPath ? secMod.detectSensitiveFile(realAbsPath) : { sensitive: false, reason: null };
+        const sens = sensDirect.sensitive ? sensDirect : sensReal;
+        if (sens.sensitive) {
+          return {
+            shouldDeny: true,
+            reason:
+              `[agy-dart sensitive-file] Command attempts to dump sensitive file '${cleanTarget}' (${sens.reason}), blocked by AGY_DART_SENSITIVE_FILE_GUARD=deny.`,
+            size: 4096,
+            targetPath: cleanTarget
+          };
+        }
+      }
+    }
+
+    const hasLimiter =
+      /(-Head|-TotalCount|-First|-Tail)\s+\d+/i.test(unquotedNoStderr) ||
+      /\|\s*(head|Select-Object|select\s+(-[a-zA-Z]+\s+)*-First|more|Out-Null|Set-Content|Out-File)\b/i.test(unquotedNoStderr) ||
+      />\s*[^>]/i.test(unquotedNoStderr);
+
+    if (hasLimiter) return { shouldDeny: false };
 
     let cumulativeNonExemptBytes = 0;
     for (const rawTarget of rawTargets) {
@@ -775,6 +981,48 @@ export function inspectCommand({ commandLine, cwd, sessionId }) {
   return { shouldDeny: false };
 }
 
+export function inspectCommand({ commandLine, cwd, sessionId, sensitiveGuardMode = null }) {
+  if (!commandLine || typeof commandLine !== "string") {
+    return { shouldDeny: false };
+  }
+
+  const cleanCmd = cleanStringArg(commandLine);
+  const maxReadBytes = getMaxReadBytes(sessionId);
+  const exemptExtensions = getExemptExtensions(sessionId);
+  const effSensMode = sensitiveGuardMode || getEffectiveConfig().sensitiveFileGuard || "off";
+  const secMod = effSensMode === "deny" ? securityModule : null;
+
+  const segments = splitTopLevelCommandSegments(cleanCmd);
+  if (segments.length === 0) return { shouldDeny: false };
+
+  let activeCwd = cwd || process.cwd();
+  for (const seg of segments) {
+    const cdStep = /^(?:cd(?:\s+\/d)?|Set-Location|sl)\s+("[^"]+"|'[^']+'|\S+)\s*$/i.exec(seg);
+    if (cdStep) {
+      let rawDir = cdStep[1];
+      if ((rawDir.startsWith('"') && rawDir.endsWith('"')) || (rawDir.startsWith("'") && rawDir.endsWith("'"))) {
+        rawDir = rawDir.slice(1, -1);
+      }
+      if (rawDir && !rawDir.startsWith("-")) {
+        activeCwd = resolveCdTargetCwdFn ? resolveCdTargetCwdFn(activeCwd, rawDir) : path.resolve(activeCwd, rawDir);
+      }
+      continue;
+    }
+    const res = inspectSingleCommandSegment({
+      commandLine: seg,
+      cwd: activeCwd,
+      sessionId,
+      maxReadBytes,
+      exemptExtensions,
+      sensitiveGuardMode: effSensMode,
+      secMod
+    });
+    if (res.shouldDeny) return res;
+  }
+
+  return { shouldDeny: false };
+}
+
 function finishAllow() {
   closeSharedStore();
   process.stdout.write(JSON.stringify({ decision: "allow" }) + "\n");
@@ -821,10 +1069,12 @@ async function main() {
     }
     const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
     const ext = path.extname(absPath).toLowerCase();
+    const guardActive = (effectiveCfg.sensitiveFileGuard || "off") !== "off";
     if (
-      isUserAttachedFile(rawFilePath, absPath) ||
-      isAgentInstructionFile(rawFilePath, absPath) ||
-      BINARY_EXTENSIONS.has(ext)
+      !guardActive &&
+      (isUserAttachedFile(rawFilePath, absPath) ||
+        isAgentInstructionFile(rawFilePath, absPath) ||
+        BINARY_EXTENSIONS.has(ext))
     ) {
       return finishAllow();
     }
@@ -836,6 +1086,9 @@ async function main() {
   await ensureStoreClass();
   if (toolName === "run_command") {
     await ensureFilterRules();
+    if ((effectiveCfg.sensitiveFileGuard || "off") === "deny") {
+      await ensureSecurityModule();
+    }
   }
 
   if (isProtectionPaused(sessionId)) {
@@ -922,6 +1175,14 @@ async function main() {
           }
         }
 
+        if (
+          isUserAttachedFile(preParsedRead.rawFilePath, absPath) ||
+          isAgentInstructionFile(preParsedRead.rawFilePath, absPath) ||
+          BINARY_EXTENSIONS.has(ext)
+        ) {
+          return finishAllow();
+        }
+
         const exemptExtensions = getExemptExtensions(sessionId);
         const isExemptExt = exemptExtensions.includes(ext);
         const isBinary = isBinaryFile(absPath, ext);
@@ -932,15 +1193,26 @@ async function main() {
 
         const isLargeFile = maxReadBytes > 0 && stat.size > maxReadBytes;
         const isWideRange = maxLineRange > 0 && (endLine === null || (endLine - startLine) > maxLineRange);
+        const requestedLineSpan = endLine !== null ? Math.max(1, endLine - startLine + 1) : 1;
+        const maxPagedSliceBytes = Math.max(maxReadBytes * 2, 36864);
+        const slicedRangeBytes =
+          isLargeFile && !isWideRange && endLine !== null
+            ? measureLineRangeBytes(absPath, startLine, endLine, stat.size, 0)
+            : 0;
+        const isMinifiedDenseSlice =
+          slicedRangeBytes > maxReadBytes && slicedRangeBytes / requestedLineSpan > 512;
+        const isOversizedNarrowSlice =
+          maxReadBytes > 0 && (isMinifiedDenseSlice || slicedRangeBytes > maxPagedSliceBytes);
 
-        if (isLargeFile && isWideRange) {
+        if (isLargeFile && (isWideRange || isOversizedNarrowSlice)) {
           const lineInstruction =
-            maxLineRange > 0
+            maxLineRange > 0 && !isOversizedNarrowSlice
               ? ` or outline via ${FAST_SERVER} read_slices({ outlines }) then pass StartLine/EndLine (<= ${maxLineRange} lines).`
-              : "";
+              : ".";
+          const reportedBytes = isOversizedNarrowSlice ? slicedRangeBytes : stat.size;
           const reason =
-            `[agy-dart protection] File is ${formatBytes(stat.size)} (~${Math.round(stat.size / 4).toLocaleString()} tokens), exceeding the ${formatBytes(maxReadBytes)} context limit. ` +
-            `Reading the entire file risks severe context bloat. ` +
+            `[agy-dart protection] File${isOversizedNarrowSlice ? " slice" : ""} is ${formatBytes(reportedBytes)} (~${Math.round(reportedBytes / 4).toLocaleString()} tokens), exceeding the ${formatBytes(maxReadBytes)} context limit. ` +
+            `Reading ${isOversizedNarrowSlice ? "giant single-line/minified content" : "the entire file"} risks severe context bloat. ` +
             `For logs/docs/data use call_mcp_tool(ServerName:"${CTX_SERVER}", ToolName:"ctx_index" or "ctx_execute", path:"${filePath}")${lineInstruction}`;
 
           recordInterception({
@@ -987,6 +1259,17 @@ async function main() {
           stat.size <= MAX_SNAPSHOT_FILE_BYTES;
         const diffReadMaxTurns = effectiveCfg.diffReadMaxTurns;
         const diffReadMaxAgeMs = effectiveCfg.diffReadMaxAgeMs;
+        const readDedupMaxSteps = Number(effectiveCfg.readDedupMaxSteps ?? 40);
+        const rawStepIdx = payload.stepIdx ?? payload.step_idx ?? payload.stepIndex ?? payload.step_index;
+        const currentStepIdx =
+          rawStepIdx !== undefined &&
+          rawStepIdx !== null &&
+          rawStepIdx !== "" &&
+          typeof rawStepIdx !== "boolean" &&
+          Number.isFinite(Number(rawStepIdx)) &&
+          Number(rawStepIdx) >= 0
+            ? Math.floor(Number(rawStepIdx))
+            : null;
 
         if (canUseReadCache && stat.size >= MIN_DEDUP_FILE_BYTES && byteOffset <= 0) {
           const readBounds = computeEffectiveReadBounds(absPath, startLine, endLine, stat.size);
@@ -1003,7 +1286,9 @@ async function main() {
                 mtimeMs: stat.mtimeMs,
                 fileSize: stat.size,
                 ctimeMs: stat.ctimeMs,
-                ino: stat.ino
+                ino: stat.ino,
+                currentStepIdx,
+                maxStepGap: readDedupMaxSteps
               });
 
               // State 2 (Unchanged covering read): 2-strike bypass
@@ -1157,7 +1442,8 @@ async function main() {
                 fileSize: stat.size,
                 ctimeMs: stat.ctimeMs,
                 ino: stat.ino,
-                byteEst: estBytes
+                byteEst: estBytes,
+                stepIdx: currentStepIdx
               });
 
               if (diffReadEnabled && (await loadCurrentRange())) {
@@ -1215,6 +1501,18 @@ async function main() {
     const rawCommandLine = args[cmdKey] || "";
     const trimmedCmd = String(rawCommandLine).trim();
     const isDaemon = Boolean(args.IsDaemon || args.isDaemon);
+    const rawWaitMs = args.WaitMsBeforeAsync ?? args.waitMsBeforeAsync;
+    const parsedWaitMs =
+      rawWaitMs !== undefined && rawWaitMs !== null && rawWaitMs !== "" && typeof rawWaitMs !== "boolean"
+        ? Number(rawWaitMs)
+        : NaN;
+    const asyncBypassMs = Number(effectiveCfg.cliFilterAsyncBypassMs ?? 2000);
+    const isAsyncBackground =
+      asyncBypassMs > 0 && Number.isFinite(parsedWaitMs) && parsedWaitMs >= 0 && parsedWaitMs <= asyncBypassMs;
+    const bypassCliFilter = isDaemon || isAsyncBackground;
+    const sandboxReadOverride = !/["$`\r\n)]/.test(PLUGIN_ROOT_POSIX)
+      ? [`read_file(${PLUGIN_ROOT_POSIX})`]
+      : undefined;
 
     let cliFilterEnabled = true;
     try {
@@ -1222,7 +1520,7 @@ async function main() {
     } catch {}
 
     // 2a. Trusted built-in CLI filter rules
-    if (cliFilterEnabled && !isDaemon && trimmedCmd) {
+    if (cliFilterEnabled && !bypassCliFilter && trimmedCmd) {
       const builtinRewrite = buildCliFilterRewrite(trimmedCmd, sessionId, cwd, { builtinOnly: true });
       if (builtinRewrite) {
         closeSharedStore();
@@ -1231,20 +1529,31 @@ async function main() {
             decision: "allow",
             overwrite: {
               [cmdKey]: builtinRewrite.rewrittenCommand
-            }
+            },
+            ...(sandboxReadOverride ? { permissionOverrides: sandboxReadOverride } : {})
           }) + "\n"
         );
         process.exit(0);
       }
     }
 
-    // 2b. Hard-deny unbounded raw file dumps / stdout downloads / unbounded git log
-    let inspection = inspectCommand({ commandLine: rawCommandLine, cwd, sessionId });
+    // 2b. Hard-deny unbounded raw file dumps / stdout downloads / unbounded git log / sensitive file dumps
+    let inspection = inspectCommand({
+      commandLine: rawCommandLine,
+      cwd,
+      sessionId,
+      sensitiveGuardMode: effectiveCfg.sensitiveFileGuard
+    });
     if (!inspection.shouldDeny && trimmedCmd && unwrapSafeCompoundCommandFn && resolveCdTargetCwdFn) {
       const unwrapped = unwrapSafeCompoundCommandFn(trimmedCmd);
       if (unwrapped && (unwrapped.cdPath || unwrapped.hasStderrRedirect)) {
         const targetCwd = unwrapped.cdPath ? resolveCdTargetCwdFn(cwd, unwrapped.cdPath) : cwd;
-        inspection = inspectCommand({ commandLine: unwrapped.innerCommand, cwd: targetCwd, sessionId });
+        inspection = inspectCommand({
+          commandLine: unwrapped.innerCommand,
+          cwd: targetCwd,
+          sessionId,
+          sensitiveGuardMode: effectiveCfg.sensitiveFileGuard
+        });
       }
     }
 
@@ -1265,7 +1574,7 @@ async function main() {
     }
 
     // 2c. Project-level declarative CLI filter rules (only after hard-deny security checks pass)
-    if (cliFilterEnabled && !isDaemon && trimmedCmd) {
+    if (cliFilterEnabled && !bypassCliFilter && trimmedCmd) {
       const customRewrite = buildCliFilterRewrite(trimmedCmd, sessionId, cwd, { customOnly: true });
       if (customRewrite) {
         closeSharedStore();
@@ -1274,7 +1583,8 @@ async function main() {
             decision: "allow",
             overwrite: {
               [cmdKey]: customRewrite.rewrittenCommand
-            }
+            },
+            ...(sandboxReadOverride ? { permissionOverrides: sandboxReadOverride } : {})
           }) + "\n"
         );
         process.exit(0);

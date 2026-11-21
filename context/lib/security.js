@@ -301,7 +301,13 @@ export async function validateFetchTarget(urlStr, options = {}) {
 }
 
 const SENSITIVE_QUERY_KEY_RE =
-  /(?:^|[_-])(?:api[_-]?key|key|token|secret|pass(?:word)?|pwd|auth(?:orization)?|sig(?:nature)?|cred(?:ential)?s?|jwt|bearer|access[_-]?token|refresh[_-]?token|session(?:[_-]?id)?|cookie|private[_-]?key)$/i;
+  /(?:^|[_-])(?:api[_-]?key|key|token|secret|pass(?:word)?|pwd|auth(?:orization)?|sig(?:nature)?|cred(?:ential)?s?|jwt|bearer|access[_-]?token|refresh[_-]?token|id[_-]?token|session(?:[_-]?id)?|cookie|private[_-]?key)$/i;
+
+function isSensitiveQueryParamKey(rawKey) {
+  if (!rawKey || typeof rawKey !== "string") return false;
+  const decamel = rawKey.replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+  return SENSITIVE_QUERY_KEY_RE.test(rawKey) || SENSITIVE_QUERY_KEY_RE.test(decamel);
+}
 
 /** Strip embedded userinfo credentials and redact sensitive query params from a URL before logging/indexing */
 export function sanitizeUrlForDisplay(urlStr) {
@@ -318,7 +324,7 @@ export function sanitizeUrlForDisplay(urlStr) {
       const keys = [...new Set([...u.searchParams.keys()])];
       for (const key of keys) {
         const vals = u.searchParams.getAll(key);
-        const keySensitive = SENSITIVE_QUERY_KEY_RE.test(key);
+        const keySensitive = isSensitiveQueryParamKey(key);
         let keyChanged = false;
         const nextVals = vals.map((v) => {
           if (keySensitive && v) {
@@ -348,11 +354,17 @@ export function sanitizeUrlForDisplay(urlStr) {
         const nextParts = parts.map((seg) => {
           const eq = seg.indexOf("=");
           if (eq === -1) return seg;
-          const k = seg.slice(0, eq);
+          const qIdx = seg.lastIndexOf("?", eq);
+          const routePrefix = qIdx !== -1 ? seg.slice(0, qIdx + 1) : "";
+          const rawKey = qIdx !== -1 ? seg.slice(qIdx + 1, eq) : seg.slice(0, eq);
+          let decodedKey = rawKey;
+          try {
+            decodedKey = decodeURIComponent(rawKey);
+          } catch {}
           const v = seg.slice(eq + 1);
-          if (v && (SENSITIVE_QUERY_KEY_RE.test(k) || redactSecrets(v, { force: true }).redactedCount > 0)) {
+          if (v && (isSensitiveQueryParamKey(decodedKey) || redactSecrets(v, { force: true }).redactedCount > 0)) {
             hashChanged = true;
-            return `${k}=[REDACTED]`;
+            return `${routePrefix}${rawKey}=[REDACTED]`;
           }
           return seg;
         });
@@ -524,6 +536,7 @@ export function getSensitiveFileGuardMode() {
 }
 
 const SAFE_DOTENV_SUFFIXES = [".example", ".sample", ".template", ".schema", ".dist", ".defaults"];
+const SAFE_DOTENV_STEM_RE = /(?:^|[._-])(?:example|sample|template|schema|dist|defaults)$/;
 
 function detectSensitiveNormalizedPath(lower) {
   const base = path.posix.basename(lower);
@@ -531,6 +544,18 @@ function detectSensitiveNormalizedPath(lower) {
 
   if (base === ".env" || base.startsWith(".env.")) {
     if (SAFE_DOTENV_SUFFIXES.some((s) => base.endsWith(s))) {
+      return { sensitive: false, reason: null };
+    }
+    return { sensitive: true, reason: "dotenv secrets file" };
+  }
+
+  if (base === ".envrc") {
+    return { sensitive: true, reason: "direnv secrets file (.envrc)" };
+  }
+
+  if (ext === ".env") {
+    const stem = base.slice(0, -4);
+    if (SAFE_DOTENV_STEM_RE.test(stem)) {
       return { sensitive: false, reason: null };
     }
     return { sensitive: true, reason: "dotenv secrets file" };
@@ -581,6 +606,12 @@ export function detectSensitiveFile(filePath) {
     return { sensitive: false, reason: null };
   }
   let normalized = filePath.replace(/\\/g, "/");
+  // Strip Windows extended-length / device path prefixes (`\\?\C:...`, `\\.\C:...`, `\\?\UNC\server\share`) first
+  if (/^\/\/[?.]\/unc\//i.test(normalized)) {
+    normalized = `//${normalized.slice(8)}`;
+  } else if (/^\/\/[?.]\//.test(normalized)) {
+    normalized = normalized.slice(4);
+  }
   // Handle Windows drive prefix cleanly for both `C:/foo` and drive-relative `C:.env` / `C:.aws/credentials`
   let drivePrefix = "";
   if (/^[a-zA-Z]:/.test(normalized)) {

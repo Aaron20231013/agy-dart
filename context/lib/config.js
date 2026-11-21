@@ -18,13 +18,16 @@ export const CONFIG_DEFAULTS = Object.freeze({
   repoHubs: true,
   readHook: true,
   readDedup: true,
+  readDedupMaxSteps: 40,
   diffRead: false, // Opt-in until multi-turn/fork baseline freshness is battle-tested
   diffReadMaxTurns: 12,
   diffReadMaxAgeMs: 15 * 60 * 1000,
   maxReadBytes: null,
   maxLineRange: null,
   maxOutputBytes: 8100,
+  execTimeoutMs: 120000,
   cliFilter: true,
+  cliFilterAsyncBypassMs: 2000,
   outlineDb: true,
   searchCacheTtlMs: 15000,
   cacheWatch: true,
@@ -85,6 +88,11 @@ function parseNonNegativeInt(raw) {
   if (typeof raw === "string" && raw.trim() === "") return undefined;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
+}
+
+function clampInt(n, min, max) {
+  if (n === undefined) return undefined;
+  return Math.min(max, Math.max(min, Math.floor(n)));
 }
 
 function parseGuardMode(raw) {
@@ -185,6 +193,11 @@ export function getConfigSnapshot(options = {}) {
   // 3. Read guards & three-state diff-read (default OFF)
   pick("readHook", parseDisableEnvFlag(env?.AGY_DART_DISABLE_READ_HOOK), cfgBool("readHook"));
   pick("readDedup", parseDisableEnvFlag(env?.AGY_DART_DISABLE_READ_DEDUP), cfgBool("readDedup"));
+  pick(
+    "readDedupMaxSteps",
+    clampInt(parseNonNegativeInt(env?.AGY_DART_READ_DEDUP_MAX_STEPS), 0, 10000),
+    clampInt(parseNonNegativeInt(cfg.readDedupMaxSteps), 0, 10000)
+  );
   let diffEnv;
   if (parseEnvBool(env?.AGY_DART_DISABLE_DIFF_READ) === true) {
     diffEnv = false;
@@ -217,9 +230,19 @@ export function getConfigSnapshot(options = {}) {
     parsePositiveInt(env?.CONTEXT_MODE_MAX_OUTPUT_BYTES),
     parsePositiveInt(cfg.maxOutputBytes)
   );
+  pick(
+    "execTimeoutMs",
+    clampInt(parsePositiveInt(env?.AGY_DART_EXEC_TIMEOUT_MS), 1000, 300000),
+    clampInt(parsePositiveInt(cfg.execTimeoutMs), 1000, 300000)
+  );
 
   // 4. CLI filter & fast MCP caches
   pick("cliFilter", parseDisableEnvFlag(env?.AGY_DART_DISABLE_CLI_FILTER), cfgBool("cliFilter"));
+  pick(
+    "cliFilterAsyncBypassMs",
+    clampInt(parseNonNegativeInt(env?.AGY_DART_CLI_FILTER_ASYNC_BYPASS_MS), 0, 60000),
+    clampInt(parseNonNegativeInt(cfg.cliFilterAsyncBypassMs), 0, 60000)
+  );
   pick("outlineDb", parseDisableEnvFlag(env?.AGY_DART_DISABLE_OUTLINE_DB), cfgBool("outlineDb"));
   pick(
     "searchCacheTtlMs",

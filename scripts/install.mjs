@@ -106,6 +106,8 @@ async function pathExists(p) {
   }
 }
 
+const KNOWN_COMMANDS = new Set(["install", "doctor", "status", "mode", "uninstall"]);
+
 function parseArgs(argv) {
   const args = argv.slice(2);
   let command = "install";
@@ -135,11 +137,11 @@ function parseArgs(argv) {
       mode = next;
     } else if (a === "--target") {
       const next = args[++i];
-      if (!next) throw new Error("Missing path after --target");
+      if (!next || next.startsWith("-")) throw new Error("Missing path after --target");
       targetDir = path.resolve(next);
     } else if (a === "--project") {
       const next = args[i + 1];
-      if (next && !next.startsWith("-")) {
+      if (next && !next.startsWith("-") && !KNOWN_COMMANDS.has(next)) {
         projectDir = path.resolve(args[++i]);
       } else {
         projectDir = process.cwd();
@@ -166,7 +168,17 @@ function parseArgs(argv) {
       : path.join(getGlobalPluginsRoot(), PLUGIN_NAME);
   }
 
-  return { command, targetDir, isProject: Boolean(projectDir), isCustomTarget, mode, installRg, withDevtools, showHelp };
+  return {
+    command,
+    targetDir,
+    projectDir,
+    isProject: Boolean(projectDir),
+    isCustomTarget,
+    mode,
+    installRg,
+    withDevtools,
+    showHelp
+  };
 }
 
 function printHelp() {
@@ -182,7 +194,7 @@ Options:
   --project [dir]        Install into <dir>/.agents/plugins/agy-dart
   --target <dir>         Install into a custom directory
   --mode <mode>          balanced-16k (default) | fast-32k | strict-8k | no-read-hook
-  --with-devtools        Also copy offline CLI devtools (benchmark, cache-simulator, cache-audit, prefix-budget)
+  --with-devtools        Also copy offline CLI devtools (benchmark, cache-simulator, cache-audit, prefix-budget, verify-package-graph, gen-review-brief)
   --runtime-only         Install runtime files only (default)
   --install-rg           On Windows x64, download official ripgrep (rg.exe) to ~/.local/bin and add to PATH
   -h, --help             Show this help
@@ -234,6 +246,14 @@ async function applyMode(targetDir, modeKey, skipDb = false) {
       ]
     }
   };
+  try {
+    const hooksLstat = await fs.lstat(hooksPath);
+    if (hooksLstat.isSymbolicLink()) {
+      throw new Error(`Refusing to write hooks.json through symlink: ${hooksPath}`);
+    }
+  } catch (err) {
+    if (err && err.code !== "ENOENT") throw err;
+  }
   await fs.writeFile(hooksPath, JSON.stringify(hooksJson, null, 2) + "\n", "utf8");
 
   if (!skipDb) {
@@ -505,6 +525,77 @@ async function runDoctor(targetDir) {
   }
 }
 
+async function unlinkReparsePoint(p) {
+  try {
+    await fs.unlink(p);
+  } catch (err) {
+    if (err && (err.code === "EISDIR" || err.code === "EPERM" || err.code === "EACCES")) {
+      await fs.rmdir(p);
+    } else if (!err || err.code !== "ENOENT") {
+      throw err;
+    }
+  }
+}
+
+async function purgeSymlinksInsideDir(rootDir) {
+  async function walk(dir) {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      let st;
+      try {
+        st = await fs.lstat(fullPath);
+      } catch {
+        continue;
+      }
+      if (st.isSymbolicLink()) {
+        await unlinkReparsePoint(fullPath);
+      } else if (st.isDirectory()) {
+        await walk(fullPath);
+      }
+    }
+  }
+  await walk(rootDir);
+}
+
+async function assertNotSymlinkTarget(targetPath, projectRoot = "") {
+  if (projectRoot) {
+    const agentsDir = path.join(projectRoot, ".agents");
+    const pluginsDir = path.join(agentsDir, "plugins");
+    for (const p of [agentsDir, pluginsDir]) {
+      try {
+        const st = await fs.lstat(p);
+        if (st.isSymbolicLink()) {
+          throw new Error(`Refusing to traverse symlink or junction directory: ${p}`);
+        }
+      } catch (err) {
+        if (err && err.code !== "ENOENT") throw err;
+      }
+    }
+  }
+  try {
+    const st = await fs.lstat(targetPath);
+    if (st.isSymbolicLink()) {
+      let targetExists = false;
+      try {
+        await fs.stat(targetPath);
+        targetExists = true;
+      } catch {}
+      if (!targetExists) {
+        throw new Error(`Refusing to install into broken symlink path: ${targetPath}`);
+      }
+      throw new Error(`Refusing to modify symlink or junction target: ${targetPath}`);
+    }
+  } catch (err) {
+    if (err && err.code !== "ENOENT") throw err;
+  }
+}
+
 async function pruneStaleEntries(dstRoot, keepRelSet) {
   const lockedDirs = [];
   async function walk(dir, relPrefix) {
@@ -517,7 +608,21 @@ async function pruneStaleEntries(dstRoot, keepRelSet) {
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       const relPosix = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) {
+      let st;
+      try {
+        st = await fs.lstat(fullPath);
+      } catch {
+        continue;
+      }
+      if (st.isSymbolicLink()) {
+        try {
+          await unlinkReparsePoint(fullPath);
+        } catch (err) {
+          if (err && (err.code === "EBUSY" || err.code === "EPERM")) {
+            lockedDirs.push(relPosix);
+          }
+        }
+      } else if (st.isDirectory()) {
         await walk(fullPath, relPosix);
         try {
           const remaining = await fs.readdir(fullPath);
@@ -557,14 +662,34 @@ function stripWinExtendedPrefix(p) {
   return p;
 }
 
-function isWinDeviceNamespacePath(p) {
-  if (process.platform !== "win32" || typeof p !== "string") return false;
+function isUncOrDevicePath(p) {
+  if (typeof p !== "string") return false;
   const trimmed = p.trim();
+  if (!trimmed) return false;
   const stripped = stripWinExtendedPrefix(trimmed);
-  if (/^[\\/]{2}[?.][\\/]/.test(stripped)) return true;
-  // Bare UNC server path with no share segment (e.g. \\server or \\server\)
-  if (/^[\\/]{2}[^\\/]+[\\/]?$/.test(stripped)) return true;
+  if (process.platform === "win32" && /^[\\/]{2}[?.][\\/]/.test(stripped)) return true;
+  // Block any UNC share or bare server path (e.g. \\server\share\dir, //server/share/dir, \\server)
+  if (/^(?:\\\\|\/\/)[^\\/?]+/.test(stripped)) return true;
   return false;
+}
+
+function hasGitMarkerSync(dirPath) {
+  if (typeof dirPath !== "string" || !dirPath.trim()) return false;
+  try {
+    fsSync.lstatSync(path.join(dirPath, ".git"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isSourceCheckoutDir(dirPath) {
+  if (hasGitMarkerSync(dirPath)) return true;
+  try {
+    return fsSync.statSync(path.join(dirPath, "tests")).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function isLexicalFilesystemRoot(p) {
@@ -589,7 +714,7 @@ function realpathCanonicalSync(p) {
 function normalizeComparePath(p) {
   const stripped = stripWinExtendedPrefix(String(p || ""));
   const resolved = path.resolve(stripped);
-  if (isWinDeviceNamespacePath(p) || isLexicalFilesystemRoot(stripped)) {
+  if (isUncOrDevicePath(p) || isLexicalFilesystemRoot(stripped)) {
     return process.platform === "win32" ? resolved.toLowerCase() : resolved;
   }
   let cur = resolved;
@@ -628,16 +753,16 @@ function isFilesystemRootPath(p) {
     : normalized === root;
 }
 
-function isProtectedTargetDir(targetPath, srcRoot) {
-  if (isWinDeviceNamespacePath(targetPath) || isFilesystemRootPath(targetPath)) {
+function isProtectedTargetDir(targetPath, srcRoot, { allowInstalledSelf = false } = {}) {
+  if (isUncOrDevicePath(targetPath) || isFilesystemRootPath(targetPath) || hasGitMarkerSync(targetPath)) {
     return true;
   }
   const home = path.resolve(os.homedir());
   const effectiveHome = path.resolve(getHomeDir());
   const globalPluginsRoot = path.resolve(getGlobalPluginsRoot());
+  const protectSrcRoot = !allowInstalledSelf || isSourceCheckoutDir(srcRoot);
   return (
-    isPathSameOrInside(srcRoot, targetPath) ||
-    isPathSameOrInside(targetPath, srcRoot) ||
+    (protectSrcRoot && (isPathSameOrInside(srcRoot, targetPath) || isPathSameOrInside(targetPath, srcRoot))) ||
     isPathSameOrInside(home, targetPath) ||
     isPathSameOrInside(effectiveHome, targetPath) ||
     isPathSameOrInside(globalPluginsRoot, targetPath)
@@ -647,6 +772,8 @@ function isProtectedTargetDir(targetPath, srcRoot) {
 async function hasValidPluginManifest(dir) {
   const manifestPath = path.join(dir, "plugin.json");
   try {
+    const mst = await fs.lstat(manifestPath);
+    if (!mst.isFile() || mst.isSymbolicLink()) return false;
     const parsedManifest = JSON.parse((await fs.readFile(manifestPath, "utf8")).replace(/^\uFEFF/, ""));
     return Boolean(parsedManifest && parsedManifest.name === PLUGIN_NAME);
   } catch {
@@ -662,9 +789,11 @@ async function runInstall(opts) {
   const dstRoot = path.resolve(opts.targetDir);
   const manifest = opts.withDevtools ? FILES_TO_COPY : RUNTIME_FILES;
 
-  if (isProtectedTargetDir(dstRoot, srcRoot)) {
+  if (isProtectedTargetDir(dstRoot, srcRoot, { allowInstalledSelf: false })) {
     throw new Error(`Refusing to install into protected directory: ${dstRoot}`);
   }
+  await assertNotSymlinkTarget(dstRoot, opts.projectDir);
+
   let dstStat = null;
   try {
     dstStat = await fs.stat(dstRoot);
@@ -696,6 +825,12 @@ async function runInstall(opts) {
   }
   if (missingSources.length > 0) {
     throw new Error(`Missing required source file(s): ${missingSources.join(", ")}`);
+  }
+
+  // Remove any pre-existing internal symlinks or Windows junctions inside dstRoot BEFORE writing files
+  // so mkdir/copyFile can never escape dstRoot into external directories.
+  if (dstStat) {
+    await purgeSymlinksInsideDir(dstRoot);
   }
 
   // Copy/overwrite all manifest files in-place FIRST, then prune stale entries.
@@ -743,12 +878,20 @@ async function main() {
       await runInstall(opts);
       break;
     case "mode": {
-      if (!(await pathExists(opts.targetDir))) {
-        throw new Error(`agy-dart is not installed at ${opts.targetDir}. Run 'install' first.`);
+      const targetResolved = path.resolve(opts.targetDir);
+      if (isProtectedTargetDir(targetResolved, REPO_ROOT, { allowInstalledSelf: true })) {
+        throw new Error(`Refusing to modify protected directory: ${targetResolved}`);
+      }
+      await assertNotSymlinkTarget(targetResolved, opts.projectDir);
+      if (!(await pathExists(targetResolved))) {
+        throw new Error(`agy-dart is not installed at ${targetResolved}. Run 'install' first.`);
+      }
+      if (!(await hasValidPluginManifest(targetResolved))) {
+        throw new Error(`Refusing to switch mode at ${targetResolved}: directory does not contain an '${PLUGIN_NAME}' plugin.json manifest.`);
       }
       const skipDb = Boolean(opts.isCustomTarget || opts.isProject);
-      const cfg = await applyMode(opts.targetDir, opts.mode, skipDb);
-      console.log(`Switched agy-dart mode at ${opts.targetDir} -> ${opts.mode} (${cfg.label})`);
+      const cfg = await applyMode(targetResolved, opts.mode, skipDb);
+      console.log(`Switched agy-dart mode at ${targetResolved} -> ${opts.mode} (${cfg.label})`);
       break;
     }
     case "doctor":
@@ -759,13 +902,19 @@ async function main() {
     }
     case "uninstall": {
       const targetResolved = path.resolve(opts.targetDir);
-      if (isProtectedTargetDir(targetResolved, REPO_ROOT)) {
+      if (isProtectedTargetDir(targetResolved, REPO_ROOT, { allowInstalledSelf: true })) {
         throw new Error(`Refusing to delete protected directory: ${targetResolved}`);
       }
+      await assertNotSymlinkTarget(targetResolved, opts.projectDir);
       if (await pathExists(targetResolved)) {
         // Verify target actually contains an agy-dart plugin.json manifest before recursive deletion
         if (!(await hasValidPluginManifest(targetResolved))) {
           throw new Error(`Refusing to delete ${targetResolved}: directory does not contain an '${PLUGIN_NAME}' plugin.json manifest.`);
+        }
+        if (isPathSameOrInside(process.cwd(), targetResolved)) {
+          try {
+            process.chdir(path.dirname(targetResolved));
+          } catch {}
         }
         try {
           await fs.rm(targetResolved, { recursive: true, force: true });

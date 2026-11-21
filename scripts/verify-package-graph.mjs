@@ -724,9 +724,10 @@ export function tokenizeJsForSpecifiers(source, options = {}) {
 /**
  * Extract relative JS/MJS module specifiers and sibling script references from source text.
  */
-export function extractLocalSpecifiers(source, fileAbsPath, rootDir = REPO_ROOT) {
+export function scanLocalSpecifiers(source, fileAbsPath, rootDir = REPO_ROOT) {
   const tokens = tokenizeJsForSpecifiers(source);
   const found = new Set();
+  const unresolved = new Set();
   const dir = path.dirname(fileAbsPath);
 
   const isStringLike = (tok) => Boolean(tok && (tok.type === "string" || tok.type === "template_static"));
@@ -751,11 +752,14 @@ export function extractLocalSpecifiers(source, fileAbsPath, rootDir = REPO_ROOT)
         }
       }
     }
+    unresolved.add(cleanSpec);
   };
 
-  // Precompute `{` -> `}` matching indices in O(T) so malformed unclosed `{` never degrades to O(T^2)
+  // Precompute `{` -> `}` and `(` -> `)` matching indices in O(T) so malformed unclosed brackets never degrade to O(T^2)
   const braceMatch = new Int32Array(tokens.length).fill(-1);
+  const parenMatch = new Int32Array(tokens.length).fill(-1);
   const braceStack = [];
+  const parenStack = [];
   for (let k = 0; k < tokens.length; k++) {
     if (isPunct(tokens[k], "{")) {
       braceStack.push(k);
@@ -763,9 +767,17 @@ export function extractLocalSpecifiers(source, fileAbsPath, rootDir = REPO_ROOT)
       if (braceStack.length > 0) {
         braceMatch[braceStack.pop()] = k;
       }
+    } else if (isPunct(tokens[k], "(")) {
+      parenStack.push(k);
+    } else if (isPunct(tokens[k], ")")) {
+      if (parenStack.length > 0) {
+        parenMatch[parenStack.pop()] = k;
+      }
     }
   }
   const findMatchingBrace = (openIdx) => (openIdx >= 0 && openIdx < braceMatch.length ? braceMatch[openIdx] : -1);
+  const findMatchingParen = (openIdx) => (openIdx >= 0 && openIdx < parenMatch.length ? parenMatch[openIdx] : -1);
+  const requireAliases = new Set(["require"]);
 
   // Extract a string-like first call argument, unwrapping optional grouping parens e.g. `import(("./x.js"))`
   const extractFirstStringCallArg = (openParenIdx, allowTrailingComma = true) => {
@@ -912,14 +924,61 @@ export function extractLocalSpecifiers(source, fileAbsPath, rootDir = REPO_ROOT)
       continue;
     }
 
-    // 3. CommonJS require("./...") (supports extensionless fallback and grouped string arg)
-    if (!afterMember && isIdent(tok, "require") && isPunct(tokens[i + 1], "(")) {
-      const reqArg = extractFirstStringCallArg(i + 1, false);
-      if (reqArg) {
-        addRel(reqArg.value, true);
-        i = reqArg.endIdx;
-      }
+    // 3a. Track `const req = createRequire(...)` / `Module.createRequire(...)` and direct chained `createRequire(...)("./...")`
+    if (
+      !afterMember &&
+      isIdent(tok) &&
+      isPunct(tokens[i + 1], "=") &&
+      ((isIdent(tokens[i + 2], "createRequire") && isPunct(tokens[i + 3], "(")) ||
+        (isIdent(tokens[i + 2]) && isPunct(tokens[i + 3], ".") && isIdent(tokens[i + 4], "createRequire") && isPunct(tokens[i + 5], "(")))
+    ) {
+      requireAliases.add(tok.value);
       continue;
+    }
+
+    if (isIdent(tok, "createRequire") && isPunct(tokens[i + 1], "(")) {
+      const closeCreateIdx = findMatchingParen(i + 1);
+      if (closeCreateIdx !== -1) {
+        if (isPunct(tokens[closeCreateIdx + 1], "(")) {
+          const chainedArg = extractFirstStringCallArg(closeCreateIdx + 1, false);
+          if (chainedArg) {
+            addRel(chainedArg.value, true);
+            i = chainedArg.endIdx;
+            continue;
+          }
+        } else if (
+          isPunct(tokens[closeCreateIdx + 1], ".") &&
+          isIdent(tokens[closeCreateIdx + 2], "resolve") &&
+          isPunct(tokens[closeCreateIdx + 3], "(")
+        ) {
+          const chainedResArg = extractFirstStringCallArg(closeCreateIdx + 3, true);
+          if (chainedResArg) {
+            addRel(chainedResArg.value, true);
+            i = chainedResArg.endIdx;
+            continue;
+          }
+        }
+      }
+    }
+
+    // 3b. CommonJS require("./..."), require.resolve("./..."), and createRequire aliases
+    if (!afterMember && isIdent(tok) && requireAliases.has(tok.value)) {
+      if (isPunct(tokens[i + 1], "(")) {
+        const reqArg = extractFirstStringCallArg(i + 1, false);
+        if (reqArg) {
+          addRel(reqArg.value, true);
+          i = reqArg.endIdx;
+        }
+        continue;
+      }
+      if (isPunct(tokens[i + 1], ".") && isIdent(tokens[i + 2], "resolve") && isPunct(tokens[i + 3], "(")) {
+        const resArg = extractFirstStringCallArg(i + 3, true);
+        if (resArg) {
+          addRel(resArg.value, true);
+          i = resArg.endIdx;
+        }
+        continue;
+      }
     }
 
     // 4. Relative URL asset/module resolution via new URL("./...", import.meta.url)
@@ -990,7 +1049,14 @@ export function extractLocalSpecifiers(source, fileAbsPath, rootDir = REPO_ROOT)
     }
   }
 
-  return Array.from(found).sort();
+  return {
+    resolved: Array.from(found).sort(),
+    unresolved: Array.from(unresolved).sort()
+  };
+}
+
+export function extractLocalSpecifiers(source, fileAbsPath, rootDir = REPO_ROOT) {
+  return scanLocalSpecifiers(source, fileAbsPath, rootDir).resolved;
 }
 
 export function discoverRuntimeEntrypoints(rootDir = REPO_ROOT) {
@@ -1045,6 +1111,7 @@ export function discoverRuntimeEntrypoints(rootDir = REPO_ROOT) {
 export function collectImportGraph(entrypoints, rootDir = REPO_ROOT) {
   const visited = new Set();
   const edges = new Map();
+  const unresolvedSpecifiers = [];
   const queue = [...entrypoints];
 
   while (queue.length > 0) {
@@ -1061,8 +1128,11 @@ export function collectImportGraph(entrypoints, rootDir = REPO_ROOT) {
       continue;
     }
     const src = fs.readFileSync(abs, "utf8");
-    const deps = extractLocalSpecifiers(src, abs, rootDir);
+    const { resolved: deps, unresolved } = scanLocalSpecifiers(src, abs, rootDir);
     edges.set(rel, deps);
+    for (const u of unresolved) {
+      unresolvedSpecifiers.push(`${rel} -> ${u}`);
+    }
     for (const d of deps) {
       if (!visited.has(d)) queue.push(d);
     }
@@ -1070,7 +1140,8 @@ export function collectImportGraph(entrypoints, rootDir = REPO_ROOT) {
 
   return {
     reachable: Array.from(visited).sort(),
-    edges: Object.fromEntries(Array.from(edges.entries()).sort(([a], [b]) => a.localeCompare(b)))
+    edges: Object.fromEntries(Array.from(edges.entries()).sort(([a], [b]) => a.localeCompare(b))),
+    unresolvedSpecifiers: unresolvedSpecifiers.sort()
   };
 }
 
@@ -1089,13 +1160,17 @@ export function verifyPackageManifest(rootDir = REPO_ROOT) {
 
   const devtoolsGraph = collectImportGraph(DEVTOOLS_FILES, rootDir);
   const missingFromFullManifest = devtoolsGraph.reachable.filter((rel) => !allSet.has(rel));
+  const unresolvedSpecifiers = Array.from(
+    new Set([...runtimeGraph.unresolvedSpecifiers, ...devtoolsGraph.unresolvedSpecifiers])
+  ).sort();
 
   const ok =
     missingOnDisk.length === 0 &&
     overlap.length === 0 &&
     missingFromRuntimeManifest.length === 0 &&
     devtoolsLeakedIntoRuntime.length === 0 &&
-    missingFromFullManifest.length === 0;
+    missingFromFullManifest.length === 0 &&
+    unresolvedSpecifiers.length === 0;
 
   return {
     ok,
@@ -1108,6 +1183,7 @@ export function verifyPackageManifest(rootDir = REPO_ROOT) {
     missingFromRuntimeManifest,
     devtoolsLeakedIntoRuntime,
     missingFromFullManifest,
+    unresolvedSpecifiers,
     runtimeGraph: runtimeGraph.edges
   };
 }
@@ -1133,6 +1209,7 @@ if (isDirectRun) {
     if (report.missingFromRuntimeManifest.length) console.error(`  - Missing from RUNTIME_FILES: ${report.missingFromRuntimeManifest.join(", ")}`);
     if (report.devtoolsLeakedIntoRuntime.length) console.error(`  - Devtools leaked into runtime: ${report.devtoolsLeakedIntoRuntime.join(", ")}`);
     if (report.missingFromFullManifest.length) console.error(`  - Missing from full manifest: ${report.missingFromFullManifest.join(", ")}`);
+    if (report.unresolvedSpecifiers.length) console.error(`  - Unresolved imports  : ${report.unresolvedSpecifiers.join(", ")}`);
   }
   if (!report.ok) process.exit(1);
 }

@@ -10,21 +10,53 @@ try {
   enableVersionedCompileCache();
 } catch {}
 
-const [{ stableSortObject }, { ContextModeStore }, { createTools }] = await Promise.all([
+const [{ stableSortObject }, { ContextModeStore }, { createTools }, handoffMod] = await Promise.all([
   import("./lib/stable-json.js"),
   import("./lib/store.js"),
-  import("./lib/tools.js")
+  import("./lib/tools.js"),
+  import("./lib/handoff.js").catch(() => ({}))
 ]);
+const inferWorkspaceFromStore =
+  typeof handoffMod?.inferWorkspaceFromStore === "function" ? handoffMod.inferWorkspaceFromStore : null;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PLUGIN_ROOT = path.resolve(__dirname, "..");
+const IS_INSTALLED_PLUGIN_COPY = !fs.existsSync(path.join(PLUGIN_ROOT, ".git"));
 let pkgVersion = "1.2.1";
 try {
-  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+  const pkg = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "package.json"), "utf8"));
   if (pkg.version) pkgVersion = pkg.version;
 } catch {}
 
+const RESERVED_SESSION_SENTINELS = new Set(["all", "lifetime", "app"]);
+
+function resolveDirectoryCandidate(raw) {
+  if (typeof raw !== "string") return null;
+  let candidate = raw.trim();
+  if (!candidate) return null;
+  if (/^file:\/\//i.test(candidate)) {
+    try {
+      candidate = fileURLToPath(candidate);
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const abs = path.resolve(candidate);
+    if (fs.statSync(abs).isDirectory()) return abs;
+  } catch {}
+  return null;
+}
+
 const store = new ContextModeStore();
-let currentCwd = process.cwd();
+let currentCwd =
+  resolveDirectoryCandidate(process.env.ANTIGRAVITY_WORKSPACE_ROOT) ||
+  resolveDirectoryCandidate(process.env.VSCODE_CWD) ||
+  process.cwd();
+let explicitWorkspaceConfigured = Boolean(
+  resolveDirectoryCandidate(process.env.ANTIGRAVITY_WORKSPACE_ROOT) ||
+    resolveDirectoryCandidate(process.env.VSCODE_CWD)
+);
 let initSessionId = null;
 const callContext = new AsyncLocalStorage();
 
@@ -33,26 +65,45 @@ function normalizeCallSessionId(raw) {
   const trimmed = raw.trim();
   if (!trimmed || trimmed.length > 128) return null;
   if (/[\x00-\x1f\x7f\\/]/.test(trimmed)) return null;
+  if (RESERVED_SESSION_SENTINELS.has(trimmed.toLowerCase())) return null;
   return trimmed;
+}
+
+function resolveSessionIdForCall() {
+  return (
+    callContext.getStore()?.sessionId ||
+    initSessionId ||
+    normalizeCallSessionId(process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID) ||
+    normalizeCallSessionId(process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID) ||
+    normalizeCallSessionId(process.env.ANTIGRAVITY_CONVERSATION_ID) ||
+    normalizeCallSessionId(process.env.CONVERSATION_ID) ||
+    "default"
+  );
+}
+
+function resolveActiveWorkspaceCwd() {
+  if (explicitWorkspaceConfigured) return currentCwd;
+  const sameAsPlugin =
+    process.platform === "win32"
+      ? path.resolve(currentCwd).toLowerCase() === PLUGIN_ROOT.toLowerCase()
+      : path.resolve(currentCwd) === PLUGIN_ROOT;
+  if (sameAsPlugin && IS_INSTALLED_PLUGIN_COPY && inferWorkspaceFromStore) {
+    const inferred = inferWorkspaceFromStore(store, resolveSessionIdForCall());
+    if (inferred) return inferred;
+  }
+  return currentCwd;
 }
 
 const tools = createTools({
   store,
-  getCwd: () => currentCwd,
-  getSessionId: () =>
-    callContext.getStore()?.sessionId ||
-    initSessionId ||
-    process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
-    process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID ||
-    process.env.ANTIGRAVITY_CONVERSATION_ID ||
-    process.env.CONVERSATION_ID ||
-    "default",
+  getCwd: resolveActiveWorkspaceCwd,
+  getSessionId: resolveSessionIdForCall,
   getDirectConversationId: () =>
     callContext.getStore()?.directConversationId ||
     callContext.getStore()?.sessionId ||
     initSessionId ||
-    process.env.ANTIGRAVITY_CONVERSATION_ID ||
-    process.env.CONVERSATION_ID ||
+    normalizeCallSessionId(process.env.ANTIGRAVITY_CONVERSATION_ID) ||
+    normalizeCallSessionId(process.env.CONVERSATION_ID) ||
     "default"
 });
 
@@ -60,12 +111,13 @@ const tools = createTools({
 const RAW_TOOL_DEFINITIONS = [
   {
     name: "ctx_batch",
-    description: "Run sequential shell commands, index combined output into FTS5, and return matching snippets (<=8.8 KB). Prefer agy-dart_fast run_checks for concurrent builds/tests.",
+    description: "Run sequential shell commands, index output into FTS5, and return matching snippets (<=8.8 KB).",
     inputSchema: {
       type: "object",
       properties: {
-        commands: { type: "array", items: { type: "string" }, description: "Shell commands" },
-        queries: { type: "array", items: { type: "string" }, description: "Optional search queries" }
+        commands: { type: "array", items: { type: "string" } },
+        cwd: { type: "string" },
+        queries: { type: "array", items: { type: "string" } }
       },
       required: ["commands"]
     }
@@ -73,56 +125,65 @@ const RAW_TOOL_DEFINITIONS = [
   {
     name: "ctx_doctor",
     description: "Check SQLite WAL/FTS5 health, DB size, feature toggles, and runtimes.",
-    inputSchema: { type: "object", properties: {} }
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" }
+      }
+    }
   },
   {
     name: "ctx_execute",
-    description: "Run JS/Python/Shell/PowerShell in a local sandbox to filter >16 KB logs or giant JSON/CSV/API data; returns concise output (<=8.8 KB) and indexes full output.",
+    description: "Run JS/Python/Shell/PowerShell in sandbox to filter >16 KB logs or giant JSON/CSV/API data (<=8.8 KB inline + FTS5 index).",
     inputSchema: {
       type: "object",
       properties: {
         language: { type: "string", enum: ["javascript", "nodejs", "python", "shell", "powershell", "cmd"] },
-        code: { type: "string", description: "Script source" },
-        file: { type: "string", description: "Script path" },
-        args: { type: "array", items: { type: "string" }, description: "CLI args" },
-        intent: { type: "string", description: "Short purpose label" }
+        code: { type: "string" },
+        file: { type: "string" },
+        args: { type: "array", items: { type: "string" } },
+        cwd: { type: "string" },
+        intent: { type: "string" },
+        timeoutSec: { type: "integer", minimum: 1, maximum: 300 }
       }
     }
   },
   {
     name: "ctx_index",
-    description: "Index a local file, URL, or raw text into SQLite FTS5 (heading-aware for Markdown).",
+    description: "Index local file, URL, or raw text into SQLite FTS5 (heading-aware for Markdown).",
     inputSchema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Local file path" },
-        url: { type: "string", description: "HTTP/HTTPS URL" },
-        content: { type: "string", description: "Raw text" },
-        label: { type: "string", description: "Source label" }
+        cwd: { type: "string" },
+        path: { type: "string" },
+        url: { type: "string" },
+        content: { type: "string" },
+        label: { type: "string" }
       }
     }
   },
   {
     name: "ctx_purge",
-    description: "Purge indexed sources/events for session, worktree, all, or stale TTL entries (with optional VACUUM).",
+    description: "Purge indexed sources/events for session, worktree, all, or stale TTL entries (optional VACUUM).",
     inputSchema: {
       type: "object",
       properties: {
+        cwd: { type: "string" },
         scope: { type: "string", enum: ["session", "worktree", "all", "stale"] },
-        sessionId: { type: "string", description: "Optional conversationId for scope='session' (avoids purging shared 'default')" },
-        olderThanDays: { type: "integer", description: "TTL age in days for scope='stale' (default 14)" },
-        vacuum: { type: "boolean", description: "Run SQLite VACUUM when scope='stale'" }
+        sessionId: { type: "string" },
+        olderThanDays: { type: "integer" },
+        vacuum: { type: "boolean" }
       }
     }
   },
   {
     name: "ctx_resume",
-    description: "Recover indexed sources/events and PostToolUse checkpoint after /compact (pass current Conversation ID as sessionId in shared MCP hosts).",
+    description: "Recover indexed sources/events and PostToolUse checkpoint after /compact.",
     inputSchema: {
       type: "object",
       properties: {
-        seq: { type: "integer", description: "Optional event sequence #" },
-        sessionId: { type: "string", description: "Optional conversationId to recover this conversation's PostToolUse checkpoint" }
+        seq: { type: "integer" },
+        sessionId: { type: "string" }
       }
     }
   },
@@ -132,11 +193,12 @@ const RAW_TOOL_DEFINITIONS = [
     inputSchema: {
       type: "object",
       properties: {
-        queries: { type: "array", items: { type: "string" }, description: "Search queries" },
-        sourceId: { type: "string", description: "Restrict to sourceId" },
+        cwd: { type: "string" },
+        queries: { type: "array", items: { type: "string" } },
+        sourceId: { type: "string" },
         scope: { type: "string", enum: ["session", "worktree", "all"] },
-        limit: { type: "integer", description: "Max hits (default 5)" },
-        offset: { type: "integer", description: "Pagination offset" }
+        limit: { type: "integer" },
+        offset: { type: "integer" }
       },
       required: ["queries"]
     }
@@ -147,8 +209,8 @@ const RAW_TOOL_DEFINITIONS = [
     inputSchema: {
       type: "object",
       properties: {
-        reset: { type: "boolean", description: "Reset session stats" },
-        sessionId: { type: "string", description: "Optional conversationId for per-conversation stats" }
+        reset: { type: "boolean" },
+        sessionId: { type: "string" }
       }
     }
   }
@@ -205,7 +267,15 @@ rl.on("line", async (line) => {
   try {
     switch (method) {
       case "initialize": {
-        if (params?.rootPath) currentCwd = params.rootPath;
+        const wsFolder = Array.isArray(params?.workspaceFolders) ? params.workspaceFolders[0]?.uri : null;
+        const initDir =
+          resolveDirectoryCandidate(wsFolder) ||
+          resolveDirectoryCandidate(params?.rootUri) ||
+          resolveDirectoryCandidate(params?.rootPath);
+        if (initDir) {
+          currentCwd = initDir;
+          explicitWorkspaceConfigured = true;
+        }
         const initSid = normalizeCallSessionId(params?.sessionId);
         if (initSid) initSessionId = initSid;
         sendResponse(id, {
@@ -297,6 +367,12 @@ rl.on("line", async (line) => {
   } catch (handlerErr) {
     sendError(id, -32603, "Internal server error", String(handlerErr));
   }
+});
+
+rl.on("close", () => {
+  try {
+    store.close();
+  } catch {}
 });
 
 process.on("SIGINT", () => {

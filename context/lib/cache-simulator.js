@@ -354,6 +354,7 @@ function extractSessionTrace(steps, parsedOpts) {
       turnIndex: turns.length,
       model: model || prevModel || "",
       prevModel,
+      turnProfile: activeTurnProfile,
       gapSec,
       ctxTokens,
       cacheReadTokens: usage.cacheReadTokens,
@@ -415,6 +416,33 @@ function extractSessionTrace(steps, parsedOpts) {
     parsedOpts.explicitInputPricePer1M ?? matchedProfile.inputPer1M ?? DEFAULT_INPUT_PRICE_PER_1M;
   const coldCompactTokens =
     parsedOpts.explicitColdCompactTokens ?? Math.round(windowTokens * COLD_COMPACT_WINDOW_RATIO);
+
+  for (const t of turns) {
+    const p = t.turnProfile || matchedProfile;
+    const pMaxGap = maxWarmGapByProfile.get(p.id) ?? null;
+    const pHas1h = Boolean(seen1hWriteByProfile.get(p.id));
+    const pCalTtl = parsedOpts.explicitTtlSec === null ? calibrateSessionTtl(p, pMaxGap, pHas1h) : null;
+    const pTtlSec = parsedOpts.explicitTtlSec ?? pCalTtl ?? p.ttlSec;
+    const pBaseWrite = p.cacheWriteMultiplier ?? 1.0;
+    const pLongWrite = p.cacheWrite1hMultiplier ?? pBaseWrite;
+    let pObsWrite;
+    if (parsedOpts.explicitWriteMultiplier !== null) {
+      pObsWrite = parsedOpts.explicitWriteMultiplier;
+    } else if (t.cacheCreation1hTokens > 0 && t.cacheCreationTokens > 0) {
+      const c1h = Math.min(t.cacheCreation1hTokens, t.cacheCreationTokens);
+      const c5m = t.cacheCreationTokens - c1h;
+      pObsWrite = (c5m * pBaseWrite + c1h * pLongWrite) / t.cacheCreationTokens;
+    } else if (pTtlSec >= TTL_1H_SEC) {
+      pObsWrite = pLongWrite;
+    } else {
+      pObsWrite = pBaseWrite;
+    }
+    t.discountRate = parsedOpts.explicitDiscountRate ?? p.cacheDiscountRate;
+    t.baseWriteMult = pBaseWrite;
+    t.longWriteMult = pLongWrite;
+    t.obsWriteMult = pObsWrite;
+    t.inputPricePer1M = parsedOpts.explicitInputPricePer1M ?? p.inputPer1M ?? DEFAULT_INPUT_PRICE_PER_1M;
+  }
 
   return {
     profile: matchedProfile,
@@ -498,10 +526,8 @@ function replayTtlPolicy(traces, parsedOpts, observedCostUsd, { id, label, ttlSe
         ? (parsedOpts.explicitWrite1hMultiplier ?? trace.longWriteMult)
         : (parsedOpts.explicitWriteMultiplier ?? trace.baseWriteMult);
     // When transcripts omit cache_creation_tokens, observed baseline bills uncached tokens at 1.0x.
-    // Charge only the incremental tier surcharge above baseWriteMult so equivalent ttl-5m matches observed.
-    const policyWriteMult = trace.hasExplicitCacheCreation
-      ? rawPolicyWriteMult
-      : Math.max(1.0, 1.0 + (rawPolicyWriteMult - trace.baseWriteMult));
+    // Measure incremental tier surcharge relative to `obsWriteMult` so replaying the already-calibrated
+    // observed TTL (whether 5m or empirically-calibrated 1h) yields 0% phantom cost bias.
     if (rawPolicyWriteMult > maxWriteMultUsed) maxWriteMultUsed = rawPolicyWriteMult;
 
     const isExplicitWriteModel =
@@ -510,6 +536,7 @@ function replayTtlPolicy(traces, parsedOpts, observedCostUsd, { id, label, ttlSe
     let sessCached = 0;
     let sessUncached = 0;
     let sessWrite = 0;
+    let sessCostRaw = 0;
     let prevSimCtx = 0;
 
     for (let idx = 0; idx < trace.turns.length; idx++) {
@@ -638,22 +665,29 @@ function replayTtlPolicy(traces, parsedOpts, observedCostUsd, { id, label, ttlSe
       sessCached += simRead;
       sessWrite += simWrite;
       sessUncached += simUncached;
+      const tRawPolicyWrite =
+        tier === "1h"
+          ? (parsedOpts.explicitWrite1hMultiplier ?? turn.longWriteMult ?? trace.longWriteMult)
+          : (parsedOpts.explicitWriteMultiplier ?? turn.baseWriteMult ?? trace.baseWriteMult);
+      const tObsWrite = turn.obsWriteMult ?? trace.obsWriteMult;
+      const tPolicyWriteMult = trace.hasExplicitCacheCreation
+        ? tRawPolicyWrite
+        : Math.max(1.0, 1.0 + (tRawPolicyWrite - tObsWrite));
+      sessCostRaw += computeTokenCostUsd(
+        simRead,
+        simUncached,
+        simWrite,
+        turn.discountRate ?? trace.cacheDiscountRate,
+        tPolicyWriteMult,
+        turn.inputPricePer1M ?? trace.inputPricePer1M
+      );
       prevSimCtx = simCtx;
     }
 
     totalCached += sessCached;
     totalWriteTokens += sessWrite;
     totalInput += sessCached + sessUncached + sessWrite;
-    totalCostUsd += roundUsd(
-      computeTokenCostUsd(
-        sessCached,
-        sessUncached,
-        sessWrite,
-        trace.cacheDiscountRate,
-        policyWriteMult,
-        trace.inputPricePer1M
-      )
-    );
+    totalCostUsd += roundUsd(sessCostRaw);
   }
 
   const writeLabel = maxWriteMultUsed > 1.0 ? `${maxWriteMultUsed.toFixed(2)}x write` : "1.0x implicit write";
@@ -713,6 +747,7 @@ function replayColdBoundaryCompactPolicy(traces, observedCostUsd) {
     let sessCached = 0;
     let sessUncached = 0;
     let sessWrite = 0;
+    let sessCostRaw = 0;
     let episodeReduction = 0;
     let prevSimCtx = 0;
 
@@ -793,21 +828,20 @@ function replayColdBoundaryCompactPolicy(traces, observedCostUsd) {
       sessCached += simRead;
       sessWrite += simWrite;
       sessUncached += simUncached;
+      sessCostRaw += computeTokenCostUsd(
+        simRead,
+        simUncached,
+        simWrite,
+        turn.discountRate ?? trace.cacheDiscountRate,
+        turn.obsWriteMult ?? trace.obsWriteMult,
+        turn.inputPricePer1M ?? trace.inputPricePer1M
+      );
       prevSimCtx = simCtx;
     }
 
     totalCached += sessCached;
     totalInput += sessCached + sessUncached + sessWrite;
-    totalCostUsd += roundUsd(
-      computeTokenCostUsd(
-        sessCached,
-        sessUncached,
-        sessWrite,
-        trace.cacheDiscountRate,
-        trace.obsWriteMult,
-        trace.inputPricePer1M
-      )
-    );
+    totalCostUsd += roundUsd(sessCostRaw);
   }
 
   let notes;
@@ -850,6 +884,7 @@ function replayCutoffPolicy(traces, observedCostUsd, { id, label, cutoffBytes, s
     let sessCached = 0;
     let sessUncached = 0;
     let sessWrite = 0;
+    let sessCostRaw = 0;
     let cumulativeAvoided = 0;
     let prevSimCtx = 0;
 
@@ -923,21 +958,20 @@ function replayCutoffPolicy(traces, observedCostUsd, { id, label, cutoffBytes, s
       sessCached += simRead;
       sessWrite += simWrite;
       sessUncached += simUncached;
+      sessCostRaw += computeTokenCostUsd(
+        simRead,
+        simUncached,
+        simWrite,
+        turn.discountRate ?? trace.cacheDiscountRate,
+        turn.obsWriteMult ?? trace.obsWriteMult,
+        turn.inputPricePer1M ?? trace.inputPricePer1M
+      );
       prevSimCtx = simCtx;
     }
 
     totalCached += sessCached;
     totalInput += sessCached + sessUncached + sessWrite;
-    totalCostUsd += roundUsd(
-      computeTokenCostUsd(
-        sessCached,
-        sessUncached,
-        sessWrite,
-        trace.cacheDiscountRate,
-        trace.obsWriteMult,
-        trace.inputPricePer1M
-      )
-    );
+    totalCostUsd += roundUsd(sessCostRaw);
   }
 
   const cutoffKb = Math.round(cutoffBytes / 1024);
@@ -1058,7 +1092,11 @@ function selectRecommendation(policies, observedDiag, traces = []) {
  * without mutating inputs.
  */
 export function simulateCachePolicies(sessions, options = {}) {
-  const safeSessions = Array.isArray(sessions) ? sessions.filter((s) => Array.isArray(s) && s.length > 0) : [];
+  const safeSessions = Array.isArray(sessions)
+    ? sessions
+        .map((s) => (Array.isArray(s) ? s : Array.isArray(s?.steps) ? s.steps : null))
+        .filter((arr) => Array.isArray(arr) && arr.length > 0)
+    : [];
   const parsedOpts = parseOptions(options);
   const observedDiag = analyzeMultipleSessionsCache(safeSessions, options);
 

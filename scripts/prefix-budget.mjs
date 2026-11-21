@@ -95,7 +95,7 @@ export const TOKEN_CALIBRATION_CORPUS = Object.freeze([
   {
     id: "cjk-prose",
     text: "本项目面向原生一体化插件，提供极速批处理、沙盒过滤、上下文护栏与服务端缓存诊断，严格遵循零运行期依赖约束。",
-    actualTokens: 58
+    actualTokens: 60
   },
   {
     id: "mixed-cjk-code",
@@ -848,21 +848,51 @@ function formatHumanReport(report) {
 
 async function main() {
   const args = process.argv.slice(2);
-  const asJson = args.includes("--json");
-  const stableOnly = args.includes("--stable-only");
-  const calibrate = args.includes("--calibrate");
-  const autoTranscript = args.includes("--auto-transcript");
+  let asJson = false;
+  let stableOnly = false;
+  let calibrate = false;
+  let autoTranscript = false;
   let transcriptPath = "";
-  const trIdx = args.indexOf("--transcript");
-  if (trIdx !== -1 && args[trIdx + 1]) {
-    transcriptPath = path.resolve(args[trIdx + 1]);
-  } else if (autoTranscript) {
-    transcriptPath = findTranscriptForConversation() || "";
-  }
   let rootDir = REPO_ROOT;
-  const targetIdx = args.indexOf("--target");
-  if (targetIdx !== -1 && args[targetIdx + 1]) {
-    rootDir = path.resolve(args[targetIdx + 1]);
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--json") {
+      asJson = true;
+    } else if (a === "--stable-only") {
+      stableOnly = true;
+    } else if (a === "--calibrate") {
+      calibrate = true;
+    } else if (a === "--auto-transcript") {
+      autoTranscript = true;
+    } else if (a === "--transcript" || a.startsWith("--transcript=")) {
+      const val = a === "--transcript" ? args[++i] : a.slice("--transcript=".length);
+      if (!val || (a === "--transcript" && val.startsWith("-"))) {
+        console.error("prefix:budget error: --transcript requires a file path");
+        process.exitCode = 1;
+        return;
+      }
+      transcriptPath = path.resolve(val);
+    } else if (a === "--target" || a.startsWith("--target=")) {
+      const val = a === "--target" ? args[++i] : a.slice("--target=".length);
+      if (!val || (a === "--target" && val.startsWith("-"))) {
+        console.error("prefix:budget error: --target requires a directory path");
+        process.exitCode = 1;
+        return;
+      }
+      rootDir = path.resolve(val);
+    } else if (a === "-h" || a === "--help") {
+      console.log("Usage: node scripts/prefix-budget.mjs [--json] [--stable-only] [--target <dir>] [--calibrate [--transcript <file> | --auto-transcript]]");
+      return;
+    } else {
+      console.error(`prefix:budget error: unknown option '${a}'`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  if (!transcriptPath && autoTranscript) {
+    transcriptPath = findTranscriptForConversation() || "";
   }
 
   if (calibrate) {
@@ -889,6 +919,9 @@ async function main() {
       if (cal.fallbackUsed && cal.transcriptPath) {
         console.log(`  - Fallback     : reference corpus (no uncontaminated transcript turns in ${path.basename(cal.transcriptPath)})`);
       }
+    }
+    if (cal.sampleCount === 0 || cal.maxRelErrorPct > cal.recommendedErrorBandPct) {
+      process.exitCode = 1;
     }
     return;
   }

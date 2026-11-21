@@ -245,11 +245,12 @@ function inspectGitWorkspace(cwd) {
   }
 
   // Prefer diff against HEAD (captures both staged & unstaged working-tree edits); fall back cleanly for unborn repos
-  let diffRes = runGitReadOnly(["-c", "core.quotepath=false", "diff", "--stat", "--stat-width=80", "HEAD"], resolved);
+  const diffBaseFlags = ["-c", "core.quotepath=false", "diff", "--no-ext-diff", "--no-textconv", "--stat", "--stat-width=80"];
+  let diffRes = runGitReadOnly([...diffBaseFlags, "HEAD"], resolved);
   if (!diffRes.ok) {
-    diffRes = runGitReadOnly(["-c", "core.quotepath=false", "diff", "--stat", "--stat-width=80", "--cached"], resolved);
+    diffRes = runGitReadOnly([...diffBaseFlags, "--cached"], resolved);
     if (!diffRes.ok || !diffRes.stdout.trim()) {
-      diffRes = runGitReadOnly(["-c", "core.quotepath=false", "diff", "--stat", "--stat-width=80"], resolved);
+      diffRes = runGitReadOnly(diffBaseFlags, resolved);
     }
   }
 

@@ -28,15 +28,18 @@
 
 ## v1.2.1 核心加固与修复
 
-1. **全仓库安全与稳定性深度加固（修复全部 76 项审计缺陷）**：
-   - **原子落盘与进程稳定**：拆分 `apply_edits` 临时文件写入与 `rename` 降级回退并确保失败全量回滚（`C-1`）；为 `context/lib/executor.js` 补齐 `stdin`/`stdout`/`stderr` 错误监听与 `close` 完整排空（`C-2`/`H-10`），PowerShell `-Command` 改用环境变量间接传参防命令注入（`M-21`），并加固 Windows `taskkill.exe` 异步错误回退与 POSIX `-pid` 进程组强杀（`H-9`）。
-   - **安全边界与 Windows 路径规范化**：修复 `batch_search` 只读 `git branch`/`tag` `OPTARG` 参数绕过（`H-1`）；`install.mjs` 的 `install`/`uninstall` 全面拦截源码库及其祖先/子目录、盘符根、用户主目录、插件根目录、符号链接、Windows `\\?\`/`\\.\`/`\\?\UNC\`/`GLOBALROOT`/`Volume` 命名空间与 8.3 短路径（`H-2`）；封堵 Sidecar/Handoff 混斜杠 UNC 与 8.3 短名逃逸（`H-3`），为 `ctx_index` 强制接入 `sensitiveFileGuard=deny` 与 NTFS/驱动器相对路径敏感检测（`H-4`/`H-5`），消除 CSS/SFC 大纲提取 $O(N^4)$ ReDoS（`H-7`），并统一替换全仓 `startsWith("..")` 路径包含检查。
-   - **会话隔离、SQLite 事务与 Node 22/24 全绿兼容**：修复跨会话检索/事件泄漏（`H-16`）、`indexContent` 覆盖旧分块与按 `worktree` 去重（`H-17`）、`chunks_tri` 孤儿清理（`H-18`）、`diffRead` 原子编辑 `ino` 独立性（`H-19`）、子 Agent 状态隔离（`H-20`）、SQLite 多语句事务与并发重试（`M-22`–`M-25`）、Sidecar 乐观更新回滚与入参校验（`H-23`/`M-29`/`M-30`）、OpenAI Responses `cached_tokens` 与 Claude 写溢价口径对齐（`H-24`/`H-25`）、静态 Hook 词法扫描（`H-26`），以及 Node 22 Sidecar 零 `stderr` 动态导入修复（Linux/Windows × Node 22/24 四路 CI 117/117 全绿）。
+1. **长任务连续执行与防过早交接（Anti-Premature-Handoff）优化**：
+   - 移除 `rules/AGENTS.md` 中诱导任务中段暂停执行 `/compact` 的指令；将 `>60s` 构建/测试与后台流式任务（`WaitMsBeforeAsync <= 2000`，`cliFilterAsyncBypassMs`）直通原生 `run_command`，并为同步 `overwrite` 附加插件目录只读 `permissionOverrides` 以免触发沙盒外审批中断。
+   - `ctx_execute` 默认超时提升至 `120s`（`execTimeoutMs`，支持单次 `timeoutSec: 1..300`）且超时返回 `timedOut: true` 与后台切换指引；为 `agy-dart_context` 全系工具补齐 `cwd` 与 MCP `initialize` `workspaceFolders`/`rootUri` 对齐；`PreInvocation` 在工具循环中段（`invocationNum >= 1`）静默空闲 TTL 与冷压缩交接横幅并将 1M 窗口 `ttlMinContext` 提升至 `300k`；读去重新增步数衰减自动放行（`readDedupMaxSteps: 40`）。
+2. **全仓库安全、隔离与跨平台深度加固**：
+   - **原子落盘与进程树回收**：拆分 `apply_edits` 临时写入与 `rename` 回退并支持悬空软链原子回滚（`C-1`/`P1-13`）；为 `executor.js`、`cli-filter.mjs`、`cache-audit.mjs` 补齐跨平台进程树强杀（Windows `System32\taskkill.exe /T /F` + 非零退出兜底、POSIX `-pid`）、ESM 顶层 `import` 自动识别、临时 `.ps1` 参数隔离与跨块 UTF-8 精确截断（`P1-02`/`P1-14`/`P2-10`）。
+   - **访问控制、SSRF、ReDoS 与 Windows 跨 Shell 保真**：全链路贯通 `sensitiveFileGuard=deny`（含软链指向敏感文件、`.envrc`/`*.env` 及 `\\?\` ADS 流）（`P1-03`）；`git remote show` 强制 `-n` 阻断网络 SSRF（`P1-04`）；`install.mjs` 拦截内部软链/NTFS 目录联接逃逸、UNC 路径与含 `.git` 副克隆并恢复安装副本自 `uninstall`（`P1-05`/`P1-06`）；`cli-filter` 严格遵守 `PATH` 逐目录 `PATHEXT` 顺序并规避 PowerShell `,`/`--`/`"` 参数损坏（`P1-07`）；`fast` 序列化响应二分死守 `<= 8.8 KB`、修复混合帧头丢包并收敛 Glob/正则/Markdown 线性复杂度（`P1-09`–`P1-12`）。
+   - **会话隔离、SQLite 事务与多厂商计费精度**：加固 Sidecar `/api/search` 与 MCP `ctx_search`/`ctx_resume` 跨会话隔离（`P1-01`）；`pruneByTtl` 纳入写事务；按轮次模型计算跨 `model_switch` 美元成本、修复 OpenAI 兼容网关缓存双计与 1h 隐式写回放基线（`P2-01`–`P2-13`）。
 
 ## v1.2.0 核心新增能力
 
 1. **Sidecar 安全加固与统一配置（`~/.agy-dart/config.json`）**：
-   - Sidecar 所有写接口（`/api/purge`、`/api/toggle-active`、`/api/cutoff`、`/api/exemptions`、`/api/maintenance`、`/api/cli-filter`、`/api/read-dedup`）强制仅允许 `POST` + `Content-Type: application/json` + 进程级随机 `X-Agy-Dart-Token` CSRF 校验，全站强制 `Host`/`Origin`/`Sec-Fetch-Site` 防 DNS Rebinding 与跨站拦截、请求体上限 `64 KB`，并加固自定义扩展名 XSS 转义。
+   - Sidecar 独立 HTTP 模式全量 `/api/*` 强制进程级随机 `X-Agy-Dart-Token` 校验（`SidecarApp` 模式全量 `/api/*` 强制 `POST` + `X-Sidecar-Token`）；`/api/search` 及所有写接口（`/api/purge`、`/api/toggle-active`、`/api/cutoff`、`/api/exemptions`、`/api/maintenance`、`/api/cli-filter`、`/api/read-dedup`）强制仅允许 `POST` + `Content-Type: application/json`，全站强制 `Host`/`Origin`/`Sec-Fetch-Site` 防 DNS Rebinding 与跨站拦截、请求体上限 `64 KB`，并加固自定义扩展名 XSS 转义。
    - 将 20+ 项 `AGY_DART_*` 环境变量收敛至 `~/.agy-dart/config.json`（环境变量始终优先覆盖），`doctor` 与 `ctx_doctor` 直接输出当前生效配置及覆盖来源。
 2. **SmartCrusher 结构化 JSON 粉碎、扩展 CLI 规则与跨 Shell 语法护栏**：
    - 新增零依赖可逆 JSON/JSONL 粉碎器（`context/lib/json-crusher.js`），自动提取大数组 Schema、首尾样本与异常项（`status >= 400`、`ok: false`、错误/空值异常），原文同步入库 FTS5。
@@ -52,7 +55,7 @@
 
 1. **透明 CLI 输出过滤（`PreToolUse.overwrite`）**：对常见高噪单条开发命令（`git status/diff/log`、`npm/pnpm/yarn/node/pytest/cargo/go/dotnet` 测试、`tsc/eslint/ruff/mypy/vite/cargo` 构建、`npm/pip install`、`docker build`）通过零依赖 `hooks/cli-filter.mjs` 在 **1 轮内透明降噪**（免去拦截重试多一轮），严格保留原始退出码、剥离 ANSI 与进度条、强制输出 `<= 8.8 KB`，并将原始大输出自动落库 FTS5 可查。
 2. **服务端 KV-Cache / Prompt Cache 保护与诊断**：
-   - 确定性前缀稳定 `SessionStart` 排布（静态路由头 → 半静态项目/目录结构 + `git HEAD` 缓存的核心导入枢纽 → 易变 `git status` 置尾）+ 瘦身冻结 Turn-0 MCP Schema（`npm run prefix:budget` 常驻约 ~2,912 tok）。
+   - 确定性前缀稳定 `SessionStart` 排布（静态路由头 → 半静态项目/目录结构 + `git HEAD` 缓存的核心导入枢纽 → 易变 `git status` 置尾）+ 瘦身冻结 Turn-0 MCP Schema（`npm run prefix:budget` 常驻约 ~2,832–2,950 tok）。
    - **模型感知动态水位 / TTL / 缓存折扣**（自动匹配 Claude / Gemini / GPT / DeepSeek / Qwen 档位并保留环境变量覆写）+ **收敛与死循环监控**（追踪近期工具指纹重复率与 `edit↔fail` 震荡计数）。
    - 零前缀污染 `PreInvocation` 钩子：利用 Antigravity 原生纯 UI 提示 `metadata.user_markdown`（`systemMessage: ""` 零 token 注入），在动态水位、热缓存延迟压缩、空闲 TTL 过期、高上下文多模态风险及死循环震荡时仅向用户预警。
    - `fast/benchmark.mjs cache` 与 Sidecar 实时面板支持失效归因、最近 15 轮 ASCII 命中率趋势条 / 微型柱状图与单步上下文增量 Top-3 工具归因。
@@ -73,8 +76,8 @@
 | :--- | :---: | :--- | :--- |
 | **[INK-Q/agy-fast](https://github.com/INK-Q/agy-fast)** | MIT | 复用 4 工具批处理引擎、`SessionStart` 快照、`<=8.8 KB` 规范与 `benchmark.mjs` | 封装为 `agy-dart_fast`，升级前缀稳定启动钩子，并为 `benchmark.mjs` 扩展 KV-Cache 失效归因与 `cache` 子命令 |
 | **[Domush/antigravity-plugin-context-mode](https://github.com/Domush/antigravity-plugin-context-mode)** | MIT | 复用并改造 `node:sqlite` FTS5 引擎、8 个 `ctx_*` 工具、`PreToolUse` 护栏与 Sidecar 面板 | 修复 `${PLUGIN_ROOT}`、16 KB/410 行阈值、`<=8.8 KB` 封顶、`SKILL.md` 白名单、Markdown 标题感知分块、DB TTL/Vacuum 与 KV-Cache 实时面板 |
-| **MIT 模式参考**（`mpecan/tokf`、`uuie/agent-cache-optimizer`、`rkolesnichenko/ccdrift`、`ooples/token-optimizer-mcp`、`tobi/qmd`、`DeusData/codebase-memory-mcp`、`tirth8205/code-review-graph`） | MIT | 借鉴声明式 CLI 过滤、前缀稳定性、缓存归因、读去重、Markdown 标题分块与 `git HEAD` 缓存依赖枢纽模式 | 纯零依赖 Node.js ESM 净室实现，原生融合 Antigravity 四大钩子与 Sidecar |
-| **仅架构思想借鉴**（`mksglu/context-mode`、`rtk-ai/rtk`、`opencode-dynamic-context-pruning`、`huiliyi37/Tianshu-harness`） | 非 MIT / Apache-2.0（**零源码引入**） | 仅参考高层次架构范式（沙盒过滤、透明钩子改写、会话去重、版本化 V8 编译缓存、SHA-256 内容去重、前缀预算审计、Ghost 拦截效率反馈、热缓存延迟压缩） | **严守红线，未引入任何一行源码**，全部自主 MIT 净室实现 |
+| **MIT 模式参考**（`mpecan/tokf`、`uuie/agent-cache-optimizer`、`rkolesnichenko/ccdrift`、`ooples/token-optimizer-mcp`、`tobi/qmd`、`DeusData/codebase-memory-mcp`、`tirth8205/code-review-graph`、`lennartschoch/opencode-cache-compact`） | MIT | 借鉴声明式 CLI 过滤、前缀稳定性、缓存归因、读去重、Markdown 标题分块、`git HEAD` 缓存依赖枢纽与压缩交接摘要模式 | 纯零依赖 Node.js ESM 净室实现，原生融合 Antigravity 四大钩子与 Sidecar |
+| **仅架构思想借鉴**（`mksglu/context-mode`、`rtk-ai/rtk`、`opencode-dynamic-context-pruning`、`the-cybersapien/claude-cache`、`huiliyi37/Tianshu-harness`） | 非 MIT / Apache-2.0（**零源码引入**） | 仅参考高层次架构范式（沙盒过滤、透明钩子改写、会话去重、KV-Cache TTL 延续性、版本化 V8 编译缓存、SHA-256 内容去重、前缀预算审计、Ghost 拦截效率反馈、热缓存延迟压缩） | **严守红线，未引入任何一行源码**，全部自主 MIT 净室实现 |
 
 ---
 

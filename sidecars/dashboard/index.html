@@ -2394,6 +2394,8 @@
     }
 
     async function toggleActiveState() {
+      ++refreshSeq;
+      const mutScope = currentScope;
       const prevPaused = isProtectionPaused;
       const nextPaused = !prevPaused;
       updateActiveBadge(nextPaused);
@@ -2404,16 +2406,16 @@
         const res = await apiFetch('/api/toggle-active', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ scope: currentScope, conversationId: convId, paused: nextPaused })
+          body: JSON.stringify({ scope: mutScope, conversationId: convId, paused: nextPaused })
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        if (data && data.isPaused !== undefined) {
+        if (currentScope === mutScope && data && data.isPaused !== undefined) {
           updateActiveBadge(data.isPaused);
         }
       } catch (e) {
         console.error('Failed to toggle active state', e);
-        updateActiveBadge(prevPaused);
+        if (currentScope === mutScope) updateActiveBadge(prevPaused);
       }
     }
 
@@ -2434,8 +2436,16 @@
         updateExemptionsList(cachedStats);
       }
 
+      cachedHandoffData = null;
+      lastHandoffMarkdown = '';
+      ++handoffFetchSeq;
       if (handoffDrawerOpen) {
         loadHandoffBrief();
+      } else {
+        const previewEl = document.getElementById('kv-handoff-preview');
+        const metaEl = document.getElementById('kv-handoff-meta');
+        if (previewEl) previewEl.textContent = '';
+        if (metaEl) metaEl.textContent = '';
       }
 
       refreshData(true);
@@ -2506,11 +2516,11 @@
       const cutoffSelect = document.getElementById('cutoff-select');
       let activeCutoff = 16384;
       if (currentScope === 'lifetime') {
-        activeCutoff = s.globalCutoffBytes !== undefined ? s.globalCutoffBytes : 16384;
+        activeCutoff = s.globalCutoffBytes !== undefined && s.globalCutoffBytes !== null ? s.globalCutoffBytes : 16384;
       } else if (currentScope === 'app') {
-        activeCutoff = s.appCutoffBytes !== undefined ? s.appCutoffBytes : (s.globalCutoffBytes || 16384);
+        activeCutoff = s.appCutoffBytes !== undefined && s.appCutoffBytes !== null ? s.appCutoffBytes : (s.globalCutoffBytes ?? 16384);
       } else {
-        activeCutoff = s.conversationCutoffBytes !== undefined ? s.conversationCutoffBytes : (s.cutoffBytes || 16384);
+        activeCutoff = s.conversationCutoffBytes !== undefined && s.conversationCutoffBytes !== null ? s.conversationCutoffBytes : (s.cutoffBytes ?? 16384);
       }
 
       const targetVal = String(activeCutoff);
@@ -2539,6 +2549,8 @@
     }
 
     async function changeCutoff(newVal) {
+      ++refreshSeq;
+      const mutScope = currentScope;
       const cutoffSelect = document.getElementById('cutoff-select');
       const prevSelectVal = cutoffSelect ? (cutoffSelect.dataset?.lastConfirmedCutoff ?? '16384') : null;
       const prevStatsSnapshot = cachedStats ? { ...cachedStats } : null;
@@ -2558,14 +2570,14 @@
           }
         }
         if (cachedStats) {
-          if (currentScope === 'lifetime') {
+          if (mutScope === 'lifetime') {
             cachedStats.globalCutoffBytes = cutoffBytes;
             cachedStats.appCutoffBytes = cutoffBytes;
             if (!cachedStats.hasConversationCutoffOverride) {
               cachedStats.conversationCutoffBytes = cutoffBytes;
               cachedStats.cutoffBytes = cutoffBytes;
             }
-          } else if (currentScope === 'app') {
+          } else if (mutScope === 'app') {
             cachedStats.appCutoffBytes = cutoffBytes;
             cachedStats.hasAppCutoffOverride = true;
           } else {
@@ -2578,7 +2590,7 @@
         const res = await apiFetch('/api/cutoff', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cutoff: cutoffBytes, scope: currentScope, conversationId: convId })
+          body: JSON.stringify({ cutoff: cutoffBytes, scope: mutScope, conversationId: convId })
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const respData = await res.json().catch(() => null);
@@ -2587,17 +2599,19 @@
           if (respData.appCutoffBytes !== undefined) cachedStats.appCutoffBytes = respData.appCutoffBytes;
           if (respData.conversationCutoffBytes !== undefined) cachedStats.conversationCutoffBytes = respData.conversationCutoffBytes;
         }
-        if (cutoffSelect && cutoffSelect.dataset) cutoffSelect.dataset.lastConfirmedCutoff = cutoffSelect.value;
+        if (currentScope === mutScope && cutoffSelect && cutoffSelect.dataset) cutoffSelect.dataset.lastConfirmedCutoff = cutoffSelect.value;
         refreshData(true);
       } catch (err) {
         console.error("Failed to update cutoff:", err);
         cachedStats = prevStatsSnapshot;
-        if (cachedStats) {
-          updateCutoffDropdown(cachedStats);
-        } else if (cutoffSelect && prevSelectVal !== null) {
-          cutoffSelect.value = prevSelectVal;
-          const restoredBytes = prevSelectVal === '0' ? 0 : (parseInt(prevSelectVal, 10) || 16384);
-          updateCutoffDropdown({ cutoffBytes: restoredBytes, appCutoffBytes: restoredBytes, globalCutoffBytes: restoredBytes, conversationCutoffBytes: restoredBytes });
+        if (currentScope === mutScope) {
+          if (cachedStats) {
+            updateCutoffDropdown(cachedStats);
+          } else if (cutoffSelect && prevSelectVal !== null) {
+            cutoffSelect.value = prevSelectVal;
+            const restoredBytes = prevSelectVal === '0' ? 0 : (parseInt(prevSelectVal, 10) || 16384);
+            updateCutoffDropdown({ cutoffBytes: restoredBytes, appCutoffBytes: restoredBytes, globalCutoffBytes: restoredBytes, conversationCutoffBytes: restoredBytes });
+          }
         }
       }
     }
@@ -2710,6 +2724,8 @@
     }
 
     async function toggleCategory(categoryId) {
+      ++refreshSeq;
+      const mutScope = currentScope;
       if (!cachedStats) cachedStats = {};
       const activeCats = getActiveCategories(cachedStats);
       const isCurrentlyActive = activeCats.includes(categoryId);
@@ -2727,18 +2743,20 @@
         const res = await apiFetch('/api/exemptions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'toggleCategory', category: categoryId, enabled: nextEnabled, scope: currentScope, conversationId: convId })
+          body: JSON.stringify({ action: 'toggleCategory', category: categoryId, enabled: nextEnabled, scope: mutScope, conversationId: convId })
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        if (data && data.exemptCategories) {
+        if (currentScope === mutScope && data && data.exemptCategories) {
           setActiveCategories(cachedStats, data.exemptCategories);
           updateExemptionsList(cachedStats);
         }
       } catch (err) {
         console.error("Failed to toggle category:", err);
-        setActiveCategories(cachedStats, activeCats);
-        updateExemptionsList(cachedStats);
+        if (currentScope === mutScope) {
+          setActiveCategories(cachedStats, activeCats);
+          updateExemptionsList(cachedStats);
+        }
       }
     }
 
@@ -2746,7 +2764,13 @@
       const input = document.getElementById('new-exempt-input');
       const val = input.value.trim();
       if (!val) return;
+      const cleanExt = val.startsWith('*.') ? val.slice(1) : val;
+      if (!/^\.?[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$/.test(cleanExt)) {
+        alert(t('alertAddExemptFail', { msg: 'Invalid extension format (e.g. .log or .csv)' }));
+        return;
+      }
 
+      ++refreshSeq;
       const params = new URLSearchParams(window.location.search);
       const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
 
@@ -2754,7 +2778,7 @@
         const res = await apiFetch('/api/exemptions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'add', ext: val, scope: currentScope, conversationId: convId })
+          body: JSON.stringify({ action: 'add', ext: cleanExt, scope: currentScope, conversationId: convId })
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         input.value = '';
@@ -3077,10 +3101,12 @@
       resultsDiv.innerHTML = `<div class="muted-note">${escapeHtml(t('searchingFts'))}</div>`;
 
       try {
+        const params = new URLSearchParams(window.location.search);
+        const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
         const res = await apiFetch('/api/search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query: q })
+          body: JSON.stringify({ query: q, scope: currentScope, conversationId: convId })
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
@@ -3113,6 +3139,8 @@
     }
 
     async function toggleCliFilter() {
+      ++refreshSeq;
+      const mutScope = currentScope;
       const btn = document.getElementById('toggle-cli-filter-btn');
       const prev = btn?.dataset.enabled === '1';
       const next = !prev;
@@ -3123,17 +3151,19 @@
         const res = await apiFetch('/api/cli-filter', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ enabled: next, scope: currentScope, conversationId: convId })
+          body: JSON.stringify({ enabled: next, scope: mutScope, conversationId: convId })
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         refreshData(false);
       } catch (e) {
         console.error(e);
-        updateFeaturePill('toggle-cli-filter-btn', t('cliFilterLabel'), prev);
+        if (currentScope === mutScope) updateFeaturePill('toggle-cli-filter-btn', t('cliFilterLabel'), prev);
       }
     }
 
     async function toggleReadDedup() {
+      ++refreshSeq;
+      const mutScope = currentScope;
       const btn = document.getElementById('toggle-read-dedup-btn');
       const prev = btn?.dataset.enabled === '1';
       const next = !prev;
@@ -3144,13 +3174,13 @@
         const res = await apiFetch('/api/read-dedup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ enabled: next, scope: currentScope, conversationId: convId })
+          body: JSON.stringify({ enabled: next, scope: mutScope, conversationId: convId })
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         refreshData(false);
       } catch (e) {
         console.error(e);
-        updateFeaturePill('toggle-read-dedup-btn', t('readDedupLabel'), prev);
+        if (currentScope === mutScope) updateFeaturePill('toggle-read-dedup-btn', t('readDedupLabel'), prev);
       }
     }
 
@@ -3871,15 +3901,16 @@
 
       if (causesEl) {
         const c = kv.bustsByCause || {};
+        const dupCnt = Number(kv.duplicateReadCount) || 0;
         causesEl.innerHTML = [
           `<span class="muted-note">${escapeHtml(t('bustsLabel'))}</span>`,
-          `<span>${escapeHtml(t('bustTtl'))} <strong>${c.ttl_idle_expiry || 0}</strong></span>`,
-          `<span>${escapeHtml(t('bustCompact'))} <strong>${c.compaction_or_truncation || 0}</strong></span>`,
-          `<span>${escapeHtml(t('bustModel'))} <strong>${c.model_switch || 0}</strong></span>`,
-          `<span>${escapeHtml(t('bustSysMsg'))} <strong>${c.system_injection || 0}</strong></span>`,
-          `<span>${escapeHtml(t('bustMedia'))} <strong>${c.multimodal_media || 0}</strong></span>`,
-          `<span>${escapeHtml(t('bustDrift'))} <strong>${c.prefix_drift || 0}</strong></span>`,
-          kv.duplicateReadCount ? `<span class="val-warn">${escapeHtml(t('bustDupReads'))} <strong>${kv.duplicateReadCount}</strong></span>` : '',
+          `<span>${escapeHtml(t('bustTtl'))} <strong>${Number(c.ttl_idle_expiry) || 0}</strong></span>`,
+          `<span>${escapeHtml(t('bustCompact'))} <strong>${Number(c.compaction_or_truncation) || 0}</strong></span>`,
+          `<span>${escapeHtml(t('bustModel'))} <strong>${Number(c.model_switch) || 0}</strong></span>`,
+          `<span>${escapeHtml(t('bustSysMsg'))} <strong>${Number(c.system_injection) || 0}</strong></span>`,
+          `<span>${escapeHtml(t('bustMedia'))} <strong>${Number(c.multimodal_media) || 0}</strong></span>`,
+          `<span>${escapeHtml(t('bustDrift'))} <strong>${Number(c.prefix_drift) || 0}</strong></span>`,
+          dupCnt > 0 ? `<span class="val-warn">${escapeHtml(t('bustDupReads'))} <strong>${dupCnt}</strong></span>` : '',
           kv.cacheCreationTokensTotal ? `<span title="${escapeHtml(t('bustWritesTip', { mult: writeMult.toFixed(2) }))}">${escapeHtml(t('bustWrites'))} <strong>${Math.round(kv.cacheCreationTokensTotal / 1000)}k</strong></span>` : '',
           kv.thinkingTokensTotal ? `<span title="${escapeHtml(t('bustThinkTip'))}">${escapeHtml(t('bustThink'))} <strong>${Math.round(kv.thinkingTokensTotal / 1000)}k</strong></span>` : ''
         ].filter(Boolean).join('');

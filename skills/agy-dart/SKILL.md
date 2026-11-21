@@ -14,13 +14,14 @@ description: >-
 
 ## 1. Thinking in Code (`ctx_execute`)
 
-For logs, test dumps, CSV/JSON files, or API responses larger than 16 KB, extract only the computed facts in the sandbox:
+For logs, test dumps, CSV/JSON files, or API responses larger than 16 KB, extract only the computed facts in the sandbox (`timeoutSec`: 1–300, default 120s; pass `cwd` when targeting a specific workspace directory; supports both CommonJS `require` and top-level ESM `import`):
 
 ```json
 {
   "language": "javascript",
   "code": "const fs = require('fs'); const lines = fs.readFileSync('build.log', 'utf8').split(/\\r?\\n/); const errs = lines.filter(l => /error|exception/i.test(l)); console.log(JSON.stringify({ totalLines: lines.length, errorCount: errs.length, sample: errs.slice(0, 20) }, null, 2));",
-  "intent": "Count and sample errors from build.log"
+  "intent": "Count and sample errors from build.log",
+  "timeoutSec": 120
 }
 ```
 
@@ -32,9 +33,9 @@ For logs, test dumps, CSV/JSON files, or API responses larger than 16 KB, extrac
 
 ## 3. Transparent CLI Filtering, SmartCrusher, Config & Read Dedup
 
-- Single noisy commands (`git status/diff/log`, `npm/pnpm/yarn/node/pytest/cargo/go` tests, builds, linters, installs, `docker build`, `gh`, `kubectl`, `terraform`, `playwright`) and safe `cd <dir> && <cmd> 2>&1` wrappers are transparently compacted `<= 8.8 KB` via `PreToolUse.overwrite` + `hooks/cli-filter.mjs` (preserving exact exit codes, applying project `.agy-dart/filters.json`, structurally compacting large JSON/JSONL via SmartCrusher, and indexing redacted raw output into FTS5).
+- Single noisy commands (`git status/diff/log`, `npm/pnpm/yarn/node/pytest/cargo/go` tests, builds, linters, installs, `docker build`, `gh`, `kubectl`, `terraform`, `playwright`) and safe `cd <dir> && <cmd> 2>&1` wrappers are transparently compacted `<= 8.8 KB` via `PreToolUse.overwrite` + `hooks/cli-filter.mjs` (preserving exact exit codes, applying project `.agy-dart/filters.json`, structurally compacting large JSON/JSONL via SmartCrusher, and indexing redacted raw output into FTS5). Background streaming tasks (`WaitMsBeforeAsync <= 2000` or `IsDaemon: true`) and long `>60s` builds bypass `cli-filter.mjs` automatically so `manage_task(status)` receives live streaming logs.
 - `ctx_index({ url })` enforces SSRF protection (`http:`/`https:` only, max 5 redirects, per-hop DNS private/loopback/IPv6-mapped blocking with IP pinning), and common credentials are redacted before indexing/returning.
-- Redundant unchanged `read_file` calls in the same direct conversation are caught on strike 1 (retry once to bypass). Opt-in modified-file compact diff-read (`diffRead: true` in `~/.agy-dart/config.json` or `AGY_DART_ENABLE_DIFF_READ=1`) is OFF by default and strictly scoped to the same direct conversation within recent turns/age.
+- Redundant unchanged `read_file` calls in the same direct conversation are caught on strike 1 (retry once to bypass), and automatically decay after `readDedupMaxSteps` (default 40 steps) so deep long-horizon tasks never waste invocations re-verifying earlier files. Opt-in modified-file compact diff-read (`diffRead: true` in `~/.agy-dart/config.json` or `AGY_DART_ENABLE_DIFF_READ=1`) is OFF by default and strictly scoped to the same direct conversation within recent turns/age.
 - Unified config: configure persistent toggles in `~/.agy-dart/config.json` (overridable via `AGY_DART_*` env vars); run `node scripts/install.mjs doctor` or `ctx_doctor` to inspect effective settings.
 
 ## 4. KV-Cache Diagnostics, Audit, Simulation & DB Maintenance

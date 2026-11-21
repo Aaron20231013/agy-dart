@@ -172,6 +172,7 @@ export class SchemaMethods {
         byte_est INTEGER NOT NULL DEFAULT 0,
         read_ts INTEGER NOT NULL,
         bypass_armed INTEGER NOT NULL DEFAULT 0,
+        read_step INTEGER,
         PRIMARY KEY (session_id, file_path, start_line, end_line)
       );
 
@@ -258,7 +259,8 @@ export class SchemaMethods {
       const readCols = this.db.prepare("PRAGMA table_info(file_reads)").all();
       for (const colDef of [
         { name: "ctime_ms", sql: "ALTER TABLE file_reads ADD COLUMN ctime_ms REAL;" },
-        { name: "ino", sql: "ALTER TABLE file_reads ADD COLUMN ino TEXT;" }
+        { name: "ino", sql: "ALTER TABLE file_reads ADD COLUMN ino TEXT;" },
+        { name: "read_step", sql: "ALTER TABLE file_reads ADD COLUMN read_step INTEGER;" }
       ]) {
         if (!readCols.some((c) => c.name === colDef.name)) {
           try {

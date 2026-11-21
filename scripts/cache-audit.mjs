@@ -551,21 +551,43 @@ function sortToolsByName(tools) {
   return [...tools].sort((a, b) => compareAscii(a?.name, b?.name));
 }
 
+const WIN_TASKKILL_BIN =
+  process.platform === "win32"
+    ? path.join(process.env.SystemRoot || process.env.WINDIR || "C:\\Windows", "System32", "taskkill.exe")
+    : "taskkill";
+
 function killChildTree(child, usedShell) {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
-  if (process.platform === "win32" && usedShell && child.pid) {
+  if (!child) return;
+  const fallbackKill = () => {
+    if (child.exitCode === null) {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    }
+  };
+  if (process.platform === "win32" && child.pid) {
+    // On Windows, child.kill("SIGTERM") on a .cmd/.bat shell wrapper only kills outer cmd.exe
+    // while setting child.signalCode = "SIGTERM" and leaving grandchild node.exe alive.
+    // Always run taskkill /T /F when usedShell is true or child has not exited.
+    if (!usedShell && child.exitCode !== null) return;
     try {
-      const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+      const killer = spawn(WIN_TASKKILL_BIN, ["/PID", String(child.pid), "/T", "/F"], {
         stdio: "ignore",
         windowsHide: true
       });
+      killer.on("error", fallbackKill);
+      killer.on("close", (code) => {
+        if (code !== 0) fallbackKill();
+      });
       killer.unref();
       return;
-    } catch {}
+    } catch {
+      fallbackKill();
+      return;
+    }
   }
-  try {
-    child.kill("SIGKILL");
-  } catch {}
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  fallbackKill();
 }
 
 /**
@@ -745,26 +767,28 @@ function probeMcpServerOnce({ command, args, cwd, env, timeoutMs }) {
         child.stdin?.end();
       } catch {}
 
-      if (child.exitCode !== null || child.signalCode !== null) {
+      if (child.exitCode !== null && !(process.platform === "win32" && needsShell)) {
         finish(outcome);
         return;
       }
 
-      const termTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          try {
-            child.kill("SIGTERM");
-          } catch {}
-        }
-      }, 80);
-      termTimer.unref();
-      timers.push(termTimer);
+      if (!(process.platform === "win32" && needsShell)) {
+        const termTimer = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            try {
+              child.kill("SIGTERM");
+            } catch {}
+          }
+        }, 80);
+        termTimer.unref();
+        timers.push(termTimer);
+      }
 
       const killTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
+        if (child.exitCode === null || (process.platform === "win32" && needsShell)) {
           killChildTree(child, needsShell);
         }
-      }, 220);
+      }, process.platform === "win32" && needsShell ? 120 : 220);
       killTimer.unref();
       timers.push(killTimer);
 

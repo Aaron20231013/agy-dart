@@ -109,9 +109,16 @@ function estimateColdReprefillHint(diag) {
   return coldUsdStr ? ` (~${coldUsdStr} cold re-prefill)` : "";
 }
 
-export function evaluateCacheAlerts(diag, { sessionId, store }) {
+export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = null }) {
   const alerts = [];
   if (!diag || diag.turnsWithUsage === 0) return alerts;
+
+  const parsedInvNum =
+    invocationNum !== undefined && invocationNum !== null && invocationNum !== "" && typeof invocationNum !== "boolean"
+      ? Number(invocationNum)
+      : NaN;
+  const isMidTurnContinuation =
+    Number.isFinite(parsedInvNum) && parsedInvNum >= 1 && diag.inToolLoop !== false;
 
   const wmKey = `cache_alert:${sessionId}:watermark`;
   const ttlKey = `cache_alert:${sessionId}:ttl_turn`;
@@ -146,58 +153,64 @@ export function evaluateCacheAlerts(diag, { sessionId, store }) {
       `Context at **${formatK(diag.currentContextTokens)} tokens** (critical watermark >= ${formatK(effectiveCrit)}${windowLabel}, cache hit ${hitPct}%${wasteHint}). Consider \`/compact\`${handoffHint} at the next milestone, then call \`ctx_resume\`.`
     );
   } else if (diag.watermark === "warn" && prevWm !== "warn" && prevWm !== "critical") {
-    setAlertMeta(wmKey, "warn");
-    const hitPct = (diag.weightedHitRate * 100).toFixed(0);
-    if (diag.compactAdvice === "delay_hot_cache") {
-      const tempLabel = String(diag.cacheTemperature || "warm").toUpperCase();
-      const savedHint = savedUsdStr ? `, ~${savedUsdStr} saved` : "";
-      alerts.push(
-        `Context reached **${formatK(diag.currentContextTokens)} tokens** (cache **${tempLabel}**, hit ${hitPct}%${savedHint}${windowLabel}). **Delay \`/compact\`** while cache is hot to avoid re-prefill; keep tool outputs compact via \`agy-dart_fast\` / \`ctx_execute\`.`
-      );
-    } else if (diag.compactAdvice === "opportunistic_cold_compact") {
-      alerts.push(
-        `Context reached **${formatK(diag.currentContextTokens)} tokens** (high watermark >= ${formatK(effectiveWarn)}${windowLabel}, cache cold). Good moment for Sidecar **Handoff Brief** + \`/compact\`, then \`ctx_resume\`.`
-      );
+    if (diag.compactAdvice === "opportunistic_cold_compact" && isMidTurnContinuation) {
+      // Suppress cold-compact handoff banner during mid-turn tool execution loops (invocationNum >= 1)
     } else {
-      alerts.push(
-        `Context reached **${formatK(diag.currentContextTokens)} tokens** (high watermark >= ${formatK(effectiveWarn)}${windowLabel}, cache hit ${hitPct}%). Keep outputs compact via \`agy-dart_fast\` / \`ctx_execute\`.`
-      );
+      setAlertMeta(wmKey, "warn");
+      const hitPct = (diag.weightedHitRate * 100).toFixed(0);
+      if (diag.compactAdvice === "delay_hot_cache") {
+        const tempLabel = String(diag.cacheTemperature || "warm").toUpperCase();
+        const savedHint = savedUsdStr ? `, ~${savedUsdStr} saved` : "";
+        alerts.push(
+          `Context reached **${formatK(diag.currentContextTokens)} tokens** (cache **${tempLabel}**, hit ${hitPct}%${savedHint}${windowLabel}). **Delay \`/compact\`** while cache is hot to avoid re-prefill; keep tool outputs compact via \`agy-dart_fast\` / \`ctx_execute\`.`
+        );
+      } else if (diag.compactAdvice === "opportunistic_cold_compact") {
+        alerts.push(
+          `Context reached **${formatK(diag.currentContextTokens)} tokens** (high watermark >= ${formatK(effectiveWarn)}${windowLabel}, cache cold). Good moment for Sidecar **Handoff Brief** + \`/compact\`, then \`ctx_resume\`.`
+        );
+      } else {
+        alerts.push(
+          `Context reached **${formatK(diag.currentContextTokens)} tokens** (high watermark >= ${formatK(effectiveWarn)}${windowLabel}, cache hit ${hitPct}%). Keep outputs compact via \`agy-dart_fast\` / \`ctx_execute\`.`
+        );
+      }
     }
   } else if (diag.watermark === "ok" && prevWm) {
     // Reset watermark state after compaction
     store.deleteMeta(wmKey);
   }
 
-  // 2. Idle Prompt-Cache TTL expiry & proactive expiring alerts (once per idle episode)
-  const ttlMinContext = Math.min(diag.delayHotMinTokens || 30000, 60000);
-  if (diag.ttlStatus === "expired" && diag.currentContextTokens >= ttlMinContext && diag.lastPlannerAt) {
-    const lastAlertedTurn = getAlertMeta(ttlKey, "");
-    if (lastAlertedTurn !== diag.lastPlannerAt) {
-      setAlertMeta(ttlKey, diag.lastPlannerAt);
-      const ttlSourceTag =
-        diag.ttlSource === "empirical"
-          ? " calibrated"
-          : diag.ttlSource === "explicit"
-            ? " configured"
-            : "";
-      const costHint = estimateColdReprefillHint(diag);
-      const compactTail = needsHandoffCue
-        ? "Good moment to copy Sidecar **Handoff Brief** + `/compact`, then `ctx_resume`."
-        : "Good moment to `/compact` if switching tasks.";
-      alerts.push(
-        `Idle **${formatDuration(diag.idleSeconds)}** (>${formatDuration(diag.cacheTtlSec)}${ttlSourceTag} KV-cache TTL) at **${formatK(diag.currentContextTokens)} tokens**${costHint} — next turn will re-prefill cold. ${compactTail}`
-      );
-    }
-  } else if (diag.ttlStatus === "expiring" && diag.currentContextTokens >= 60000 && diag.lastPlannerAt) {
-    const lastAlertedExpiring = getAlertMeta(ttlExpiringKey, "");
-    if (lastAlertedExpiring !== diag.lastPlannerAt) {
-      setAlertMeta(ttlExpiringKey, diag.lastPlannerAt);
-      const remSec = Math.max(0, Math.round(Number(diag.ttlRemainingSec ?? 0)));
-      const remLabel = remSec <= 60 ? `${remSec}s` : formatDuration(remSec);
-      const costHint = estimateColdReprefillHint(diag);
-      alerts.push(
-        `KV-cache expiring in **${remLabel}** at **${formatK(diag.currentContextTokens)} tokens**${costHint} — send your next turn soon to stay warm, or copy Sidecar **Handoff Brief** before \`/compact\`.`
-      );
+  // 2. Idle Prompt-Cache TTL expiry & proactive expiring alerts (once per idle episode, turn entry only)
+  const ttlMinContext = Math.max(60000, diag.coldCompactTokens || 60000);
+  if (!isMidTurnContinuation) {
+    if (diag.ttlStatus === "expired" && diag.currentContextTokens >= ttlMinContext && diag.lastPlannerAt) {
+      const lastAlertedTurn = getAlertMeta(ttlKey, "");
+      if (lastAlertedTurn !== diag.lastPlannerAt) {
+        setAlertMeta(ttlKey, diag.lastPlannerAt);
+        const ttlSourceTag =
+          diag.ttlSource === "empirical"
+            ? " calibrated"
+            : diag.ttlSource === "explicit"
+              ? " configured"
+              : "";
+        const costHint = estimateColdReprefillHint(diag);
+        const compactTail = needsHandoffCue
+          ? "Good moment to copy Sidecar **Handoff Brief** + `/compact`, then `ctx_resume`."
+          : "Good moment to `/compact` if switching tasks.";
+        alerts.push(
+          `Idle **${formatDuration(diag.idleSeconds)}** (>${formatDuration(diag.cacheTtlSec)}${ttlSourceTag} KV-cache TTL) at **${formatK(diag.currentContextTokens)} tokens**${costHint} — next turn will re-prefill cold. ${compactTail}`
+        );
+      }
+    } else if (diag.ttlStatus === "expiring" && diag.currentContextTokens >= ttlMinContext && diag.lastPlannerAt) {
+      const lastAlertedExpiring = getAlertMeta(ttlExpiringKey, "");
+      if (lastAlertedExpiring !== diag.lastPlannerAt) {
+        setAlertMeta(ttlExpiringKey, diag.lastPlannerAt);
+        const remSec = Math.max(0, Math.round(Number(diag.ttlRemainingSec ?? 0)));
+        const remLabel = remSec <= 60 ? `${remSec}s` : formatDuration(remSec);
+        const costHint = estimateColdReprefillHint(diag);
+        alerts.push(
+          `KV-cache expiring in **${remLabel}** at **${formatK(diag.currentContextTokens)} tokens**${costHint} — send your next turn soon to stay warm, or copy Sidecar **Handoff Brief** before \`/compact\`.`
+        );
+      }
     }
   }
 
@@ -353,7 +366,11 @@ async function main() {
       return;
     }
 
-    const alerts = evaluateCacheAlerts(diag, { sessionId: targetConvId, store });
+    const alerts = evaluateCacheAlerts(diag, {
+      sessionId: targetConvId,
+      store,
+      invocationNum: payload?.invocationNum ?? payload?.invocation_num ?? null
+    });
     store.close();
     store = null;
 

@@ -113,6 +113,244 @@ function sanitizeDiagText(val, maxBytes = 80) {
 }
 
 /**
+ * Resolve a command name on Windows honoring per-directory PATHEXT precedence.
+ * Returns the full path ONLY when the highest-priority match is a native `.exe`;
+ * immediately returns `null` if an earlier PATH directory or extension matches a `.cmd`/`.bat`/`.ps1` shim
+ * (preventing stale global `.exe` binaries later in PATH from hijacking local project shims).
+ */
+export function resolveWindowsExeOnPath(cmdName, cwd = process.cwd(), env = process.env) {
+  if (!cmdName || typeof cmdName !== "string" || /[\r\n\0]/.test(cmdName)) return null;
+  const hasSep = cmdName.includes("/") || cmdName.includes("\\");
+  const tryFile = (p) => {
+    try {
+      return fs.existsSync(p) && fs.statSync(p).isFile() ? p : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const baseName = path.win32.basename(cmdName);
+  const explicitExt = path.win32.extname(baseName).toLowerCase();
+  const pathextRaw =
+    env?.PATHEXT || env?.Pathext || ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PS1";
+  const exts = [];
+  for (const rawExt of pathextRaw.split(";")) {
+    const cleanExt = rawExt.trim().toLowerCase();
+    if (!cleanExt) continue;
+    const normExt = cleanExt.startsWith(".") ? cleanExt : `.${cleanExt}`;
+    if (!exts.includes(normExt)) exts.push(normExt);
+  }
+  for (const mustExt of [".com", ".exe", ".bat", ".cmd", ".ps1"]) {
+    if (!exts.includes(mustExt)) exts.push(mustExt);
+  }
+
+  const checkDirCandidate = (dirPath, name) => {
+    const targetBase = path.join(dirPath, name);
+    if (explicitExt && exts.includes(explicitExt)) {
+      const exactHit = tryFile(targetBase);
+      if (exactHit) {
+        return { matched: true, exePath: explicitExt === ".exe" ? exactHit : null };
+      }
+      return { matched: false, exePath: null };
+    }
+    for (const ext of exts) {
+      const hit = tryFile(`${targetBase}${ext}`);
+      if (hit) {
+        return { matched: true, exePath: ext === ".exe" ? hit : null };
+      }
+    }
+    if (explicitExt) {
+      const rawHit = tryFile(targetBase);
+      if (rawHit) {
+        return { matched: true, exePath: explicitExt === ".exe" ? rawHit : null };
+      }
+    }
+    return { matched: false, exePath: null };
+  };
+
+  if (hasSep) {
+    const resolved = path.resolve(cwd || process.cwd(), cmdName);
+    const res = checkDirCandidate(path.dirname(resolved), path.basename(resolved));
+    return res.matched ? res.exePath : null;
+  }
+
+  const pathEnv = env?.PATH || env?.Path || "";
+  const searchDirs = [];
+  const nodeBinDirs = ["node_modules/.bin"];
+  void nodeBinDirs;
+  for (const dir of pathEnv.split(";")) {
+    const cleanDir = dir.trim().replace(/^"|"$/g, "");
+    if (cleanDir) searchDirs.push(cleanDir);
+  }
+  for (const cleanDir of searchDirs) {
+    const res = checkDirCandidate(cleanDir, cmdName);
+    if (res.matched) {
+      return res.exePath;
+    }
+  }
+  return null;
+}
+
+/**
+ * Parse a simple single command line into `{ bin, args }` for direct `shell: false` execution on Windows.
+ * Handles PowerShell `''` escaped single quotes inside `'...'`, preserves UNC `\\server\share` inside `"..."`,
+ * and resolves trailing backslash `"E:\repo\"` vs C-style `\"` accurately.
+ */
+export function tryParseSimpleCommand(cmd) {
+  if (!cmd || typeof cmd !== "string") return null;
+  const tokens = [];
+  let i = 0;
+  const len = cmd.length;
+  while (i < len) {
+    while (i < len && /\s/.test(cmd[i])) i++;
+    if (i >= len) break;
+    let tok = "";
+    let hasContent = false;
+    while (i < len && !/\s/.test(cmd[i])) {
+      const ch = cmd[i];
+      if (ch === "'") {
+        hasContent = true;
+        const openIdx = i;
+        i++;
+        let closed = false;
+        while (i < len) {
+          if (cmd[i] === "'") {
+            if (i + 1 < len && cmd[i + 1] === "'") {
+              // Empty `''` standalone token vs PowerShell escaped `''` inside `'don''t'` or `''''`
+              if (i === openIdx + 1 && (i + 2 >= len || /\s/.test(cmd[i + 2]))) {
+                i += 2;
+                closed = true;
+                break;
+              }
+              tok += "'";
+              i += 2;
+              continue;
+            }
+            i++;
+            closed = true;
+            break;
+          }
+          tok += cmd[i];
+          i++;
+        }
+        if (!closed) return null;
+      } else if (ch === '"') {
+        hasContent = true;
+        i++;
+        let closed = false;
+        while (i < len) {
+          if (cmd[i] === "\\" && i + 1 < len) {
+            if (cmd[i + 1] === "\\" && i + 2 < len && cmd[i + 2] === '"') {
+              // Escaped trailing backslash before closing quote: `"E:\\repo\\"` -> `E:\repo\`
+              tok += "\\";
+              i += 3;
+              closed = true;
+              break;
+            }
+            if (cmd[i + 1] === '"') {
+              // If another `"` exists later in `cmd`, treat `\"` as escaped quote; otherwise treat `\` as
+              // Windows trailing path separator (`"E:\repo\"`) and `"` as the closing quote.
+              if (cmd.indexOf('"', i + 2) !== -1) {
+                tok += '"';
+                i += 2;
+                continue;
+              }
+              tok += "\\";
+              i += 2;
+              closed = true;
+              break;
+            }
+          }
+          if (cmd[i] === '"') {
+            i++;
+            closed = true;
+            break;
+          }
+          tok += cmd[i];
+          i++;
+        }
+        if (!closed) return null;
+      } else {
+        if (/[|;&<>`$()%!{}#\r\n\0]/.test(ch)) return null;
+        tok += ch;
+        hasContent = true;
+        i++;
+      }
+    }
+    if (hasContent) tokens.push(tok);
+  }
+  if (tokens.length === 0) return null;
+  return { bin: tokens[0], args: tokens.slice(1) };
+}
+
+function hasWindowsCrossShellHazard(innerCmd, targetCwd, env = process.env) {
+  if (!innerCmd || typeof innerCmd !== "string") return false;
+  let hasUnquotedComma = false;
+  let hasStandaloneDoubleDash = false;
+  let hasSingleQuotedDoubleQuote = false;
+
+  let i = 0;
+  const len = innerCmd.length;
+  while (i < len) {
+    while (i < len && /\s/.test(innerCmd[i])) i++;
+    if (i >= len) break;
+    const tokStart = i;
+    let tokHasQuote = false;
+    while (i < len && !/\s/.test(innerCmd[i])) {
+      const ch = innerCmd[i];
+      if (ch === "'") {
+        tokHasQuote = true;
+        i++;
+        while (i < len) {
+          if (innerCmd[i] === "'") {
+            if (i + 1 < len && innerCmd[i + 1] === "'") {
+              i += 2;
+              continue;
+            }
+            i++;
+            break;
+          }
+          if (innerCmd[i] === '"') hasSingleQuotedDoubleQuote = true;
+          i++;
+        }
+      } else if (ch === '"') {
+        tokHasQuote = true;
+        i++;
+        while (i < len) {
+          if (innerCmd[i] === "\\" && i + 1 < len && innerCmd[i + 1] === '"' && innerCmd.indexOf('"', i + 2) !== -1) {
+            i += 2;
+            continue;
+          }
+          if (innerCmd[i] === '"') {
+            i++;
+            break;
+          }
+          i++;
+        }
+      } else {
+        if (ch === ",") hasUnquotedComma = true;
+        i++;
+      }
+    }
+    const rawTok = innerCmd.slice(tokStart, i);
+    if (!tokHasQuote && rawTok === "--") {
+      hasStandaloneDoubleDash = true;
+    }
+  }
+
+  if (hasUnquotedComma || hasStandaloneDoubleDash) {
+    return true;
+  }
+  if (hasSingleQuotedDoubleQuote) {
+    const parsed = tryParseSimpleCommand(innerCmd);
+    if (!parsed || !resolveWindowsExeOnPath(parsed.bin, targetCwd, env)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Linear O(N) tokenizer for `git` / `git.exe` invocations with safe leading global options.
  * Supports `-C <path>`, `-C<path>`, `--no-pager`, `-P`, `--git-dir <path>` / `--git-dir=<path>`,
  * and `--work-tree <path>` / `--work-tree=<path>`.
@@ -915,7 +1153,14 @@ export function isSafeRegex(source) {
     return true;
   };
 
-  const chargeBarrierBypass = () => {
+  const chargeBarrierBypass = (activePrev, repeatCs, isAnchored) => {
+    if (!isAnchored && repeatCs && repeatCs[5] && activePrev) {
+      let broadOverlaps = 0;
+      for (const p of activePrev) {
+        if (p.cs[5] && csOverlaps(p.cs, repeatCs)) broadOverlaps += 1;
+      }
+      if (broadOverlaps >= 2) return false;
+    }
     barrierBypassCount += 1;
     return barrierBypassCount <= 3;
   };
@@ -992,7 +1237,7 @@ export function isSafeRegex(source) {
           spaceWildcardUsed = true;
           top.usedSpaceWildcard = true;
         } else if (rawPrevOverlapsCs(top.curPrev, atomCs)) {
-          if (!chargeBarrierBypass()) return false;
+          if (!chargeBarrierBypass(top.curPrev, atomCs, top.curAnchoredStart)) return false;
         }
         const nextList = csIsEmpty(atomCs) ? null : [makePrevEntry(atomCs, [])];
         recordLookaroundVarRepeat(nextList);
@@ -1226,7 +1471,7 @@ export function isSafeRegex(source) {
           if (!chargeVarRepeatInteraction(groupCs, parent.curAnchoredStart)) return false;
           if (prevOverlapsCs(frame.incomingPrev, entryCs)) return false;
           if (rawPrevOverlapsCs(frame.incomingPrev, entryCs)) {
-            if (!chargeBarrierBypass()) return false;
+            if (!chargeBarrierBypass(frame.incomingPrev, entryCs, parent.curAnchoredStart)) return false;
           }
           const nextList = csIsEmpty(groupCs) ? null : [makePrevEntry(groupCs, [])];
           recordLookaroundVarRepeat(nextList);
@@ -2131,6 +2376,13 @@ export function matchFilterRule(commandLine, options = {}) {
   const inner = unwrapped.innerCommand;
   if (SKIP_FLAGS_RE.test(inner)) return null;
 
+  const baseCwd = options?.cwd || process.cwd();
+  const effectiveTargetCwd = unwrapped.cdPath ? resolveCdTargetCwd(baseCwd, unwrapped.cdPath) : baseCwd;
+  const activePlatform = options?.platform || process.platform;
+  if (activePlatform === "win32" && hasWindowsCrossShellHazard(inner, effectiveTargetCwd, options?.env || process.env)) {
+    return null;
+  }
+
   if (!options.customOnly) {
     for (const rule of FILTER_RULES) {
       const matchResult = typeof rule.match === "function" ? rule.match(inner) : rule.pattern.test(inner);
@@ -2166,7 +2418,6 @@ export function matchFilterRule(commandLine, options = {}) {
 
   // Fallback to project-level declarative rules (.agy-dart/filters.json)
   // Prefer the unwrapped `cd <path>` target directory first, then fall back to caller cwd.
-  const baseCwd = options?.cwd || process.cwd();
   const searchCwds = [];
   if (unwrapped.cdPath) {
     const targetCwd = resolveCdTargetCwd(baseCwd, unwrapped.cdPath);
@@ -2176,9 +2427,11 @@ export function matchFilterRule(commandLine, options = {}) {
   if (!searchCwds.some((d) => path.resolve(d) === resolvedBase)) {
     searchCwds.push(resolvedBase);
   }
+  const matchDeadline = Date.now() + 25;
   for (const dir of searchCwds) {
     const projectRules = loadProjectFilterRules(dir);
     for (const rule of projectRules) {
+      if (Date.now() > matchDeadline) return null;
       if (rule.pattern.test(inner)) {
         return {
           rule,

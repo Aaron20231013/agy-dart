@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   MAX_CHUNK_BYTES,
   RRF_K,
@@ -7,6 +7,37 @@ import {
   sanitizeTrigramQuery,
   truncateUtf8Bytes
 } from "./schema.js";
+
+function parseMarkdownHeadingLinear(line) {
+  if (!line || line.length > 1024 || line.charCodeAt(0) !== 0x23) return null;
+  let hashes = 0;
+  while (hashes < line.length && hashes <= 6 && line.charCodeAt(hashes) === 0x23) {
+    hashes += 1;
+  }
+  if (hashes < 1 || hashes > 6 || hashes >= line.length) return null;
+  const after = line.charCodeAt(hashes);
+  if (after !== 0x20 && after !== 0x09) return null;
+  let start = hashes + 1;
+  while (start < line.length && (line.charCodeAt(start) === 0x20 || line.charCodeAt(start) === 0x09)) {
+    start += 1;
+  }
+  let end = line.length;
+  while (end > start && (line.charCodeAt(end - 1) === 0x20 || line.charCodeAt(end - 1) === 0x09)) {
+    end -= 1;
+  }
+  let hashEnd = end;
+  while (hashEnd > start && line.charCodeAt(hashEnd - 1) === 0x23) {
+    hashEnd -= 1;
+  }
+  if (hashEnd < end && (hashEnd === start || line.charCodeAt(hashEnd - 1) === 0x20 || line.charCodeAt(hashEnd - 1) === 0x09)) {
+    end = hashEnd;
+    while (end > start && (line.charCodeAt(end - 1) === 0x20 || line.charCodeAt(end - 1) === 0x09)) {
+      end -= 1;
+    }
+  }
+  if (end <= start) return null;
+  return { level: hashes, text: line.slice(start, end) };
+}
 
 export class FtsMethods {
   /** Safely split an oversized single line into <= maxBytes UTF-8 slices */
@@ -114,7 +145,7 @@ export class FtsMethods {
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      const fenceMatch = /^(\s*)(`{3,}|~{3,})(.*)$/.exec(line);
+      const fenceMatch = line.length <= 1024 ? /^(\s*)(`{3,}|~{3,})(.*)$/.exec(line) : null;
       if (fenceMatch) {
         const marker = fenceMatch[2];
         const rest = fenceMatch[3] || "";
@@ -133,10 +164,10 @@ export class FtsMethods {
       }
 
       if (!inFence) {
-        const headingMatch = /^(#{1,6})\s+(.+?)\s*#*$/.exec(line);
+        const headingMatch = parseMarkdownHeadingLinear(line);
         if (headingMatch) {
-          const level = headingMatch[1].length;
-          const headingText = headingMatch[2].trim();
+          const level = headingMatch.level;
+          const headingText = headingMatch.text;
           const prevLevel = headingStack.length > 0 ? headingStack[headingStack.length - 1].level : 0;
           const isSiblingOrAscent = prevLevel > 0 && level <= prevLevel;
 
@@ -266,7 +297,9 @@ export class FtsMethods {
       }
     }
 
-    const id = sourceId || `s_${now}_${(++this.sourceCounter).toString(36)}`;
+    const id =
+      sourceId ||
+      `s_${now}_${process.pid.toString(36)}_${randomBytes(3).toString("hex")}_${(++this.sourceCounter).toString(36)}`;
     const isoDate = new Date(now).toISOString();
 
     const detailedChunks = this.chunkContentDetailed(rawText, MAX_CHUNK_BYTES, { label: lbl, isMarkdown });
@@ -291,10 +324,8 @@ export class FtsMethods {
     `);
 
     this._withWriteTx(() => {
-      if (sourceId) {
-        deleteOldChunks.run(id);
-        deleteOldChunksTri.run(id);
-      }
+      deleteOldChunks.run(id);
+      deleteOldChunksTri.run(id);
       insertSource.run(id, sid, wt, ag, k, lbl, totalBytes, chunkCount, now, isoDate, now, contentHash);
 
       for (let ord = 0; ord < chunkCount; ord++) {
@@ -324,6 +355,9 @@ export class FtsMethods {
     const queryList = Array.isArray(queries) ? queries : [queries];
     const maxHits = Math.min(Math.max(1, limit || 5), 20);
     const skipHits = Math.max(0, offset || 0);
+    const effScope = scope === "all" ? "all" : scope === "worktree" ? "worktree" : "session";
+    const effSid = typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : "default";
+    const effWorktree = typeof worktree === "string" && worktree.trim() ? worktree.trim() : "";
 
     const scores = new Map();
 
@@ -345,12 +379,17 @@ export class FtsMethods {
           sql += " AND source_id = ?";
           params.push(sourceId);
         }
-        if (scope === "session" && sessionId) {
+        if (effScope === "session") {
           sql += " AND session_id = ?";
-          params.push(sessionId);
-        } else if (scope === "worktree" && worktree) {
-          sql += " AND worktree = ?";
-          params.push(worktree);
+          params.push(effSid);
+        } else if (effScope === "worktree") {
+          if (effWorktree) {
+            sql += " AND worktree = ?";
+            params.push(effWorktree);
+          } else {
+            sql += " AND session_id = ?";
+            params.push(effSid);
+          }
         }
 
         sql += " ORDER BY rank LIMIT 30";
@@ -397,12 +436,17 @@ export class FtsMethods {
           sqlTri += " AND t.source_id = ?";
           paramsTri.push(sourceId);
         }
-        if (scope === "session" && sessionId) {
+        if (effScope === "session") {
           sqlTri += " AND t.session_id = ?";
-          paramsTri.push(sessionId);
-        } else if (scope === "worktree" && worktree) {
-          sqlTri += " AND s.worktree = ?";
-          paramsTri.push(worktree);
+          paramsTri.push(effSid);
+        } else if (effScope === "worktree") {
+          if (effWorktree) {
+            sqlTri += " AND s.worktree = ?";
+            paramsTri.push(effWorktree);
+          } else {
+            sqlTri += " AND t.session_id = ?";
+            paramsTri.push(effSid);
+          }
         }
 
         sqlTri += " LIMIT 30";
@@ -606,11 +650,16 @@ export class FtsMethods {
   /** Retrieve full event body by sequence number (scoped to session when sessionId is provided) */
   getEventBySeq(seq, sessionId = null) {
     this.open();
-    if (sessionId && sessionId !== "all" && sessionId !== "lifetime") {
-      const row = this.db.prepare("SELECT * FROM events WHERE seq = ? AND session_id = ?").get(seq, sessionId);
+    const numSeq = typeof seq === "object" && seq !== null ? Number(seq.seq) : Number(seq);
+    if (!Number.isInteger(numSeq) || numSeq <= 0) return null;
+    if (sessionId && sessionId !== "all" && sessionId !== "lifetime" && sessionId !== "app") {
+      const row = this.db.prepare("SELECT * FROM events WHERE seq = ? AND session_id = ?").get(numSeq, sessionId);
       return row || null;
     }
-    const row = this.db.prepare("SELECT * FROM events WHERE seq = ?").get(seq);
+    if (sessionId === "app") {
+      return null;
+    }
+    const row = this.db.prepare("SELECT * FROM events WHERE seq = ?").get(numSeq);
     return row || null;
   }
 

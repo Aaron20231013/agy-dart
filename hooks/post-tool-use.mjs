@@ -152,10 +152,14 @@ export function extractInvalidationTargets(toolName, args = {}, cwd = process.cw
         }
       }
     } else if (mcpTool === "ctx_resume") {
-      clearAllSession = true;
+      if (mcpArgs.seq === undefined || mcpArgs.seq === null) {
+        clearAllSession = true;
+      }
     }
   } else if (toolName === "ctx_resume" || /(?:^|_)ctx_resume$/.test(toolName)) {
-    clearAllSession = true;
+    if (args.seq === undefined || args.seq === null) {
+      clearAllSession = true;
+    }
   }
 
   return { paths, clearAllSession };
@@ -176,10 +180,15 @@ function extractResponseIsError(payload = {}) {
   return false;
 }
 
-function extractPartialAppliedPaths(responseText, toolName, args = {}, cwd = process.cwd()) {
+function extractPartialAppliedPaths(responseText, toolName, args = {}, cwd = process.cwd(), candidatePaths = []) {
   if (!responseText || !/Partial edit applied\b/i.test(responseText)) return null;
+  // If the MCP output was truncated to <=8.8 KB, the `Applied:` section may have clipped trailing edited files;
+  // fall back conservatively to invalidating all candidate input paths so no modified file stays stale in `file_reads`.
+  if (/\.\.\.\s*\[truncated/i.test(responseText) && Array.isArray(candidatePaths) && candidatePaths.length > 0) {
+    return candidatePaths;
+  }
   const appliedBlockMatch = responseText.match(/Applied:\r?\n([\s\S]*?)(?:\r?\n\r?\nFailed\b|$)/i);
-  if (!appliedBlockMatch) return [];
+  if (!appliedBlockMatch) return candidatePaths.length > 0 ? candidatePaths : [];
 
   let baseCwd = cwd;
   const resolveBase = (rawCwd) => {
@@ -337,7 +346,10 @@ async function main() {
   if (clearAllSession || paths.length > 0 || verifySignal) {
     let store = null;
     try {
-      const { ContextModeStore } = await import("../context/lib/store.js");
+      const [{ ContextModeStore }, { redactSecrets }] = await Promise.all([
+        import("../context/lib/store.js"),
+        import("../context/lib/security.js")
+      ]);
       store = new ContextModeStore({ hookMode: true });
       if (clearAllSession) {
         store.invalidateFileReads(sessionId, null);
@@ -345,7 +357,7 @@ async function main() {
           store.invalidateFileReads(directConvId, null);
         }
       } else if (paths.length > 0) {
-        const partialApplied = extractPartialAppliedPaths(responseText, toolName, args, cwd);
+        const partialApplied = extractPartialAppliedPaths(responseText, toolName, args, cwd, paths);
         const explicitlyApplied = /^\s*Applied edits to \d+ file\(s\):/im.test(responseText);
         const abortedNoWrite =
           partialApplied === null &&
@@ -361,12 +373,22 @@ async function main() {
             if (directConvId && directConvId !== sessionId) {
               store.invalidateFileReads(directConvId, absPath);
             }
+            if (typeof store.invalidateFileReadsByPath === "function") {
+              store.invalidateFileReadsByPath(absPath);
+            }
           }
           store.recordModifiedFiles(sessionId, effectivePaths, { worktree: cwd, tool: toolName });
         }
       }
       if (verifySignal) {
-        store.recordVerificationResult(sessionId, { ...verifySignal, worktree: cwd });
+        const safeCommand = redactSecrets(verifySignal.command || "").text;
+        const safeSummary = redactSecrets(verifySignal.summary || "").text;
+        store.recordVerificationResult(sessionId, {
+          ...verifySignal,
+          command: safeCommand,
+          summary: safeSummary,
+          worktree: cwd
+        });
       }
     } catch {
       // Fail-open: never block PostToolUse

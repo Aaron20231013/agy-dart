@@ -3,7 +3,7 @@ import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import { getConfigSnapshot } from "./config.js";
-import { executeCode, runProcess, OUTPUT_CAP } from "./executor.js";
+import { executeCode, resolveExecTimeoutMs, runProcess, OUTPUT_CAP } from "./executor.js";
 import { SNIPPET_MAX_BYTES } from "./store.js";
 import {
   detectSensitiveFile,
@@ -19,6 +19,33 @@ const MAX_INLINE_PREVIEW_BYTES = 8100; // Keep total MCP JSON response <= 8.8 KB
 const MAX_MCP_JSON_BYTES = 8700;
 const MAX_FETCH_REDIRECTS = 5;
 const MAX_FETCH_BODY_BYTES = 10 * 1024 * 1024;
+const MAX_INDEX_FILE_BYTES = 32 * 1024 * 1024;
+const RESERVED_SESSION_SENTINELS = new Set(["all", "lifetime", "app"]);
+
+function normalizeExplicitSessionId(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128) return null;
+  if (/[\x00-\x1f\x7f\\/]/.test(trimmed)) return null;
+  if (RESERVED_SESSION_SENTINELS.has(trimmed.toLowerCase())) return null;
+  return trimmed;
+}
+
+function resolveCallCwd(argCwd, fallbackCwd) {
+  const base = fallbackCwd || process.cwd();
+  if (typeof argCwd !== "string" || !argCwd.trim()) return base;
+  const resolved = path.resolve(base, argCwd.trim());
+  let st;
+  try {
+    st = fs.statSync(resolved);
+  } catch {
+    throw new Error(`Working directory not found: ${argCwd}`);
+  }
+  if (!st.isDirectory()) {
+    throw new Error(`Working directory is not a directory: ${argCwd}`);
+  }
+  return resolved;
+}
 
 let jsonCrusherMod = undefined;
 async function getJsonCrusher() {
@@ -277,21 +304,61 @@ export function createTools({
 }) {
   return {
     // 1. ctx_execute
-    async ctx_execute({ language = "shell", code = "", file = "", args = [], intent = "" } = {}) {
+    async ctx_execute({
+      language = "shell",
+      code = "",
+      file = "",
+      args = [],
+      intent = "",
+      cwd: argCwd = "",
+      timeoutSec = undefined,
+      timeoutMs: argTimeoutMs = undefined
+    } = {}) {
       const startTime = Date.now();
-      const cwd = getCwd();
+      const cwd = resolveCallCwd(argCwd, getCwd());
       const sessionId = getSessionId();
+
+      if (file) {
+        const absFile = path.isAbsolute(file) ? file : path.resolve(cwd, file);
+        let realAbsFile = absFile;
+        try {
+          realAbsFile = fs.realpathSync(absFile);
+        } catch {}
+        const sensDirect = detectSensitiveFile(absFile);
+        const sensReal =
+          realAbsFile !== absFile ? detectSensitiveFile(realAbsFile) : { sensitive: false, reason: null };
+        const sens = sensDirect.sensitive ? sensDirect : sensReal;
+        if (sens.sensitive && getSensitiveFileGuardMode() === "deny") {
+          throw new Error(
+            `Blocked executing sensitive file '${path.basename(absFile)}' (${sens.reason}) because sensitiveFileGuard is set to 'deny'.`
+          );
+        }
+      }
+
+      const cfgTimeoutMs = getConfigSnapshot().values.execTimeoutMs;
+      const requestedTimeoutMs =
+        timeoutSec !== undefined && timeoutSec !== null && timeoutSec !== "" && typeof timeoutSec !== "boolean"
+          ? Number(timeoutSec) * 1000
+          : argTimeoutMs;
+      const effTimeoutMs = resolveExecTimeoutMs(requestedTimeoutMs, cfgTimeoutMs);
 
       const result = await executeCode({
         language,
         code,
         file,
         args,
-        cwd
+        cwd,
+        timeoutMs: effTimeoutMs
       });
 
       const elapsedMs = Date.now() - startTime;
-      const rawCombined = (result.stdout ? result.stdout : "") + (result.stderr ? "\n" + result.stderr : "");
+      const timeoutHint = result.timedOut
+        ? `\n[ctx_execute timed out after ${Math.round(effTimeoutMs / 1000)}s. For >60s builds/tests or background servers/watchers, use native run_command (WaitMsBeforeAsync <= 2000) instead of synchronous MCP.]`
+        : "";
+      const rawCombined =
+        (result.stdout ? result.stdout : "") +
+        (result.stderr ? "\n" + result.stderr : "") +
+        timeoutHint;
       const redacted = redactSecrets(rawCombined);
       const fullOutput = redacted.text;
       const fullBytes = Buffer.byteLength(fullOutput, "utf8");
@@ -335,6 +402,7 @@ export function createTools({
             const probeObj = {
               ok: result.ok,
               exitCode: result.exitCode,
+              ...(result.timedOut ? { timedOut: true } : {}),
               elapsedMs,
               language,
               intent: intent || null,
@@ -375,6 +443,7 @@ export function createTools({
       const responseObj = {
         ok: result.ok,
         exitCode: result.exitCode,
+        ...(result.timedOut ? { timedOut: true } : {}),
         elapsedMs,
         language,
         intent: intent || null,
@@ -431,16 +500,17 @@ export function createTools({
     },
 
     // 2. ctx_batch
-    async ctx_batch({ commands = [], queries = [] } = {}) {
-      const cwd = getCwd();
+    async ctx_batch({ commands = [], queries = [], cwd: argCwd = "" } = {}) {
+      const cwd = resolveCallCwd(argCwd, getCwd());
       const sessionId = getSessionId();
       const cmdList = Array.isArray(commands) ? commands : [commands];
       const outputs = [];
       let totalRawBytes = 0;
+      const effTimeoutMs = resolveExecTimeoutMs(undefined, getConfigSnapshot().values.execTimeoutMs);
 
       for (const cmd of cmdList) {
         if (!cmd) continue;
-        const res = await executeCode({ language: "shell", code: cmd, cwd });
+        const res = await executeCode({ language: "shell", code: cmd, cwd, timeoutMs: effTimeoutMs });
         const text = `=== Command: ${cmd} (exit: ${res.exitCode}) ===\n${res.stdout || ""}${res.stderr ? "\n[stderr]\n" + res.stderr : ""}\n`;
         totalRawBytes += Buffer.byteLength(text, "utf8");
         outputs.push(text);
@@ -530,8 +600,8 @@ export function createTools({
     },
 
     // 3. ctx_index
-    async ctx_index({ path: filePath = "", url = "", content = "", label = "" } = {}) {
-      const cwd = getCwd();
+    async ctx_index({ path: filePath = "", url = "", content = "", label = "", cwd: argCwd = "" } = {}) {
+      const cwd = resolveCallCwd(argCwd, getCwd());
       const sessionId = getSessionId();
       let rawText = content || "";
       let resolvedLabel = label;
@@ -545,8 +615,19 @@ export function createTools({
       } else if (filePath) {
         resolvedLabel = resolvedLabel || filePath;
         const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-        if (!fs.existsSync(absPath)) {
+        let st;
+        try {
+          st = fs.statSync(absPath);
+        } catch {
           throw new Error(`File not found: ${filePath}`);
+        }
+        if (!st.isFile()) {
+          throw new Error(`Not a regular file: ${filePath}`);
+        }
+        if (st.size > MAX_INDEX_FILE_BYTES) {
+          throw new Error(
+            `File too large to index (${formatBytes(st.size)} exceeds ${formatBytes(MAX_INDEX_FILE_BYTES)} limit): ${filePath}`
+          );
         }
         let realAbsPath = absPath;
         try {
@@ -627,8 +708,8 @@ export function createTools({
     },
 
     // 4. ctx_search
-    async ctx_search({ queries = [], sourceId = null, scope = "session", limit = 5, offset = 0 } = {}) {
-      const cwd = getCwd();
+    async ctx_search({ queries = [], sourceId = null, scope = "session", limit = 5, offset = 0, cwd: argCwd = "" } = {}) {
+      const cwd = resolveCallCwd(argCwd, getCwd());
       const sessionId = getSessionId();
 
       const res = store.search({
@@ -660,6 +741,9 @@ export function createTools({
       const snipSuffix = "\n... [capped <=8.8KB]";
       for (const hit of res.hits) {
         const entry = { ...hit };
+        if (typeof entry.title === "string" && Buffer.byteLength(entry.title, "utf8") > 240) {
+          entry.title = `${truncateUtf8(entry.title, 236)}...`;
+        }
         boundedHits.push(entry);
         payload.returned = boundedHits.length;
         if (measurePayload() <= MAX_SEARCH_JSON_BYTES) {
@@ -694,10 +778,7 @@ export function createTools({
 
     // 5. ctx_resume
     async ctx_resume({ seq = null, sessionId: argSessionId = null } = {}) {
-      const explicitSid =
-        typeof argSessionId === "string" && argSessionId.trim() && argSessionId.trim().length <= 128 && !/[\x00-\x1f\x7f\\/]/.test(argSessionId.trim())
-          ? argSessionId.trim()
-          : null;
+      const explicitSid = normalizeExplicitSessionId(argSessionId);
       const sessionId = explicitSid || getSessionId();
       if (seq !== null && seq !== undefined) {
         const ev = store.getEventBySeq(seq, sessionId);
@@ -821,10 +902,7 @@ export function createTools({
 
     // 6. ctx_stats
     async ctx_stats({ reset = false, sessionId: argSessionId = null } = {}) {
-      const explicitSid =
-        typeof argSessionId === "string" && argSessionId.trim() && argSessionId.trim().length <= 128 && !/[\x00-\x1f\x7f\\/]/.test(argSessionId.trim())
-          ? argSessionId.trim()
-          : null;
+      const explicitSid = normalizeExplicitSessionId(argSessionId);
       const sessionId = explicitSid || getSessionId();
       if (reset) {
         store.purge({ scope: "session", sessionId });
@@ -866,13 +944,14 @@ export function createTools({
     },
 
     // 7. ctx_doctor
-    async ctx_doctor() {
+    async ctx_doctor({ cwd: argCwd = "" } = {}) {
+      const cwd = resolveCallCwd(argCwd, getCwd());
       const doc = store.doctor();
       const cfgSnap = getConfigSnapshot();
       let projectFilters = { exists: false, error: null, loadedCount: 0, rejectedCount: 0, rejected: [] };
       try {
         const { inspectProjectFilterRules } = await import("../../hooks/filter-rules.mjs");
-        const diag = inspectProjectFilterRules(getCwd());
+        const diag = inspectProjectFilterRules(cwd);
         projectFilters = {
           path: diag.path,
           exists: diag.exists,
@@ -935,13 +1014,16 @@ export function createTools({
     },
 
     // 8. ctx_purge
-    async ctx_purge({ scope = "session", olderThanDays = 14, vacuum = false, sessionId: argSessionId = null } = {}) {
-      const explicitSid =
-        typeof argSessionId === "string" && argSessionId.trim() && argSessionId.trim().length <= 128 && !/[\x00-\x1f\x7f\\/]/.test(argSessionId.trim())
-          ? argSessionId.trim()
-          : null;
+    async ctx_purge({
+      scope = "session",
+      olderThanDays = 14,
+      vacuum = false,
+      sessionId: argSessionId = null,
+      cwd: argCwd = ""
+    } = {}) {
+      const explicitSid = normalizeExplicitSessionId(argSessionId);
       const sessionId = explicitSid || getSessionId();
-      const cwd = getCwd();
+      const cwd = resolveCallCwd(argCwd, getCwd());
       return store.purge({ scope, sessionId, worktree: cwd, olderThanDays, vacuum });
     }
   };
