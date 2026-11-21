@@ -26,15 +26,19 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 
 ---
 
-## What's New in v1.2.1
+## What's New in v1.2.2
 
 1. **Long-Task Continuity & Anti-Premature-Handoff Protections**:
    - Removed mid-task `/compact` prompts from `rules/AGENTS.md` and routed `>60s` builds/tests + background tasks (`WaitMsBeforeAsync <= 2000`, `cliFilterAsyncBypassMs`) directly to native `run_command` (preserving live streaming logs and attaching read-only `permissionOverrides` for plugin scripts on sync `overwrite`).
    - Raised `ctx_execute` default timeout to `120s` (`execTimeoutMs`, per-call `timeoutSec: 1..300`) with `timedOut: true` guidance, added workspace `cwd` support across `agy-dart_context` tools + MCP `initialize` `workspaceFolders`/`rootUri`, suppressed mid-turn tool-loop (`invocationNum >= 1`) TTL/cold-compact banners in `PreInvocation` (scaling 1M-window `ttlMinContext` to `300k`), and added step-based read-dedup decay (`readDedupMaxSteps: 40`).
-2. **Full-Repository Security, Isolation & Protocol Hardening**:
-   - **Atomic Edits & Process Tree Cleanup**: Split `apply_edits` temp-file write from `rename` fallback with dangling-symlink rollback (`C-1`/`P1-13`); hardened `executor.js`, `cli-filter.mjs`, and `cache-audit.mjs` with cross-platform process-tree teardown (`System32\taskkill.exe /T /F` + non-zero close fallback on Windows, `-pid` on POSIX), auto-ESM `--input-type=module` detection, ephemeral `.ps1` argument isolation, and exact UTF-8 byte slicing (`P1-02`/`P1-14`/`P2-10`).
-   - **Access-Control, SSRF, ReDoS & Windows Shell Fidelity**: Enforced end-to-end `sensitiveFileGuard=deny` (including symlinked files, `.envrc`/`*.env`, and `\\?\` ADS paths) across `PreToolUse`, `fast/mcp-server.mjs`, `ctx_index`, and `ctx_execute` (`P1-03`); forced `-n` on `git remote show` to block network SSRF (`P1-04`); hardened `install.mjs` against internal symlinks/NTFS junctions, UNC shares, `.git` clones/worktrees, while supporting self-`uninstall` (`P1-05`/`P1-06`); respected per-directory `PATHEXT` precedence and PowerShell `,`/`--`/`"` safety in `cli-filter` (`P1-07`); and capped serialized `fast` JSON-RPC payloads `<= 8.8 KB` with mixed `\n\n`/`\r\n\r\n` frame safety and bounded glob/regex/Markdown linear parsers (`P1-09`–`P1-12`).
-   - **Session Isolation, SQLite Transactions & Multi-Provider Accuracy**: Enforced strict session/worktree/lifetime isolation in Sidecar `/api/search` and MCP `ctx_search`/`ctx_resume` (`P1-01`); wrapped `pruneByTtl` in transactions; computed per-turn USD cost across `model_switch`, fixed OpenAI gateway cached-token double-counting, and anchored 1h implicit-write replay deltas (`P2-01`–`P2-13`).
+2. **Second-Round Deep Audit, Cross-Platform CI & Protocol Hardening (42 Verified Fixes)**:
+   - **Access-Control, SSRF, ReDoS & Windows Shell Fidelity**: Enforced end-to-end `sensitiveFileGuard=deny` (including symlinked files, `.envrc`/`*.env`, and `\\?\` ADS paths) across `PreToolUse`, `fast/mcp-server.mjs`, `ctx_index`, and `ctx_execute` (`P1-03`); forced `-n` on `git remote show` to block network SSRF (`P1-04`); hardened `install.mjs` against internal symlinks/NTFS junctions, UNC shares, and `.git` clones/worktrees while supporting self-`uninstall` (`P1-05`/`P1-06`); respected per-directory `PATHEXT` precedence and PowerShell `,`/`--`/`"` safety in `cli-filter` (`P1-07`); and capped serialized `fast` JSON-RPC payloads `<= 8.8 KB` with mixed `\n\n`/`\r\n\r\n` frame safety, dangling-symlink rollback, and bounded glob/regex/Markdown linear parsers (`P1-09`–`P1-13`).
+   - **Session Isolation, Process-Group Teardown & Multi-Provider Accuracy**: Enforced strict session/worktree/lifetime isolation in Sidecar `/api/search` and MCP `ctx_search`/`ctx_resume` (`P1-01`); added POSIX `detached` process-group + Windows `taskkill /T /F` teardown, linear JS ESM `--input-type=module` lexer, recursive subshell inspection, and graceful Windows `413` socket close; wrapped `pruneByTtl` in transactions, computed per-turn USD cost across `model_switch`, fixed OpenAI gateway cached-token double-counting, and anchored 1h implicit-write replay deltas (126/126 tests across Linux & Windows on Node 22/24).
+
+## What's New in v1.2.1
+
+1. **Full-Repository Security & Stability Hardening (76 Audited Fixes)**:
+   - Split `apply_edits` temp-file write from `rename` fallback with guaranteed rollback (`C-1`), attached `child.stdin`/`stdout`/`stderr` error handlers and `close`-drained capture in `context/lib/executor.js` (`C-2`/`H-10`), hardened PowerShell `-Command` argument passing via env-var indirection (`M-21`), closed read-only `git branch`/`tag` `OPTARG` bypasses (`H-1`), hardened Windows `\\?\`/`\\.\`/8.3 path canonicalization (`H-2`/`H-3`), and eliminated $O(N^4)$ CSS/SFC outline ReDoS (`H-7`).
 
 ## What's New in v1.2.0
 

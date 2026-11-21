@@ -26,15 +26,19 @@
 
 ---
 
-## v1.2.1 核心加固与修复
+## v1.2.2 核心新增与深度加固
 
 1. **长任务连续执行与防过早交接（Anti-Premature-Handoff）优化**：
    - 移除 `rules/AGENTS.md` 中诱导任务中段暂停执行 `/compact` 的指令；将 `>60s` 构建/测试与后台流式任务（`WaitMsBeforeAsync <= 2000`，`cliFilterAsyncBypassMs`）直通原生 `run_command`，并为同步 `overwrite` 附加插件目录只读 `permissionOverrides` 以免触发沙盒外审批中断。
    - `ctx_execute` 默认超时提升至 `120s`（`execTimeoutMs`，支持单次 `timeoutSec: 1..300`）且超时返回 `timedOut: true` 与后台切换指引；为 `agy-dart_context` 全系工具补齐 `cwd` 与 MCP `initialize` `workspaceFolders`/`rootUri` 对齐；`PreInvocation` 在工具循环中段（`invocationNum >= 1`）静默空闲 TTL 与冷压缩交接横幅并将 1M 窗口 `ttlMinContext` 提升至 `300k`；读去重新增步数衰减自动放行（`readDedupMaxSteps: 40`）。
-2. **全仓库安全、隔离与跨平台深度加固**：
-   - **原子落盘与进程树回收**：拆分 `apply_edits` 临时写入与 `rename` 回退并支持悬空软链原子回滚（`C-1`/`P1-13`）；为 `executor.js`、`cli-filter.mjs`、`cache-audit.mjs` 补齐跨平台进程树强杀（Windows `System32\taskkill.exe /T /F` + 非零退出兜底、POSIX `-pid`）、ESM 顶层 `import` 自动识别、临时 `.ps1` 参数隔离与跨块 UTF-8 精确截断（`P1-02`/`P1-14`/`P2-10`）。
-   - **访问控制、SSRF、ReDoS 与 Windows 跨 Shell 保真**：全链路贯通 `sensitiveFileGuard=deny`（含软链指向敏感文件、`.envrc`/`*.env` 及 `\\?\` ADS 流）（`P1-03`）；`git remote show` 强制 `-n` 阻断网络 SSRF（`P1-04`）；`install.mjs` 拦截内部软链/NTFS 目录联接逃逸、UNC 路径与含 `.git` 副克隆并恢复安装副本自 `uninstall`（`P1-05`/`P1-06`）；`cli-filter` 严格遵守 `PATH` 逐目录 `PATHEXT` 顺序并规避 PowerShell `,`/`--`/`"` 参数损坏（`P1-07`）；`fast` 序列化响应二分死守 `<= 8.8 KB`、修复混合帧头丢包并收敛 Glob/正则/Markdown 线性复杂度（`P1-09`–`P1-12`）。
-   - **会话隔离、SQLite 事务与多厂商计费精度**：加固 Sidecar `/api/search` 与 MCP `ctx_search`/`ctx_resume` 跨会话隔离（`P1-01`）；`pruneByTtl` 纳入写事务；按轮次模型计算跨 `model_switch` 美元成本、修复 OpenAI 兼容网关缓存双计与 1h 隐式写回放基线（`P2-01`–`P2-13`）。
+2. **第二轮对抗性审计、跨平台 CI 与协议深度加固（42 项核实修复）**：
+   - **访问控制、SSRF、ReDoS 与 Windows 跨 Shell 保真**：全链路贯通 `sensitiveFileGuard=deny`（含软链指向敏感文件、`.envrc`/`*.env` 及 `\\?\` ADS 流）（`P1-03`）；`git remote show` 强制 `-n` 阻断网络 SSRF（`P1-04`）；`install.mjs` 拦截内部软链/NTFS 目录联接逃逸、UNC 路径与含 `.git` 副克隆并恢复安装副本自 `uninstall`（`P1-05`/`P1-06`）；`cli-filter` 严格遵守 `PATH` 逐目录 `PATHEXT` 顺序并规避 PowerShell `,`/`--`/`"` 参数损坏（`P1-07`）；`fast` 序列化响应二分死守 `<= 8.8 KB`、修复混合帧头丢包与悬空软链回滚，并收敛 Glob/正则/Markdown 线性复杂度（`P1-09`–`P1-13`）。
+   - **会话隔离、进程组回收与多厂商计费精度**：加固 Sidecar `/api/search` 与 MCP `ctx_search`/`ctx_resume` 跨会话隔离（`P1-01`）；补齐 POSIX `detached` 进程组与 Windows `taskkill /T /F` 树级回收、线性 JS ESM `--input-type=module` 词法检测、递归子 Shell 转储拦截及 Windows `413` 优雅关连接；`pruneByTtl` 纳入写事务，按轮次模型计算跨 `model_switch` 美元成本、修复 OpenAI 兼容网关缓存双计与 1h 隐式写回放基线（Linux & Windows × Node 22/24 全矩阵 126/126 全绿）。
+
+## v1.2.1 核心加固与修复
+
+1. **全仓库首轮安全与稳定性审计修复（76 项修复）**：
+   - 拆分 `apply_edits` 临时写入与 `rename` 回退保证原子回滚（`C-1`），补齐 `executor.js` 子进程流异常监听与 `close` 排空（`C-2`/`H-10`）、PowerShell 环境变量参数隔离（`M-21`）、只读 `git branch`/`tag` 参数封堵（`H-1`）、Windows `\\?\`/`\\.\`/8.3 路径规范化（`H-2`/`H-3`）及 CSS/SFC 线性大纲提取（`H-7`）。
 
 ## v1.2.0 核心新增能力
 

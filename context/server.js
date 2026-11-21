@@ -22,7 +22,7 @@ const inferWorkspaceFromStore =
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
 const IS_INSTALLED_PLUGIN_COPY = !fs.existsSync(path.join(PLUGIN_ROOT, ".git"));
-let pkgVersion = "1.2.1";
+let pkgVersion = "1.2.2";
 try {
   const pkg = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "package.json"), "utf8"));
   if (pkg.version) pkgVersion = pkg.version;
