@@ -26,6 +26,16 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 
 ---
 
+## What's New in v1.3.0
+
+1. **4-Tier Host-Aligned Read Guard & Review Workflow First-Class Support**:
+   - Aligned default source-file cutoff to **`45 KiB` (`46,080 B` / `<= 800` lines, `host-45k` mode)** matching Antigravity's native `read_file` cap with **2-strike soft guard** (5-branch session/subagent/anonymous TTL key isolation) so large source files and MCP-less subagents never deadlock, while keeping high-noise logs/locks/minified bundles at **`16 KB`** (`noiseMaxReadBytes`) and `.patch`/`.diff` code-review files at **`128 KB`** (`reviewMaxReadBytes`) with native `ByteOffset` / open-ended `StartLine` pagination continuation.
+   - Decoupled `read_file` size exemptions (`exemptExtensions`, linear ReDoS-proof `exemptPaths`, `readGuardMode: "soft"|"strict"|"off"`) from **both** `readDedup`/`diffRead` (exempt text files still enjoy duplicate-read protection) and `run_command` (which now uses an independent `shellDumpMaxBytes = 16 KB` and no longer allows `cat huge.png` / `curl .../archive.zip` bypasses).
+   - Fixed pre-1a read-cache priority (eliminating the 3-strike trap), `measureLineRangeBytes` `>2 MB && startLine > 1` blind spot, multi-line prose mislabeling as minified, `sensitive_read_confirm` TTL/isolation, `getExemptExtensions` split-state bug, Sidecar `/api/purge` `"conversation"` scope error, dynamic custom cutoff dropdown echo, and bidirectional upgrade migration (`cutoff:source` migrates legacy `16384` default while preserving custom cutoffs).
+2. **Native Diff Outlines & 3-Stage Context-Preserving `git diff` / `gh pr diff` Filter**:
+   - Added zero-dependency `.patch`/`.diff` outline parser (`extractDiffSymbols`) to `agy-dart_fast` `read_slices({ outlines })` mapping changed files (`+add/-del`) and `@@` hunks.
+   - Upgraded `filterGitDiff` to 3-stage context fidelity (Stage 1 lossless within `<= 7.9 KB` budget → Stage 2 `-U`/`--unified`/`-W`/`--word-diff` context-preserved cap → Stage 3 1-line context before compact `+/-`, plus mailbox `From <sha>` / `---` support) and fixed `filterGhCli` so `gh pr view` with Markdown diff fences is never wiped.
+
 ## What's New in v1.2.2
 
 1. **Long-Task Continuity & Anti-Premature-Handoff Protections**:
@@ -90,8 +100,8 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 | Workload | Designated Tool | Why |
 | :--- | :--- | :--- |
 | Multi-query code search / glob / read-only `git` | `agy-dart_fast` → `batch_search` | Up to 20 concurrent queries via `rg`/Node, `<= 8.8 KB` inline |
-| Unknown large source files (>300 lines) | `agy-dart_fast` → `read_slices({ outlines })` + parallel `read_file` | Map symbols once, then read exact ranges with 7ms local allowlisted `read_file` |
-| Small source files (<300 lines / <16 KB) | Built-in `read_file` (parallel) | 0 remote checks (~7ms), 46 KB/call inline, passes default 16 KB gate |
+| Unknown large source / `.patch` (>300 lines) | `agy-dart_fast` → `read_slices({ outlines })` + parallel `read_file` | Map symbols or diff files/hunks once, then read exact ranges with 7ms local `read_file` |
+| Source files (<45 KiB) & diffs (<128 KB) | Built-in `read_file` (parallel, `<= 800` lines) | 0 remote checks (~7ms), 45 KiB host cap, 2-strike soft guard above cutoff |
 | Multi-hunk / multi-file edits + verify | `agy-dart_fast` → `apply_edits` | Atomic commits, `bestEffort`, inline `verify` saves full turns |
 | Concurrent build / lint / test checks | `agy-dart_fast` → `run_checks` | True concurrency pool with noise stripping (never sequential `ctx_batch`) |
 | **Large logs (>16 KB – MBs), giant JSON/CSV, API dumps** | `agy-dart_context` → `ctx_execute` | Run local Node/Python/Shell filter scripts; return only concise answers (`<= 8.8 KB`) |
@@ -108,7 +118,7 @@ Requires **Node.js >= 22** (uses built-in `node:sqlite`; **no `npm install` need
 git clone https://github.com/zou172866/agy-dart.git
 cd agy-dart
 
-# Install with balanced 16 KB guard + live doctor check
+# Install with host-aligned 45 KiB soft guard + live doctor check
 .\install.ps1
 
 # Recommended: also auto-install official ripgrep (rg.exe) to ~/.local/bin
@@ -124,11 +134,11 @@ cd agy-dart
 
 ### Cross-Platform CLI
 ```bash
-node scripts/install.mjs install --mode balanced-16k
+node scripts/install.mjs install                           # default host-45k (preserves custom cutoffs on upgrade)
 node scripts/install.mjs install --with-devtools             # also install offline audit/benchmark CLIs
 node scripts/install.mjs install --project /path/to/repo   # workspace-scoped
 node scripts/install.mjs doctor
-node scripts/install.mjs mode fast-32k                     # balanced-16k | fast-32k | strict-8k | no-read-hook
+node scripts/install.mjs mode fast-32k                     # host-45k | fast-32k | balanced-16k | strict-8k | no-read-hook
 node scripts/install.mjs uninstall
 ```
 
@@ -137,7 +147,7 @@ node scripts/install.mjs uninstall
 Paste this prompt into Antigravity:
 
 ```text
-Clone https://github.com/zou172866/agy-dart.git to a temp folder, run `node scripts/install.mjs install --mode balanced-16k` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
+Clone https://github.com/zou172866/agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
 ```
 
 Restart Antigravity (or reload window) and start a new conversation. If you previously installed standalone `agy-fast` or `antigravity-plugin-context-mode`, disable or remove them under **Customizations → Installed** to avoid duplicate MCP servers/hooks.

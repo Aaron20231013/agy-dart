@@ -1319,6 +1319,7 @@
             <option value="8192">8 KB</option>
             <option value="16384">16 KB</option>
             <option value="32768">32 KB</option>
+            <option value="46080">45 KB (host cap)</option>
             <option value="65536">64 KB</option>
             <option id="cutoff-none-opt" value="0" data-i18n="cutoffNone">none</option>
           </select>
@@ -1503,7 +1504,7 @@
             <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
           </svg>
           <span class="band-title" data-i18n="exemptTitle">Exempt File Types</span>
-          <span class="band-sub" data-i18n="exemptSub">(Bypass size cutoff)</span>
+          <span class="band-sub" data-i18n="exemptSub">(Bypass read_file size guard only; keeps read-dedup &amp; cat/curl guards)</span>
         </span>
         <span class="accordion-right">
           <span id="category-summary" class="mono muted-note">6 of 7 active</span>
@@ -1575,7 +1576,7 @@
             <span class="gate-bullet"></span>
             <div>
               <span class="gate-name">PreToolUse (read_file):</span>
-              <span id="gate-read-cutoff">Blocks files &gt;16 KB un-paged; requires line slices (&le;410 lines) + 2-strike unchanged dedup</span>
+              <span id="gate-read-cutoff">Soft-guards files &gt;45 KB un-paged (16 KB logs/minified, 128 KB diffs); &le;800-line slices + 2-strike dedup</span>
             </div>
           </div>
           <div class="gate-item" data-i18n-title="gateCmdTip" title="Transparently filters noisy dev CLI outputs via PreToolUse.overwrite and blocks unbounded raw file dumps">
@@ -1705,7 +1706,7 @@
         handoffError: 'Error',
         handoffFailBody: 'Failed to build handoff brief: {msg}',
         exemptTitle: 'Exempt File Types',
-        exemptSub: '(Bypass size cutoff)',
+        exemptSub: '(Bypass read_file size guard only; keeps read-dedup & cat/curl guards)',
         attachExemptTip: 'Files attached directly in chat messages bypass cutoff restrictions so agents can inspect them in full',
         attachExemptText: '@ / Drag-drop attachments always exempt',
         resetDefaultsBtn: 'Reset Defaults',
@@ -1765,8 +1766,9 @@
         stateOn: 'ON',
         stateOff: 'OFF',
         gateReadTip: 'Prevents huge files from overflowing the LLM context window and guards against unchanged duplicate re-reads',
-        gateReadDisabled: 'Cutoff disabled (all file sizes allowed un-paged)',
-        gateReadEnabled: 'Blocks files >{size} un-paged; requires line slices (≤{lines} lines) + 2-strike unchanged dedup',
+        gateReadDisabled: 'read_file size cutoff disabled (read-dedup & cat/curl guards stay active)',
+        gateReadEnabled: 'Soft-guards >{size} un-paged ({noise} logs/minified, {review} diffs); ≤{lines}-line slices + 2-strike dedup',
+        gateReadStrict: 'Strict-blocks >{size} un-paged ({noise} logs/minified, {review} diffs); ≤{lines}-line slices + 2-strike dedup',
         gateCmdTip: 'Transparently filters noisy dev CLI outputs via PreToolUse.overwrite and blocks unbounded raw file dumps',
         gateCmdDesc: 'Transparently compacts noisy CLI (<code>git</code>, tests, builds) to ≤8.8 KB + blocks unbounded <code>cat</code>/<code>Get-Content</code>',
         gateLifecycleTip: 'Invalidates read-dedup entries on edits and emits zero-prefix-pollution UI-only KV-cache watermark/TTL warnings',
@@ -1942,7 +1944,7 @@
         handoffError: '出错',
         handoffFailBody: '生成交接简报失败：{msg}',
         exemptTitle: '豁免文件类型',
-        exemptSub: '（跳过体积截断）',
+        exemptSub: '（仅跳过 read_file 体积拦截，保留读去重与 cat/curl 防护）',
         attachExemptTip: '聊天中通过 @ 或拖拽直接附加的文件始终豁免截断，保证模型完整查看',
         attachExemptText: '@ / 拖拽附件始终豁免',
         resetDefaultsBtn: '恢复默认',
@@ -2002,8 +2004,9 @@
         stateOn: '开',
         stateOff: '关',
         gateReadTip: '防止超大文件撑爆上下文，并拦截未修改文件的重复读取',
-        gateReadDisabled: '体积截断已关闭（允许整读任意大小文件）',
-        gateReadEnabled: '拦截 >{size} 未分页整读；要求按行切片（≤{lines} 行）+ 未变二次读去重',
+        gateReadDisabled: 'read_file 体积拦截已关闭（读去重与 cat/curl 防护仍生效）',
+        gateReadEnabled: '>{size} 未分页软护栏（日志/压缩 {noise}，diff/patch {review}）；≤{lines} 行切片 + 二次读去重',
+        gateReadStrict: '>{size} 未分页严格拦截（日志/压缩 {noise}，diff/patch {review}）；≤{lines} 行切片 + 二次读去重',
         gateCmdTip: '通过 PreToolUse.overwrite 透明压缩开发命令输出，并硬拒绝无界整文件打印',
         gateCmdDesc: '透明压缩高频 CLI（<code>git</code>、测试、构建）至 ≤8.8 KB，并拦截无界 <code>cat</code>/<code>Get-Content</code>',
         gateLifecycleTip: '编辑文件自动失效读去重缓存，并通过零前缀污染 UI-only 通道推送 KV-Cache 水位/TTL 预警',
@@ -2454,7 +2457,7 @@
     function calculateMaxLineRange(bytes) {
       const b = Number(bytes || 0);
       if (b <= 0) return 0;
-      return Math.max(50, Math.round(b / 40));
+      return Math.min(800, Math.max(50, Math.round(b / 40)));
     }
 
     function formatBytes(bytes) {
@@ -2512,47 +2515,82 @@
       return fetch(finalUrl, fetchOpts);
     }
 
+    function renderGateReadCutoff(activeCutoff, s) {
+      const gateReadCutoff = document.getElementById('gate-read-cutoff');
+      if (!gateReadCutoff) return;
+      const guardMode = (s && s.readGuardMode) || 'soft';
+      if (activeCutoff === 0 || guardMode === 'off') {
+        gateReadCutoff.innerText = t('gateReadDisabled');
+      } else {
+        const fmtTier = (b) => {
+          const n = Number(b || 0);
+          if (n <= 0) return 'off';
+          return n % 1024 === 0 ? `${n / 1024} KB` : formatBytes(n);
+        };
+        const maxLines = calculateMaxLineRange(activeCutoff);
+        const noiseStr = fmtTier(s && s.noiseMaxReadBytes !== undefined ? s.noiseMaxReadBytes : 16384);
+        const reviewStr = fmtTier(s && s.reviewMaxReadBytes !== undefined ? s.reviewMaxReadBytes : 131072);
+        const key = guardMode === 'strict' ? 'gateReadStrict' : 'gateReadEnabled';
+        gateReadCutoff.innerText = t(key, { size: formatBytes(activeCutoff), lines: maxLines, noise: noiseStr, review: reviewStr });
+      }
+    }
+
     function updateCutoffDropdown(s) {
       const cutoffSelect = document.getElementById('cutoff-select');
-      let activeCutoff = 16384;
+      const DEFAULT_CUTOFF_VAL = 46080;
+      let activeCutoff = DEFAULT_CUTOFF_VAL;
       if (currentScope === 'lifetime') {
-        activeCutoff = s.globalCutoffBytes !== undefined && s.globalCutoffBytes !== null ? s.globalCutoffBytes : 16384;
+        activeCutoff = s.globalCutoffBytes !== undefined && s.globalCutoffBytes !== null ? s.globalCutoffBytes : DEFAULT_CUTOFF_VAL;
       } else if (currentScope === 'app') {
-        activeCutoff = s.appCutoffBytes !== undefined && s.appCutoffBytes !== null ? s.appCutoffBytes : (s.globalCutoffBytes ?? 16384);
+        activeCutoff = s.appCutoffBytes !== undefined && s.appCutoffBytes !== null ? s.appCutoffBytes : (s.globalCutoffBytes ?? DEFAULT_CUTOFF_VAL);
       } else {
-        activeCutoff = s.conversationCutoffBytes !== undefined && s.conversationCutoffBytes !== null ? s.conversationCutoffBytes : (s.cutoffBytes ?? 16384);
+        activeCutoff = s.conversationCutoffBytes !== undefined && s.conversationCutoffBytes !== null ? s.conversationCutoffBytes : (s.cutoffBytes ?? DEFAULT_CUTOFF_VAL);
       }
 
       const targetVal = String(activeCutoff);
       let matched = false;
+      const existingCustom = typeof cutoffSelect.querySelector === 'function'
+        ? cutoffSelect.querySelector('option[data-custom-cutoff="1"]')
+        : null;
       for (const opt of cutoffSelect.options) {
-        if (opt.value === targetVal) {
+        if (opt.value === targetVal && !(opt.dataset && opt.dataset.customCutoff === '1')) {
           cutoffSelect.value = targetVal;
           matched = true;
           break;
         }
       }
-      if (!matched) {
-        cutoffSelect.value = targetVal === '0' ? '0' : '16384';
+      if (matched) {
+        if (existingCustom && typeof cutoffSelect.removeChild === 'function') {
+          try { cutoffSelect.removeChild(existingCustom); } catch {}
+        }
+      } else if (targetVal === '0') {
+        cutoffSelect.value = '0';
+      } else if (typeof document.createElement === 'function' && typeof cutoffSelect.appendChild === 'function') {
+        const customOpt = existingCustom || document.createElement('option');
+        customOpt.value = targetVal;
+        customOpt.textContent = `${formatBytes(activeCutoff)} (custom)`;
+        if (typeof customOpt.setAttribute === 'function') customOpt.setAttribute('data-custom-cutoff', '1');
+        if (customOpt.dataset) customOpt.dataset.customCutoff = '1';
+        if (!existingCustom) {
+          cutoffSelect.appendChild(customOpt);
+          if (Array.isArray(cutoffSelect.options) && !cutoffSelect.options.includes(customOpt)) {
+            cutoffSelect.options.push(customOpt);
+          }
+        }
+        cutoffSelect.value = targetVal;
+      } else {
+        cutoffSelect.value = targetVal;
       }
       if (cutoffSelect.dataset) cutoffSelect.dataset.lastConfirmedCutoff = cutoffSelect.value;
 
-      const gateReadCutoff = document.getElementById('gate-read-cutoff');
-      if (gateReadCutoff) {
-        if (activeCutoff === 0) {
-          gateReadCutoff.innerText = t('gateReadDisabled');
-        } else {
-          const maxLines = calculateMaxLineRange(activeCutoff);
-          gateReadCutoff.innerText = t('gateReadEnabled', { size: formatBytes(activeCutoff), lines: maxLines });
-        }
-      }
+      renderGateReadCutoff(activeCutoff, s);
     }
 
     async function changeCutoff(newVal) {
       ++refreshSeq;
       const mutScope = currentScope;
       const cutoffSelect = document.getElementById('cutoff-select');
-      const prevSelectVal = cutoffSelect ? (cutoffSelect.dataset?.lastConfirmedCutoff ?? '16384') : null;
+      const prevSelectVal = cutoffSelect ? (cutoffSelect.dataset?.lastConfirmedCutoff ?? '46080') : null;
       const prevStatsSnapshot = cachedStats ? { ...cachedStats } : null;
       try {
         const params = new URLSearchParams(window.location.search);
@@ -2560,15 +2598,7 @@
         const cutoffBytes = newVal === '0' || newVal === 0 ? 0 : parseInt(newVal, 10);
 
         if (cutoffSelect) cutoffSelect.value = String(cutoffBytes);
-        const gateReadCutoff = document.getElementById('gate-read-cutoff');
-        if (gateReadCutoff) {
-          if (cutoffBytes === 0) {
-            gateReadCutoff.innerText = t('gateReadDisabled');
-          } else {
-            const maxLines = calculateMaxLineRange(cutoffBytes);
-            gateReadCutoff.innerText = t('gateReadEnabled', { size: formatBytes(cutoffBytes), lines: maxLines });
-          }
-        }
+        renderGateReadCutoff(cutoffBytes, cachedStats);
         if (cachedStats) {
           if (mutScope === 'lifetime') {
             cachedStats.globalCutoffBytes = cutoffBytes;
@@ -2609,7 +2639,7 @@
             updateCutoffDropdown(cachedStats);
           } else if (cutoffSelect && prevSelectVal !== null) {
             cutoffSelect.value = prevSelectVal;
-            const restoredBytes = prevSelectVal === '0' ? 0 : (parseInt(prevSelectVal, 10) || 16384);
+            const restoredBytes = prevSelectVal === '0' ? 0 : (parseInt(prevSelectVal, 10) || 46080);
             updateCutoffDropdown({ cutoffBytes: restoredBytes, appCutoffBytes: restoredBytes, globalCutoffBytes: restoredBytes, conversationCutoffBytes: restoredBytes });
           }
         }
@@ -2619,7 +2649,7 @@
     const DEFAULT_CATEGORIES_META = [
       { id: 'images', name: 'Images', extensions: ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico', '.tiff', '.psd'] },
       { id: 'documents', name: 'Documents', extensions: ['.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt', '.odt', '.rtf'] },
-      { id: 'code', name: 'Source Code', extensions: ['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.rs', '.go', '.java', '.c', '.cpp', '.h', '.cs', '.html', '.css', '.json', '.yaml', '.yml', '.sql', '.sh', '.ps1'] },
+      { id: 'code', name: 'Source Code', extensions: ['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.rs', '.go', '.java', '.c', '.cpp', '.h', '.cs', '.html', '.css', '.yaml', '.yml', '.sh', '.ps1'] },
       { id: 'models3d', name: '3D Models', extensions: ['.blend', '.fbx', '.obj', '.gltf', '.glb', '.stl', '.dae', '.3ds', '.step', '.iges'] },
       { id: 'music', name: 'Music', extensions: ['.mp3', '.wav', '.ogg', '.flac', '.aac', '.m4a', '.wma', '.midi'] },
       { id: 'video', name: 'Video', extensions: ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv', '.m4v'] },

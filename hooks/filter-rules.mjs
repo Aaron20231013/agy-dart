@@ -1595,24 +1595,113 @@ function filterGitStatus(combined, exitCode) {
   return keep.join("\n");
 }
 
-/** Rule 2: git diff */
-function filterGitDiff(combined, exitCode) {
+function parseGitDiffPath(line) {
+  if (!line || line.length > 1024) return "";
+  const rest = line.slice(11).trim();
+  if (!rest) return "";
+  const readToken = (str, start, isSecond = false) => {
+    let i = start;
+    while (i < str.length && str[i] === " ") i++;
+    if (i >= str.length) return null;
+    if (str[i] === '"') {
+      let j = i + 1;
+      let val = "";
+      while (j < str.length) {
+        if (str[j] === "\\" && j + 1 < str.length) {
+          val += str[j] + str[j + 1];
+          j += 2;
+          continue;
+        }
+        if (str[j] === '"') {
+          return { val, next: j + 1 };
+        }
+        val += str[j];
+        j++;
+      }
+      return { val, next: j };
+    }
+    if (isSecond) {
+      return { val: str.slice(i), next: str.length };
+    }
+    const nextQuoteB = str.indexOf(' "b/', i);
+    if (nextQuoteB !== -1) return { val: str.slice(i, nextQuoteB), next: nextQuoteB + 1 };
+    const nextPlainB = str.indexOf(" b/", i);
+    if (nextPlainB !== -1) return { val: str.slice(i, nextPlainB), next: nextPlainB + 1 };
+    const sp = str.indexOf(" ", i);
+    if (sp === -1) return { val: str.slice(i), next: str.length };
+    return { val: str.slice(i, sp), next: sp + 1 };
+  };
+  const first = readToken(rest, 0, false);
+  if (!first) return rest;
+  const second = readToken(rest, first.next, true);
+  const chosen = second && second.val ? second.val : first.val;
+  return chosen.replace(/^[ab]\//, "").trim();
+}
+
+function isLikelyGitDiffHeaderFollowup(nextLine) {
+  if (typeof nextLine !== "string") return false;
+  return (
+    nextLine.startsWith("index ") ||
+    nextLine.startsWith("new file mode ") ||
+    nextLine.startsWith("deleted file mode ") ||
+    nextLine.startsWith("old mode ") ||
+    nextLine.startsWith("new mode ") ||
+    nextLine.startsWith("rename from ") ||
+    nextLine.startsWith("copy from ") ||
+    nextLine.startsWith("Binary files ") ||
+    nextLine.startsWith("similarity index ") ||
+    nextLine.startsWith("--- ")
+  );
+}
+
+/** Rule 2: git diff (3-stage context-preserving filter: lossless within budget -> 1-line ctx -> compact +/-; honors -U/--unified/-W/--word-diff & mailbox patches) */
+function filterGitDiff(combined, exitCode, ctx = {}) {
   if (exitCode !== 0) return combined;
-  const lines = combined.split("\n");
+  const cmdStr = String(ctx?.command || "");
+  const hasExplicitContextFlag =
+    /(?:^|\s)(?:-U\s*\d+|--unified(?:=\d+)?|-W|--function-context|--word-diff(?:=\S+)?)(?=\s|$)/.test(cmdStr);
+  const isWordDiffCmd = /(?:^|\s)--word-diff(?:=\S+)?(?=\s|$)/.test(cmdStr);
+
+  const lines = combined.replace(/\r\n/g, "\n").split("\n");
   const files = [];
+  const mailboxSubjects = [];
   let curFile = null;
   let inHunk = false;
-  const compactHunks = [];
+  let inCommitMsg = false;
+  let pendingFromSha = "";
+  const entries = [];
 
-  for (const line of lines) {
+  for (let idx = 0; idx < lines.length; idx++) {
+    const line = lines[idx];
+    const fromMatch = /^From ([0-9a-f]{40})\s/.exec(line);
+    if (fromMatch) {
+      inHunk = false;
+      inCommitMsg = true;
+      pendingFromSha = fromMatch[1].slice(0, 8);
+      continue;
+    }
+    if (inCommitMsg) {
+      if (line === "---") {
+        inCommitMsg = false;
+        continue;
+      }
+      const subjMatch = /^Subject:\s*(.+)$/i.exec(line);
+      if (subjMatch && mailboxSubjects.length < 10) {
+        mailboxSubjects.push(`${pendingFromSha || "commit"} ${subjMatch[1].trim().slice(0, 100)}`);
+        continue;
+      }
+      if (!line.startsWith("diff --git ") || !isLikelyGitDiffHeaderFollowup(lines[idx + 1])) {
+        continue;
+      }
+      inCommitMsg = false;
+    }
+
     if (line.startsWith("diff --git ")) {
       inHunk = false;
-      const mQuoted = /^diff --git "a\/(.+?)" "b\/(.+)"$/.exec(line);
-      const mPlain = !mQuoted ? /^diff --git a\/(.+?) b\/(.+)$/.exec(line) : null;
-      const name = mQuoted ? mQuoted[2] : mPlain ? mPlain[2] : line.slice(11);
+      const name = parseGitDiffPath(line) || line.slice(11);
       curFile = { name, added: 0, removed: 0 };
       files.push(curFile);
-      compactHunks.push(`=== ${name}`);
+      entries.push({ text: `=== ${name}`, kind: "file" });
       continue;
     }
     if (!inHunk && (line.startsWith("index ") || line.startsWith("--- ") || line.startsWith("+++ "))) {
@@ -1620,47 +1709,128 @@ function filterGitDiff(combined, exitCode) {
     }
     if (line.startsWith("@@ ")) {
       inHunk = true;
-      compactHunks.push(line);
+      entries.push({ text: line, kind: "hunk" });
       continue;
     }
-    if (line.startsWith("+")) {
-      if (curFile) curFile.added += 1;
-      compactHunks.push(line);
+    if (!inHunk) {
+      if (
+        line.startsWith("new file mode ") ||
+        line.startsWith("deleted file mode ") ||
+        line.startsWith("old mode ") ||
+        line.startsWith("new mode ") ||
+        line.startsWith("Binary files ") ||
+        line.startsWith("rename from ") ||
+        line.startsWith("rename to ") ||
+        line.startsWith("copy from ") ||
+        line.startsWith("copy to ")
+      ) {
+        entries.push({ text: line, kind: "meta" });
+      }
       continue;
     }
-    if (line.startsWith("-")) {
-      if (curFile) curFile.removed += 1;
-      compactHunks.push(line);
+
+    // Inside hunk
+    if (line === "-- " && (lines[idx + 1] === undefined || /^\d+\.\d+/.test(lines[idx + 1].trim()))) {
+      inHunk = false;
       continue;
     }
-    if (
-      line.startsWith("new file mode ") ||
-      line.startsWith("deleted file mode ") ||
-      line.startsWith("old mode ") ||
-      line.startsWith("new mode ") ||
-      line.startsWith("Binary files ") ||
-      line.startsWith("rename from ") ||
-      line.startsWith("rename to ") ||
-      line.startsWith("copy from ") ||
-      line.startsWith("copy to ")
-    ) {
-      compactHunks.push(line);
+    const openAdd = line.indexOf("{+");
+    const hasWordAdd = openAdd !== -1 && line.indexOf("+}", openAdd + 2) !== -1;
+    const openDel = line.indexOf("[-");
+    const hasWordDel = openDel !== -1 && line.indexOf("-]", openDel + 2) !== -1;
+    if (hasWordAdd || hasWordDel) {
+      if (curFile && hasWordAdd) curFile.added += 1;
+      if (curFile && hasWordDel) curFile.removed += 1;
+      entries.push({ text: line, kind: "change" });
+      continue;
+    }
+    if (!isWordDiffCmd) {
+      if (line.startsWith("+")) {
+        if (curFile) curFile.added += 1;
+        entries.push({ text: line, kind: "change" });
+        continue;
+      }
+      if (line.startsWith("-")) {
+        if (curFile) curFile.removed += 1;
+        entries.push({ text: line, kind: "change" });
+        continue;
+      }
+    }
+    if (line.startsWith(" ") || line === "" || line.startsWith("\\ No newline") || isWordDiffCmd) {
+      entries.push({ text: line, kind: "context" });
     }
   }
 
   if (files.length === 0) return combined;
 
-  const summaryHeader = [
+  const headerLines = [];
+  if (mailboxSubjects.length > 0) {
+    headerLines.push(`Patches: ${mailboxSubjects.length}`);
+    for (const s of mailboxSubjects) headerLines.push(`  ${s}`);
+  }
+  headerLines.push(
     `Files changed: ${files.length}`,
     ...files.slice(0, 40).map((f) => `  ${f.name} (+${f.added} / -${f.removed})`),
     ...(files.length > 40 ? [`  ... (+${files.length - 40} more files)`] : []),
     ""
-  ].join("\n");
+  );
+  const summaryHeader = headerLines.join("\n");
 
+  const effectiveMaxBytes =
+    Number.isFinite(ctx?.maxBytes) && ctx.maxBytes > 0 ? ctx.maxBytes : MAX_FILTERED_OUTPUT_BYTES;
   const headerBytes = Buffer.byteLength(summaryHeader, "utf8");
-  const hunkBudget = Math.max(1200, MAX_FILTERED_OUTPUT_BYTES - headerBytes - 300);
-  const { text: hunkText, omitted } = compactLinesBudget(compactHunks, hunkBudget);
-  const tail = omitted > 0 ? `\n... [+${omitted} diff lines omitted; narrow with 'git diff -- <file>' or ctx_search]` : "";
+  const hunkBudget = Math.max(800, effectiveMaxBytes - headerBytes - 180);
+  const ctxHint = ctx?.sourceId ? `ctx_search(sourceId:"${ctx.sourceId}")` : "ctx_search";
+
+  // Stage 1: Lossless within budget (100% of context lines preserved)
+  const allLines = entries.map((e) => e.text);
+  const allText = allLines.join("\n");
+  if (Buffer.byteLength(allText, "utf8") <= hunkBudget) {
+    return `${summaryHeader}${allText}`;
+  }
+
+  // Stage 2: Over budget + explicit context flag (-U/--unified/-W/--word-diff) -> preserve context, cap to budget
+  if (hasExplicitContextFlag) {
+    const { text: hunkText, omitted } = compactLinesBudget(allLines, hunkBudget);
+    if (Array.isArray(ctx?.notes)) ctx.notes.push("context-preserved, capped");
+    const tail =
+      omitted > 0
+        ? `\n... [+${omitted} diff lines omitted; narrow with 'git diff -- <file>' or ${ctxHint}]`
+        : "";
+    return `${summaryHeader}${hunkText}${tail}`;
+  }
+
+  // Stage 3a: Ordinary over-budget diff -> keep 1 line of context before/after every changed line
+  const keepCtx1 = new Array(entries.length).fill(false);
+  for (let i = 0; i < entries.length; i++) {
+    if (entries[i].kind !== "context") {
+      keepCtx1[i] = true;
+    }
+    if (entries[i].kind === "change") {
+      if (i > 0 && entries[i - 1].kind === "context") keepCtx1[i - 1] = true;
+      if (i + 1 < entries.length && entries[i + 1].kind === "context") keepCtx1[i + 1] = true;
+    }
+  }
+  const ctx1Lines = [];
+  let droppedForCtx1 = 0;
+  for (let i = 0; i < entries.length; i++) {
+    if (keepCtx1[i]) ctx1Lines.push(entries[i].text);
+    else droppedForCtx1 += 1;
+  }
+  const ctx1Text = ctx1Lines.join("\n");
+  if (Buffer.byteLength(ctx1Text, "utf8") <= hunkBudget) {
+    if (droppedForCtx1 > 0 && Array.isArray(ctx?.notes)) ctx.notes.push("context trimmed to 1 line");
+    return `${summaryHeader}${ctx1Text}`;
+  }
+
+  // Stage 3b: Still over budget -> compact +/- hunks only
+  const compactLines = entries.filter((e) => e.kind !== "context").map((e) => e.text);
+  const { text: hunkText, omitted } = compactLinesBudget(compactLines, hunkBudget);
+  if (Array.isArray(ctx?.notes)) ctx.notes.push("context compacted");
+  const tail =
+    omitted > 0
+      ? `\n... [+${omitted} diff lines omitted; narrow with 'git diff -- <file>' or ${ctxHint}]`
+      : "";
   return `${summaryHeader}${hunkText}${tail}`;
 }
 
@@ -1813,10 +1983,17 @@ function filterDockerBuild(combined, exitCode) {
 }
 
 /** Rule 8: GitHub CLI (gh pr view/diff/checks, gh run view, gh issue view) */
-function filterGhCli(combined, exitCode) {
+function filterGhCli(combined, exitCode, ctx = {}) {
   if (exitCode !== 0) return combined;
-  if (combined.includes("diff --git ")) {
-    return filterGitDiff(combined, exitCode);
+  const rawCmdStr = String(ctx?.command || "").trim();
+  const unwrapped = rawCmdStr ? unwrapSafeCompoundCommand(rawCmdStr) : null;
+  const cmdStr = unwrapped ? unwrapped.innerCommand : rawCmdStr;
+  const isPrDiffCmd = /^gh(?:\.exe)?\s+pr\s+diff(?:\s|$)/i.test(cmdStr);
+  const head512 = combined.replace(/\r\n/g, "\n").slice(0, 512).trimStart();
+  const startsLikeDiff =
+    /^diff --git /.test(head512) || /^From [0-9a-f]{40}\s/.test(head512);
+  if (isPrDiffCmd || startsLikeDiff) {
+    return filterGitDiff(combined, exitCode, ctx);
   }
   const lines = combined.split("\n").map((l) => l.trimEnd());
   const nonEmpty = lines.filter((l) => l.trim().length > 0);
@@ -2272,6 +2449,15 @@ export const FILTER_RULES = [
       const parsed = parseGitSubcommand(cmd);
       return parsed && parsed.subcommand === "diff" ? { matched: true, skipTarget: parsed.rest } : false;
     },
+    prepareCommand(cmd) {
+      if (/(?:^|\s)--word-diff=color(?=\s|$)/i.test(cmd)) {
+        return {
+          effectiveCommand: cmd.replace(/((?:^|\s))--word-diff=color(?=\s|$)/gi, "$1--word-diff=plain"),
+          note: "normalized --word-diff=color to plain"
+        };
+      }
+      return { effectiveCommand: cmd, note: null };
+    },
     filter: filterGitDiff
   },
   {
@@ -2535,11 +2721,23 @@ export function applyFilterRule(ruleId, rawStdout, rawStderr, exitCode = 0, opti
     }
   }
 
+  const ruleNotes = [];
   if (!crushedJson) {
     const stderrForGuard = rawStderr || (typeof options.capturedStderr === "string" ? options.capturedStderr : "");
     const cleanedStderr = stderrForGuard ? stripAnsiAndProgress(stderrForGuard) : "";
-    filtered = rule ? rule.filter(cleaned, exitCode, { cleanedStderr }) : cleaned;
+    filtered = rule
+      ? rule.filter(cleaned, exitCode, {
+          cleanedStderr,
+          command: typeof options.command === "string" ? options.command : "",
+          maxBytes: crushBudget,
+          sourceId: options.sourceId || null,
+          notes: ruleNotes
+        })
+      : cleaned;
     if (!filtered && cleaned) filtered = cleaned;
+    for (const rn of ruleNotes) {
+      if (typeof rn === "string" && rn.trim()) noteParts.push(rn.trim());
+    }
 
     // Also structurally crush if post-rule output is STILL large JSON/JSONL
     if (
@@ -2568,12 +2766,14 @@ export function applyFilterRule(ruleId, rawStdout, rawStderr, exitCode = 0, opti
     truncated = true;
   }
 
+  const hasRuleNotes = ruleNotes.length > 0;
   let filteredBodyBytes = Buffer.byteLength(filtered, "utf8");
-  // Never inflate tiny already-compact outputs when no truncation, JSON crush, or rewrite note occurred
+  // Never inflate tiny already-compact outputs when no truncation, JSON crush, or rewrite/rule note occurred
   if (
     !truncated &&
     !crushedJson &&
     !options.note &&
+    !hasRuleNotes &&
     filteredBodyBytes >= rawBytes &&
     Buffer.byteLength(cleaned, "utf8") <= maxBytes
   ) {
@@ -2582,7 +2782,7 @@ export function applyFilterRule(ruleId, rawStdout, rawStderr, exitCode = 0, opti
   }
 
   const savedBytes = Math.max(0, rawBytes - filteredBodyBytes);
-  const wasFiltered = truncated || crushedJson || savedBytes >= 256 || Boolean(options.note);
+  const wasFiltered = truncated || crushedJson || savedBytes >= 256 || Boolean(options.note) || hasRuleNotes;
 
   if (wasFiltered) {
     const pct = rawBytes > 0 ? ((savedBytes / rawBytes) * 100).toFixed(0) : "0";

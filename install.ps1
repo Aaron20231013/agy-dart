@@ -5,14 +5,15 @@
   .\install.ps1
   .\install.ps1 -InstallRg
   .\install.ps1 -WithDevtools
-  .\install.ps1 -Mode fast-32k
+  .\install.ps1 -Mode host-45k
+  .\install.ps1 -Mode balanced-16k
   .\install.ps1 -Command doctor
 #>
 param(
   [ValidateSet("install", "doctor", "uninstall", "mode")]
   [string]$Command = "install",
-  [ValidateSet("balanced-16k", "fast-32k", "strict-8k", "no-read-hook")]
-  [string]$Mode = "balanced-16k",
+  [ValidateSet("host-45k", "balanced-16k", "fast-32k", "strict-8k", "no-read-hook")]
+  [string]$Mode = "host-45k",
   [switch]$InstallRg,
   [switch]$WithDevtools,
   [string]$Project = ""
@@ -29,7 +30,9 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
 
 $nodeArgs = @($Installer, $Command)
 if ($Command -eq "install") {
-  $nodeArgs += @("--mode", $Mode)
+  if ($PSBoundParameters.ContainsKey("Mode")) {
+    $nodeArgs += @("--mode", $Mode)
+  }
   if ($InstallRg) { $nodeArgs += "--install-rg" }
   if ($WithDevtools) { $nodeArgs += "--with-devtools" }
 } elseif ($Command -eq "mode") {

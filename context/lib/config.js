@@ -17,12 +17,18 @@ export const CONFIG_DEFAULTS = Object.freeze({
   subagentIncludeGit: false,
   repoHubs: true,
   readHook: true,
+  readGuardMode: "soft",
   readDedup: true,
   readDedupMaxSteps: 40,
   diffRead: false, // Opt-in until multi-turn/fork baseline freshness is battle-tested
   diffReadMaxTurns: 12,
   diffReadMaxAgeMs: 15 * 60 * 1000,
   maxReadBytes: null,
+  noiseMaxReadBytes: 16384,
+  reviewMaxReadBytes: 131072,
+  shellDumpMaxBytes: 16384,
+  exemptExtensions: Object.freeze([]),
+  exemptPaths: Object.freeze([]),
   maxLineRange: null,
   maxOutputBytes: 8100,
   execTimeoutMs: 120000,
@@ -104,6 +110,75 @@ function parseGuardMode(raw) {
   return undefined;
 }
 
+function parseReadGuardMode(raw) {
+  if (raw === undefined || raw === null) return undefined;
+  const s = String(raw).trim().toLowerCase();
+  if (!s) return undefined;
+  if (s === "soft" || s === "2-strike" || s === "warn" || s === "balanced") return "soft";
+  if (s === "strict" || s === "hard" || s === "deny" || s === "block") return "strict";
+  if (s === "off" || s === "disabled" || s === "none" || s === "0" || s === "false") return "off";
+  return undefined;
+}
+
+function parseExemptExtensions(raw) {
+  if (raw === undefined || raw === null) return undefined;
+  let items;
+  if (Array.isArray(raw)) {
+    items = raw;
+  } else if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return undefined;
+    items = trimmed.split(/[,;\s]+/);
+  } else {
+    return undefined;
+  }
+  const out = [];
+  const seen = new Set();
+  for (const item of items) {
+    if (typeof item !== "string") continue;
+    const clean = item.trim().toLowerCase();
+    if (!clean) continue;
+    const formatted = clean.startsWith(".") ? clean : `.${clean}`;
+    if (!/^\.[a-z0-9][a-z0-9._+-]{0,31}$/i.test(formatted)) continue;
+    if (!seen.has(formatted)) {
+      seen.add(formatted);
+      out.push(formatted);
+      if (out.length >= 128) break;
+    }
+  }
+  return out;
+}
+
+function parseExemptPaths(raw) {
+  if (raw === undefined || raw === null) return undefined;
+  let items;
+  if (Array.isArray(raw)) {
+    items = raw;
+  } else if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return undefined;
+    items = trimmed.split(/[,;\r\n]+/);
+  } else {
+    return undefined;
+  }
+  const out = [];
+  const seen = new Set();
+  for (const item of items) {
+    if (typeof item !== "string") continue;
+    let clean = item.trim().replace(/\\/g, "/");
+    if (!clean || clean.length > 256 || /[\x00-\x1f\x7f]/.test(clean)) continue;
+    while (clean.startsWith("./")) clean = clean.slice(2);
+    clean = clean.replace(/\/{2,}/g, "/");
+    if (!clean) continue;
+    if (!seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+      if (out.length >= 64) break;
+    }
+  }
+  return out;
+}
+
 export function loadConfigFile(configPath = getConfigPath()) {
   const resolved = path.resolve(configPath);
   try {
@@ -153,7 +228,11 @@ export function getConfigSnapshot(options = {}) {
   const configPath = options.configPath ? path.resolve(options.configPath) : getConfigPath(env);
   const loaded = loadConfigFile(configPath);
   const cfg = loaded.data || {};
-  const values = { ...CONFIG_DEFAULTS };
+  const values = {
+    ...CONFIG_DEFAULTS,
+    exemptExtensions: [],
+    exemptPaths: []
+  };
   const sources = {};
   for (const k of Object.keys(CONFIG_DEFAULTS)) {
     sources[k] = "default";
@@ -192,6 +271,7 @@ export function getConfigSnapshot(options = {}) {
 
   // 3. Read guards & three-state diff-read (default OFF)
   pick("readHook", parseDisableEnvFlag(env?.AGY_DART_DISABLE_READ_HOOK), cfgBool("readHook"));
+  pick("readGuardMode", parseReadGuardMode(env?.AGY_DART_READ_GUARD_MODE), parseReadGuardMode(cfg.readGuardMode));
   pick("readDedup", parseDisableEnvFlag(env?.AGY_DART_DISABLE_READ_DEDUP), cfgBool("readDedup"));
   pick(
     "readDedupMaxSteps",
@@ -217,17 +297,42 @@ export function getConfigSnapshot(options = {}) {
   );
   pick(
     "maxReadBytes",
-    parseNonNegativeInt(env?.CONTEXT_MODE_MAX_READ_BYTES),
+    parseNonNegativeInt(env?.AGY_DART_MAX_READ_BYTES) ?? parseNonNegativeInt(env?.CONTEXT_MODE_MAX_READ_BYTES),
     parseNonNegativeInt(cfg.maxReadBytes)
   );
   pick(
+    "noiseMaxReadBytes",
+    parseNonNegativeInt(env?.AGY_DART_NOISE_MAX_READ_BYTES),
+    parseNonNegativeInt(cfg.noiseMaxReadBytes)
+  );
+  pick(
+    "reviewMaxReadBytes",
+    parseNonNegativeInt(env?.AGY_DART_REVIEW_MAX_READ_BYTES),
+    parseNonNegativeInt(cfg.reviewMaxReadBytes)
+  );
+  pick(
+    "shellDumpMaxBytes",
+    parseNonNegativeInt(env?.AGY_DART_SHELL_DUMP_MAX_BYTES),
+    parseNonNegativeInt(cfg.shellDumpMaxBytes)
+  );
+  pick(
+    "exemptExtensions",
+    parseExemptExtensions(env?.AGY_DART_EXEMPT_EXTENSIONS),
+    parseExemptExtensions(cfg.exemptExtensions)
+  );
+  pick(
+    "exemptPaths",
+    parseExemptPaths(env?.AGY_DART_EXEMPT_PATHS),
+    parseExemptPaths(cfg.exemptPaths)
+  );
+  pick(
     "maxLineRange",
-    parsePositiveInt(env?.CONTEXT_MODE_MAX_LINE_RANGE),
+    parsePositiveInt(env?.AGY_DART_MAX_LINE_RANGE) ?? parsePositiveInt(env?.CONTEXT_MODE_MAX_LINE_RANGE),
     parsePositiveInt(cfg.maxLineRange)
   );
   pick(
     "maxOutputBytes",
-    parsePositiveInt(env?.CONTEXT_MODE_MAX_OUTPUT_BYTES),
+    parsePositiveInt(env?.AGY_DART_MAX_OUTPUT_BYTES) ?? parsePositiveInt(env?.CONTEXT_MODE_MAX_OUTPUT_BYTES),
     parsePositiveInt(cfg.maxOutputBytes)
   );
   pick(
@@ -287,7 +392,7 @@ export function getEffectiveConfig(options = {}) {
   return getConfigSnapshot(options).values;
 }
 
-export function formatEffectiveConfigLines(snapshot = getConfigSnapshot()) {
+export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra = {}) {
   const { configPath, fileExists, configError, values, sources } = snapshot;
   const lines = [];
   const fileNote = configError
@@ -298,6 +403,7 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot()) {
   lines.push(`  - Config file   : ${configPath} [${fileNote}]`);
   const summaryKeys = [
     "readHook",
+    "readGuardMode",
     "readDedup",
     "diffRead",
     "cliFilter",
@@ -312,8 +418,33 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot()) {
     const srcTag = sources[k] !== "default" ? `*${sources[k]}` : "";
     return `${k}=${values[k]}${srcTag}`;
   });
-  lines.push(`  - Active flags  : ${pairs.slice(0, 5).join(", ")}`);
-  lines.push(`                    ${pairs.slice(5).join(", ")}`);
+  lines.push(`  - Active flags  : ${pairs.slice(0, 6).join(", ")}`);
+  lines.push(`                    ${pairs.slice(6).join(", ")}`);
+
+  const effSourceCutoff =
+    extra && Number.isFinite(extra.sourceCutoffBytes)
+      ? extra.sourceCutoffBytes
+      : values.maxReadBytes !== null && values.maxReadBytes !== undefined
+        ? values.maxReadBytes
+        : 46080;
+  const effSourceProv =
+    extra && typeof extra.sourceCutoffSource === "string" && extra.sourceCutoffSource
+      ? extra.sourceCutoffSource
+      : sources.maxReadBytes !== "default"
+        ? sources.maxReadBytes
+        : "default";
+  const fmtKb = (b) => (b === 0 ? "0 (off)" : b % 1024 === 0 ? `${b / 1024} KB` : `${b} B`);
+  const exemptSummary = [
+    Array.isArray(values.exemptPaths) && values.exemptPaths.length > 0 ? `exemptPaths=${values.exemptPaths.length}` : "",
+    Array.isArray(values.exemptExtensions) && values.exemptExtensions.length > 0 ? `exemptExt=${values.exemptExtensions.length}` : ""
+  ]
+    .filter(Boolean)
+    .join(", ");
+  lines.push(
+    `  - Read guard    : mode=${values.readGuardMode} (${sources.readGuardMode}), source=${fmtKb(effSourceCutoff)} (${effSourceProv}), ` +
+      `noise=${fmtKb(values.noiseMaxReadBytes)}, review=${fmtKb(values.reviewMaxReadBytes)}, shellDump=${fmtKb(values.shellDumpMaxBytes)}` +
+      (exemptSummary ? `, ${exemptSummary}` : "")
+  );
 
   const overrides = Object.keys(sources)
     .filter((k) => sources[k] !== "default")

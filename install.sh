@@ -8,7 +8,7 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 if [ "$#" -eq 0 ]; then
-  exec node "$SCRIPT_DIR/scripts/install.mjs" install --mode balanced-16k
+  exec node "$SCRIPT_DIR/scripts/install.mjs" install
 else
   exec node "$SCRIPT_DIR/scripts/install.mjs" "$@"
 fi

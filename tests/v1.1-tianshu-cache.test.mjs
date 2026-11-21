@@ -454,16 +454,22 @@ test("T3: Dual MCP tools/list deterministic sorting & recursive keys + prefix-bu
   }
 });
 
-test("T4: Ghost Registry tracks paged recalls after large-file blocks, triggers 32 KB recommendation, and stays 1.0 when ctx_index is used", async () => {
+test("T4: Ghost Registry tracks paged recalls after large-file blocks, triggers host-45k recommendation under tight cutoff, and stays 1.0 when ctx_index is used", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-ghost-"));
   const tmpDb = path.join(tmpDir, "context.db");
 
   try {
-    // Scenario A: 3 large files blocked by PreToolUse, then each recalled via 2 paged read_file calls covering >=70%
+    // Scenario A: Tight 16 KB cutoff blocks 3 ~24 KB source files, then each recalled via 2 paged read_file calls covering >=70%
     const sidRecall = "ghost-recall-session";
+    const initStore = new ContextModeStore({ dbPath: tmpDb });
+    try {
+      initStore.setCutoff(16384, sidRecall);
+    } finally {
+      initStore.close();
+    }
     for (let i = 1; i <= 3; i++) {
       const filePath = path.join(tmpDir, `large_${i}.ts`);
-      // ~600 lines * ~40 bytes = ~24 KB (> 16 KB cutoff)
+      // ~600 lines * ~40 bytes = ~24 KB (> 16 KB tight cutoff)
       const content = Array.from({ length: 600 }, (_, ln) => `export const row_${i}_${ln} = "payload_${ln.toString().padStart(4, "0")}";`).join("\n");
       fs.writeFileSync(filePath, content, "utf8");
 
@@ -497,7 +503,7 @@ test("T4: Ghost Registry tracks paged recalls after large-file blocks, triggers 
     assert.equal(ghostA.evictionEfficiency, 0);
     assert.equal(
       ghostA.recommendation,
-      "Cutoff may be too tight for this repo; consider switching to 32 KB (fast-32k)."
+      "Cutoff may be too tight for this repo; consider switching to 45 KB (host-45k)."
     );
 
     // Verify ctx_stats attaches ghost object and Ghost Efficiency line
@@ -708,13 +714,13 @@ test("Hardening: Ghost recall still tracks when read-dedup is off, pruneByTtl cl
   const tmpDb = path.join(tmpDir, "context.db");
 
   try {
-    // 1. Ghost recall works even when read-dedup is disabled
+    // 1. Ghost recall works even when read-dedup is disabled (tested at default 45 KiB cutoff)
     const store = new ContextModeStore({ dbPath: tmpDb });
     store.setReadDedupEnabled(false, "conversation", "no-dedup-sess");
     const bigFile = path.join(tmpDir, "big_nodedup.ts");
     fs.writeFileSync(
       bigFile,
-      Array.from({ length: 600 }, (_, i) => `export const item_${i} = "value_${i.toString().padStart(4, "0")}";`).join("\n"),
+      Array.from({ length: 1400 }, (_, i) => `export const item_${i} = "value_${i.toString().padStart(4, "0")}";`).join("\n"),
       "utf8"
     );
     const denied = runHook(
@@ -725,12 +731,12 @@ test("Hardening: Ghost recall still tracks when read-dedup is off, pruneByTtl cl
     assert.equal(denied.decision, "deny");
     const p1 = runHook(
       "hooks/pre-tool-use.mjs",
-      { conversationId: "no-dedup-sess", toolCall: { name: "read_file", args: { Path: bigFile, StartLine: 1, EndLine: 300 } } },
+      { conversationId: "no-dedup-sess", toolCall: { name: "read_file", args: { Path: bigFile, StartLine: 1, EndLine: 700 } } },
       tmpDb
     );
     const p2 = runHook(
       "hooks/pre-tool-use.mjs",
-      { conversationId: "no-dedup-sess", toolCall: { name: "read_file", args: { Path: bigFile, StartLine: 301, EndLine: 600 } } },
+      { conversationId: "no-dedup-sess", toolCall: { name: "read_file", args: { Path: bigFile, StartLine: 701, EndLine: 1400 } } },
       tmpDb
     );
     assert.equal(p1.decision, "allow");
@@ -930,13 +936,13 @@ test("Review hardening: live V8 compile-cache artifacts, Windows case-safe pruni
       assert.equal(fs.existsSync(zeroDb), false, `${tc.name} must stay 0-SQLite`);
     }
 
-    // 2. Ghost Registry exact byte scan:
-    //    - Long-line file (200 lines * ~138B = ~27.7KB) 100% read in 2 slices MUST trigger ghost recall
-    //    - Short-line file (1100 lines * 20B = 22KB) 30% read in 2 slices MUST NOT false-positive
+    // 2. Ghost Registry exact byte scan (at default 45 KiB cutoff):
+    //    - Long-line file (400 lines * ~138B = ~55.5KB) 100% read in 2 slices MUST trigger ghost recall
+    //    - Short-line file (2600 lines * 20B = ~52KB) ~29% read in 2 slices MUST NOT false-positive
     const longFile = path.join(tmpDir, "long_lines.ts");
     fs.writeFileSync(
       longFile,
-      Array.from({ length: 200 }, (_, i) => `export const row_${i} = "${"A".repeat(110)}";`).join("\n"),
+      Array.from({ length: 400 }, (_, i) => `export const row_${i} = "${"A".repeat(110)}";`).join("\n"),
       "utf8"
     );
     assert.equal(
@@ -944,18 +950,18 @@ test("Review hardening: live V8 compile-cache artifacts, Windows case-safe pruni
       "deny"
     );
     assert.equal(
-      runHook("hooks/pre-tool-use.mjs", { conversationId: "ghost-long", toolCall: { name: "read_file", args: { Path: longFile, StartLine: 1, EndLine: 100 } } }, tmpDb).decision,
+      runHook("hooks/pre-tool-use.mjs", { conversationId: "ghost-long", toolCall: { name: "read_file", args: { Path: longFile, StartLine: 1, EndLine: 200 } } }, tmpDb).decision,
       "allow"
     );
     assert.equal(
-      runHook("hooks/pre-tool-use.mjs", { conversationId: "ghost-long", toolCall: { name: "read_file", args: { Path: longFile, StartLine: 101, EndLine: 200 } } }, tmpDb).decision,
+      runHook("hooks/pre-tool-use.mjs", { conversationId: "ghost-long", toolCall: { name: "read_file", args: { Path: longFile, StartLine: 201, EndLine: 400 } } }, tmpDb).decision,
       "allow"
     );
 
     const shortFile = path.join(tmpDir, "short_lines.yaml");
     fs.writeFileSync(
       shortFile,
-      Array.from({ length: 1100 }, (_, i) => `k_${String(i).padStart(4, "0")}: val_${String(i).padStart(4, "0")}`).join("\n"),
+      Array.from({ length: 3000 }, (_, i) => `k_${String(i).padStart(4, "0")}: val_${String(i).padStart(4, "0")}`).join("\n"),
       "utf8"
     );
     assert.equal(
@@ -963,11 +969,11 @@ test("Review hardening: live V8 compile-cache artifacts, Windows case-safe pruni
       "deny"
     );
     assert.equal(
-      runHook("hooks/pre-tool-use.mjs", { conversationId: "ghost-short", toolCall: { name: "read_file", args: { Path: shortFile, StartLine: 1, EndLine: 170 } } }, tmpDb).decision,
+      runHook("hooks/pre-tool-use.mjs", { conversationId: "ghost-short", toolCall: { name: "read_file", args: { Path: shortFile, StartLine: 1, EndLine: 440 } } }, tmpDb).decision,
       "allow"
     );
     assert.equal(
-      runHook("hooks/pre-tool-use.mjs", { conversationId: "ghost-short", toolCall: { name: "read_file", args: { Path: shortFile, StartLine: 500, EndLine: 669 } } }, tmpDb).decision,
+      runHook("hooks/pre-tool-use.mjs", { conversationId: "ghost-short", toolCall: { name: "read_file", args: { Path: shortFile, StartLine: 1000, EndLine: 1439 } } }, tmpDb).decision,
       "allow"
     );
 

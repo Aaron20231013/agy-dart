@@ -19,7 +19,7 @@ const __dirname = path.dirname(__selfPath);
 const FAST_SNAPSHOT_SCRIPT = path.resolve(__dirname, "..", "fast", "session-start.mjs");
 
 export const STATIC_COOP_NOTE =
-  "agy-dart active: use agy-dart_fast + parallel ranged read_file for source code search/outline/edits/checks; use agy-dart_context (ctx_execute / ctx_index / ctx_search) for >16 KB logs, large JSON/CSV/API payloads, or long docs/URLs.";
+  "agy-dart active: use agy-dart_fast + parallel ranged read_file (45 KiB/800 lines) for code/diffs; use agy-dart_context (ctx_execute / ctx_index / ctx_search) for >16 KB logs, large JSON/CSV/API dumps, or long docs/URLs.";
 
 function readStdin(timeoutMs = 1500) {
   return new Promise((resolve) => {
@@ -65,7 +65,8 @@ function nonEmptyString(val) {
   return typeof val === "string" && val.trim().length > 0 ? val.trim() : "";
 }
 
-const SUBAGENT_ROLE_RE = /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier)(?:$|[-_\s/])/i;
+const SUBAGENT_ROLE_RE =
+  /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?)(?:$|[-_\s/])/i;
 
 /**
  * Detect whether a SessionStart hook payload / environment belongs to a subagent or swarm worker.
@@ -83,11 +84,21 @@ export function isSubagentPayload(payload, env = process.env) {
     return true;
   }
 
+  if (nonEmptyString(p.subagentId) || nonEmptyString(p.subagent_id)) {
+    return true;
+  }
+
   if (p.metadata && typeof p.metadata === "object") {
     if (
       p.metadata.subagent === true ||
+      p.metadata.isSubagent === true ||
+      p.metadata.is_subagent === true ||
+      nonEmptyString(p.metadata.subagentId) ||
+      nonEmptyString(p.metadata.subagent_id) ||
       nonEmptyString(p.metadata.parentConversationId) ||
-      nonEmptyString(p.metadata.parent_conversation_id)
+      nonEmptyString(p.metadata.parent_conversation_id) ||
+      nonEmptyString(p.metadata.parentSessionId) ||
+      nonEmptyString(p.metadata.parent_session_id)
     ) {
       return true;
     }
@@ -102,7 +113,11 @@ export function isSubagentPayload(payload, env = process.env) {
     return true;
   }
 
-  const rootId = nonEmptyString(p.rootConversationId) || nonEmptyString(p.root_conversation_id);
+  const rootId =
+    nonEmptyString(p.rootConversationId) ||
+    nonEmptyString(p.root_conversation_id) ||
+    nonEmptyString(p.metadata?.rootConversationId) ||
+    nonEmptyString(p.metadata?.root_conversation_id);
   const convId =
     nonEmptyString(p.conversationId) ||
     nonEmptyString(p.conversation_id) ||
@@ -121,7 +136,12 @@ export function isSubagentPayload(payload, env = process.env) {
     p.sessionType,
     p.session_type,
     p.sessionKind,
-    p.session_kind
+    p.session_kind,
+    p.metadata?.role,
+    p.metadata?.agentRole,
+    p.metadata?.agent_role,
+    p.metadata?.agentType,
+    p.metadata?.agent_type
   ];
   for (const candidate of roleCandidates) {
     const text = nonEmptyString(candidate);

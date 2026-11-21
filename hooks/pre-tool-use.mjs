@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
-import { getEffectiveConfig } from "../context/lib/config.js";
+import { getConfigSnapshot, getEffectiveConfig } from "../context/lib/config.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -73,10 +73,17 @@ if (!isDirectRun) {
   await Promise.all([ensureStoreClass(), ensureFilterRules(), ensureSecurityModule(), ensureTextDiffModule()]);
 }
 
-export const DEFAULT_MAX_READ_BYTES = 16384; // 16 KB balanced default (~410 lines)
-export const DEFAULT_MAX_LINE_RANGE = 410;
+export const DEFAULT_MAX_READ_BYTES = 46080; // 45 KiB — exact alignment with Antigravity read_file host return cap
+export const DEFAULT_NOISE_MAX_READ_BYTES = 16384; // 16 KB — Tier 1 high-noise logs/locks/minified bundles
+export const DEFAULT_REVIEW_MAX_READ_BYTES = 131072; // 128 KB — Tier 3 .patch/.diff code-review files
+export const DEFAULT_SHELL_DUMP_MAX_BYTES = 16384; // 16 KB — independent run_command cat/Get-Content dump limit
+export const DEFAULT_MAX_LINE_RANGE = 800; // Clamped to Antigravity read_file host return cap
 export const HOST_READ_MAX_LINES = 800; // Antigravity read_file host return cap (lines)
 export const HOST_READ_MAX_BYTES = 46080; // Antigravity read_file host return cap (bytes)
+export const LARGE_READ_CONFIRM_TTL_MS = 120 * 1000;
+export const LARGE_READ_CONFIRM_SHORT_TTL_MS = 30 * 1000;
+export const SENSITIVE_READ_CONFIRM_TTL_MS = 120 * 1000;
+export const SENSITIVE_READ_CONFIRM_SHORT_TTL_MS = 30 * 1000;
 export const MIN_DEDUP_FILE_BYTES = 1024;
 export const MAX_SNAPSHOT_FILE_BYTES = 256 * 1024;
 export const MIN_DIFF_READ_BYTES = 1536;
@@ -124,21 +131,41 @@ function getMaxReadBytes(sessionId = null) {
   }
 }
 
-function getExemptExtensions(sessionId = null) {
-  try {
-    return getSharedStore().getExemptExtensions(sessionId);
-  } catch {
-    return Array.from(BINARY_EXTENSIONS);
+function getShellDumpMaxBytes() {
+  const cfgShell = getEffectiveConfig().shellDumpMaxBytes;
+  if (cfgShell !== null && cfgShell !== undefined && Number.isFinite(Number(cfgShell))) {
+    return Math.max(0, Math.floor(Number(cfgShell)));
   }
+  return DEFAULT_SHELL_DUMP_MAX_BYTES;
 }
 
-function getMaxLineRange(maxReadBytes = DEFAULT_MAX_READ_BYTES) {
+function getExemptExtensions(sessionId = null) {
+  const merged = new Set();
+  try {
+    for (const ext of getSharedStore().getExemptExtensions(sessionId)) {
+      merged.add(ext);
+    }
+  } catch {
+    for (const ext of BINARY_EXTENSIONS) {
+      merged.add(ext);
+    }
+  }
+  const cfgExts = getEffectiveConfig().exemptExtensions;
+  if (Array.isArray(cfgExts)) {
+    for (const ext of cfgExts) {
+      if (typeof ext === "string" && ext) merged.add(ext.toLowerCase());
+    }
+  }
+  return Array.from(merged);
+}
+
+export function getMaxLineRange(maxReadBytes = DEFAULT_MAX_READ_BYTES) {
   const cfgRange = getEffectiveConfig().maxLineRange;
   if (cfgRange !== null && cfgRange !== undefined && cfgRange > 0) {
-    return cfgRange;
+    return Math.min(HOST_READ_MAX_LINES, cfgRange);
   }
   if (maxReadBytes === 0) return 0;
-  return Math.max(50, Math.round(maxReadBytes / 40));
+  return Math.min(HOST_READ_MAX_LINES, Math.max(50, Math.round(maxReadBytes / 40)));
 }
 
 function formatBytes(bytes) {
@@ -190,13 +217,19 @@ export function cleanFilePath(val) {
 }
 
 export function parseLineArg(val) {
-  if (val === undefined || val === null) return null;
+  if (val === undefined || val === null || typeof val === "boolean") return null;
+  if (typeof val === "number") {
+    return Number.isSafeInteger(val) ? val : null;
+  }
   const str = cleanStringArg(val);
   if (!str || str.toLowerCase() === "null" || str.toLowerCase() === "undefined") {
     return null;
   }
-  const parsed = parseInt(str, 10);
-  return Number.isNaN(parsed) ? null : parsed;
+  if (!/^[+-]?\d+$/.test(str)) {
+    return null;
+  }
+  const parsed = Number(str);
+  return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 const KNOWN_TEXT_EXTENSIONS = new Set([
@@ -225,6 +258,218 @@ const AGENT_INSTRUCTION_BASENAMES = new Set([
   "gemini.md",
   "claude.md"
 ]);
+
+const NOISE_EXTENSIONS = new Set([
+  ".log", ".csv", ".tsv", ".jsonl", ".ndjson", ".har", ".sql", ".map"
+]);
+
+const NOISE_LOCK_BASENAMES = new Set([
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "cargo.lock",
+  "composer.lock",
+  "bun.lock",
+  "bun.lockb",
+  "poetry.lock",
+  "gemfile.lock",
+  "pipfile.lock",
+  "uv.lock"
+]);
+
+const NOISE_SUFFIXES = [".min.js", ".min.mjs", ".min.cjs", ".min.css", ".bundle.js", ".chunk.js"];
+
+const REVIEW_DIFF_EXTENSIONS = new Set([".patch", ".diff"]);
+
+/** Linear O(|str|*|pat|) single-segment wildcard matcher (* and ?); zero RegExp, zero ReDoS */
+function matchSegmentWildcard(str, pat) {
+  let s = 0;
+  let p = 0;
+  let starIdx = -1;
+  let matchIdx = 0;
+  while (s < str.length) {
+    if (p < pat.length && (pat[p] === "?" || pat[p] === str[s])) {
+      s++;
+      p++;
+    } else if (p < pat.length && pat[p] === "*") {
+      starIdx = p++;
+      matchIdx = s;
+    } else if (starIdx !== -1) {
+      p = starIdx + 1;
+      s = ++matchIdx;
+    } else {
+      return false;
+    }
+  }
+  while (p < pat.length && pat[p] === "*") p++;
+  return p === pat.length;
+}
+
+/** Linear O(N*M) path segment glob matcher supporting **, *, ? without user regexes */
+function matchPathSegments(segs, patSegs) {
+  let s = 0;
+  let p = 0;
+  let starP = -1;
+  let starS = 0;
+  while (s < segs.length) {
+    if (p < patSegs.length && patSegs[p] === "**") {
+      starP = p++;
+      starS = s;
+    } else if (p < patSegs.length && matchSegmentWildcard(segs[s], patSegs[p])) {
+      s++;
+      p++;
+    } else if (starP !== -1) {
+      p = starP + 1;
+      s = ++starS;
+    } else {
+      return false;
+    }
+  }
+  while (p < patSegs.length && patSegs[p] === "**") p++;
+  return p === patSegs.length;
+}
+
+/** Check whether absPath matches a single user-configured exemptPaths glob/prefix (linear, ReDoS-proof) */
+export function matchesExemptPath(absPath, cwd, rawPattern, platform = process.platform) {
+  if (!absPath || typeof rawPattern !== "string") return false;
+  let pat = rawPattern.trim().replace(/\\/g, "/");
+  if (!pat || pat.length > 256) return false;
+  while (pat.startsWith("./")) pat = pat.slice(2);
+  pat = pat.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
+  if (!pat) return false;
+
+  const isWin = platform === "win32";
+  const pathMod = isWin ? path.win32 : path.posix;
+  const fold = (s) => (isWin ? s.toLowerCase() : s);
+  const absPosix = fold(String(absPath).replace(/\\/g, "/").replace(/\/{2,}/g, "/"));
+  const normPat = fold(pat);
+
+  let relPosix = "";
+  if (cwd) {
+    const rel = pathMod.relative(cwd, absPath);
+    if (
+      rel &&
+      rel !== ".." &&
+      !rel.startsWith("../") &&
+      !rel.startsWith("..\\") &&
+      !pathMod.isAbsolute(rel)
+    ) {
+      relPosix = fold(rel.replace(/\\/g, "/"));
+    }
+  }
+
+  const isAbsPat = normPat.startsWith("/") || /^[a-z]:\//i.test(normPat);
+  const hasWildcard = normPat.includes("*") || normPat.includes("?");
+
+  const matchTarget = (target, patternStr) => {
+    if (!target) return false;
+    if (!hasWildcard) {
+      return target === patternStr || target.startsWith(`${patternStr}/`);
+    }
+    const segs = target.split("/").filter(Boolean);
+    const patSegs = patternStr.split("/").filter(Boolean);
+    return matchPathSegments(segs, patSegs);
+  };
+
+  if (isAbsPat) {
+    return matchTarget(absPosix, normPat);
+  }
+  if (relPosix && matchTarget(relPosix, normPat)) {
+    return true;
+  }
+  if (normPat.startsWith("**/")) {
+    return matchTarget(absPosix, normPat);
+  }
+  return false;
+}
+
+export function matchesAnyExemptPath(absPath, cwd, patterns, platform = process.platform) {
+  if (!Array.isArray(patterns) || patterns.length === 0) return false;
+  for (const pat of patterns) {
+    if (matchesExemptPath(absPath, cwd, pat, platform)) return true;
+  }
+  return false;
+}
+
+function isDenseMinifiedChunk(buf, bytesRead) {
+  if (bytesRead < 1024) return false;
+  let newlineCount = 0;
+  let curLineLen = 0;
+  let maxLineLen = 0;
+  for (let i = 0; i < bytesRead; i++) {
+    if (buf[i] === 0x0a) {
+      newlineCount++;
+      if (curLineLen > maxLineLen) maxLineLen = curLineLen;
+      curLineLen = 0;
+    } else {
+      curLineLen++;
+    }
+  }
+  if (curLineLen > maxLineLen) maxLineLen = curLineLen;
+  const linesInSample = newlineCount + (buf[bytesRead - 1] !== 0x0a ? 1 : 0);
+  const avgLineBytes = bytesRead / Math.max(1, linesInSample);
+  return avgLineBytes > 512 && maxLineLen > 1024;
+}
+
+/** Probe 4 KB head (plus midpoint & tail when >8 KB) to detect minified / single-line dense text even behind >4 KB license headers */
+function probeMinifiedHead(absPath, fileSize = 0) {
+  try {
+    const fd = fs.openSync(absPath, "r");
+    const buf = Buffer.allocUnsafe(4096);
+    try {
+      const headRead = fs.readSync(fd, buf, 0, 4096, 0);
+      if (isDenseMinifiedChunk(buf, headRead)) return true;
+      const totalSize = fileSize > 0 ? fileSize : fs.fstatSync(fd).size;
+      if (totalSize > 8192) {
+        const midOffset = Math.max(4096, Math.floor((totalSize - 4096) / 2));
+        const midRead = fs.readSync(fd, buf, 0, 4096, midOffset);
+        if (isDenseMinifiedChunk(buf, midRead)) {
+          const tailOffset = Math.max(4096, totalSize - 4096);
+          const tailRead = fs.readSync(fd, buf, 0, 4096, tailOffset);
+          if (isDenseMinifiedChunk(buf, tailRead)) return true;
+        }
+      }
+      return false;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+/** Classify non-binary file into Tier 1 ("noise"), Tier 2 ("source"), or Tier 3 ("review") */
+export function classifyFileTier(absPath, ext, fileSize, noiseProbeThreshold = DEFAULT_NOISE_MAX_READ_BYTES) {
+  const lowerExt = (ext || "").toLowerCase();
+  const baseLower = path.basename(absPath || "").toLowerCase();
+
+  let realAbsPath = absPath;
+  try {
+    realAbsPath = fs.realpathSync(absPath);
+  } catch {}
+  const realExt = realAbsPath !== absPath ? path.extname(realAbsPath).toLowerCase() : lowerExt;
+  const realBaseLower = realAbsPath !== absPath ? path.basename(realAbsPath).toLowerCase() : baseLower;
+
+  const isNoiseByName = (e, b) =>
+    NOISE_EXTENSIONS.has(e) || NOISE_LOCK_BASENAMES.has(b) || NOISE_SUFFIXES.some((suf) => b.endsWith(suf));
+
+  if (isNoiseByName(lowerExt, baseLower) || isNoiseByName(realExt, realBaseLower)) {
+    const isMinifiedContent =
+      NOISE_SUFFIXES.some((suf) => baseLower.endsWith(suf)) ||
+      NOISE_SUFFIXES.some((suf) => realBaseLower.endsWith(suf));
+    return { tier: "noise", isMinifiedContent };
+  }
+
+  if (REVIEW_DIFF_EXTENSIONS.has(lowerExt)) {
+    return { tier: "review", isMinifiedContent: false };
+  }
+
+  if (noiseProbeThreshold > 0 && fileSize > noiseProbeThreshold && probeMinifiedHead(absPath, fileSize)) {
+    return { tier: "noise", isMinifiedContent: true };
+  }
+
+  return { tier: "source", isMinifiedContent: false };
+}
 
 function isUserAttachedFile(filePath, absPath) {
   const normalized = (absPath || filePath || "").replace(/\\/g, "/").toLowerCase();
@@ -311,7 +556,8 @@ export function hasExplicitConversationId(payload = {}, env = process.env) {
   return typeof raw === "string" && raw.trim().length > 0 && raw.trim() !== "default";
 }
 
-const SUBAGENT_ROLE_GUARD_RE = /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier)(?:$|[-_\s/])/i;
+const SUBAGENT_ROLE_GUARD_RE =
+  /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?)(?:$|[-_\s/])/i;
 
 export function isSubagentReadPayload(payload = {}, env = process.env) {
   if (env?.ANTIGRAVITY_PARENT_CONVERSATION_ID) return true;
@@ -319,11 +565,19 @@ export function isSubagentReadPayload(payload = {}, env = process.env) {
   if (envSub === "1" || envSub === "true") return true;
   if (!payload || typeof payload !== "object") return false;
   if (payload.subagent === true || payload.isSubagent === true || payload.is_subagent === true) return true;
+  if (
+    (typeof payload.subagentId === "string" && payload.subagentId.trim()) ||
+    (typeof payload.subagent_id === "string" && payload.subagent_id.trim())
+  ) {
+    return true;
+  }
   if (payload.metadata && typeof payload.metadata === "object") {
     if (
       payload.metadata.subagent === true ||
       payload.metadata.isSubagent === true ||
       payload.metadata.is_subagent === true ||
+      (typeof payload.metadata.subagentId === "string" && payload.metadata.subagentId.trim()) ||
+      (typeof payload.metadata.subagent_id === "string" && payload.metadata.subagent_id.trim()) ||
       payload.metadata.parentConversationId ||
       payload.metadata.parent_conversation_id ||
       payload.metadata.parentSessionId ||
@@ -335,7 +589,12 @@ export function isSubagentReadPayload(payload = {}, env = process.env) {
   if (payload.parentConversationId || payload.parent_conversation_id || payload.parentSessionId || payload.parent_session_id) {
     return true;
   }
-  const rootId = payload.rootConversationId || payload.root_conversation_id || payload.metadata?.rootConversationId || "";
+  const rootId =
+    payload.rootConversationId ||
+    payload.root_conversation_id ||
+    payload.metadata?.rootConversationId ||
+    payload.metadata?.root_conversation_id ||
+    "";
   const convId = payload.conversationId || payload.conversation_id || payload.sessionId || payload.session_id || "";
   if (rootId && convId && rootId !== convId) return true;
   const roleCandidates = [
@@ -350,7 +609,9 @@ export function isSubagentReadPayload(payload = {}, env = process.env) {
     payload.session_kind,
     payload.metadata?.role,
     payload.metadata?.agentRole,
-    payload.metadata?.agent_role
+    payload.metadata?.agent_role,
+    payload.metadata?.agentType,
+    payload.metadata?.agent_type
   ];
   for (const candidate of roleCandidates) {
     if (typeof candidate === "string" && candidate.trim() && SUBAGENT_ROLE_GUARD_RE.test(candidate.trim())) {
@@ -358,6 +619,78 @@ export function isSubagentReadPayload(payload = {}, env = process.env) {
     }
   }
   return false;
+}
+
+export function resolveSubagentId(payload = {}) {
+  return cleanStringArg(
+    payload.subagentId ||
+      payload.subagent_id ||
+      payload.metadata?.subagentId ||
+      payload.metadata?.subagent_id ||
+      ""
+  );
+}
+
+function hash8(val) {
+  return createHash("sha256").update(String(val ?? ""), "utf8").digest("hex").slice(0, 8);
+}
+
+/**
+ * 5-branch isolation matrix for 2-strike confirm keys (both large_read_confirm and sensitive_read_confirm):
+ *   1. Independent explicit conversation -> conv:<directConvId> (120s TTL, refresh on allow)
+ *   2. Shares parent convId + explicit subagentId -> sub:<directConvId>:<subIdHash8> (120s TTL, refresh on allow)
+ *   3. Shares parent convId without subagentId -> sub:<directConvId>:<agentHash8> (30s TTL, do not consume)
+ *   4. Only parent/root convId (no direct convId) -> sub:<sessionId>:<subIdOrAgentHash8> (30s TTL, consume iff subId)
+ *   5. Pure anonymous call -> anon:<cwdHash8> (30s TTL, consume on allow)
+ */
+export function buildConfirmScope({
+  directConvId,
+  sessionId,
+  hasExplicitConvId,
+  subagentSharesParentContext,
+  subagentId,
+  agentName,
+  cwd
+}) {
+  if (hasExplicitConvId && !subagentSharesParentContext) {
+    return {
+      scopeKey: `conv:${directConvId}`,
+      ttlMs: LARGE_READ_CONFIRM_TTL_MS,
+      consumeOnAllow: false,
+      refreshOnAllow: true
+    };
+  }
+  if (hasExplicitConvId && subagentSharesParentContext && subagentId) {
+    return {
+      scopeKey: `sub:${directConvId}:${hash8(subagentId)}`,
+      ttlMs: LARGE_READ_CONFIRM_TTL_MS,
+      consumeOnAllow: false,
+      refreshOnAllow: true
+    };
+  }
+  if (hasExplicitConvId && subagentSharesParentContext) {
+    return {
+      scopeKey: `sub:${directConvId}:${hash8(agentName || "subagent")}`,
+      ttlMs: LARGE_READ_CONFIRM_SHORT_TTL_MS,
+      consumeOnAllow: false,
+      refreshOnAllow: false
+    };
+  }
+  if (sessionId && sessionId !== "default") {
+    const subTag = subagentId ? hash8(subagentId) : hash8(agentName || "subagent");
+    return {
+      scopeKey: `sub:${sessionId}:${subTag}`,
+      ttlMs: LARGE_READ_CONFIRM_SHORT_TTL_MS,
+      consumeOnAllow: Boolean(subagentId),
+      refreshOnAllow: false
+    };
+  }
+  return {
+    scopeKey: `anon:${hash8(cwd || process.cwd())}`,
+    ttlMs: LARGE_READ_CONFIRM_SHORT_TTL_MS,
+    consumeOnAllow: true,
+    refreshOnAllow: false
+  };
 }
 
 export function resolveAgentName(payload = {}) {
@@ -419,48 +752,140 @@ function sha256Text(text) {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-/** Measure exact UTF-8 byte length of 1-based inclusive line range [startLine..endLine] */
+/** Measure UTF-8 byte length of 1-based inclusive line range [startLine..endLine] (bounded <=2 MB streaming for huge files) */
 function measureLineRangeBytes(absPath, startLine, endLine, fileSize, fallbackBytes) {
   if (endLine === null || endLine === undefined) return fallbackBytes;
   const sLine = Math.max(1, Number(startLine) || 1);
   const eLine = Number(endLine);
   if (!Number.isFinite(eLine) || eLine < sLine) return 0;
   try {
-    let buf;
-    if (fileSize > MAX_SLICE_MEASURE_BYTES) {
-      if (sLine > 1) return fallbackBytes;
-      const capLen = Math.min(fileSize, 65536);
-      buf = Buffer.allocUnsafe(capLen);
-      const fd = fs.openSync(absPath, "r");
-      try {
-        const bytesRead = fs.readSync(fd, buf, 0, capLen, 0);
-        buf = buf.subarray(0, bytesRead);
-      } finally {
-        fs.closeSync(fd);
+    if (fileSize <= MAX_SLICE_MEASURE_BYTES) {
+      const buf = fs.readFileSync(absPath);
+      if (buf.length === 0) return 0;
+      let lineNum = 1;
+      let rangeStart = sLine === 1 ? 0 : null;
+      let rangeEnd = buf.length;
+      for (let i = 0; i < buf.length; i++) {
+        if (buf[i] === 0x0a) {
+          if (lineNum === eLine) {
+            rangeEnd = i + 1;
+            break;
+          }
+          lineNum++;
+          if (lineNum === sLine) {
+            rangeStart = i + 1;
+          }
+        }
       }
-    } else {
-      buf = fs.readFileSync(absPath);
+      if (rangeStart === null) return 0;
+      return Math.max(0, rangeEnd - rangeStart);
     }
-    if (buf.length === 0) return 0;
+
+    // Bounded streaming scan (<= 2 MB) eliminates the >2 MB && sLine > 1 blind spot without risking OOM
+    const CHUNK_SIZE = 65536;
+    const chunk = Buffer.allocUnsafe(CHUNK_SIZE);
+    const fd = fs.openSync(absPath, "r");
+    let scannedBytes = 0;
+    let scannedNewlines = 0;
     let lineNum = 1;
     let rangeStart = sLine === 1 ? 0 : null;
-    let rangeEnd = buf.length;
-    for (let i = 0; i < buf.length; i++) {
-      if (buf[i] === 0x0a) {
-        if (lineNum === eLine) {
-          rangeEnd = i + 1;
+    let rangeEnd = null;
+    try {
+      while (scannedBytes < MAX_SLICE_MEASURE_BYTES) {
+        const toRead = Math.min(CHUNK_SIZE, MAX_SLICE_MEASURE_BYTES - scannedBytes);
+        const bytesRead = fs.readSync(fd, chunk, 0, toRead, scannedBytes);
+        if (bytesRead <= 0) break;
+        for (let i = 0; i < bytesRead; i++) {
+          if (chunk[i] === 0x0a) {
+            scannedNewlines++;
+            if (lineNum === eLine) {
+              rangeEnd = scannedBytes + i + 1;
+              break;
+            }
+            lineNum++;
+            if (lineNum === sLine) {
+              rangeStart = scannedBytes + i + 1;
+            }
+          }
+        }
+        scannedBytes += bytesRead;
+        if (rangeEnd !== null) break;
+        if (rangeStart !== null && scannedBytes - rangeStart > 262144) {
+          rangeEnd = scannedBytes;
           break;
         }
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (rangeStart !== null) {
+      return Math.max(0, (rangeEnd !== null ? rangeEnd : scannedBytes) - rangeStart);
+    }
+    if (scannedBytes >= fileSize) {
+      return 0;
+    }
+    const avgLineBytes = scannedBytes / Math.max(1, scannedNewlines + 1);
+    const span = Math.max(1, eLine - sLine + 1);
+    return Math.max(fallbackBytes, Math.min(fileSize, Math.round(avgLineBytes * span)));
+  } catch {
+    return fallbackBytes;
+  }
+}
+
+/** Measure remaining UTF-8 bytes from 1-based startLine to EOF (used for open-ended StartLine continuations) */
+function measureRemainingFromLineBytes(absPath, startLine, fileSize) {
+  const sLine = Math.max(1, Number(startLine) || 1);
+  if (sLine <= 1) return fileSize;
+  if (fileSize > MAX_SLICE_MEASURE_BYTES) return fileSize;
+  try {
+    const buf = fs.readFileSync(absPath);
+    if (buf.length === 0) return 0;
+    let lineNum = 1;
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i] === 0x0a) {
         lineNum++;
         if (lineNum === sLine) {
-          rangeStart = i + 1;
+          return Math.max(0, buf.length - (i + 1));
         }
       }
     }
-    if (rangeStart === null) return 0;
-    return Math.max(0, rangeEnd - rangeStart);
+    return 0;
   } catch {
-    return fallbackBytes;
+    return fileSize;
+  }
+}
+
+/** Count exact lines (<= 2 MB) or estimate lines (> 2 MB) for actionable deny/soft-guard guidance */
+function countFileLinesApprox(absPath, fileSize) {
+  try {
+    if (fileSize <= MAX_SLICE_MEASURE_BYTES) {
+      const buf = fs.readFileSync(absPath);
+      if (buf.length === 0) return { lines: 0, exact: true };
+      let nl = 0;
+      for (let i = 0; i < buf.length; i++) {
+        if (buf[i] === 0x0a) nl++;
+      }
+      const lines = nl + (buf[buf.length - 1] !== 0x0a ? 1 : 0);
+      return { lines, exact: true };
+    }
+    const sampleSize = 65536;
+    const buf = Buffer.allocUnsafe(sampleSize);
+    const fd = fs.openSync(absPath, "r");
+    let bytesRead = 0;
+    try {
+      bytesRead = fs.readSync(fd, buf, 0, sampleSize, 0);
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (bytesRead <= 0) return { lines: 0, exact: false };
+    let nl = 0;
+    for (let i = 0; i < bytesRead; i++) {
+      if (buf[i] === 0x0a) nl++;
+    }
+    const avg = bytesRead / Math.max(1, nl + 1);
+    return { lines: Math.max(1, Math.round(fileSize / avg)), exact: false };
+  } catch {
+    return { lines: 0, exact: false };
   }
 }
 
@@ -865,7 +1290,7 @@ function parseLeadingLooseGitSubcommand(cmd) {
   return null;
 }
 
-function inspectSingleCommandSegment({ commandLine, cwd, sessionId, maxReadBytes, exemptExtensions, sensitiveGuardMode, secMod }) {
+function inspectSingleCommandSegment({ commandLine, cwd, sessionId, shellDumpMaxBytes, sensitiveGuardMode, secMod }) {
   const cleanCmd = cleanStringArg(commandLine);
   if (!cleanCmd) return { shouldDeny: false };
 
@@ -911,15 +1336,6 @@ function inspectSingleCommandSegment({ commandLine, cwd, sessionId, maxReadBytes
     const hasLimiter = /\|\s*(head|Select-Object|select|more)\b/i.test(unquotedNoStderr);
     if (!writesToFile && !hasLimiter) {
       const urlMatch = cleanCmd.match(/https?:\/\/[^\s"']+/i);
-      if (urlMatch) {
-        try {
-          const parsedUrl = new URL(urlMatch[0]);
-          const ext = path.extname(parsedUrl.pathname).toLowerCase();
-          if (ext && exemptExtensions.includes(ext)) {
-            return { shouldDeny: false };
-          }
-        } catch {}
-      }
       return {
         shouldDeny: true,
         reason:
@@ -993,18 +1409,20 @@ function inspectSingleCommandSegment({ commandLine, cwd, sessionId, maxReadBytes
       try {
         if (fs.existsSync(absPath)) {
           checked = true;
-          if (isAgentInstructionFile(rawTarget, absPath)) continue;
-          const ext = path.extname(absPath).toLowerCase();
-          if (ext && exemptExtensions.includes(ext)) continue;
+          let realAbsPath = absPath;
+          try {
+            realAbsPath = fs.realpathSync(absPath);
+          } catch {}
+          if (isAgentInstructionFile(rawTarget, absPath) && isAgentInstructionFile(realAbsPath, realAbsPath)) continue;
           const stat = fs.statSync(absPath);
           cumulativeNonExemptBytes += stat.size;
-          if (maxReadBytes > 0 && (stat.size > maxReadBytes || cumulativeNonExemptBytes > maxReadBytes)) {
+          if (shellDumpMaxBytes > 0 && (stat.size > shellDumpMaxBytes || cumulativeNonExemptBytes > shellDumpMaxBytes)) {
             const reportSize = Math.max(stat.size, cumulativeNonExemptBytes);
             return {
               shouldDeny: true,
               reason:
                 `[agy-dart protection] Command attempts an un-paged dump of '${cleanTarget}' (${formatBytes(reportSize)}), ` +
-                `exceeding the ${formatBytes(maxReadBytes)} context limit. ` +
+                `exceeding the ${formatBytes(shellDumpMaxBytes)} shell dump limit. ` +
                 `Use call_mcp_tool(ServerName:"${CTX_SERVER}", ToolName:"ctx_execute") or append '| Select-Object -First 50' / '-Head 50'.`,
               size: reportSize,
               targetPath: cleanTarget
@@ -1173,7 +1591,7 @@ function extractNestedShellCommands(seg) {
   return nested;
 }
 
-function inspectCommandRecursive({ commandLine, cwd, sessionId, maxReadBytes, exemptExtensions, effSensMode, secMod, depth }) {
+function inspectCommandRecursive({ commandLine, cwd, sessionId, shellDumpMaxBytes, effSensMode, secMod, depth }) {
   if (!commandLine || typeof commandLine !== "string" || depth > 3) {
     return { shouldDeny: false };
   }
@@ -1198,8 +1616,7 @@ function inspectCommandRecursive({ commandLine, cwd, sessionId, maxReadBytes, ex
       commandLine: seg,
       cwd: activeCwd,
       sessionId,
-      maxReadBytes,
-      exemptExtensions,
+      shellDumpMaxBytes,
       sensitiveGuardMode: effSensMode,
       secMod
     });
@@ -1212,8 +1629,7 @@ function inspectCommandRecursive({ commandLine, cwd, sessionId, maxReadBytes, ex
           commandLine: nestedCmd,
           cwd: activeCwd,
           sessionId,
-          maxReadBytes,
-          exemptExtensions,
+          shellDumpMaxBytes,
           effSensMode,
           secMod,
           depth: depth + 1
@@ -1231,8 +1647,7 @@ export function inspectCommand({ commandLine, cwd, sessionId, sensitiveGuardMode
     return { shouldDeny: false };
   }
 
-  const maxReadBytes = getMaxReadBytes(sessionId);
-  const exemptExtensions = getExemptExtensions(sessionId);
+  const shellDumpMaxBytes = getShellDumpMaxBytes();
   const effSensMode = sensitiveGuardMode || getEffectiveConfig().sensitiveFileGuard || "off";
   const secMod = effSensMode === "deny" ? securityModule : null;
 
@@ -1240,8 +1655,7 @@ export function inspectCommand({ commandLine, cwd, sessionId, sensitiveGuardMode
     commandLine,
     cwd,
     sessionId,
-    maxReadBytes,
-    exemptExtensions,
+    shellDumpMaxBytes,
     effSensMode,
     secMod,
     depth: 0
@@ -1274,8 +1688,10 @@ async function main() {
   const sessionId = resolveSharedSessionId(payload);
   const directConvId = resolveDirectConversationId(payload);
   const isSubagentCall = isSubagentReadPayload(payload);
+  const subagentId = resolveSubagentId(payload);
   const agentName = resolveAgentName(payload);
-  const effectiveCfg = getEffectiveConfig();
+  const cfgSnapshot = getConfigSnapshot();
+  const effectiveCfg = cfgSnapshot.values;
 
   // 0-SQLite fast path: bypass DB & heavy module loading entirely for unconditionally allowed tools/files
   if (toolName !== "read_file" && toolName !== "view_file" && toolName !== "run_command") {
@@ -1320,15 +1736,29 @@ async function main() {
     return finishAllow();
   }
 
-  // 1. Guard read_file / view_file (unless disabled via env for ultra-low-latency mode B)
+  // 1. Guard read_file / view_file (unless disabled via env/config for ultra-low-latency mode B)
   if (preParsedRead) {
     const { filePath, absPath, ext } = preParsedRead;
     const rawStartLine = parseLineArg(args.StartLine ?? args.startLine ?? args.start_line);
     const startLine = rawStartLine !== null && rawStartLine >= 1 ? rawStartLine : 1;
     const rawEndLine = parseLineArg(args.EndLine ?? args.endLine ?? args.end_line);
     const endLine = rawEndLine !== null && rawEndLine > 0 ? rawEndLine : null;
+    const byteOffset = Math.max(0, parseLineArg(args.ByteOffset ?? args.byteOffset ?? args.byte_offset) ?? 0);
     const maxReadBytes = getMaxReadBytes(sessionId);
-    const maxLineRange = getMaxLineRange(maxReadBytes);
+    const readGuardMode = effectiveCfg.readGuardMode || "soft";
+    const normKey = process.platform === "win32" ? absPath.toLowerCase() : absPath;
+
+    const hasExplicitConvId = hasExplicitConversationId(payload);
+    const subagentSharesParentContext = isSubagentCall && directConvId === sessionId;
+    const confirmScope = buildConfirmScope({
+      directConvId,
+      sessionId,
+      hasExplicitConvId,
+      subagentSharesParentContext,
+      subagentId,
+      agentName,
+      cwd
+    });
 
     try {
       if (fs.existsSync(absPath)) {
@@ -1343,7 +1773,7 @@ async function main() {
           ino: String(rawStat.ino)
         };
 
-        // Optional sensitive credential file read guard (opt-in via config/AGY_DART_SENSITIVE_FILE_GUARD=warn|deny)
+        // Optional sensitive credential file read guard (ALWAYS runs BEFORE Tier 0, exemptions & size guard)
         const rawSensMode = effectiveCfg.sensitiveFileGuard || "off";
         if (rawSensMode === "warn" || rawSensMode === "deny") {
           const sec = await ensureSecurityModule();
@@ -1358,8 +1788,7 @@ async function main() {
               realAbsPath !== absPath ? sec.detectSensitiveFile(realAbsPath) : { sensitive: false, reason: null };
             const sens = sensDirect.sensitive ? sensDirect : sensReal;
             if (sens.sensitive) {
-              const normKey = process.platform === "win32" ? absPath.toLowerCase() : absPath;
-              const confirmKey = `sensitive_read_confirm:${sessionId}:${normKey}`;
+              const confirmKey = `sensitive_read_confirm:${confirmScope.scopeKey}:${normKey}`;
               if (guardMode === "deny") {
                 const reason =
                   `[agy-dart sensitive-file] Reading '${filePath}' (${sens.reason}) is blocked by AGY_DART_SENSITIVE_FILE_GUARD=deny to keep raw secrets out of LLM context.`;
@@ -1377,7 +1806,11 @@ async function main() {
                 process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
                 process.exit(0);
               }
-              const confirmed = getSharedStore().getTimedMeta(confirmKey, "");
+              const sensTtlMs =
+                confirmScope.ttlMs === LARGE_READ_CONFIRM_TTL_MS
+                  ? SENSITIVE_READ_CONFIRM_TTL_MS
+                  : SENSITIVE_READ_CONFIRM_SHORT_TTL_MS;
+              const confirmed = getSharedStore().getTimedMeta(confirmKey, "", sensTtlMs);
               if (!confirmed) {
                 getSharedStore().setTimedMeta(confirmKey, "1");
                 const reason =
@@ -1395,11 +1828,16 @@ async function main() {
                 closeSharedStore();
                 process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
                 process.exit(0);
+              } else if (confirmScope.consumeOnAllow) {
+                try {
+                  getSharedStore().deleteMeta(confirmKey);
+                } catch {}
               }
             }
           }
         }
 
+        // Tier 0: unconditional allow (attachments, instruction files, binary files)
         if (
           isUserAttachedFile(preParsedRead.rawFilePath, absPath) ||
           isAgentInstructionFile(preParsedRead.rawFilePath, absPath) ||
@@ -1408,64 +1846,12 @@ async function main() {
           return finishAllow();
         }
 
-        const exemptExtensions = getExemptExtensions(sessionId);
-        const isExemptExt = exemptExtensions.includes(ext);
         const isBinary = isBinaryFile(absPath, ext);
-
-        if (isExemptExt || isBinary) {
+        if (isBinary) {
           return finishAllow();
         }
 
-        const isLargeFile = maxReadBytes > 0 && stat.size > maxReadBytes;
-        const isWideRange = maxLineRange > 0 && (endLine === null || (endLine - startLine) > maxLineRange);
-        const requestedLineSpan = endLine !== null ? Math.max(1, endLine - startLine + 1) : 1;
-        const maxPagedSliceBytes = Math.max(maxReadBytes * 2, 36864);
-        const slicedRangeBytes =
-          isLargeFile && !isWideRange && endLine !== null
-            ? measureLineRangeBytes(absPath, startLine, endLine, stat.size, 0)
-            : 0;
-        const isMinifiedDenseSlice =
-          slicedRangeBytes > maxReadBytes && slicedRangeBytes / requestedLineSpan > 512;
-        const isOversizedNarrowSlice =
-          maxReadBytes > 0 && (isMinifiedDenseSlice || slicedRangeBytes > maxPagedSliceBytes);
-
-        if (isLargeFile && (isWideRange || isOversizedNarrowSlice)) {
-          const lineInstruction =
-            maxLineRange > 0 && !isOversizedNarrowSlice
-              ? ` or outline via ${FAST_SERVER} read_slices({ outlines }) then pass StartLine/EndLine (<= ${maxLineRange} lines).`
-              : ".";
-          const reportedBytes = isOversizedNarrowSlice ? slicedRangeBytes : stat.size;
-          const reason =
-            `[agy-dart protection] File${isOversizedNarrowSlice ? " slice" : ""} is ${formatBytes(reportedBytes)} (~${Math.round(reportedBytes / 4).toLocaleString()} tokens), exceeding the ${formatBytes(maxReadBytes)} context limit. ` +
-            `Reading ${isOversizedNarrowSlice ? "giant single-line/minified content" : "the entire file"} risks severe context bloat. ` +
-            `For logs/docs/data use call_mcp_tool(ServerName:"${CTX_SERVER}", ToolName:"ctx_index" or "ctx_execute", path:"${filePath}")${lineInstruction}`;
-
-          recordInterception({
-            sessionId,
-            agent: agentName,
-            cwd,
-            toolName,
-            path: filePath,
-            size: stat.size,
-            reason
-          });
-
-          try {
-            getSharedStore().recordGhostInterception({
-              sessionId,
-              filePath: absPath,
-              fileSize: stat.size,
-              cutoffBytes: maxReadBytes
-            });
-          } catch {}
-
-          closeSharedStore();
-          process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
-          process.exit(0);
-        }
-
-        // 1b. Three-State Session File Read Cache: Full -> Unchanged Dedup -> Compact Unified Diff on Modified
-        const byteOffset = parseLineArg(args.ByteOffset ?? args.byteOffset) ?? 0;
+        // Prepare Three-State Read Cache state upfront so cache hits run BEFORE Section 1a (eliminates 3-strike trap!)
         const estBytes =
           endLine !== null
             ? Math.min(stat.size, Math.max(MIN_DEDUP_FILE_BYTES, Math.max(1, endLine - startLine + 1) * 45))
@@ -1475,8 +1861,6 @@ async function main() {
           dedupEnabled = getSharedStore().isReadDedupEnabled(sessionId);
         } catch {}
 
-        const hasExplicitConvId = hasExplicitConversationId(payload);
-        const subagentSharesParentContext = isSubagentCall && directConvId === sessionId;
         const canUseReadCache = dedupEnabled && hasExplicitConvId && !subagentSharesParentContext;
         const diffReadEnabled =
           canUseReadCache &&
@@ -1496,13 +1880,35 @@ async function main() {
             ? Math.floor(Number(rawStepIdx))
             : null;
 
+        let readBounds = null;
+        let effectiveEndLine = endLine;
+        let convTurnSeq = 0;
+        let currentRangeText = null;
+        let currentSha256 = null;
+        let currentRangeBytes = 0;
+        let skipSizeGuardDueToCacheBypass = false;
+
+        const loadCurrentRange = async () => {
+          if (currentRangeText !== null) return true;
+          const rawDisk = readUtf8TextSafe(absPath);
+          if (rawDisk === null) return false;
+          const { extractLineSlice } = await ensureTextDiffModule();
+          currentRangeText = extractLineSlice(rawDisk, startLine, effectiveEndLine, 1);
+          const sliceBytes = Buffer.byteLength(currentRangeText, "utf8");
+          currentRangeBytes =
+            effectiveEndLine === null && startLine === 1 ? Math.max(sliceBytes, stat.size) : sliceBytes;
+          currentSha256 = sha256Text(currentRangeText);
+          return true;
+        };
+
+        // Pre-1a Read Cache Priority Check (State 2 unchanged dedup / State 3 diff-read / armed bypass)
         if (canUseReadCache && stat.size >= MIN_DEDUP_FILE_BYTES && byteOffset <= 0) {
-          const readBounds = computeEffectiveReadBounds(absPath, startLine, endLine, stat.size);
-          const effectiveEndLine = readBounds.effectiveEndLine;
+          readBounds = computeEffectiveReadBounds(absPath, startLine, endLine, stat.size);
+          effectiveEndLine = readBounds.effectiveEndLine;
           if (!readBounds.skipCache) {
             try {
               const store = getSharedStore();
-              const convTurnSeq = diffReadEnabled ? store.getConversationTurnSeq(directConvId) : 0;
+              convTurnSeq = diffReadEnabled ? store.getConversationTurnSeq(directConvId) : 0;
               const dup = store.findDuplicateRead({
                 sessionId: directConvId,
                 filePath: absPath,
@@ -1516,7 +1922,6 @@ async function main() {
                 maxStepGap: readDedupMaxSteps
               });
 
-              // State 2 (Unchanged covering read): 2-strike bypass
               if (dup && Number(dup.bypass_armed) === 0) {
                 store.armReadBypass({
                   sessionId: directConvId,
@@ -1546,27 +1951,9 @@ async function main() {
                 process.exit(0);
               }
 
-              let currentRangeText = null;
-              let currentSha256 = null;
-              let currentRangeBytes = 0;
-
-              const loadCurrentRange = async () => {
-                if (currentRangeText !== null) return true;
-                const rawDisk = readUtf8TextSafe(absPath);
-                if (rawDisk === null) return false;
-                const { extractLineSlice } = await ensureTextDiffModule();
-                currentRangeText = extractLineSlice(rawDisk, startLine, effectiveEndLine, 1);
-                const sliceBytes = Buffer.byteLength(currentRangeText, "utf8");
-                currentRangeBytes =
-                  effectiveEndLine === null && startLine === 1 ? Math.max(sliceBytes, stat.size) : sliceBytes;
-                currentSha256 = sha256Text(currentRangeText);
-                return true;
-              };
-
-              // State 3 (Modified file previously snapshotted in the SAME direct conversation within recent N turns & age)
-              // Omit `ino` filter here so atomic-rename edits (apply_edits, git checkout, prettier) still hit the baseline;
-              // MAX_DIFF_READ_RATIO (0.4) already guards against unrelated file replacement.
-              if (!dup && diffReadEnabled) {
+              if (dup && Number(dup.bypass_armed) === 1) {
+                skipSizeGuardDueToCacheBypass = true;
+              } else if (!dup && diffReadEnabled) {
                 const snapshot = store.findFileSnapshot({
                   sessionId: directConvId,
                   filePath: absPath,
@@ -1579,24 +1966,22 @@ async function main() {
                 const baselineFullTs = snapshot ? Number(snapshot.full_read_ts || snapshot.updated_ts || 0) : 0;
                 const baselineFullSeq = snapshot ? Number(snapshot.full_read_seq || 0) : 0;
                 const bypassArmed = Boolean(snapshot && Number(snapshot.bypass_armed) === 1);
-                const ageFresh = !snapshot || (diffReadMaxAgeMs <= 0) || (Date.now() - baselineFullTs <= diffReadMaxAgeMs);
+                const ageFresh = !snapshot || diffReadMaxAgeMs <= 0 || Date.now() - baselineFullTs <= diffReadMaxAgeMs;
                 const turnsFresh =
                   !snapshot ||
                   diffReadMaxTurns <= 0 ||
                   convTurnSeq - Math.max(0, baselineFullSeq) <= diffReadMaxTurns;
 
-                // Never chain a second diff when bypass_armed === 1 (a prior diff was already delivered
-                // without a subsequent full verbatim read): fall through to full-file allow and re-anchor baseline.
-                if (snapshot && !bypassArmed && ageFresh && turnsFresh && (await loadCurrentRange())) {
+                if (snapshot && bypassArmed) {
+                  skipSizeGuardDueToCacheBypass = true;
+                } else if (snapshot && !bypassArmed && ageFresh && turnsFresh && (await loadCurrentRange())) {
                   const { computeUnifiedDiff, extractLineSlice } = await ensureTextDiffModule();
                   const baselineText = snapshot.isExactRange
                     ? snapshot.content
                     : extractLineSlice(snapshot.content, startLine, effectiveEndLine, snapshot.start_line);
                   const baselineSha256 = snapshot.isExactRange ? snapshot.sha256 : sha256Text(baselineText);
 
-                  if (currentSha256 === baselineSha256) {
-                    // PostToolUse edit invalidation with unchanged disk bytes (v1.1 compatibility) -> allow full verbatim.
-                  } else if (currentRangeBytes >= MIN_DIFF_READ_BYTES) {
+                  if (currentSha256 !== baselineSha256 && currentRangeBytes >= MIN_DIFF_READ_BYTES) {
                     const diff = computeUnifiedDiff(baselineText, currentRangeText, {
                       fileLabel: path.basename(filePath),
                       startLine,
@@ -1655,9 +2040,284 @@ async function main() {
                   }
                 }
               }
+            } catch {
+              // Fail-open on DB/diff errors
+            }
+          }
+        }
 
-              // State 1 (First read) / Strike 2 bypass / stale baseline / large rewrite fallback:
-              // Record this allowed read (resets bypass_armed = 0) and save compressed snapshot baseline anchored to this full read.
+        // Section 1a: Tiered File Size Guard (exemptExtensions / exemptPaths / readGuardMode=off ONLY skip 1a, NEVER 1b readDedup!)
+        let realAbsForGuard = absPath;
+        try {
+          realAbsForGuard = fs.realpathSync(absPath);
+        } catch {}
+        const realExtForGuard = realAbsForGuard !== absPath ? path.extname(realAbsForGuard).toLowerCase() : ext;
+        const exemptExtensions = getExemptExtensions(sessionId);
+        const isExemptExt =
+          Boolean(ext && exemptExtensions.includes(ext)) &&
+          (realAbsForGuard === absPath || Boolean(realExtForGuard && exemptExtensions.includes(realExtForGuard)));
+        let isExemptPath = matchesAnyExemptPath(absPath, cwd, effectiveCfg.exemptPaths);
+        if (isExemptPath && realAbsForGuard !== absPath) {
+          let realCwdForExempt = cwd;
+          try {
+            realCwdForExempt = fs.realpathSync(cwd);
+          } catch {}
+          if (!matchesAnyExemptPath(realAbsForGuard, realCwdForExempt, effectiveCfg.exemptPaths)) {
+            isExemptPath = false;
+          }
+        }
+        const isReadSizeExempt = isExemptExt || isExemptPath;
+
+        if (!skipSizeGuardDueToCacheBypass && !isReadSizeExempt && readGuardMode !== "off" && maxReadBytes > 0) {
+          const cfgNoiseMax = Number(effectiveCfg.noiseMaxReadBytes ?? DEFAULT_NOISE_MAX_READ_BYTES);
+          const cfgReviewMax = Number(effectiveCfg.reviewMaxReadBytes ?? DEFAULT_REVIEW_MAX_READ_BYTES);
+          const noiseIsExplicit = cfgSnapshot.sources.noiseMaxReadBytes !== "default";
+          const reviewIsExplicit = cfgSnapshot.sources.reviewMaxReadBytes !== "default";
+          const noiseProbeThreshold = noiseIsExplicit
+            ? cfgNoiseMax
+            : cfgNoiseMax === 0
+              ? 0
+              : Math.min(maxReadBytes, cfgNoiseMax);
+
+          const { tier, isMinifiedContent } = classifyFileTier(absPath, ext, stat.size, noiseProbeThreshold);
+          let tierCutoffBytes;
+          if (tier === "noise") {
+            tierCutoffBytes = noiseIsExplicit
+              ? cfgNoiseMax
+              : cfgNoiseMax === 0
+                ? 0
+                : Math.min(maxReadBytes, cfgNoiseMax);
+          } else if (tier === "review") {
+            tierCutoffBytes = reviewIsExplicit
+              ? cfgReviewMax
+              : cfgReviewMax === 0
+                ? 0
+                : Math.max(maxReadBytes, cfgReviewMax);
+          } else {
+            tierCutoffBytes = maxReadBytes;
+          }
+
+          if (tierCutoffBytes > 0) {
+            const tierMaxLineRange = getMaxLineRange(tierCutoffBytes);
+            const fullConfirmKey = `large_read_confirm:${confirmScope.scopeKey}:${normKey}:full`;
+            const fileSig = `${Math.round(stat.mtimeMs)}:${stat.size}`;
+
+            let priorReadSummary = null;
+            let hasPriorFullConfirm = false;
+            const loadPriorReadSummary = () => {
+              if (priorReadSummary !== null) return priorReadSummary;
+              try {
+                if (hasExplicitConvId) {
+                  priorReadSummary = getSharedStore().getPriorReadSummary(directConvId, absPath);
+                  return priorReadSummary;
+                }
+              } catch {}
+              priorReadSummary = { hasPrior: false, hasFullOrLargeRead: false, maxEndLine: 0 };
+              return priorReadSummary;
+            };
+            const checkPriorFullConfirmOnly = () => {
+              if (hasPriorFullConfirm) return true;
+              try {
+                const st = getSharedStore();
+                const priorFull = st.getTimedMeta(fullConfirmKey, "", confirmScope.ttlMs);
+                if (priorFull === fileSig) {
+                  hasPriorFullConfirm = true;
+                  return true;
+                }
+              } catch {}
+              return false;
+            };
+            const checkPriorByteContinuation = () => {
+              if (checkPriorFullConfirmOnly()) return true;
+              return loadPriorReadSummary().hasFullOrLargeRead;
+            };
+            const checkPriorLineContinuation = (reqStartLine) => {
+              if (checkPriorFullConfirmOnly()) return true;
+              const summary = loadPriorReadSummary();
+              if (!summary.hasFullOrLargeRead) return false;
+              return summary.maxEndLine === -1 || (summary.maxEndLine >= 50 && reqStartLine >= summary.maxEndLine);
+            };
+
+            const remainingBytes = Math.max(0, stat.size - byteOffset);
+            let isContinuationAllow = false;
+            if (byteOffset > 0) {
+              if (remainingBytes <= tierCutoffBytes) {
+                isContinuationAllow = true;
+              } else if (readGuardMode !== "strict" && byteOffset >= HOST_READ_MAX_BYTES) {
+                if (tier !== "noise" && checkPriorByteContinuation()) {
+                  isContinuationAllow = true;
+                } else if (tier === "noise" && checkPriorFullConfirmOnly()) {
+                  isContinuationAllow = true;
+                }
+              }
+            } else if (startLine > 1 && endLine === null && !isMinifiedContent) {
+              const remainingFromStart = measureRemainingFromLineBytes(absPath, startLine, stat.size);
+              if (remainingFromStart <= tierCutoffBytes) {
+                isContinuationAllow = true;
+              } else if (readGuardMode !== "strict" && tier !== "noise" && checkPriorLineContinuation(startLine)) {
+                isContinuationAllow = true;
+              }
+            }
+            if (isContinuationAllow && hasPriorFullConfirm && confirmScope.refreshOnAllow) {
+              try {
+                getSharedStore().setTimedMeta(fullConfirmKey, fileSig);
+              } catch {}
+            }
+
+            if (!isContinuationAllow) {
+              const isLargeFile = remainingBytes > tierCutoffBytes;
+              const isWideRange = tierMaxLineRange > 0 && (endLine === null || endLine - startLine > tierMaxLineRange);
+              const requestedLineSpan = endLine !== null ? Math.max(1, endLine - startLine + 1) : 1;
+              const maxPagedSliceBytes = Math.max(HOST_READ_MAX_BYTES, tierCutoffBytes * 2);
+              const slicedRangeBytes =
+                isLargeFile && !isWideRange && endLine !== null
+                  ? measureLineRangeBytes(absPath, startLine, endLine, stat.size, 0)
+                  : 0;
+              const avgSliceLineBytes = slicedRangeBytes / requestedLineSpan;
+              const isMinifiedDenseSlice =
+                slicedRangeBytes > tierCutoffBytes && avgSliceLineBytes > 512;
+              const isOversizedMultiLineSlice =
+                !isMinifiedDenseSlice && slicedRangeBytes > maxPagedSliceBytes;
+
+              if (isLargeFile && (isWideRange || isMinifiedDenseSlice || isOversizedMultiLineSlice)) {
+                const isHardDeny =
+                  readGuardMode === "strict" ||
+                  (!isSubagentCall && (tier === "noise" || isMinifiedDenseSlice));
+
+                const modeSig = isMinifiedDenseSlice
+                  ? "dense"
+                  : endLine !== null
+                    ? `slice:${startLine}:${endLine}`
+                    : "full";
+                const confirmKey = `large_read_confirm:${confirmScope.scopeKey}:${normKey}:${modeSig}`;
+
+                let softBypassAllowed = false;
+                if (!isHardDeny) {
+                  try {
+                    const st = getSharedStore();
+                    const prevSig = st.getTimedMeta(confirmKey, "", confirmScope.ttlMs);
+                    if (prevSig === fileSig) {
+                      softBypassAllowed = true;
+                      if (confirmScope.consumeOnAllow) {
+                        st.deleteMeta(confirmKey);
+                      } else if (confirmScope.refreshOnAllow) {
+                        st.setTimedMeta(confirmKey, fileSig);
+                      }
+                    }
+                  } catch {}
+                }
+
+                if (!softBypassAllowed) {
+                  if (!isHardDeny) {
+                    try {
+                      getSharedStore().setTimedMeta(confirmKey, fileSig);
+                    } catch {}
+                  }
+
+                  const lineInfo = countFileLinesApprox(absPath, stat.size);
+                  const lineMeta =
+                    lineInfo.lines > 0
+                      ? `, ${lineInfo.exact ? "" : "~"}${lineInfo.lines.toLocaleString()} lines`
+                      : "";
+                  const reportedBytes =
+                    isMinifiedDenseSlice || isOversizedMultiLineSlice ? slicedRangeBytes : remainingBytes;
+                  const softRetryHint = !isHardDeny
+                    ? ` Or call ${toolName} once more to proceed (host caps each read at 45 KiB / ${HOST_READ_MAX_LINES} lines).`
+                    : "";
+
+                  let reason;
+                  if (isMinifiedDenseSlice) {
+                    reason =
+                      `[agy-dart protection] File slice is ${formatBytes(reportedBytes)} (~${Math.round(reportedBytes / 4).toLocaleString()} tokens), exceeding the ${formatBytes(tierCutoffBytes)} context limit. ` +
+                      `Reading giant single-line/minified content risks severe context bloat. ` +
+                      (isSubagentCall
+                        ? `Prefer inspecting specific offsets or narrow ranges.${softRetryHint}`
+                        : `For logs/docs/data use call_mcp_tool(ServerName:"${CTX_SERVER}", ToolName:"ctx_index" or "ctx_execute", path:"${filePath}").${softRetryHint}`);
+                  } else if (isOversizedMultiLineSlice) {
+                    const suggestedLines = Math.max(
+                      20,
+                      Math.min(tierMaxLineRange, Math.floor(maxPagedSliceBytes / Math.max(1, avgSliceLineBytes)))
+                    );
+                    reason =
+                      `[agy-dart protection] File slice (${requestedLineSpan} lines, ~${Math.round(avgSliceLineBytes)} B/line) is ${formatBytes(reportedBytes)} (~${Math.round(reportedBytes / 4).toLocaleString()} tokens), exceeding the ${formatBytes(maxPagedSliceBytes)} paged slice cap. ` +
+                      `Pass a smaller StartLine/EndLine window (<= ${suggestedLines} lines)${
+                        isSubagentCall
+                          ? `.${softRetryHint}`
+                          : `, or use call_mcp_tool(ServerName:"${CTX_SERVER}", ToolName:"ctx_index" or "ctx_execute", path:"${filePath}").${softRetryHint}`
+                      }`;
+                  } else if (tier === "review") {
+                    const lineRangeHint =
+                      tierMaxLineRange > 0 ? `StartLine/EndLine (<= ${tierMaxLineRange} lines)` : "StartLine/EndLine";
+                    reason =
+                      `[agy-dart protection] Diff/patch file is ${formatBytes(reportedBytes)} (~${Math.round(reportedBytes / 4).toLocaleString()} tokens${lineMeta}), exceeding the ${formatBytes(tierCutoffBytes)} review limit. ` +
+                      (isSubagentCall
+                        ? `Use ${lineRangeHint} to inspect specific hunks.${softRetryHint}`
+                        : `Outline changed files & hunks via ${FAST_SERVER} read_slices({ outlines: ["${filePath}"] }) then read targeted ${lineRangeHint}.${softRetryHint}`);
+                  } else if (isSubagentCall) {
+                    const lineRangeHint =
+                      tierMaxLineRange > 0 ? `StartLine/EndLine (<= ${tierMaxLineRange} lines)` : "StartLine/EndLine";
+                    reason =
+                      `[agy-dart protection] File is ${formatBytes(reportedBytes)} (~${Math.round(reportedBytes / 4).toLocaleString()} tokens${lineMeta}), exceeding the ${formatBytes(tierCutoffBytes)} context limit. ` +
+                      `Use native ${toolName} with ${lineRangeHint} to read relevant sections (or ${FAST_SERVER} read_slices if available).${softRetryHint}`;
+                  } else {
+                    const lineInstruction =
+                      tierMaxLineRange > 0
+                        ? ` or outline via ${FAST_SERVER} read_slices({ outlines }) then pass StartLine/EndLine (<= ${tierMaxLineRange} lines).`
+                        : ".";
+                    reason =
+                      `[agy-dart protection] File is ${formatBytes(reportedBytes)} (~${Math.round(reportedBytes / 4).toLocaleString()} tokens${lineMeta}), exceeding the ${formatBytes(tierCutoffBytes)} context limit. ` +
+                      `Reading the entire file risks severe context bloat. ` +
+                      `For logs/docs/data use call_mcp_tool(ServerName:"${CTX_SERVER}", ToolName:"ctx_index" or "ctx_execute", path:"${filePath}")${lineInstruction}${softRetryHint}`;
+                  }
+
+                  recordInterception({
+                    sessionId,
+                    agent: agentName,
+                    cwd,
+                    toolName,
+                    path: filePath,
+                    size: stat.size,
+                    reason
+                  });
+
+                  try {
+                    getSharedStore().recordGhostInterception({
+                      sessionId,
+                      filePath: absPath,
+                      fileSize: stat.size,
+                      cutoffBytes: tierCutoffBytes
+                    });
+                  } catch {}
+
+                  closeSharedStore();
+                  process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
+                  process.exit(0);
+                }
+              } else if (
+                byteOffset === 0 &&
+                endLine !== null &&
+                isLargeFile &&
+                (confirmScope.refreshOnAllow || confirmScope.consumeOnAllow)
+              ) {
+                // Agent obeyed Strike 1 with a compliant narrow slice: clear any stale :full confirm token
+                try {
+                  getSharedStore().deleteMeta(fullConfirmKey);
+                } catch {}
+              }
+            }
+          }
+        }
+
+        // 1b. State 1 (First read) / Strike 2 bypass / stale baseline / large rewrite fallback:
+        // Record this allowed read (resets bypass_armed = 0) and save compressed snapshot baseline anchored to this full read.
+        if (canUseReadCache && stat.size >= MIN_DEDUP_FILE_BYTES && byteOffset <= 0) {
+          if (!readBounds) {
+            readBounds = computeEffectiveReadBounds(absPath, startLine, endLine, stat.size);
+            effectiveEndLine = readBounds.effectiveEndLine;
+          }
+          if (!readBounds.skipCache) {
+            try {
+              const store = getSharedStore();
               store.recordFileRead({
                 sessionId: directConvId,
                 filePath: absPath,
@@ -1667,7 +2327,7 @@ async function main() {
                 fileSize: stat.size,
                 ctimeMs: stat.ctimeMs,
                 ino: stat.ino,
-                byteEst: estBytes,
+                byteEst: readBounds.hostTruncated ? Math.max(estBytes, HOST_READ_MAX_BYTES) : estBytes,
                 stepIdx: currentStepIdx
               });
 

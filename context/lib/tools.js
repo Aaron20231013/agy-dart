@@ -961,6 +961,7 @@ export function createTools({
           rejected: diag.rejected
         };
       } catch {}
+      const cutoffInfo = store.getCutoffInfo(getSessionId());
       const out = {
         doctor: doc,
         features: {
@@ -969,7 +970,19 @@ export function createTools({
           diffReadEnabled: cfgSnap.values.diffRead,
           headingAwareMarkdownChunking: true,
           secretRedactionEnabled: isSecretRedactionEnabled(),
-          sensitiveFileGuardMode: getSensitiveFileGuardMode()
+          sensitiveFileGuardMode: getSensitiveFileGuardMode(),
+          readGuardMode: cfgSnap.values.readGuardMode
+        },
+        readGuard: {
+          mode: cfgSnap.values.readGuardMode,
+          modeSource: cfgSnap.sources.readGuardMode,
+          sourceCutoffBytes: cutoffInfo.cutoffBytes,
+          sourceCutoffSource: cutoffInfo.source,
+          noiseMaxReadBytes: cfgSnap.values.noiseMaxReadBytes,
+          reviewMaxReadBytes: cfgSnap.values.reviewMaxReadBytes,
+          shellDumpMaxBytes: cfgSnap.values.shellDumpMaxBytes,
+          exemptPathsCount: Array.isArray(cfgSnap.values.exemptPaths) ? cfgSnap.values.exemptPaths.length : 0,
+          exemptExtensionsCount: Array.isArray(cfgSnap.values.exemptExtensions) ? cfgSnap.values.exemptExtensions.length : 0
         },
         config: {
           path: cfgSnap.configPath,

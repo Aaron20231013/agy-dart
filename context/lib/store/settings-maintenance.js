@@ -1,7 +1,8 @@
 import fs from "node:fs";
-import { getEffectiveConfig } from "../config.js";
+import { getConfigSnapshot, getEffectiveConfig } from "../config.js";
 import {
   DEFAULT_ACTIVE_CATEGORIES,
+  DEFAULT_CUTOFF_BYTES,
   DEFAULT_EXEMPT_EXTENSIONS,
   FILE_CATEGORIES
 } from "./schema.js";
@@ -284,6 +285,7 @@ export class SettingsMaintenanceMethods {
           DELETE FROM outline_cache;
           DELETE FROM ghost_interceptions;
           DELETE FROM session_checkpoints;
+          DELETE FROM meta WHERE key LIKE 'large_read_confirm:%' OR key LIKE 'sensitive_read_confirm:%';
         `);
       });
       try {
@@ -345,7 +347,7 @@ export class SettingsMaintenanceMethods {
       return { ok: true, purged: "worktree", worktree };
     }
 
-    if (scope === "session") {
+    if (scope === "session" || scope === "conversation") {
       const sid = sessionId || "default";
       this._withWriteTx(() => {
         this.db.prepare("DELETE FROM chunks WHERE session_id = ?").run(sid);
@@ -356,6 +358,18 @@ export class SettingsMaintenanceMethods {
         this.db.prepare("DELETE FROM file_snapshots WHERE session_id = ?").run(sid);
         this.db.prepare("DELETE FROM ghost_interceptions WHERE session_id = ?").run(sid);
         this.db.prepare("DELETE FROM session_checkpoints WHERE session_id = ?").run(sid);
+        const escSid = String(sid).replace(/[\\%_]/g, "\\$&");
+        this.db
+          .prepare(
+            "DELETE FROM meta WHERE key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\'"
+          )
+          .run(
+            `large_read_confirm:conv:${escSid}:%`,
+            `large_read_confirm:sub:${escSid}:%`,
+            `sensitive_read_confirm:${escSid}:%`,
+            `sensitive_read_confirm:conv:${escSid}:%`,
+            `sensitive_read_confirm:sub:${escSid}:%`
+          );
       });
       return { ok: true, purged: "session", sessionId: sid };
     }
@@ -428,17 +442,34 @@ export class SettingsMaintenanceMethods {
     this.db.prepare("DELETE FROM meta WHERE key = ?").run(key);
   }
 
-  /** Read a timestamped meta value (backward compatible with plain string values) */
-  getTimedMeta(key, defaultValue = null) {
+  /** Read a timestamped meta value with optional TTL enforcement (backward compatible with 2-arg calls) */
+  getTimedMeta(key, defaultValue = null, maxAgeMs = 0) {
     const raw = this.getMeta(key, null);
     if (raw === null) return defaultValue;
+    const enforceTtl = Number.isFinite(maxAgeMs) && maxAgeMs > 0;
     if (raw.startsWith("{")) {
       try {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === "object" && "v" in parsed) {
+          if (enforceTtl) {
+            const ts = Number(parsed.ts);
+            if (!Number.isFinite(ts) || ts <= 0 || Date.now() - ts > maxAgeMs) {
+              try {
+                this.deleteMeta(key);
+              } catch {}
+              return defaultValue;
+            }
+          }
           return parsed.v;
         }
       } catch {}
+    }
+    if (enforceTtl) {
+      // Plain legacy string or corrupted entry lacks a valid timestamp -> treat as expired
+      try {
+        this.deleteMeta(key);
+      } catch {}
+      return defaultValue;
     }
     return raw;
   }
@@ -461,8 +492,8 @@ export class SettingsMaintenanceMethods {
     return this.getMeta(`cutoff:session:${sessionId}`) !== null;
   }
 
-  /** Get active cutoff in bytes (0 = none/disabled) */
-  getCutoff(sessionId = null) {
+  /** Get active cutoff in bytes along with provenance ("sqlite:session"|"sqlite:app"|"env"|"config"|"sqlite:user"|"sqlite:installer_default"|"default") */
+  getCutoffInfo(sessionId = null) {
     this.open();
     const parseMetaCutoff = (raw) => {
       if (raw === null || raw === undefined) return null;
@@ -473,42 +504,56 @@ export class SettingsMaintenanceMethods {
     if (sessionId && sessionId !== "all" && sessionId !== "lifetime") {
       const sessionCutoff = parseMetaCutoff(this.getMeta(`cutoff:session:${sessionId}`));
       if (sessionCutoff !== null) {
-        return sessionCutoff;
+        return { cutoffBytes: sessionCutoff, source: "sqlite:session" };
       }
       // If checking a conversation, fall back to the app session cutoff if set
       if (sessionId !== "app") {
         const appCutoff = parseMetaCutoff(this.getMeta("cutoff:session:app"));
         if (appCutoff !== null) {
-          return appCutoff;
+          return { cutoffBytes: appCutoff, source: "sqlite:app" };
         }
       }
     }
 
     // 2. Unified config / env override if explicitly set
-    const cfgMaxRead = getEffectiveConfig().maxReadBytes;
+    const cfgSnap = getConfigSnapshot();
+    const cfgMaxRead = cfgSnap.values.maxReadBytes;
     if (cfgMaxRead !== null && cfgMaxRead !== undefined && Number.isFinite(Number(cfgMaxRead))) {
-      return Math.max(0, Math.floor(Number(cfgMaxRead)));
+      return {
+        cutoffBytes: Math.max(0, Math.floor(Number(cfgMaxRead))),
+        source: cfgSnap.sources.maxReadBytes === "env" ? "env" : "config"
+      };
     }
 
     // 3. Saved global setting in SQLite
     const globalCutoff = parseMetaCutoff(this.getMeta("cutoff:global"));
     if (globalCutoff !== null) {
-      return globalCutoff;
+      const metaSrc = this.getMeta("cutoff:source", null);
+      return {
+        cutoffBytes: globalCutoff,
+        source: metaSrc === "installer_default" ? "sqlite:installer_default" : "sqlite:user"
+      };
     }
 
-    // 4. Default 16 KB (balanced co-op cutoff for agy-dart: allows <16 KB small files & <=410-line slices)
-    return 16384;
+    // 4. Default 45 KiB (46,080 B — aligns with Antigravity read_file host cap & <= 800-line window)
+    return { cutoffBytes: DEFAULT_CUTOFF_BYTES, source: "default" };
+  }
+
+  /** Get active cutoff in bytes (0 = none/disabled) */
+  getCutoff(sessionId = null) {
+    return this.getCutoffInfo(sessionId).cutoffBytes;
   }
 
   /** Set cutoff in bytes (0 = none/disabled) */
-  setCutoff(bytes, sessionId = null) {
+  setCutoff(bytes, sessionId = null, options = {}) {
     this.open();
     const val = parseInt(bytes, 10);
-    const numVal = Number.isNaN(val) ? 16384 : Math.max(0, val);
+    const numVal = Number.isNaN(val) ? DEFAULT_CUTOFF_BYTES : Math.max(0, val);
     if (sessionId && sessionId !== "all" && sessionId !== "lifetime") {
       this.setMeta(`cutoff:session:${sessionId}`, numVal);
     } else {
       this.setMeta("cutoff:global", numVal);
+      this.setMeta("cutoff:source", options?.source === "installer_default" ? "installer_default" : "user");
       // When changing cutoff in lifetime, clear session-level and default overrides
       // so new sessions and new conversations inherit this global setting as their default.
       this.deleteMeta("cutoff:session:app");
@@ -696,37 +741,50 @@ export class SettingsMaintenanceMethods {
     return filtered;
   }
 
-  /** Get list of file extensions exempt from the size cutoff */
+  /** Get list of file extensions exempt from the read_file size cutoff */
   getExemptExtensions(sessionId = null) {
     this.open();
-    // 1. Session/Conversation override
+    // Scope precedence: session:<sid> -> session:app -> global.
+    // Only honor a legacy raw `exempt_ext:<scope>` key if that highest-precedence scope has
+    // NO structured `exempt_categories`/`custom_exempt_ext` keys; otherwise compute dynamically
+    // from getExemptCategories(sid) U getCustomExemptExtensions(sid) so global category updates
+    // are never shadowed by stale cached session `exempt_ext` snapshots.
+    const scopes = [];
     if (sessionId && sessionId !== "all" && sessionId !== "lifetime") {
-      const raw = this.getMeta(`exempt_ext:session:${sessionId}`);
-      if (raw) {
+      scopes.push(`session:${sessionId}`);
+      if (sessionId !== "app") {
+        scopes.push("session:app");
+      }
+    }
+    scopes.push("global");
+
+    for (const sc of scopes) {
+      const hasCats = this.getMeta(`exempt_categories:${sc}`) !== null;
+      const hasCustom = this.getMeta(`custom_exempt_ext:${sc}`) !== null;
+      if (hasCats || hasCustom) {
+        break;
+      }
+      const rawExt = this.getMeta(`exempt_ext:${sc}`);
+      if (rawExt !== null) {
         try {
-          const parsed = JSON.parse(raw);
+          const parsed = JSON.parse(rawExt);
           if (Array.isArray(parsed)) return parsed;
         } catch {}
       }
-      // If checking a conversation, fall back to the app session exemptions if set
-      if (sessionId !== "app") {
-        const appRaw = this.getMeta("exempt_ext:session:app");
-        if (appRaw) {
-          try {
-            const parsed = JSON.parse(appRaw);
-            if (Array.isArray(parsed)) return parsed;
-          } catch {}
+    }
+
+    const activeCats = this.getExemptCategories(sessionId);
+    const customs = this.getCustomExemptExtensions(sessionId);
+    const combined = new Set(customs);
+    for (const catId of activeCats) {
+      const cat = FILE_CATEGORIES[catId];
+      if (cat && Array.isArray(cat.extensions)) {
+        for (const ext of cat.extensions) {
+          combined.add(ext);
         }
       }
     }
-    const globalRaw = this.getMeta("exempt_ext:global");
-    if (globalRaw) {
-      try {
-        const parsed = JSON.parse(globalRaw);
-        if (Array.isArray(parsed)) return parsed;
-      } catch {}
-    }
-    return [...DEFAULT_EXEMPT_EXTENSIONS];
+    return Array.from(combined);
   }
 
   /** Set list of file extensions exempt from the size cutoff */
@@ -921,10 +979,13 @@ export class SettingsMaintenanceMethods {
       const outlineRes = this.db.prepare("DELETE FROM outline_cache WHERE updated_ts < ?").run(cutoffTs);
       this.db.prepare("DELETE FROM repo_cache WHERE updated_ts < ?").run(repoCacheCutoffTs);
 
-      // Prune stale per-session PreInvocation alert/compaction/sensitive-file meta keys so meta stays bounded
+      // Prune stale per-session PreInvocation alert/compaction/sensitive-file/large-read-confirm meta keys so meta stays bounded
       try {
+        const confirmCutoffTs = now - 10 * 60 * 1000;
         const metaRows = this.db
-          .prepare("SELECT key, value FROM meta WHERE key LIKE 'cache_alert:%' OR key LIKE 'compact_invalidated:%' OR key LIKE 'sensitive_read_confirm:%' OR key LIKE 'conv_turn_seq:%'")
+          .prepare(
+            "SELECT key, value FROM meta WHERE key LIKE 'cache_alert:%' OR key LIKE 'compact_invalidated:%' OR key LIKE 'sensitive_read_confirm:%' OR key LIKE 'large_read_confirm:%' OR key LIKE 'conv_turn_seq:%'"
+          )
           .all();
         const delMetaStmt = this.db.prepare("DELETE FROM meta WHERE key = ?");
         for (const row of metaRows) {
@@ -935,7 +996,13 @@ export class SettingsMaintenanceMethods {
               if (p && Number.isFinite(p.ts)) entryTs = p.ts;
             } catch {}
           }
-          if (entryTs > 0 && entryTs < cutoffTs) {
+          const isShortConfirm =
+            row.key.startsWith("large_read_confirm:") || row.key.startsWith("sensitive_read_confirm:");
+          if (isShortConfirm) {
+            if (entryTs <= 0 || entryTs < confirmCutoffTs) {
+              delMetaStmt.run(row.key);
+            }
+          } else if (entryTs > 0 && entryTs < cutoffTs) {
             delMetaStmt.run(row.key);
           }
         }

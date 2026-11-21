@@ -4135,14 +4135,210 @@ function extractSfcSymbols(lines) {
   }
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
+function parseGitDiffPath(line) {
+  if (!line || line.length > 1024) return "";
+  const rest = line.slice(11).trim();
+  if (!rest) return "";
+  const readToken = (str, start, isSecond = false) => {
+    let i = start;
+    while (i < str.length && str[i] === " ") i++;
+    if (i >= str.length) return null;
+    if (str[i] === '"') {
+      let j = i + 1;
+      let val = "";
+      while (j < str.length) {
+        if (str[j] === "\\" && j + 1 < str.length) {
+          val += str[j] + str[j + 1];
+          j += 2;
+          continue;
+        }
+        if (str[j] === '"') {
+          return { val, next: j + 1 };
+        }
+        val += str[j];
+        j++;
+      }
+      return { val, next: j };
+    }
+    if (isSecond) {
+      return { val: str.slice(i), next: str.length };
+    }
+    const nextQuoteB = str.indexOf(' "b/', i);
+    if (nextQuoteB !== -1) {
+      return { val: str.slice(i, nextQuoteB), next: nextQuoteB + 1 };
+    }
+    const nextPlainB = str.indexOf(" b/", i);
+    if (nextPlainB !== -1) {
+      return { val: str.slice(i, nextPlainB), next: nextPlainB + 1 };
+    }
+    const sp = str.indexOf(" ", i);
+    if (sp === -1) return { val: str.slice(i), next: str.length };
+    return { val: str.slice(i, sp), next: sp + 1 };
+  };
+  const first = readToken(rest, 0, false);
+  if (!first) return rest.slice(0, 120);
+  const second = readToken(rest, first.next, true);
+  const chosen = second && second.val ? second.val : first.val;
+  return chosen.replace(/^[ab]\//, "").trim().slice(0, 120);
+}
+function isLikelyGitDiffHeaderFollowup(nextLine) {
+  if (typeof nextLine !== "string") return false;
+  return (
+    nextLine.startsWith("index ") ||
+    nextLine.startsWith("new file mode ") ||
+    nextLine.startsWith("deleted file mode ") ||
+    nextLine.startsWith("old mode ") ||
+    nextLine.startsWith("new mode ") ||
+    nextLine.startsWith("rename from ") ||
+    nextLine.startsWith("copy from ") ||
+    nextLine.startsWith("Binary files ") ||
+    nextLine.startsWith("similarity index ") ||
+    nextLine.startsWith("--- ")
+  );
+}
+function extractDiffSymbols(lines) {
+  const symbols = [];
+  let curFile = null;
+  let curHunk = null;
+  let inHunk = false;
+  let inCommitMsg = false;
+  let sawGitHeaderForFile = false;
+  let sawGitDiffInPatch = false;
+
+  const closeHunk = (endLine) => {
+    if (curHunk) {
+      curHunk.endLine = Math.max(curHunk.startLine, endLine);
+      curHunk = null;
+    }
+  };
+  const closeFile = (endLine) => {
+    closeHunk(endLine);
+    if (curFile) {
+      curFile.endLine = Math.max(curFile.startLine, endLine);
+      curFile.name = `${curFile.rawName} (+${curFile.added}/-${curFile.removed})`;
+      delete curFile.rawName;
+      delete curFile.added;
+      delete curFile.removed;
+      curFile = null;
+    }
+    inHunk = false;
+    sawGitHeaderForFile = false;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineNum = i + 1;
+
+    if (line.length <= 512 && /^From [0-9a-f]{40}\s/.test(line)) {
+      closeFile(i);
+      inCommitMsg = true;
+      continue;
+    }
+    if (inCommitMsg) {
+      if (line === "---") {
+        inCommitMsg = false;
+        continue;
+      }
+      if (!line.startsWith("diff --git ") || !isLikelyGitDiffHeaderFollowup(lines[i + 1])) continue;
+      inCommitMsg = false;
+    }
+
+    if (line.startsWith("diff --git ")) {
+      closeFile(i);
+      const rawName = parseGitDiffPath(line) || line.slice(11).trim().slice(0, 120);
+      curFile = {
+        kind: "file",
+        name: rawName,
+        rawName,
+        startLine: lineNum,
+        endLine: lineNum,
+        depth: 0,
+        added: 0,
+        removed: 0
+      };
+      symbols.push(curFile);
+      sawGitHeaderForFile = true;
+      sawGitDiffInPatch = true;
+      continue;
+    }
+
+    // Standard `diff -u` header without `diff --git` (never split inside a git-diff hunk on `---`/`+++` code lines)
+    if (
+      !sawGitDiffInPatch &&
+      line.startsWith("--- ") &&
+      i + 1 < lines.length &&
+      lines[i + 1].startsWith("+++ ") &&
+      (!sawGitHeaderForFile && (!inHunk || (i + 2 < lines.length && lines[i + 2].startsWith("@@ "))))
+    ) {
+      closeFile(i);
+      const plusLine = lines[i + 1].slice(4).split("\t")[0].trim();
+      const minusLine = line.slice(4).split("\t")[0].trim();
+      const chosenRaw = plusLine === "/dev/null" && minusLine && minusLine !== "/dev/null" ? minusLine : plusLine;
+      const unquoted = chosenRaw.replace(/^"(.*)"$/, "$1");
+      const rawName = unquoted.replace(/^[ab]\//, "").slice(0, 120) || "patch";
+      curFile = {
+        kind: "file",
+        name: rawName,
+        rawName,
+        startLine: lineNum,
+        endLine: lineNum + 1,
+        depth: 0,
+        added: 0,
+        removed: 0
+      };
+      symbols.push(curFile);
+      i += 1;
+      continue;
+    }
+
+    if (line.startsWith("@@ ")) {
+      closeHunk(i);
+      inHunk = true;
+      sawGitHeaderForFile = false;
+      const hunkLabel = line.trim().slice(0, 88);
+      curHunk = {
+        kind: "hunk",
+        name: hunkLabel,
+        startLine: lineNum,
+        endLine: lineNum,
+        depth: curFile ? 1 : 0
+      };
+      symbols.push(curHunk);
+      if (curFile) curFile.endLine = lineNum;
+      continue;
+    }
+
+    if (inHunk) {
+      if (line === "-- " && (lines[i + 1] === void 0 || /^\d+\.\d+/.test(lines[i + 1].trim()))) {
+        closeHunk(i);
+        inHunk = false;
+        continue;
+      }
+      if (curFile) {
+        if (line.startsWith("+")) curFile.added += 1;
+        else if (line.startsWith("-")) curFile.removed += 1;
+        curFile.endLine = lineNum;
+      }
+      if (curHunk) curHunk.endLine = lineNum;
+    } else if (curFile) {
+      curFile.endLine = lineNum;
+    }
+  }
+
+  closeFile(lines.length);
+  return symbols;
+}
 function extractSymbolsFromLines(filePath, lines) {
   if (lines.length > 0 && lines[0].startsWith("\uFEFF")) {
     lines = [lines[0].slice(1), ...lines.slice(1)];
   }
+  const ext = path4.extname(filePath).toLowerCase();
+  if (ext === ".patch" || ext === ".diff") {
+    return extractDiffSymbols(lines);
+  }
   if (lines.some((l) => l.length > 2048)) {
     lines = lines.map((l) => (l.length > 2048 ? "" : l));
   }
-  const ext = path4.extname(filePath).toLowerCase();
   switch (ext) {
     case ".ts":
     case ".tsx":
@@ -4192,6 +4388,9 @@ function extractSymbolsFromLines(filePath, lines) {
     case ".yaml":
     case ".yml":
       return extractJsonYamlSymbols(lines, false);
+    case ".patch":
+    case ".diff":
+      return extractDiffSymbols(lines);
     default:
       return extractTsJsSymbols(lines);
   }

@@ -10,7 +10,7 @@ description: >-
 `agy-dart` unites two zero-dependency engines plus four lifecycle hooks inside one Antigravity plugin:
 1. **`agy-dart_fast`** — batched search/outlines/edits/checks (`<= 8.8 KB` inline).
 2. **`agy-dart_context`** — local sandbox filtering & heading-aware SQLite FTS5 (`~/.agy-dart/context.db`).
-3. **Lifecycle Guards** — prefix-stable `SessionStart` (with `git HEAD`-cached repo hubs), `PreToolUse` (transparent `overwrite` CLI filtering + 16 KB gate + 2-strike unchanged read dedup), `PostToolUse` (edit/compaction dedup invalidation), and `PreInvocation` (zero-prefix-pollution UI-only KV-cache watermark/TTL alerts).
+3. **Lifecycle Guards** — prefix-stable `SessionStart` (with `git HEAD`-cached repo hubs), `PreToolUse` (transparent `overwrite` CLI filtering with 3-stage context-preserving `git diff` + 4-tier read guard: 45 KiB / 800-line source 2-strike, 16 KB noise/minified, 128 KB `.patch`/`.diff` + 2-strike unchanged read dedup + independent 16 KB shell dump guard), `PostToolUse` (edit/compaction dedup invalidation), and `PreInvocation` (zero-prefix-pollution UI-only KV-cache watermark/TTL alerts).
 
 ## 1. Thinking in Code (`ctx_execute`)
 
@@ -36,7 +36,7 @@ For logs, test dumps, CSV/JSON files, or API responses larger than 16 KB, extrac
 - Single noisy commands (`git status/diff/log`, `npm/pnpm/yarn/node/pytest/cargo/go` tests, builds, linters, installs, `docker build`, `gh`, `kubectl`, `terraform`, `playwright`) and safe `cd <dir> && <cmd> 2>&1` wrappers are transparently compacted `<= 8.8 KB` via `PreToolUse.overwrite` + `hooks/cli-filter.mjs` (preserving exact exit codes, applying project `.agy-dart/filters.json`, structurally compacting large JSON/JSONL via SmartCrusher, and indexing redacted raw output into FTS5). Background streaming tasks (`WaitMsBeforeAsync <= 2000` or `IsDaemon: true`) and long `>60s` builds bypass `cli-filter.mjs` automatically so `manage_task(status)` receives live streaming logs.
 - `ctx_index({ url })` enforces SSRF protection (`http:`/`https:` only, max 5 redirects, per-hop DNS private/loopback/IPv6-mapped blocking with IP pinning), and common credentials are redacted before indexing/returning.
 - Redundant unchanged `read_file` calls in the same direct conversation are caught on strike 1 (retry once to bypass), and automatically decay after `readDedupMaxSteps` (default 40 steps) so deep long-horizon tasks never waste invocations re-verifying earlier files. Opt-in modified-file compact diff-read (`diffRead: true` in `~/.agy-dart/config.json` or `AGY_DART_ENABLE_DIFF_READ=1`) is OFF by default and strictly scoped to the same direct conversation within recent turns/age.
-- Unified config: configure persistent toggles in `~/.agy-dart/config.json` (overridable via `AGY_DART_*` env vars); run `node scripts/install.mjs doctor` or `ctx_doctor` to inspect effective settings.
+- Unified config: configure persistent toggles in `~/.agy-dart/config.json` (overridable via `AGY_DART_*` env vars, including `readGuardMode: "soft"|"strict"|"off"`, `noiseMaxReadBytes`, `reviewMaxReadBytes`, `shellDumpMaxBytes`, `exemptPaths`, `exemptExtensions`); run `node scripts/install.mjs doctor` or `ctx_doctor` to inspect effective settings and cutoff provenance.
 
 ## 4. KV-Cache Diagnostics, Audit, Simulation & DB Maintenance
 

@@ -1,9 +1,9 @@
 # `agy-dart` — AI 审阅技术简报（AI Review Brief）
 
-> **本文档用途**：面向代码审阅 AI / 架构审计 AI / 安全审查 AI 的高密度项目总览与审阅路线图。对应代码与测试基线提交：`f456902`（正式发布标签 `v1.2.2`）。代码行数、模块映射与测试数量由 `scripts/gen-review-brief.mjs` 自动同步并受 `--check` 漂移守卫保护。
+> **本文档用途**：面向代码审阅 AI / 架构审计 AI / 安全审查 AI 的高密度项目总览与审阅路线图。对应代码与测试基线提交：`f456902`（正式发布标签 `v1.3.0`）。代码行数、模块映射与测试数量由 `scripts/gen-review-brief.mjs` 自动同步并受 `--check` 漂移守卫保护。
 
 <!-- AUTO:META:START -->
-> **同步快照（由 `scripts/gen-review-brief.mjs` 自动维护）**：版本 `v1.2.2` · 核心追踪文件 36 个（合计 38,470 行） · 测试套件 17 个 / 126 个用例 · 可运行 `node scripts/gen-review-brief.mjs --check` 检验零漂移。
+> **同步快照（由 `scripts/gen-review-brief.mjs` 自动维护）**：版本 `v1.3.0` · 核心追踪文件 36 个（合计 39,892 行） · 测试套件 18 个 / 132 个用例 · 可运行 `node scripts/gen-review-brief.mjs --check` 检验零漂移。
 <!-- AUTO:META:END -->
 
 ---
@@ -78,7 +78,7 @@ flowchart TB
     end
 
     SS -->|静态头+布局+git-HEAD枢纽+可选易变git尾| DB
-    PTU -->|1. 0-SQLite快路径 / 敏感文件守卫 / 16KB拦截+Ghost<br/>2. 对话隔离读缓存: 全文 / 未变2-strike / 可选Opt-in Diff<br/>3. PreToolUse.overwrite 透明改写 cli-filter.mjs| DB
+    PTU -->|1. 0-SQLite快路径 / 敏感守卫(TTL+5分支) / 读缓存优先防三连拒<br/>2. 四层读分级(噪声16KB/源码45KiB软护栏/diff128KB+ByteOffset)<br/>3. 独立shellDump守卫 + PreToolUse.overwrite 透明改写 cli-filter.mjs| DB
     PSTU -->|编辑清file_reads保快照; ctx_resume清共享+直接对话缓存| DB
     PI -->|尾读transcript.jsonl -> 模型画像/USD/实证TTL/死循环<br/>零污染 UI-only user_markdown| DB
     FAST -->|L1+L2 SQLite outline_cache / batch_search 短效缓存| DB
@@ -101,19 +101,19 @@ flowchart TB
 
 | 文件 | 行数 | 核心职责与关键导出 |
 | :--- | ---: | :--- |
-| `context/lib/store.js` | 200 | `ContextModeStore` 门面类：统一导出与原型聚合（下拆 `context/lib/store/` 5 个职责子模块） |
-| `context/lib/store/schema.js` | 325 | SQLite WAL + FTS5 DDL、幂等列迁移（`content_hash`/`full_read_ts`/`full_read_seq`）、常量与路径解析 |
+| `context/lib/store.js` | 202 | `ContextModeStore` 门面类：统一导出与原型聚合（下拆 `context/lib/store/` 5 个职责子模块） |
+| `context/lib/store/schema.js` | 326 | SQLite WAL + FTS5 DDL、幂等列迁移（`content_hash`/`full_read_ts`/`full_read_seq`）、常量与路径解析 |
 | `context/lib/store/fts.js` | 675 | 标题感知 Markdown 分块、SHA-256 去重索引、Porter BM25 + Trigram RRF 检索与事件流 |
-| `context/lib/store/reads.js` | 648 | 会话未变更读去重（`file_reads`）、gzip 文本快照（`file_snapshots`）、会话轮次序与 Ghost Registry |
+| `context/lib/store/reads.js` | 699 | 会话未变更读去重（`file_reads`）、gzip 文本快照（`file_snapshots`）、会话轮次序与 Ghost Registry |
 | `context/lib/store/checkpoints.js` | 402 | 结构化会话恢复卡（`session_checkpoints`）、持久化符号大纲（`outline_cache`）与 `repo_cache` |
-| `context/lib/store/settings-maintenance.js` | 1,052 | `meta` 配置、阈值/豁免管理、`getStats`、`getFeatureRoi` 遥测 ROI 量化、TTL 清理与 `VACUUM` |
-| `context/lib/config.js` | 326 | 统一配置加载器（`~/.agy-dart/config.json` + `AGY_DART_*` 环境变量覆盖 + 生效来源追踪） |
+| `context/lib/store/settings-maintenance.js` | 1,119 | `meta` 配置、阈值/豁免管理、`getStats`、`getFeatureRoi` 遥测 ROI 量化、TTL 清理与 `VACUUM` |
+| `context/lib/config.js` | 457 | 统一配置加载器（`~/.agy-dart/config.json` + `AGY_DART_*` 环境变量覆盖 + 生效来源追踪） |
 | `context/lib/cache/profiles.js` | 303 | `MODEL_CACHE_PROFILES`（含 Gemini 4/Neon/Carbon/Argon/Hydrogen、Claude 4 系列）、`resolveModelProfile`、`computeCacheWarmth` 与写溢价成本数学 |
 | `context/lib/cache-analyzer.js` | 2,334 | Transcript KV-Cache 诊断引擎：多厂商 Token 提取（防重计）、实证 TTL 校准、7 桶 `contextComposition`、`subagentBreakdown`、死循环 `loopWatch`、6 类 Bust 归因 |
 | `context/lib/cache-simulator.js` | 1,228 | 离线策略回放引擎（devtools）：对比 7 套策略（`observed`、`ttl-5m`、`ttl-1h`、`cold-boundary-compact`、`cutoff-strict/balanced/relaxed`） |
 | `context/lib/repo-skeleton.js` | 1,139 | `git HEAD` 缓存的核心依赖枢纽扫描（JS/TS + JSONC `tsconfig` `paths`、Python、Rust、Go `go.mod`、Vue/Svelte、Dart、Java） |
 | `context/lib/json-crusher.js` | 876 | 零依赖可逆 JSON/JSONL 结构化粉碎器：提取 Schema/空值统计 + 首尾样本 + 异常项，附带 FTS5 `sourceId` |
-| `context/lib/tools.js` | 1,031 | `agy-dart_context` 8 个 MCP 工具实现；`dedup: true`、`smartCrushJson`、`featureRoi`、生效配置诊断与 `<= 8.8 KB` UTF-8 封顶 |
+| `context/lib/tools.js` | 1,044 | `agy-dart_context` 8 个 MCP 工具实现；`dedup: true`、`smartCrushJson`、`featureRoi`、生效配置诊断与 `<= 8.8 KB` UTF-8 封顶 |
 | `context/lib/security.js` | 646 | `validateFetchTarget`（SSRF 逐跳 DNS + IPv4/IPv6 + IP Pinning）、`redactSecrets`、`detectSensitiveFile` |
 | `context/lib/handoff.js` | 575 | 缓存友好交接摘要生成器：`buildHandoffBrief`（分支 + `git diff --stat`、`sessionCheckpoint`、FTS5 句柄、脱敏与 UTF-8 封顶） |
 | `context/lib/text-diff.js` | 442 | 零依赖行级 Unified Diff 引擎：首尾裁剪 + 有界 Myers + 线性降级保护 + 1-based `startLine` 偏移 |
@@ -124,29 +124,29 @@ flowchart TB
 
 | 文件 | 行数 | 核心职责与关键导出 |
 | :--- | ---: | :--- |
-| `hooks/filter-rules.mjs` | 2,614 | CLI 降噪规则库：安全拆解单层 `cd [/d] <path> && <cmd>` + `2>&1`、拦截 cmd/PS 危险语法（`%`/`!`/`{}`/`@`/非 git `^`）、11 类内置规则、`.agy-dart/filters.json` ReDoS 防护与大 JSON 粉碎 |
-| `hooks/pre-tool-use.mjs` | 1,828 | 统一 `PreToolUse` 网关：0-SQLite 快路径 → 可选敏感文件守卫 → 16 KB/410 行大文件拦截 + Ghost → 三态读缓存（`diffRead` 默认关闭、按直接对话 ID 隔离且受轮次/时间新鲜度约束）→ `run_command` 透明 `overwrite` |
+| `hooks/filter-rules.mjs` | 2,814 | CLI 降噪规则库：安全拆解单层 `cd [/d] <path> && <cmd>` + `2>&1`、拦截 cmd/PS 危险语法（`%`/`!`/`{}`/`@`/非 git `^`）、11 类内置规则（含三阶段上下文保真 `filterGitDiff` 与 `gh pr view` 防误伤）、`.agy-dart/filters.json` ReDoS 防护与大 JSON 粉碎 |
+| `hooks/pre-tool-use.mjs` | 2,488 | 统一 `PreToolUse` 网关：0-SQLite 快路径 → 敏感文件守卫（TTL + 5 分支隔离）→ 读缓存优先防三连拒 → 四层读分级（噪声/压缩 16 KB、常规源码 45 KiB / 800 行 2-strike、`.patch`/`.diff` 128 KB + `ByteOffset` 续读 + 线性 `exemptPaths`）→ 独立 `shellDumpMaxBytes` `run_command` 守卫与透明 `overwrite` |
 | `hooks/pre-invocation.mjs` | 427 | 零前缀污染 `PreInvocation` 守卫：尾读 `transcript.jsonl`，输出水位/热缓存延迟/TTL 预警/多模态悬崖/死循环告警（全部 `systemMessage: ""`），且在 `cacheWatch=false`/暂停下仍维持 `diffRead` 轮次递增 |
 | `hooks/post-tool-use.mjs` | 426 | 编辑触发单文件 `file_reads` 失效（保快照）并记录 `modifiedFiles`；`ctx_resume` 同时清共享与直接对话快照；写入测试/构建结论到 `sessionCheckpoint` |
 | `hooks/cli-filter.mjs` | 449 | `PreToolUse.overwrite` 执行代理：Windows `cmd.exe`/`powershell.exe` 精确透传退出码、密钥脱敏、原输出入 FTS5、降噪并死守 `<= 8.8 KB` |
-| `hooks/session-start.mjs` | 314 | 前缀稳定启动钩子：支持 `stablePrefixOnly` 与子 Agent 自动省略易变 Git 尾段（并在子进程隔离禁用 Git） |
+| `hooks/session-start.mjs` | 334 | 前缀稳定启动钩子：支持 `stablePrefixOnly` 与子 Agent 自动省略易变 Git 尾段（并在子进程隔离禁用 Git） |
 | `hooks/compile-cache.mjs` | 206 | 版本化 V8 编译缓存管理（保留最近 3 个版本）与跨 Node 22/24 的 `suppressSqliteExperimentalWarning()` 零 stderr 护栏 |
 
 ### 3.3 双 MCP 引擎、Sidecar 面板与审计脚本
 
 | 文件 | 行数 | 核心职责与关键导出 |
 | :--- | ---: | :--- |
-| `fast/mcp-server.mjs` | 4,963 | `agy-dart_fast` 4 工具批处理引擎：V8 编译缓存、`read_slices` L1+L2 SQLite `outline_cache` 与 4 MB 切片缓存、`batch_search` 工作区指纹缓存 |
+| `fast/mcp-server.mjs` | 5,162 | `agy-dart_fast` 4 工具批处理引擎：V8 编译缓存、`read_slices` L1+L2 SQLite `outline_cache`（含原生 `.patch`/`.diff` 变更大纲）与 4 MB 切片缓存、`batch_search` 工作区指纹缓存 |
 | `fast/benchmark.mjs` | 1,574 | 离线轨迹基准 CLI（devtools）：`analyze`、`compare`、`cache`、`cache simulate` |
 | `fast/session-start.mjs` | 691 | 上游工作区结构与 Git 状态快照生成器（由 `hooks/session-start.mjs` 封装调用，已禁自动更新） |
 | `context/server.js` | 401 | `agy-dart_context` MCP stdio 服务端：先激活 V8 编译缓存与 SQLite 告警静默再动态加载库模块；导出冻结规范排序 `TOOL_DEFINITIONS` |
 | `scripts/cache-audit.mjs` | 2,770 | 全域环境 Prompt Cache 体检 `npm run cache:audit`（devtools）：规则/技能 CJK 估 token、双次握手探测 MCP 确定性、静态分析中段 Hook |
-| `scripts/install.mjs` | 954 | 跨平台安装/卸载/模式切换/`doctor` 健康自检：拆分 `RUNTIME_FILES`（默认）与 `DEVTOOLS_FILES`（`--with-devtools`），`doctor` 输出生效配置 |
+| `scripts/install.mjs` | 994 | 跨平台安装/卸载/模式切换/`doctor` 健康自检：拆分 `RUNTIME_FILES`（默认）与 `DEVTOOLS_FILES`（`--with-devtools`），`doctor` 输出生效配置 |
 | `scripts/verify-package-graph.mjs` | 1,216 | 静态 Import 图打包校验器（devtools）：线性 JS 词法解析器提取含/无分号（ASI）、多行、注释穿插与带属性动态导入的 ESM/CJS 依赖，证明无漏打模块且 devtools 零泄漏 |
 | `scripts/prefix-budget.mjs` | 953 | Turn-0 前缀预算、双 MCP 指纹与 `--calibrate` 跨语种 Token 估算误差校准审计（devtools，读取统一 `config.json`，超预算/非规范时非零退出码卡口 CI） |
 | `scripts/gen-review-brief.mjs` | 353 | `AI_REVIEW_BRIEF.md` 代码行数/测试基线自动生成与 `--check` 漂移守卫（devtools） |
-| `sidecars/dashboard/server.mjs` | 1,444 | Sidecar HTTP / SidecarApp 服务：严格 `Host`/同源 `Origin`/`Sec-Fetch-Site` 白名单（拦截 `cross-site`、`same-site` 及伪造头）、`X-Frame-Options: DENY`、独立 HTTP 全部 `/api/*` 强制随机 `X-Agy-Dart-Token`、SidecarApp 模式全部 `/api/*` 仅限 POST（强制 `X-Sidecar-Token`）、写接口与 `/api/search` 仅 POST + `application/json` + 64 KB 请求体上限与 `featureRoi` |
-| `sidecars/dashboard/index.html` | 3,986 | 实时仪表盘前端：自动注入并携带 CSRF Token、全部 `/api/*` 调用统一 POST JSON、XSS 转义加固、1s 本地 TTL 进度条、Handoff 抽屉与上下文构成条 |
+| `sidecars/dashboard/server.mjs` | 1,452 | Sidecar HTTP / SidecarApp 服务：严格 `Host`/同源 `Origin`/`Sec-Fetch-Site` 白名单（拦截 `cross-site`、`same-site` 及伪造头）、`X-Frame-Options: DENY`、独立 HTTP 全部 `/api/*` 强制随机 `X-Agy-Dart-Token`、SidecarApp 模式全部 `/api/*` 仅限 POST（强制 `X-Sidecar-Token`）、写接口与 `/api/search` 仅 POST + `application/json` + 64 KB 请求体上限与 `featureRoi` |
+| `sidecars/dashboard/index.html` | 4,016 | 实时仪表盘前端：自动注入并携带 CSRF Token、全部 `/api/*` 调用统一 POST JSON、XSS 转义加固、1s 本地 TTL 进度条、Handoff 抽屉与上下文构成条 |
 <!-- AUTO:CODE_MAP:END -->
 
 ---
@@ -177,10 +177,12 @@ WAL 模式 + `busy_timeout = 5000` + `synchronous = NORMAL` + `_withBusyRetry` �
 | `compileCache` / `compileCacheDir` | `AGY_DART_DISABLE_COMPILE_CACHE` / `_DIR` | `true` / `null` | V8 版本化编译缓存开关与目录 |
 | `stablePrefixOnly` / `subagentIncludeGit` | `AGY_DART_STABLE_PREFIX_ONLY` / `SUBAGENT_INCLUDE_GIT` | `false` / `false` | 省略易变 Git 尾段实现跨会话/子 Agent 共享前缀 |
 | `repoHubs` | `AGY_DART_DISABLE_REPO_HUBS` | `true` | `SessionStart` 依赖枢纽扫描 |
-| `readHook` / `readDedup` | `AGY_DART_DISABLE_READ_HOOK` / `_READ_DEDUP` | `true` / `true` | 读守卫与未变重复读 2-strike 去重 |
+| `readHook` / `readGuardMode` / `readDedup` | `AGY_DART_DISABLE_READ_HOOK` / `_READ_GUARD_MODE` / `_READ_DEDUP` | `true` / `"soft"` / `true` | 读守卫开关、模式（`soft`/`strict`/`off`）与未变重复读 2-strike 去重 |
 | `diffRead` | `AGY_DART_ENABLE_DIFF_READ` / `AGY_DART_DISABLE_DIFF_READ` | **`false`** | 修改后增量 Unified Diff 读缓存（**默认关闭**，需显式开启；`DISABLE=1` 优先级最高） |
 | `diffReadMaxTurns` / `diffReadMaxAgeMs` | `AGY_DART_DIFF_READ_MAX_TURNS` / `_MAX_AGE_MS` | `12` / `900000` | Diff 基线新鲜度上界（超过则自动回退全文放行，含 `PreInvocation` 轮次推进） |
-| `maxReadBytes` / `maxLineRange` / `maxOutputBytes` | `CONTEXT_MODE_MAX_READ_BYTES` / `_LINE_RANGE` / `_OUTPUT_BYTES` | `null` / `null` / `8100` | 读截断字节阈值、单次最大行窗与沙盒预览上限覆写 |
+| `maxReadBytes` / `noiseMaxReadBytes` / `reviewMaxReadBytes` / `shellDumpMaxBytes` | `AGY_DART_MAX_READ_BYTES` / `_NOISE_` / `_REVIEW_` / `_SHELL_DUMP_MAX_BYTES` | `null` (45 KiB) / `16384` / `131072` / `16384` | 四层读截断与独立 Shell 盲吐字节阈值（兼容旧 `CONTEXT_MODE_MAX_READ_BYTES`） |
+| `exemptPaths` / `exemptExtensions` | `AGY_DART_EXEMPT_PATHS` / `_EXEMPT_EXTENSIONS` | `[]` / `[]` | 仅用户可信配置中的线性无 ReDoS 路径/扩展名白名单（仅跳过 1a 体积拦截，保留去重与敏感/Shell 守卫） |
+| `maxLineRange` / `maxOutputBytes` | `AGY_DART_MAX_LINE_RANGE` / `_MAX_OUTPUT_BYTES` | `null` (≤800) / `8100` | 单次最大行窗（钳位宿主 800 行）与沙盒预览上限覆写（兼容 `CONTEXT_MODE_*`） |
 | `cliFilter` | `AGY_DART_DISABLE_CLI_FILTER` | `true` | 透明 CLI 输出降噪 |
 | `outlineDb` / `searchCacheTtlMs` | `AGY_DART_DISABLE_OUTLINE_DB` / `SEARCH_CACHE_TTL_MS` | `true` / `15000` | `read_slices` L2 持久化与 `batch_search` 短效缓存 |
 | `cacheWatch` | `AGY_DART_DISABLE_CACHE_WATCH` | `true` | `PreInvocation` KV-Cache 监控 |
@@ -207,9 +209,9 @@ WAL 模式 + `busy_timeout = 5000` + `synchronous = NORMAL` + `_withBusyRetry` �
 在 `e:\work\agy-dart` 下运行：
 
 ```bash
-# 1. 全量 16 个测试套件（integration + 3 套 v1.1 + 12 套 v1.2 含安全加固、属性/模糊与深度审计回归测试）
+# 1. 全量 18 个测试套件（integration + 3 套 v1.1 + 13 套 v1.2 + v1.3 读守卫重构专项回归测试）
 npm test
-# 预期基线：117/117 PASS, 0 fail
+# 预期基线：132/132 PASS, 0 fail
 
 # 2. 静态 Import 图打包完整性与 runtime/devtools 隔离校验
 npm run verify:pkg

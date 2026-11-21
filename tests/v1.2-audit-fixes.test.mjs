@@ -799,7 +799,7 @@ test("Audit P1/P2/P3 (H-13, H-14, H-16, H-17, H-18, M-22..M-27, P3-5, P3-10, P3-
     assert.notEqual(doc.sqliteVersion, process.versions.node, "P3-10: sqliteVersion must not return Node version");
     assert.match(String(doc.sqliteVersion), /^\d+\.\d+\.\d+/, `P3-10: unexpected sqliteVersion: ${doc.sqliteVersion}`);
     store.db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run("cutoff:global", "corrupted_nan");
-    assert.equal(store.getCutoff(null), 16384, "P3-10: non-numeric cutoff:global meta must fall back to default 16384");
+    assert.equal(store.getCutoff(null), 46080, "P3-10: non-numeric cutoff:global meta must fall back to default 46080");
 
     // M-25: purge({ scope: "all" }) succeeds cleanly
     const purgeAll = store.purge({ scope: "all" });

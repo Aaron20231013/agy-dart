@@ -11,6 +11,7 @@ export const MAX_SNAPSHOTS_PER_SESSION = 64;
 export const MAX_OUTLINE_CACHE_DB_ENTRIES = 512;
 export const MAX_OUTLINE_JSON_BYTES = 128 * 1024;
 export const DEFAULT_FILE_READ_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_CUTOFF_BYTES = 46080; // 45 KiB — aligns with Antigravity read_file host return cap
 
 export const FILE_CATEGORIES = {
   images: {
@@ -26,7 +27,7 @@ export const FILE_CATEGORIES = {
   code: {
     id: "code",
     name: "Source Code",
-    extensions: [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".cs", ".html", ".css", ".json", ".yaml", ".yml", ".sql", ".sh", ".ps1"]
+    extensions: [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".cs", ".html", ".css", ".yaml", ".yml", ".sh", ".ps1"]
   },
   models3d: {
     id: "models3d",
@@ -211,7 +212,7 @@ export class SchemaMethods {
         session_id TEXT NOT NULL,
         file_path TEXT NOT NULL,
         file_size INTEGER NOT NULL DEFAULT 0,
-        cutoff_bytes INTEGER NOT NULL DEFAULT 16384,
+        cutoff_bytes INTEGER NOT NULL DEFAULT 46080,
         blocked_ts INTEGER NOT NULL,
         recall_reads INTEGER NOT NULL DEFAULT 0,
         recall_bytes INTEGER NOT NULL DEFAULT 0,

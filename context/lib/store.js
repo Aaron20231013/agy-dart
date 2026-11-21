@@ -3,6 +3,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
   DEFAULT_ACTIVE_CATEGORIES,
+  DEFAULT_CUTOFF_BYTES,
   DEFAULT_EXEMPT_EXTENSIONS,
   DEFAULT_FILE_READ_MAX_AGE_MS,
   FILE_CATEGORIES,
@@ -27,6 +28,7 @@ import { SettingsMaintenanceMethods } from "./store/settings-maintenance.js";
 
 export {
   DEFAULT_ACTIVE_CATEGORIES,
+  DEFAULT_CUTOFF_BYTES,
   DEFAULT_EXEMPT_EXTENSIONS,
   DEFAULT_FILE_READ_MAX_AGE_MS,
   FILE_CATEGORIES,

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import {
+  DEFAULT_CUTOFF_BYTES,
   DEFAULT_FILE_READ_MAX_AGE_MS,
   MAX_SNAPSHOTS_PER_SESSION,
   MAX_SNAPSHOT_BYTES
@@ -530,8 +531,54 @@ export class ReadMethods {
     });
   }
 
+  /** Check whether this session already has any non-expired file_reads row for filePath (used for pagination continuations) */
+  hasPriorFileRead(sessionId, filePath, maxAgeMs = DEFAULT_FILE_READ_MAX_AGE_MS) {
+    return this.getPriorReadSummary(sessionId, filePath, maxAgeMs).hasPrior;
+  }
+
+  /** Summarize non-expired file_reads rows for a file in this session (used for pagination continuations) */
+  getPriorReadSummary(sessionId, filePath, maxAgeMs = DEFAULT_FILE_READ_MAX_AGE_MS) {
+    this.open();
+    const sid = sessionId || "default";
+    const norm = this._normalizeTrackPath(filePath);
+    if (!norm) {
+      return { hasPrior: false, hasFullOrLargeRead: false, maxEndLine: 0 };
+    }
+    const minTs = Date.now() - Math.max(0, Number(maxAgeMs) || DEFAULT_FILE_READ_MAX_AGE_MS);
+    const rows = this.db
+      .prepare(
+        "SELECT start_line, end_line, byte_est FROM file_reads WHERE session_id = ? AND file_path = ? AND read_ts >= ?"
+      )
+      .all(sid, norm, minTs);
+    if (!rows || rows.length === 0) {
+      return { hasPrior: false, hasFullOrLargeRead: false, maxEndLine: 0 };
+    }
+    let hasEof = false;
+    let hasFullOrLargeRead = false;
+    let maxEndLine = 0;
+    for (const r of rows) {
+      const sLine = Number(r.start_line) || 1;
+      const eLine = Number(r.end_line);
+      const bEst = Number(r.byte_est) || 0;
+      if (eLine === -1) {
+        hasEof = true;
+        hasFullOrLargeRead = true;
+      } else if (eLine > 0) {
+        if (eLine > maxEndLine) maxEndLine = eLine;
+        if (bEst >= DEFAULT_CUTOFF_BYTES || eLine - sLine + 1 >= 400) {
+          hasFullOrLargeRead = true;
+        }
+      }
+    }
+    return {
+      hasPrior: true,
+      hasFullOrLargeRead,
+      maxEndLine: hasEof ? -1 : maxEndLine
+    };
+  }
+
   /** Record a large-file interception in the Ghost Registry to track subsequent paged recalls */
-  recordGhostInterception({ sessionId, filePath, fileSize = 0, cutoffBytes = 16384 }) {
+  recordGhostInterception({ sessionId, filePath, fileSize = 0, cutoffBytes = DEFAULT_CUTOFF_BYTES }) {
     this.open();
     const sid = sessionId || "default";
     const norm = this._normalizeTrackPath(filePath);
@@ -632,8 +679,12 @@ export class ReadMethods {
     const evictionEfficiency = totalBlocked > 0 ? Number((1 - ghostRecalls / totalBlocked).toFixed(4)) : 1;
     const currentCutoff = this.getCutoff(sid === "all" || sid === "lifetime" ? null : sid);
     const recommendation =
-      totalBlocked >= 3 && evictionEfficiency < 0.65 && currentCutoff > 0 && currentCutoff < 32768
-        ? "Cutoff may be too tight for this repo; consider switching to 32 KB (fast-32k)."
+      totalBlocked >= 3 && evictionEfficiency < 0.65 && currentCutoff > 0
+        ? currentCutoff < 46080
+          ? "Cutoff may be too tight for this repo; consider switching to 45 KB (host-45k)."
+          : currentCutoff < 65536
+            ? "Cutoff may be too tight for this repo; consider switching to 64 KB or adding exemptPaths."
+            : null
         : null;
 
     return {

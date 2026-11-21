@@ -218,8 +218,8 @@ const CORE_LIB_ENTRIES = [
 ];
 
 const HOOK_ENTRIES = [
-  ["hooks/filter-rules.mjs", "CLI 降噪规则库：安全拆解单层 `cd [/d] <path> && <cmd>` + `2>&1`、拦截 cmd/PS 危险语法（`%`/`!`/`{}`/`@`/非 git `^`）、11 类内置规则、`.agy-dart/filters.json` ReDoS 防护与大 JSON 粉碎"],
-  ["hooks/pre-tool-use.mjs", "统一 `PreToolUse` 网关：0-SQLite 快路径 → 可选敏感文件守卫 → 16 KB/410 行大文件拦截 + Ghost → 三态读缓存（`diffRead` 默认关闭、按直接对话 ID 隔离且受轮次/时间新鲜度约束）→ `run_command` 透明 `overwrite`"],
+  ["hooks/filter-rules.mjs", "CLI 降噪规则库：安全拆解单层 `cd [/d] <path> && <cmd>` + `2>&1`、拦截 cmd/PS 危险语法（`%`/`!`/`{}`/`@`/非 git `^`）、11 类内置规则（含三阶段上下文保真 `filterGitDiff` 与 `gh pr view` 防误伤）、`.agy-dart/filters.json` ReDoS 防护与大 JSON 粉碎"],
+  ["hooks/pre-tool-use.mjs", "统一 `PreToolUse` 网关：0-SQLite 快路径 → 敏感文件守卫（TTL + 5 分支隔离）→ 读缓存优先防三连拒 → 四层读分级（噪声/压缩 16 KB、常规源码 45 KiB / 800 行 2-strike、`.patch`/`.diff` 128 KB + `ByteOffset` 续读 + 线性 `exemptPaths`）→ 独立 `shellDumpMaxBytes` `run_command` 守卫与透明 `overwrite`"],
   ["hooks/pre-invocation.mjs", "零前缀污染 `PreInvocation` 守卫：尾读 `transcript.jsonl`，输出水位/热缓存延迟/TTL 预警/多模态悬崖/死循环告警（全部 `systemMessage: \"\"`），且在 `cacheWatch=false`/暂停下仍维持 `diffRead` 轮次递增"],
   ["hooks/post-tool-use.mjs", "编辑触发单文件 `file_reads` 失效（保快照）并记录 `modifiedFiles`；`ctx_resume` 同时清共享与直接对话快照；写入测试/构建结论到 `sessionCheckpoint`"],
   ["hooks/cli-filter.mjs", "`PreToolUse.overwrite` 执行代理：Windows `cmd.exe`/`powershell.exe` 精确透传退出码、密钥脱敏、原输出入 FTS5、降噪并死守 `<= 8.8 KB`"],
@@ -228,7 +228,7 @@ const HOOK_ENTRIES = [
 ];
 
 const ENGINE_ENTRIES = [
-  ["fast/mcp-server.mjs", "`agy-dart_fast` 4 工具批处理引擎：V8 编译缓存、`read_slices` L1+L2 SQLite `outline_cache` 与 4 MB 切片缓存、`batch_search` 工作区指纹缓存"],
+  ["fast/mcp-server.mjs", "`agy-dart_fast` 4 工具批处理引擎：V8 编译缓存、`read_slices` L1+L2 SQLite `outline_cache`（含原生 `.patch`/`.diff` 变更大纲）与 4 MB 切片缓存、`batch_search` 工作区指纹缓存"],
   ["fast/benchmark.mjs", "离线轨迹基准 CLI（devtools）：`analyze`、`compare`、`cache`、`cache simulate`"],
   ["fast/session-start.mjs", "上游工作区结构与 Git 状态快照生成器（由 `hooks/session-start.mjs` 封装调用，已禁自动更新）"],
   ["context/server.js", "`agy-dart_context` MCP stdio 服务端：先激活 V8 编译缓存与 SQLite 告警静默再动态加载库模块；导出冻结规范排序 `TOOL_DEFINITIONS`"],
@@ -261,7 +261,7 @@ export function computeBriefMetrics(rootDir = REPO_ROOT) {
   const totalTrackedLines = Object.values(fileLineCounts).reduce((a, b) => a + b, 0);
 
   return {
-    version: pkg.version || "1.2.2",
+    version: pkg.version || "1.3.0",
     gitHeadShort: getGitHeadSha(rootDir),
     testFiles: tests.files,
     testCases: tests.cases,

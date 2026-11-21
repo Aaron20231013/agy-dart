@@ -26,6 +26,16 @@
 
 ---
 
+## v1.3.0 核心升级（四层读守卫 + 评审一等公民 + Diff 三阶段保真）
+
+1. **宿主对齐四层读拦截架构（默认 `45 KiB` / `800 行` + 2-strike 软护栏）**：
+   - 将常规源码默认阈值对齐 Antigravity 原生 `read_file` 封顶（**`45 KiB` = `46,080 B` / `<= 800 行`**，`host-45k` 模式）并启用 **2-strike 软护栏**（5 分支会话/子代理/匿名 TTL 隔离），彻底解决无 MCP 子代理死锁与大源码硬拒；同时保持高噪日志/锁文件/压缩单行文件 **`16 KB`**（`noiseMaxReadBytes`）与 `.patch`/`.diff` 评审文件 **`128 KB`**（`reviewMaxReadBytes`），原生放行 `ByteOffset` 与开放尾行 `StartLine` 分页续读。
+   - 彻底解耦 `read_file` 体积豁免（`exemptExtensions`、零 ReDoS 线性 `exemptPaths`、`readGuardMode: "soft"|"strict"|"off"`）与 **`readDedup`/`diffRead`** 以及 **`run_command`**（独立 `shellDumpMaxBytes = 16 KB`，封堵 `cat huge.png` / `curl .../archive.zip` 绕过且 `cutoff=0` 不再放穿 `cat`）。
+   - 修复读缓存优先防三连拒、`measureLineRangeBytes` `>2 MB && sLine > 1` 盲区、宽行多行文本误报压缩文件、`sensitive_read_confirm` TTL/隔离、`getExemptExtensions` 分裂 Bug、Sidecar `/api/purge` `"conversation"` 报错、自定义阈值下拉回显与平滑升级迁移（`cutoff:source` 自动迁旧默认 `16384 -> 46080` 且不覆盖自定义值）。
+2. **原生 `.patch`/`.diff` 符号大纲 & `git diff` / `gh pr diff` 三阶段上下文保真**：
+   - `agy-dart_fast` `read_slices({ outlines })` 新增零依赖 `.patch`/`.diff` 解析器（`extractDiffSymbols`），1 次大纲即列出全部变更文件（`+add/-del`）与 `@@` hunk 行号范围。
+   - `filterGitDiff` 升级为预算内 100% 保留上下文 → 显式 `-U`/`--unified`/`-W`/`--word-diff` 保上下文截断 → 超预算普通 diff 先缩至 1 行上下文再压缩 `+/-`（并支持 `From <sha>`/`---` 邮件箱补丁头）；修复 `filterGhCli` 不再误伤正文中含 ```` ```diff ```` 代码块的 `gh pr view`。
+
 ## v1.2.2 核心新增与深度加固
 
 1. **长任务连续执行与防过早交接（Anti-Premature-Handoff）优化**：
@@ -90,8 +100,8 @@
 | 任务类型 | 唯一指定工具 | 优势 |
 | :--- | :--- | :--- |
 | 代码文本 / 正则 / Glob / 只读 Git 查询 | `agy-dart_fast` → `batch_search` | 1 次调用并发最多 20 条查询，走 `rg` 毫秒级，≤ 8.8 KB 零溢盘 |
-| 未知大源码文件（>300 行） | `agy-dart_fast` → `read_slices({ outlines })` + 并行内置 `read_file` | 先 1 次拿全文件符号行号，再用本地 7ms 白名单 `read_file` 精确读分段 |
-| 中小源码文件（<300 行 / <16 KB） | 内置 `read_file`（同轮并行） | 0 远端审查（~7ms）、46 KB/call 内联，16 KB 默认阈值直接放行 |
+| 未知大源码 / `.patch` 补丁（>300 行） | `agy-dart_fast` → `read_slices({ outlines })` + 并行内置 `read_file` | 先 1 次拿全文件符号或 diff 文件/hunk 行号，再用本地 7ms `read_file` 精确读分段 |
+| 常规源码（<45 KiB）与 `.patch`（<128 KB） | 内置 `read_file`（同轮并行，≤800 行） | 0 远端审查（~7ms）、45 KiB 宿主封顶，超限走 2-strike 软护栏不死锁 |
 | 多处 / 跨文件代码编辑 + 验证 | `agy-dart_fast` → `apply_edits` | 原子提交、`bestEffort` 防整批回滚、内联 `verify` 省一轮 |
 | 并发构建 / Lint / 单元测试 | `agy-dart_fast` → `run_checks` | 真并发池 + 自动降噪（不用串行的 `ctx_batch`） |
 | **分析超大日志（>16 KB ~ 数十 MB）** | `agy-dart_context` → `ctx_execute` | 本地 Node/Python/Shell 沙盒脚本聚合过滤，仅返回精简结论（≤ 8.8 KB） |
@@ -110,7 +120,7 @@
 git clone https://github.com/zou172866/agy-dart.git
 cd agy-dart
 
-# 默认安装（方案 A：16 KB / 410 行均衡护栏 + 自动健康自检）
+# 默认安装（host-45k：45 KiB / 800 行宿主对齐软护栏 + 自动健康自检，升级自动保留自定义阈值）
 .\install.ps1
 
 # 推荐：安装插件并自动补装官方 ripgrep (rg.exe) 到 ~/.local/bin 并加入 PATH
@@ -131,11 +141,11 @@ brew install ripgrep   # macOS
 ### 通用 Node.js 命令（全平台 / 支持项目级安装）
 
 ```bash
-# 全局安装到 ~/.gemini/config/plugins/agy-dart（默认仅安装运行时）
-node scripts/install.mjs install --mode balanced-16k
+# 全局安装到 ~/.gemini/config/plugins/agy-dart（默认 host-45k 仅安装运行时）
+node scripts/install.mjs install
 
 # 同时安装离线审计 / 压测 / 策略回放等开发工具 CLI
-node scripts/install.mjs install --mode balanced-16k --with-devtools
+node scripts/install.mjs install --with-devtools
 
 # 仅安装到当前项目仓库（.agents/plugins/agy-dart）
 node scripts/install.mjs install --project /path/to/your-repo
@@ -152,7 +162,7 @@ node scripts/install.mjs uninstall
 也可以直接把下面这句话发给 Antigravity：
 
 ```text
-请将 https://github.com/zou172866/agy-dart.git 克隆到临时目录，运行其中的 scripts/install.mjs install --mode balanced-16k 完成全局安装并跑 doctor 自检（Windows 如未安装 rg 请同时传 --install-rg）。
+请将 https://github.com/zou172866/agy-dart.git 克隆到临时目录，运行其中的 scripts/install.mjs install 完成全局安装并跑 doctor 自检（Windows 如未安装 rg 请同时传 --install-rg）。
 ```
 
 > **生效提示**：安装完成后，重启 Antigravity（或重载窗口）并开启新对话即可生效。如果你之前单独安装过 `agy-fast` 或 `antigravity-plugin-context-mode`，请在 **Customizations → Installed** 中关闭或移除旧单独插件，避免重复挂载。
@@ -164,13 +174,16 @@ node scripts/install.mjs uninstall
 除了在右侧 Aux Pane 的 **agy-dart Context** 实时面板中随时点选阈值或暂停（`Active / Paused`），也可以用命令行一键切换预设模式：
 
 ```bash
-# 方案 A（默认推荐）：放行 <16 KB 文件与 <=410 行分段读，拦截无界盲读与大命令 dump
+# 默认推荐（宿主对齐 45 KiB / 800 行软护栏 + 16 KB 高噪/压缩 + 128 KB diff/patch）
+node scripts/install.mjs mode host-45k
+
+# 经典方案 A：16 KB / 410 行
 node scripts/install.mjs mode balanced-16k
 
-# 宽松方案 A（适合超大源码文件较多的仓）：32 KB / 820 行
+# 宽松模式：32 KB / 800 行
 node scripts/install.mjs mode fast-32k
 
-# 严格模式：8 KB / 200 行
+# 严格模式：8 KB / 205 行
 node scripts/install.mjs mode strict-8k
 
 # 方案 B（极致低延迟）：仅拦截无界 run_command（cat/Get-Content/git log/curl），彻底免除 read_file Hook 同步耗时

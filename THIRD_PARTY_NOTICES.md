@@ -44,7 +44,7 @@ SOFTWARE.
 - **License**: MIT License
 - **What is reused / adapted**:
   - Local-first `node:sqlite` WAL + FTS5 (Porter BM25 + Trigram RRF) storage engine (`context/lib/store.js`), sandboxed code executor (`context/lib/executor.js`), MCP tools (`context/lib/tools.js`, `context/server.js`), lifecycle `PreToolUse` protection logic (`hooks/pre-tool-use.mjs`), and Aux Pane Sidecar dashboard (`sidecars/dashboard/`).
-  - Adapted in `agy-dart` with: `${PLUGIN_ROOT}` MCP paths, isolated `~/.agy-dart/context.db`, 16 KB / 410-line default balanced cutoff, `<= 8.8 KB` UTF-8 hard output cap, single-connection SQLite reuse inside hooks, automatic exemption for agent instruction files (`SKILL.md`/`AGENTS.md`/`GEMINI.md`/`CLAUDE.md`), dynamic `sidecar_sdk` resolution, heading-aware Markdown chunking, read-dedup tracking, TTL pruning + VACUUM, and live KV-cache telemetry.
+  - Adapted in `agy-dart` with: `${PLUGIN_ROOT}` MCP paths, isolated `~/.agy-dart/context.db`, 4-tier host-aligned read guard (45 KiB / 800-line default source 2-strike, 16 KB noise/minified, 128 KB `.patch`/`.diff`), `<= 8.8 KB` UTF-8 hard output cap, single-connection SQLite reuse inside hooks, automatic exemption for agent instruction files (`SKILL.md`/`AGENTS.md`/`GEMINI.md`/`CLAUDE.md`), dynamic `sidecar_sdk` resolution, heading-aware Markdown chunking, read-dedup tracking, TTL pruning + VACUUM, and live KV-cache telemetry.
 
 ```text
 MIT License

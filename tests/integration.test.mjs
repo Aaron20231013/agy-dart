@@ -75,7 +75,7 @@ test("MCP servers: fast (4 tools) and context (8 tools) both pass live JSON-RPC 
   }
 });
 
-test("PreToolUse: 16 KB default cutoff, ranged allow, SKILL.md exemption, and unbounded command deny", () => {
+test("PreToolUse: 45 KiB default cutoff, 16 KB log guard, ranged allow, SKILL.md exemption, and unbounded command deny", () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-hook-"));
   const tmpDb = path.join(tmpDir, "context.db");
   const small12k = path.join(tmpDir, "small.ts");
@@ -87,10 +87,13 @@ test("PreToolUse: 16 KB default cutoff, ranged allow, SKILL.md exemption, and un
   fs.writeFileSync(bigSkill, "# Skill Manual\n" + "instruction text ".repeat(1500)); // ~25 KB
 
   try {
-    // 1. Default cutoff in fresh DB is 16 KB
+    // 1. Default cutoff in fresh DB is 45 KiB (46,080 B, aligned with Antigravity host read_file cap)
     const store = new ContextModeStore({ dbPath: tmpDb });
-    assert.equal(store.getCutoff(null), 16384);
-    store.close();
+    try {
+      assert.equal(store.getCutoff(null), 46080);
+    } finally {
+      store.close();
+    }
 
     // 2. 12 KB source file allowed whole
     const rSmall = runPreHook({ toolCall: { name: "read_file", args: { Path: small12k } } }, tmpDb);

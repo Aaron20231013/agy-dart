@@ -4,8 +4,8 @@
 
 | Task | Tool | Why |
 | :--- | :--- | :--- |
-| Outline unknown large source (>300 lines; 10–20/batch) | `agy-dart_fast` → `read_slices({ outlines })` | Maps symbols in 1 call; then read <=200-line ranges in parallel `read_file` |
-| Read small source (<16 KB) or known ranges | Built-in `read_file` (parallel, <=410 lines) | ~7ms local; unchanged duplicate reads auto-guarded (retry once to bypass) |
+| Outline unknown large source / `.patch` (>300 lines; 10–20/batch) | `agy-dart_fast` → `read_slices({ outlines })` | Maps symbols/diff hunks in 1 call; then read targeted ranges in parallel `read_file` |
+| Read source (<45 KiB), `.patch` (<128 KB), or known ranges | Built-in `read_file` (parallel, <=800 lines) | ~7ms local; 45 KiB host cap; unchanged dupes & >45 KiB soft-guarded (retry once) |
 | >=2 text/regex/glob/read-only `git` queries | `agy-dart_fast` → `batch_search` (1 call) | Concurrent `rg`/Node execution, <=8.8 KB |
 | >=2 hunks/files edit, or edit + verify | `agy-dart_fast` → `apply_edits` (`bestEffort` >=3 files) | Atomic commits + inline `verify` |
 | >=2 concurrent checks (<=60s) | `agy-dart_fast` → `run_checks` | True pool; use `run_command` for >60s builds/tests or async (`WaitMsBeforeAsync <= 2000`) |

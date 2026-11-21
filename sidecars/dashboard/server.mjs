@@ -229,7 +229,7 @@ function getPackageVersion() {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../../package.json"), "utf8"));
     if (pkg.version) return pkg.version;
   } catch {}
-  return "1.2.2";
+  return "1.3.0";
 }
 
 function getRenderedHtml(csrfToken = SIDECAR_CSRF_TOKEN) {
@@ -353,13 +353,21 @@ function getStatsPayload(data, defaultConvId = "default") {
     : (isAppScope ? stats.appCustomExtensions : stats.conversationCustomExtensions);
 
   // Sandbox preview cap is double cutoff, hard-capped at 8100 B to prevent Antigravity MCP output.txt spills
-  const cfgMaxOutputBytes = getEffectiveConfig().maxOutputBytes || 8100;
+  const effCfg = getEffectiveConfig();
+  const cfgMaxOutputBytes = effCfg.maxOutputBytes || 8100;
   stats.sandboxCapBytes = Math.min(
     8100,
     stats.cutoffBytes > 0
       ? stats.cutoffBytes * 2
       : cfgMaxOutputBytes
   );
+  stats.readGuardMode = effCfg.readGuardMode || "soft";
+  stats.noiseMaxReadBytes = effCfg.noiseMaxReadBytes ?? 16384;
+  stats.reviewMaxReadBytes = effCfg.reviewMaxReadBytes ?? 131072;
+  stats.shellDumpMaxBytes = effCfg.shellDumpMaxBytes ?? 16384;
+  if (typeof store.getCutoffInfo === "function") {
+    stats.cutoffSource = store.getCutoffInfo(isLifetimeScope ? null : targetSid).source;
+  }
   stats.isPaused = store.isPaused(targetSid);
   stats.cliFilterEnabled = store.isCliFilterEnabled(targetSid);
   stats.readDedupEnabled = store.isReadDedupEnabled(targetSid);
@@ -980,7 +988,7 @@ function handlePurgeMutation(data, defaultConvId = "default") {
   } else if (scope === "app" || scope === "session") {
     return store.purge({ scope: "app", sinceTs: appStartTime });
   }
-  return store.purge({ scope: "conversation", sessionId: convId });
+  return store.purge({ scope: "session", sessionId: convId });
 }
 
 function handleMaintenanceMutation(data) {

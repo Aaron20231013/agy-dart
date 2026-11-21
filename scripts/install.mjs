@@ -12,10 +12,11 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 const PLUGIN_NAME = "agy-dart";
 
 const MODES = {
-  "strict-8k": { cutoffBytes: 8192, readHook: true, label: "Strict (8 KB / 200 lines)" },
-  "balanced-16k": { cutoffBytes: 16384, readHook: true, label: "Balanced Scheme A (16 KB / 410 lines, recommended)" },
-  "fast-32k": { cutoffBytes: 32768, readHook: true, label: "Relaxed Scheme A (32 KB / 820 lines)" },
-  "no-read-hook": { cutoffBytes: 16384, readHook: false, label: "Ultra-fast Scheme B (command guard only, no read_file hook)" }
+  "strict-8k": { cutoffBytes: 8192, readHook: true, label: "Strict (8 KB / 205 lines)" },
+  "balanced-16k": { cutoffBytes: 16384, readHook: true, label: "Classic Balanced (16 KB / 410 lines)" },
+  "fast-32k": { cutoffBytes: 32768, readHook: true, label: "Relaxed (32 KB / 800 lines)" },
+  "host-45k": { cutoffBytes: 46080, readHook: true, label: "Host-Aligned Default (45 KiB / 800 lines, 2-strike soft guard, recommended)" },
+  "no-read-hook": { cutoffBytes: 46080, readHook: false, label: "Ultra-fast Scheme B (command guard only, no read_file hook)" }
 };
 
 export const RUNTIME_FILES = Object.freeze([
@@ -113,7 +114,8 @@ function parseArgs(argv) {
   let command = "install";
   let targetDir = "";
   let projectDir = "";
-  let mode = "balanced-16k";
+  let mode = "host-45k";
+  let explicitMode = false;
   let installRg = false;
   let withDevtools = false;
   let showHelp = false;
@@ -135,6 +137,7 @@ function parseArgs(argv) {
         throw new Error(`Invalid --mode '${next}'. Expected one of: ${Object.keys(MODES).join(", ")}`);
       }
       mode = next;
+      explicitMode = true;
     } else if (a === "--target") {
       const next = args[++i];
       if (!next || next.startsWith("-")) throw new Error("Missing path after --target");
@@ -159,6 +162,7 @@ function parseArgs(argv) {
       throw new Error(`Unknown mode '${positional[1]}'. Expected one of: ${Object.keys(MODES).join(", ")}`);
     }
     mode = positional[1];
+    explicitMode = true;
   }
 
   const isCustomTarget = Boolean(targetDir);
@@ -175,6 +179,7 @@ function parseArgs(argv) {
     isProject: Boolean(projectDir),
     isCustomTarget,
     mode,
+    explicitMode,
     installRg,
     withDevtools,
     showHelp
@@ -193,7 +198,7 @@ Usage:
 Options:
   --project [dir]        Install into <dir>/.agents/plugins/agy-dart
   --target <dir>         Install into a custom directory
-  --mode <mode>          balanced-16k (default) | fast-32k | strict-8k | no-read-hook
+  --mode <mode>          host-45k (default) | fast-32k | balanced-16k | strict-8k | no-read-hook
   --with-devtools        Also copy offline CLI devtools (benchmark, cache-simulator, cache-audit, prefix-budget, verify-package-graph, gen-review-brief)
   --runtime-only         Install runtime files only (default)
   --install-rg           On Windows x64, download official ripgrep (rg.exe) to ~/.local/bin and add to PATH
@@ -201,7 +206,7 @@ Options:
 `);
 }
 
-async function applyMode(targetDir, modeKey, skipDb = false) {
+async function applyMode(targetDir, modeKey, skipDb = false, { explicitMode = true } = {}) {
   const cfg = MODES[modeKey];
   const hooksPath = path.join(targetDir, "hooks.json");
   const hooksJson = {
@@ -260,8 +265,29 @@ async function applyMode(targetDir, modeKey, skipDb = false) {
     const storeUrl = pathToFileURL(path.join(targetDir, "context", "lib", "store.js")).href;
     const { ContextModeStore } = await import(storeUrl);
     const store = new ContextModeStore();
-    store.setCutoff(cfg.cutoffBytes, "lifetime");
-    store.close();
+    try {
+      if (explicitMode) {
+        store.setCutoff(cfg.cutoffBytes, "lifetime", { source: "user" });
+      } else {
+        const existingGlobal = store.getMeta("cutoff:global", null);
+        const existingSource = store.getMeta("cutoff:source", null);
+        if (existingGlobal === null) {
+          store.setCutoff(cfg.cutoffBytes, "lifetime", { source: "installer_default" });
+        } else if (
+          existingSource === "installer_default" ||
+          (existingGlobal === "16384" && existingSource === null)
+        ) {
+          store.setCutoff(cfg.cutoffBytes, "lifetime", { source: "installer_default" });
+          if (existingGlobal !== String(cfg.cutoffBytes)) {
+            console.log(`  - Migrated legacy default cutoff ${existingGlobal} B -> ${cfg.cutoffBytes} B (${modeKey})`);
+          }
+        } else {
+          console.log(`  - Preserved existing custom global cutoff (${existingGlobal} B; pass --mode ${modeKey} to override)`);
+        }
+      }
+    } finally {
+      store.close();
+    }
   }
   return cfg;
 }
@@ -430,7 +456,21 @@ async function runDoctor(targetDir) {
     try {
       const cfgModPath = path.join(targetDir, "context", "lib", "config.js");
       const cfgMod = await import(pathToFileURL((await pathExists(cfgModPath)) ? cfgModPath : path.join(REPO_ROOT, "context", "lib", "config.js")).href);
-      configLines = cfgMod.formatEffectiveConfigLines(cfgMod.getConfigSnapshot());
+      let extraReadGuard = {};
+      try {
+        const storeModPath = path.join(targetDir, "context", "lib", "store.js");
+        const storeMod = await import(pathToFileURL((await pathExists(storeModPath)) ? storeModPath : path.join(REPO_ROOT, "context", "lib", "store.js")).href);
+        const liveStore = new storeMod.ContextModeStore({ hookMode: true });
+        try {
+          const info = typeof liveStore.getCutoffInfo === "function" ? liveStore.getCutoffInfo(null) : null;
+          if (info) {
+            extraReadGuard = { sourceCutoffBytes: info.cutoffBytes, sourceCutoffSource: info.source };
+          }
+        } finally {
+          liveStore.close();
+        }
+      } catch {}
+      configLines = cfgMod.formatEffectiveConfigLines(cfgMod.getConfigSnapshot(), extraReadGuard);
     } catch {}
 
     let filterDiag = null;
@@ -854,7 +894,7 @@ async function runInstall(opts) {
   }
 
   const skipDb = Boolean(opts.isCustomTarget || opts.isProject);
-  const modeCfg = await applyMode(dstRoot, opts.mode, skipDb);
+  const modeCfg = await applyMode(dstRoot, opts.mode, skipDb, { explicitMode: opts.explicitMode });
   console.log(`Configured mode: ${opts.mode} — ${modeCfg.label}`);
 
   if (opts.installRg) {
@@ -890,7 +930,7 @@ async function main() {
         throw new Error(`Refusing to switch mode at ${targetResolved}: directory does not contain an '${PLUGIN_NAME}' plugin.json manifest.`);
       }
       const skipDb = Boolean(opts.isCustomTarget || opts.isProject);
-      const cfg = await applyMode(targetResolved, opts.mode, skipDb);
+      const cfg = await applyMode(targetResolved, opts.mode, skipDb, { explicitMode: true });
       console.log(`Switched agy-dart mode at ${targetResolved} -> ${opts.mode} (${cfg.label})`);
       break;
     }
