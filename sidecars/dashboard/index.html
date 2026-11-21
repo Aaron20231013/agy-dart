@@ -1519,6 +1519,7 @@
         <div class="sub-head">
           <span data-i18n="fileCategoriesLabel">File Categories (toggle groups):</span>
         </div>
+        <div class="footnote" data-i18n="categoryProtectHint">Unchecked groups (such as Source Code) are still readable — files over the cutoff guide the AI to inspect outlines and read line slices instead of dumping the whole file.</div>
 
         <div id="category-toggles" class="chip-group">
           <button onclick="toggleCategory('images')" class="toggle-chip is-on"><span class="toggle-chip-dot"></span><span>Images</span></button>
@@ -1710,6 +1711,7 @@
         resetDefaultsBtn: 'Reset Defaults',
         resetDefaultsTip: 'Restore default file categories and clear custom extensions',
         fileCategoriesLabel: 'File Categories (toggle groups):',
+        categoryProtectHint: 'Unchecked groups (such as Source Code) are still readable — files over the cutoff guide the AI to inspect outlines and read line slices instead of dumping the whole file.',
         catSummary: '{active} of {total} active',
         catTip: '{name} ({count} types: {sample}) — Click to {action}',
         actionDisable: 'disable',
@@ -1946,6 +1948,7 @@
         resetDefaultsBtn: '恢复默认',
         resetDefaultsTip: '恢复默认文件分组并清空自定义扩展名',
         fileCategoriesLabel: '文件分组（点击开关）：',
+        categoryProtectHint: '未勾选分组（如源代码）并非禁止读取，而是在文件超过截断阈值时引导 AI 先看大纲再按行分段精读，防止大文件撑爆上下文。',
         catSummary: '已启用 {active} / {total} 组',
         catTip: '{name}（{count} 种：{sample}）— 点击{action}',
         actionDisable: '关闭',
