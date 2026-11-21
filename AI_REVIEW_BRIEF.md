@@ -1,6 +1,6 @@
 # `agy-dart` — AI 审阅技术简报（AI Review Brief）
 
-> **本文档用途**：面向代码审阅 AI / 架构审计 AI / 安全审查 AI 的高密度项目总览与审阅路线图。对应代码与测试基线提交：`bdf2a7d`（发布候选标签 `v1.2.0-rc`）。代码行数、模块映射与测试数量由 `scripts/gen-review-brief.mjs` 自动同步并受 `--check` 漂移守卫保护。
+> **本文档用途**：面向代码审阅 AI / 架构审计 AI / 安全审查 AI 的高密度项目总览与审阅路线图。对应代码与测试基线提交：`554f5e9`（发布候选标签 `v1.2.0-rc`）。代码行数、模块映射与测试数量由 `scripts/gen-review-brief.mjs` 自动同步并受 `--check` 漂移守卫保护。
 
 <!-- AUTO:META:START -->
 > **同步快照（由 `scripts/gen-review-brief.mjs` 自动维护）**：版本 `v1.2.0` · 核心追踪文件 36 个（合计 34,287 行） · 测试套件 15 个 / 106 个用例 · 可运行 `node scripts/gen-review-brief.mjs --check` 检验零漂移。
