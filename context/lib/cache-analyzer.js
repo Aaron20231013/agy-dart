@@ -662,7 +662,7 @@ function isSubagentDelegationCall(call) {
   return false;
 }
 
-function isSubagentStep(step) {
+export function isSubagentStep(step) {
   if (!step || typeof step !== "object") return false;
   if (step.subagent === true || step.is_subagent === true || step.isSubagent === true) return true;
   const source = typeof step.source === "string" ? step.source.trim().toUpperCase() : "";
@@ -1871,6 +1871,18 @@ export function analyzeMultipleSessionsCache(sessions, options = {}) {
 }
 
 /**
+ * Strictly validate a conversationId before joining it onto local brain root paths.
+ * Blocks path traversal (`..`, `/`, `\`, drive letters, NUL bytes) and overly long inputs.
+ */
+export function isSafeConversationId(conversationId) {
+  if (typeof conversationId !== "string") return false;
+  const trimmed = conversationId.trim();
+  if (!trimmed || trimmed.length > 128) return false;
+  if (trimmed === "." || trimmed === ".." || trimmed.includes("..")) return false;
+  return /^[A-Za-z0-9._-]+$/.test(trimmed);
+}
+
+/**
  * Locate Antigravity transcript_full.jsonl / transcript.jsonl for a conversationId.
  * When exactOnly=false (default), falls back to the most recently modified local transcript
  * if conversationId is omitted, "all", "app", "default", or not found.
@@ -1898,17 +1910,43 @@ export function findTranscriptForConversation(conversationId = null, optionsOrEx
     conversationId !== "app";
 
   if (isSpecific) {
+    if (!isSafeConversationId(conversationId)) {
+      return null;
+    }
+    const safeId = conversationId.trim();
     for (const root of roots) {
+      if (!root || typeof root !== "string") continue;
+      const resolvedRoot = path.resolve(root);
+      let realRoot = null;
       const candidates = [
-        path.join(root, conversationId, ".system_generated", "logs", "transcript_full.jsonl"),
-        path.join(root, conversationId, ".system_generated", "logs", "transcript.jsonl"),
-        path.join(root, conversationId, ".system_generated", "transcript_full.jsonl"),
-        path.join(root, conversationId, ".system_generated", "transcript.jsonl"),
-        path.join(root, conversationId, "transcript_full.jsonl"),
-        path.join(root, conversationId, "transcript.jsonl")
+        path.join(resolvedRoot, safeId, ".system_generated", "logs", "transcript_full.jsonl"),
+        path.join(resolvedRoot, safeId, ".system_generated", "logs", "transcript.jsonl"),
+        path.join(resolvedRoot, safeId, ".system_generated", "transcript_full.jsonl"),
+        path.join(resolvedRoot, safeId, ".system_generated", "transcript.jsonl"),
+        path.join(resolvedRoot, safeId, "transcript_full.jsonl"),
+        path.join(resolvedRoot, safeId, "transcript.jsonl")
       ];
       for (const c of candidates) {
-        if (fs.existsSync(c)) return c;
+        const resolvedCand = path.resolve(c);
+        const rel = path.relative(
+          process.platform === "win32" ? resolvedRoot.toLowerCase() : resolvedRoot,
+          process.platform === "win32" ? resolvedCand.toLowerCase() : resolvedCand
+        );
+        if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) continue;
+        if (!fs.existsSync(resolvedCand)) continue;
+        try {
+          if (realRoot === null) realRoot = fs.realpathSync(resolvedRoot);
+          const realCand = fs.realpathSync(resolvedCand);
+          const realRel = path.relative(
+            process.platform === "win32" ? realRoot.toLowerCase() : realRoot,
+            process.platform === "win32" ? realCand.toLowerCase() : realCand
+          );
+          if (realRel && !realRel.startsWith("..") && !path.isAbsolute(realRel) && fs.statSync(realCand).isFile()) {
+            return realCand;
+          }
+        } catch {
+          // Reject unreadable or escaping symlink targets
+        }
       }
     }
   }

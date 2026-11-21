@@ -78,6 +78,8 @@ export class ReadMethods {
     endLine = null,
     mtimeMs,
     fileSize,
+    ctimeMs = null,
+    ino = null,
     maxAgeMs = DEFAULT_FILE_READ_MAX_AGE_MS
   }) {
     this.open();
@@ -89,10 +91,13 @@ export class ReadMethods {
     const reqEnd = Number.isFinite(endLine) && endLine > 0 ? endLine : -1; // -1 == EOF
     const hasCutoff = Number.isFinite(maxAgeMs) && maxAgeMs > 0;
     const minTs = hasCutoff ? Date.now() - maxAgeMs : 0;
+    const hasCtime = ctimeMs !== null && ctimeMs !== undefined && Number.isFinite(Number(ctimeMs));
+    const normCtime = hasCtime ? Number(ctimeMs) : null;
+    const normIno = ino !== null && ino !== undefined && String(ino) !== "" ? String(ino) : null;
 
     const rows = this.db
       .prepare(`
-        SELECT start_line, end_line, mtime_ms, file_size, byte_est, read_ts, bypass_armed
+        SELECT start_line, end_line, mtime_ms, file_size, ctime_ms, ino, byte_est, read_ts, bypass_armed
         FROM file_reads
         WHERE session_id = ? AND file_path = ?
       `)
@@ -102,6 +107,16 @@ export class ReadMethods {
     for (const row of rows) {
       if (Math.abs(Number(row.mtime_ms) - Number(mtimeMs)) > 1 || Number(row.file_size) !== Number(fileSize)) {
         continue;
+      }
+      if (hasCtime) {
+        if (row.ctime_ms === null || row.ctime_ms === undefined || Math.abs(Number(row.ctime_ms) - normCtime) > 0.01) {
+          continue;
+        }
+      }
+      if (normIno !== null) {
+        if (row.ino === null || row.ino === undefined || String(row.ino) !== normIno) {
+          continue;
+        }
       }
       if (hasCutoff && Number(row.read_ts) < minTs) continue;
       const coversStart = Number(row.start_line) <= reqStart;
@@ -136,23 +151,69 @@ export class ReadMethods {
   }
 
   /** Record an allowed file read in the session read tracker */
-  recordFileRead({ sessionId, filePath, startLine = 1, endLine = null, mtimeMs, fileSize, byteEst = 0 }) {
+  recordFileRead({
+    sessionId,
+    filePath,
+    startLine = 1,
+    endLine = null,
+    mtimeMs,
+    fileSize,
+    ctimeMs = null,
+    ino = null,
+    byteEst = 0
+  }) {
     this.open();
     const sid = sessionId || "default";
     const norm = this._normalizeTrackPath(filePath);
     if (!norm) return;
     const reqStart = Number.isFinite(startLine) && startLine > 0 ? startLine : 1;
     const reqEnd = Number.isFinite(endLine) && endLine > 0 ? endLine : -1;
+    const hasCtime = ctimeMs !== null && ctimeMs !== undefined && Number.isFinite(Number(ctimeMs));
+    const normCtime = hasCtime ? Number(ctimeMs) : null;
+    const normIno = ino !== null && ino !== undefined && String(ino) !== "" ? String(ino) : null;
     const now = Date.now();
 
     this._withBusyRetry(() => {
       // Evict stale versions of this file in this session
-      this.db
-        .prepare(`
-          DELETE FROM file_reads
-          WHERE session_id = ? AND file_path = ? AND (ABS(mtime_ms - ?) > 1 OR file_size != ?)
-        `)
-        .run(sid, norm, mtimeMs, fileSize);
+      if (hasCtime && normIno !== null) {
+        this.db
+          .prepare(`
+            DELETE FROM file_reads
+            WHERE session_id = ? AND file_path = ? AND (
+              ABS(mtime_ms - ?) > 1 OR file_size != ?
+              OR ctime_ms IS NULL OR ABS(ctime_ms - ?) > 0.01
+              OR ino IS NULL OR ino != ?
+            )
+          `)
+          .run(sid, norm, mtimeMs, fileSize, normCtime, normIno);
+      } else if (hasCtime) {
+        this.db
+          .prepare(`
+            DELETE FROM file_reads
+            WHERE session_id = ? AND file_path = ? AND (
+              ABS(mtime_ms - ?) > 1 OR file_size != ?
+              OR ctime_ms IS NULL OR ABS(ctime_ms - ?) > 0.01
+            )
+          `)
+          .run(sid, norm, mtimeMs, fileSize, normCtime);
+      } else if (normIno !== null) {
+        this.db
+          .prepare(`
+            DELETE FROM file_reads
+            WHERE session_id = ? AND file_path = ? AND (
+              ABS(mtime_ms - ?) > 1 OR file_size != ?
+              OR ino IS NULL OR ino != ?
+            )
+          `)
+          .run(sid, norm, mtimeMs, fileSize, normIno);
+      } else {
+        this.db
+          .prepare(`
+            DELETE FROM file_reads
+            WHERE session_id = ? AND file_path = ? AND (ABS(mtime_ms - ?) > 1 OR file_size != ?)
+          `)
+          .run(sid, norm, mtimeMs, fileSize);
+      }
 
       // Consume any armed 2-strike bypass across all covering rows for this file so superset rows don't stay bypassed forever
       this.db
@@ -164,16 +225,18 @@ export class ReadMethods {
 
       this.db
         .prepare(`
-          INSERT INTO file_reads (session_id, file_path, start_line, end_line, mtime_ms, file_size, byte_est, read_ts, bypass_armed)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+          INSERT INTO file_reads (session_id, file_path, start_line, end_line, mtime_ms, file_size, ctime_ms, ino, byte_est, read_ts, bypass_armed)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
           ON CONFLICT(session_id, file_path, start_line, end_line) DO UPDATE SET
             mtime_ms = excluded.mtime_ms,
             file_size = excluded.file_size,
+            ctime_ms = excluded.ctime_ms,
+            ino = excluded.ino,
             byte_est = excluded.byte_est,
             read_ts = excluded.read_ts,
             bypass_armed = 0
         `)
-        .run(sid, norm, reqStart, reqEnd, mtimeMs, fileSize, byteEst, now);
+        .run(sid, norm, reqStart, reqEnd, mtimeMs, fileSize, normCtime, normIno, byteEst, now);
     });
   }
 
@@ -212,6 +275,7 @@ export class ReadMethods {
     sha256 = null,
     mtimeMs = 0,
     fileSize = 0,
+    ino = null,
     content,
     bypassArmed = 0,
     fullReadTs = null,
@@ -230,6 +294,7 @@ export class ReadMethods {
     }
     const reqStart = Number.isFinite(startLine) && startLine > 0 ? Math.floor(startLine) : 1;
     const reqEnd = Number.isFinite(endLine) && endLine > 0 ? Math.floor(endLine) : -1;
+    const normIno = ino !== null && ino !== undefined && String(ino) !== "" ? String(ino) : null;
     const digest = sha256 || createHash("sha256").update(content, "utf8").digest("hex");
     const contentGz = gzipSync(Buffer.from(content, "utf8"), { level: 1 });
     const now = Date.now();
@@ -244,26 +309,28 @@ export class ReadMethods {
       : MAX_SNAPSHOTS_PER_SESSION;
 
     this._withBusyRetry(() => {
-      // Evict strictly covered older subset snapshots so a newer superset read is never shadowed
+      // Evict strictly covered older subset snapshots (same inode when known) so a newer superset read is never shadowed
       this.db
         .prepare(`
           DELETE FROM file_snapshots
           WHERE session_id = ? AND file_path = ?
+            AND (? IS NULL OR ino IS NULL OR ino = ?)
             AND start_line >= ?
             AND (? = -1 OR (end_line != -1 AND end_line <= ?))
             AND NOT (start_line = ? AND end_line = ?)
         `)
-        .run(sid, norm, reqStart, reqEnd, reqEnd, reqStart, reqEnd);
+        .run(sid, norm, normIno, normIno, reqStart, reqEnd, reqEnd, reqStart, reqEnd);
 
       this.db
         .prepare(`
           INSERT INTO file_snapshots (
-            session_id, file_path, start_line, end_line, sha256, mtime_ms, file_size, raw_bytes, content_gz, updated_ts, bypass_armed, full_read_ts, full_read_seq
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            session_id, file_path, start_line, end_line, sha256, mtime_ms, file_size, ino, raw_bytes, content_gz, updated_ts, bypass_armed, full_read_ts, full_read_seq
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(session_id, file_path, start_line, end_line) DO UPDATE SET
             sha256 = excluded.sha256,
             mtime_ms = excluded.mtime_ms,
             file_size = excluded.file_size,
+            ino = excluded.ino,
             raw_bytes = excluded.raw_bytes,
             content_gz = excluded.content_gz,
             updated_ts = excluded.updated_ts,
@@ -271,7 +338,7 @@ export class ReadMethods {
             full_read_ts = excluded.full_read_ts,
             full_read_seq = excluded.full_read_seq
         `)
-        .run(sid, norm, reqStart, reqEnd, digest, mtimeMs, fileSize, rawBytes, contentGz, now, armed, effFullReadTs, effFullReadSeq);
+        .run(sid, norm, reqStart, reqEnd, digest, mtimeMs, fileSize, normIno, rawBytes, contentGz, now, armed, effFullReadTs, effFullReadSeq);
 
       // Enforce bounded per-session LRU snapshot cap
       const countRow = this.db
@@ -312,6 +379,7 @@ export class ReadMethods {
     filePath,
     startLine = 1,
     endLine = null,
+    ino = null,
     maxAgeMs = DEFAULT_FILE_READ_MAX_AGE_MS
   }) {
     this.open();
@@ -321,12 +389,13 @@ export class ReadMethods {
 
     const reqStart = Number.isFinite(startLine) && startLine > 0 ? Math.floor(startLine) : 1;
     const reqEnd = Number.isFinite(endLine) && endLine > 0 ? Math.floor(endLine) : -1;
+    const normIno = ino !== null && ino !== undefined && String(ino) !== "" ? String(ino) : null;
     const hasCutoff = Number.isFinite(maxAgeMs) && maxAgeMs > 0;
     const minTs = hasCutoff ? Date.now() - maxAgeMs : 0;
 
     const rows = this.db
       .prepare(`
-        SELECT start_line, end_line, sha256, mtime_ms, file_size, raw_bytes, content_gz, updated_ts, bypass_armed, full_read_ts, full_read_seq
+        SELECT start_line, end_line, sha256, mtime_ms, file_size, ino, raw_bytes, content_gz, updated_ts, bypass_armed, full_read_ts, full_read_seq
         FROM file_snapshots
         WHERE session_id = ? AND file_path = ?
       `)
@@ -335,6 +404,9 @@ export class ReadMethods {
     const candidates = [];
     for (const row of rows) {
       if (hasCutoff && Number(row.updated_ts) < minTs) continue;
+      if (normIno !== null && (row.ino === null || row.ino === undefined || String(row.ino) !== normIno)) {
+        continue;
+      }
       const coversStart = Number(row.start_line) <= reqStart;
       const coversEnd = Number(row.end_line) === -1 || (reqEnd !== -1 && Number(row.end_line) >= reqEnd);
       if (coversStart && coversEnd) {

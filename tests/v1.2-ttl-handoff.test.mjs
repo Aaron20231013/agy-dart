@@ -442,7 +442,7 @@ test("P1-7.3: Standalone Sidecar HTTP /api/handoff + /api/cache-diag (serverNowM
     assert.ok(!html.includes("previewEl.innerHTML"), "Handoff preview must never use innerHTML");
     assert.ok(html.includes("navigator.clipboard.writeText"));
     assert.ok(html.includes("document.execCommand('copy')"));
-    assert.ok(html.includes("/api/handoff?scope="));
+    assert.ok(html.includes("apiFetch('/api/handoff'"));
 
     const scriptMatches = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
     assert.ok(scriptMatches.length >= 1);

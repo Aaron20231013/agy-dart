@@ -96,11 +96,18 @@ export class SchemaMethods {
   /** Initialize tables, FTS5 virtual tables, and indexes */
   initSchema() {
     if (!this.db) return;
+    const busyMs = Number.isFinite(this.busyTimeoutMs) && this.busyTimeoutMs >= 0 ? Math.floor(this.busyTimeoutMs) : 5000;
+    const initStart = Date.now();
     try {
-      this.db.exec("PRAGMA busy_timeout = 5000;");
+      this.db.exec(`PRAGMA busy_timeout = ${busyMs};`);
       this.db.exec("PRAGMA journal_mode = WAL;");
       this.db.exec("PRAGMA synchronous = NORMAL;");
-    } catch {
+    } catch (err) {
+      const msg = String(err?.message || err || "");
+      const isBusy = err?.code === "ERR_SQLITE_ERROR" && /database is locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(msg);
+      if (this.hookMode && isBusy && this.maxRetryDeadlineMs > 0 && Date.now() - initStart >= this.maxRetryDeadlineMs) {
+        throw err;
+      }
       // Fallback if PRAGMA configuration is restricted
     }
 
@@ -160,6 +167,8 @@ export class SchemaMethods {
         end_line INTEGER NOT NULL,
         mtime_ms REAL NOT NULL,
         file_size INTEGER NOT NULL,
+        ctime_ms REAL,
+        ino TEXT,
         byte_est INTEGER NOT NULL DEFAULT 0,
         read_ts INTEGER NOT NULL,
         bypass_armed INTEGER NOT NULL DEFAULT 0,
@@ -176,6 +185,7 @@ export class SchemaMethods {
         sha256 TEXT NOT NULL,
         mtime_ms REAL NOT NULL,
         file_size INTEGER NOT NULL,
+        ino TEXT,
         raw_bytes INTEGER NOT NULL DEFAULT 0,
         content_gz BLOB NOT NULL,
         updated_ts INTEGER NOT NULL,
@@ -244,11 +254,27 @@ export class SchemaMethods {
       }
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_sources_session_hash ON sources(session_id, content_hash);");
 
-      // Idempotent schema upgrade: ensure file_snapshots tracks full_read_ts & full_read_seq for freshness bounds
+      // Idempotent schema upgrade: ensure file_reads tracks ctime_ms & ino to catch atomic replace / preserved-mtime edits
+      const readCols = this.db.prepare("PRAGMA table_info(file_reads)").all();
+      for (const colDef of [
+        { name: "ctime_ms", sql: "ALTER TABLE file_reads ADD COLUMN ctime_ms REAL;" },
+        { name: "ino", sql: "ALTER TABLE file_reads ADD COLUMN ino TEXT;" }
+      ]) {
+        if (!readCols.some((c) => c.name === colDef.name)) {
+          try {
+            this.db.exec(colDef.sql);
+          } catch (err) {
+            if (!/duplicate column name/i.test(String(err?.message || ""))) throw err;
+          }
+        }
+      }
+
+      // Idempotent schema upgrade: ensure file_snapshots tracks full_read_ts, full_read_seq & ino
       const snapCols = this.db.prepare("PRAGMA table_info(file_snapshots)").all();
       for (const colDef of [
         { name: "full_read_ts", sql: "ALTER TABLE file_snapshots ADD COLUMN full_read_ts INTEGER NOT NULL DEFAULT 0;" },
-        { name: "full_read_seq", sql: "ALTER TABLE file_snapshots ADD COLUMN full_read_seq INTEGER NOT NULL DEFAULT 0;" }
+        { name: "full_read_seq", sql: "ALTER TABLE file_snapshots ADD COLUMN full_read_seq INTEGER NOT NULL DEFAULT 0;" },
+        { name: "ino", sql: "ALTER TABLE file_snapshots ADD COLUMN ino TEXT;" }
       ]) {
         if (!snapCols.some((c) => c.name === colDef.name)) {
           try {
@@ -260,33 +286,37 @@ export class SchemaMethods {
       }
     });
 
-    // Virtual FTS5 tables
-    this.db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
-        source_id UNINDEXED,
-        session_id UNINDEXED,
-        worktree UNINDEXED,
-        agent UNINDEXED,
-        ord UNINDEXED,
-        body,
-        title,
-        tokenize = 'porter unicode61 remove_diacritics 2'
-      );
+    // Virtual FTS5 tables & schema_version (wrapped in busy-retry for concurrent cold starts)
+    this._withBusyRetry(() => {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+          source_id UNINDEXED,
+          session_id UNINDEXED,
+          worktree UNINDEXED,
+          agent UNINDEXED,
+          ord UNINDEXED,
+          body,
+          title,
+          tokenize = 'porter unicode61 remove_diacritics 2'
+        );
 
-      CREATE VIRTUAL TABLE IF NOT EXISTS chunks_tri USING fts5(
-        source_id UNINDEXED,
-        session_id UNINDEXED,
-        ord UNINDEXED,
-        body,
-        tokenize = 'trigram'
-      );
-    `);
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_tri USING fts5(
+          source_id UNINDEXED,
+          session_id UNINDEXED,
+          ord UNINDEXED,
+          body,
+          tokenize = 'trigram'
+        );
+      `);
 
-    const versionRow = this.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get();
-    if (!versionRow) {
-      this.db.prepare("INSERT INTO meta(key, value) VALUES ('schema_version', '3')").run();
-    } else if (versionRow.value !== "3") {
-      this.db.prepare("UPDATE meta SET value = '3' WHERE key = 'schema_version'").run();
-    }
+      const versionRow = this.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get();
+      if (!versionRow) {
+        this.db
+          .prepare("INSERT INTO meta(key, value) VALUES ('schema_version', '3') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+          .run();
+      } else if (versionRow.value !== "3") {
+        this.db.prepare("UPDATE meta SET value = '3' WHERE key = 'schema_version'").run();
+      }
+    });
   }
 }

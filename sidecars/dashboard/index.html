@@ -632,11 +632,7 @@
       const token = params.get('token');
       const csrfToken = getCsrfToken();
 
-      let finalUrl = path;
-      if (token && !finalUrl.includes('token=')) {
-        const sep = finalUrl.includes('?') ? '&' : '?';
-        finalUrl += `${sep}token=${encodeURIComponent(token)}`;
-      }
+      const finalUrl = path;
 
       const headers = new Headers(options.headers || {});
       if (token && !headers.has('X-Sidecar-Token')) {
@@ -973,8 +969,10 @@
         const params = new URLSearchParams(window.location.search);
         const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
         
-        const statsUrl = `/api/stats?scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
-        const statsRes = await apiFetch(statsUrl, { method: 'GET' });
+        const statsRes = await apiFetch('/api/stats', {
+          method: 'POST',
+          body: JSON.stringify({ scope: currentScope, conversationId: convId })
+        });
         if (!statsRes.ok) throw new Error(`Stats HTTP ${statsRes.status}`);
         const s = await statsRes.json();
         cachedStats = s;
@@ -1040,7 +1038,7 @@
 
         // Doctor health + DB size
         try {
-          const docRes = await apiFetch('/api/doctor', { method: 'GET' });
+          const docRes = await apiFetch('/api/doctor', { method: 'POST', body: '{}' });
           if (docRes.ok) {
             const d = await docRes.json();
             if (d.status) {
@@ -1056,8 +1054,10 @@
 
         // KV-Cache & Context Watermark telemetry
         try {
-          const kvUrl = `/api/cache-diag?scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
-          const kvRes = await apiFetch(kvUrl, { method: 'GET' });
+          const kvRes = await apiFetch('/api/cache-diag', {
+            method: 'POST',
+            body: JSON.stringify({ scope: currentScope, conversationId: convId })
+          });
           if (kvRes.ok) {
             const kv = await kvRes.json();
             renderKvCacheCard(kv);
@@ -1065,8 +1065,10 @@
         } catch {}
 
         // Recent sources & guard events
-        const resumeUrl = `/api/resume?scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
-        const resumeRes = await apiFetch(resumeUrl, { method: 'GET' });
+        const resumeRes = await apiFetch('/api/resume', {
+          method: 'POST',
+          body: JSON.stringify({ scope: currentScope, conversationId: convId })
+        });
         if (resumeRes.ok) {
           const r = await resumeRes.json();
           const sourcesDiv = document.getElementById('sources-list');
@@ -1200,7 +1202,10 @@
       resultsDiv.innerHTML = '<div class="text-slate-400 italic text-xs">Loading chunks for source...</div>';
 
       try {
-        const res = await apiFetch(`/api/source-chunks?sourceId=${encodeURIComponent(sourceId)}`, { method: 'GET' });
+        const res = await apiFetch('/api/source-chunks', {
+          method: 'POST',
+          body: JSON.stringify({ sourceId })
+        });
         if (res.ok) {
           const data = await res.json();
           if (data.chunks && data.chunks.length > 0) {
@@ -1563,8 +1568,10 @@
       try {
         const params = new URLSearchParams(window.location.search);
         const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
-        const url = `/api/handoff?scope=${encodeURIComponent(currentScope)}&conversationId=${encodeURIComponent(convId)}`;
-        const res = await apiFetch(url, { method: 'GET' });
+        const res = await apiFetch('/api/handoff', {
+          method: 'POST',
+          body: JSON.stringify({ scope: currentScope, conversationId: convId })
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (reqSeq !== handoffFetchSeq) return;

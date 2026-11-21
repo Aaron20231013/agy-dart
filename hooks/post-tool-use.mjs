@@ -7,6 +7,7 @@
  * When `ctx_resume` is called after conversation compaction, invalidates BOTH
  * `file_reads` and `file_snapshots` for the session.
  */
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
@@ -319,7 +320,7 @@ async function main() {
     let store = null;
     try {
       const { ContextModeStore } = await import("../context/lib/store.js");
-      store = new ContextModeStore();
+      store = new ContextModeStore({ hookMode: true });
       if (clearAllSession) {
         store.invalidateFileReads(sessionId, null);
         if (directConvId && directConvId !== sessionId) {
@@ -362,12 +363,19 @@ async function main() {
 }
 
 const __selfPath = path.resolve(fileURLToPath(import.meta.url));
-const isDirectRun = Boolean(
-  process.argv[1] &&
-    (process.platform === "win32"
-      ? path.resolve(process.argv[1]).toLowerCase() === __selfPath.toLowerCase()
-      : path.resolve(process.argv[1]) === __selfPath)
-);
+function isSameFilePath(a, b) {
+  if (!a || !b) return false;
+  const norm = (p) => {
+    const resolved = path.resolve(p);
+    let real = resolved;
+    try {
+      real = fs.realpathSync(resolved);
+    } catch {}
+    return process.platform === "win32" ? real.toLowerCase() : real;
+  };
+  return norm(a) === norm(b);
+}
+const isDirectRun = Boolean(process.argv[1] && isSameFilePath(process.argv[1], __selfPath));
 if (isDirectRun) {
   main().catch(() => {
     process.stdout.write("{}\n");

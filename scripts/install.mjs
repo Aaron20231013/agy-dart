@@ -398,6 +398,21 @@ async function runDoctor(targetDir) {
       configLines = cfgMod.formatEffectiveConfigLines(cfgMod.getConfigSnapshot());
     } catch {}
 
+    let filterDiag = null;
+    try {
+      const frModPath = path.join(targetDir, "hooks", "filter-rules.mjs");
+      const frMod = await import(pathToFileURL((await pathExists(frModPath)) ? frModPath : path.join(REPO_ROOT, "hooks", "filter-rules.mjs")).href);
+      if (typeof frMod.inspectProjectFilterRules === "function") {
+        const cwdDiag = frMod.inspectProjectFilterRules(process.cwd());
+        if (cwdDiag.exists) {
+          filterDiag = cwdDiag;
+        } else if (path.resolve(targetDir) !== path.resolve(process.cwd())) {
+          const targetDiag = frMod.inspectProjectFilterRules(targetDir);
+          if (targetDiag.exists) filterDiag = targetDiag;
+        }
+      }
+    } catch {}
+
     const hooksRaw = JSON.parse(await fs.readFile(path.join(targetDir, "hooks.json"), "utf8"));
     const matcher = hooksRaw?.["agy-dart-lifecycle"]?.PreToolUse?.[0]?.matcher || "";
     const hasPostCfg = Array.isArray(hooksRaw?.["agy-dart-lifecycle"]?.PostToolUse);
@@ -418,6 +433,29 @@ async function runDoctor(targetDir) {
     console.log(`  - Sidecar UI    : ${hasSidecar ? "OK (sidecars/dashboard present)" : "MISSING"}`);
     for (const line of configLines) {
       console.log(line);
+    }
+    const sanitizeTerminalText = (val, maxBytes = 120) => {
+      let s = String(val ?? "")
+        .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+        .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+        .replace(/\x1b[@-Z\\-_]/g, "");
+      if (typeof s.toWellFormed === "function") s = s.toWellFormed();
+      s = s.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").replace(/\s+/g, " ").trim();
+      if (Buffer.byteLength(s, "utf8") <= maxBytes) return s;
+      return Buffer.from(s, "utf8").subarray(0, maxBytes).toString("utf8").replace(/\uFFFD+$/, "");
+    };
+    if (filterDiag && filterDiag.exists) {
+      const safeFilterPath = sanitizeTerminalText(filterDiag.path, 240);
+      if (filterDiag.error) {
+        console.log(`  - Project filters : ERROR (${sanitizeTerminalText(filterDiag.error, 80)}) at ${safeFilterPath}`);
+      } else {
+        console.log(`  - Project filters : ${filterDiag.loadedCount} loaded, ${filterDiag.rejectedCount} rejected (${safeFilterPath})`);
+        for (const rej of filterDiag.rejected) {
+          console.log(
+            `      ! rejected [${sanitizeTerminalText(rej.id, 48)}] (${sanitizeTerminalText(rej.field, 24)}: ${sanitizeTerminalText(rej.reason, 48)})`
+          );
+        }
+      }
     }
 
     // Friendly warning if standalone legacy plugins coexist globally

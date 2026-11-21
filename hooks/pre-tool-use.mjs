@@ -12,9 +12,15 @@ const CLI_FILTER_SCRIPT = path.resolve(__dirname, "cli-filter.mjs");
 
 function isMainModule() {
   if (!process.argv[1]) return false;
-  const a = path.resolve(process.argv[1]);
-  const b = path.resolve(__filename);
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  const norm = (p) => {
+    const resolved = path.resolve(p);
+    let real = resolved;
+    try {
+      real = fs.realpathSync(resolved);
+    } catch {}
+    return process.platform === "win32" ? real.toLowerCase() : real;
+  };
+  return norm(process.argv[1]) === norm(__filename);
 }
 
 const isDirectRun = isMainModule();
@@ -23,6 +29,8 @@ const isDirectRun = isMainModule();
 // actually caches store.js & filter-rules.mjs AND 0-SQLite fast paths skip loading them entirely.
 let ContextModeStoreClass = null;
 let matchFilterRuleFn = null;
+let unwrapSafeCompoundCommandFn = null;
+let resolveCdTargetCwdFn = null;
 let securityModule = null;
 let textDiffModule = null;
 
@@ -35,7 +43,11 @@ async function ensureStoreClass() {
 
 async function ensureFilterRules() {
   if (!matchFilterRuleFn) {
-    ({ matchFilterRule: matchFilterRuleFn } = await import("./filter-rules.mjs"));
+    ({
+      matchFilterRule: matchFilterRuleFn,
+      unwrapSafeCompoundCommand: unwrapSafeCompoundCommandFn,
+      resolveCdTargetCwd: resolveCdTargetCwdFn
+    } = await import("./filter-rules.mjs"));
   }
   return matchFilterRuleFn;
 }
@@ -60,6 +72,8 @@ if (!isDirectRun) {
 
 export const DEFAULT_MAX_READ_BYTES = 16384; // 16 KB balanced default (~410 lines)
 export const DEFAULT_MAX_LINE_RANGE = 410;
+export const HOST_READ_MAX_LINES = 800; // Antigravity read_file host return cap (lines)
+export const HOST_READ_MAX_BYTES = 46080; // Antigravity read_file host return cap (bytes)
 export const MIN_DEDUP_FILE_BYTES = 1024;
 export const MAX_SNAPSHOT_FILE_BYTES = 256 * 1024;
 export const MIN_DIFF_READ_BYTES = 1536;
@@ -75,7 +89,7 @@ function getSharedStore() {
     if (!ContextModeStoreClass) {
       throw new Error("ContextModeStore not initialized");
     }
-    sharedStore = new ContextModeStoreClass();
+    sharedStore = new ContextModeStoreClass({ hookMode: true });
   }
   return sharedStore;
 }
@@ -266,15 +280,26 @@ export function resolveSharedSessionId(payload = {}) {
   );
 }
 
-export function resolveDirectConversationId(payload = {}) {
+export function resolveDirectConversationId(payload = {}, env = process.env) {
   return (
     payload.conversationId ||
     payload.conversation_id ||
     payload.sessionId ||
     payload.session_id ||
-    process.env.ANTIGRAVITY_CONVERSATION_ID ||
+    env?.ANTIGRAVITY_CONVERSATION_ID ||
     "default"
   );
+}
+
+export function hasExplicitConversationId(payload = {}, env = process.env) {
+  const raw =
+    payload.conversationId ||
+    payload.conversation_id ||
+    payload.sessionId ||
+    payload.session_id ||
+    env?.ANTIGRAVITY_CONVERSATION_ID ||
+    "";
+  return typeof raw === "string" && raw.trim().length > 0 && raw.trim() !== "default";
 }
 
 export function isSubagentReadPayload(payload = {}, env = process.env) {
@@ -383,10 +408,109 @@ function measureLineRangeBytes(absPath, startLine, endLine, fileSize, fallbackBy
   }
 }
 
+/**
+ * Compute the effective inclusive end line that the host `read_file` tool will actually return
+ * (Antigravity truncates at max 800 lines or 46,080 bytes), so read-dedup & diff-read never
+ * record unread lines as EOF (`-1`) and falsely block subsequent paginated reads.
+ */
+export function computeEffectiveReadBounds(
+  absPath,
+  startLine,
+  requestedEndLine,
+  fileSize,
+  maxHostLines = HOST_READ_MAX_LINES,
+  maxHostBytes = HOST_READ_MAX_BYTES
+) {
+  const sLine = Math.max(1, Number(startLine) || 1);
+  const reqEnd = Number.isFinite(requestedEndLine) && requestedEndLine > 0 ? Math.floor(requestedEndLine) : null;
+  const lineCapEnd = sLine + maxHostLines - 1;
+
+  if (reqEnd !== null && reqEnd <= lineCapEnd && fileSize <= maxHostBytes) {
+    return { effectiveEndLine: reqEnd, hostTruncated: false, skipCache: false };
+  }
+
+  if (fileSize > MAX_SLICE_MEASURE_BYTES) {
+    return {
+      effectiveEndLine: reqEnd !== null ? Math.min(reqEnd, lineCapEnd) : lineCapEnd,
+      hostTruncated: true,
+      skipCache: true
+    };
+  }
+
+  try {
+    const buf = fs.readFileSync(absPath);
+    if (buf.length === 0) {
+      return { effectiveEndLine: reqEnd, hostTruncated: false, skipCache: false };
+    }
+    let lineNum = 1;
+    let pos = 0;
+    while (lineNum < sLine && pos < buf.length) {
+      if (buf[pos] === 0x0a) lineNum++;
+      pos++;
+    }
+    if (lineNum < sLine || pos >= buf.length) {
+      return { effectiveEndLine: reqEnd, hostTruncated: false, skipCache: false };
+    }
+
+    let linesIncluded = 0;
+    let bytesIncluded = 0;
+    let lastCompleteLine = sLine - 1;
+    let hitLineCap = false;
+    let hitByteCap = false;
+    let lineStart = pos;
+
+    while (pos <= buf.length) {
+      const atEnd = pos === buf.length;
+      const isNl = !atEnd && buf[pos] === 0x0a;
+      if (isNl || atEnd) {
+        if (atEnd && pos === lineStart) break;
+        const lineEnd = isNl ? pos + 1 : pos;
+        const lineBytes = lineEnd - lineStart;
+        const curLineNum = sLine + linesIncluded;
+
+        if (reqEnd !== null && curLineNum > reqEnd) {
+          break;
+        }
+        if (linesIncluded >= maxHostLines) {
+          hitLineCap = true;
+          break;
+        }
+        if (bytesIncluded + lineBytes > maxHostBytes) {
+          hitByteCap = true;
+          break;
+        }
+        bytesIncluded += lineBytes;
+        linesIncluded++;
+        lastCompleteLine = curLineNum;
+        lineStart = lineEnd;
+        if (atEnd) break;
+      }
+      pos++;
+    }
+
+    if (hitByteCap) {
+      if (lastCompleteLine < sLine) {
+        return { effectiveEndLine: sLine, hostTruncated: true, skipCache: true };
+      }
+      return { effectiveEndLine: lastCompleteLine, hostTruncated: true, skipCache: false };
+    }
+    if (hitLineCap) {
+      return { effectiveEndLine: lastCompleteLine, hostTruncated: true, skipCache: false };
+    }
+    return { effectiveEndLine: reqEnd, hostTruncated: false, skipCache: false };
+  } catch {
+    return {
+      effectiveEndLine: reqEnd !== null ? Math.min(reqEnd, lineCapEnd) : lineCapEnd,
+      hostTruncated: true,
+      skipCache: true
+    };
+  }
+}
+
 /** Build a shell-safe PreToolUse.overwrite command wrapping a noisy CLI command via cli-filter.mjs */
-export function buildCliFilterRewrite(commandLine, sessionId = "default", cwd = process.cwd()) {
+export function buildCliFilterRewrite(commandLine, sessionId = "default", cwd = process.cwd(), matchOptions = {}) {
   if (!matchFilterRuleFn) return null;
-  const matched = matchFilterRuleFn(commandLine, { cwd });
+  const matched = matchFilterRuleFn(commandLine, { cwd, ...matchOptions });
   if (!matched) return null;
   const scriptPosix = CLI_FILTER_SCRIPT.replace(/\\/g, "/");
   // Bail out if plugin install path itself has shell-special characters
@@ -440,10 +564,11 @@ export function inspectCommand({ commandLine, cwd, sessionId }) {
     }
   }
 
-  // 2. Direct curl / wget to stdout
+  // 2. Direct curl / wget to stdout (ignore `2>&1` stderr-to-stdout merge which does NOT redirect to a file)
+  const cmdNoStderrMerge = cleanCmd.replace(/(?:^|\s)2>&1(?=\s|$)/g, " ");
   if (/^\s*(curl(\.exe)?|wget(\.exe)?)\b/i.test(cleanCmd)) {
-    const writesToFile = /(-o\s+|-O\s+|--output\s+|>)/i.test(cleanCmd);
-    const hasLimiter = /\|\s*(head|Select-Object|select|more)/i.test(cleanCmd);
+    const writesToFile = /(-o\s+|-O\s+|--output\s+|>)/i.test(cmdNoStderrMerge);
+    const hasLimiter = /\|\s*(head|Select-Object|select|more)/i.test(cmdNoStderrMerge);
     if (!writesToFile && !hasLimiter) {
       const urlMatch = cleanCmd.match(/https?:\/\/[^\s"']+/i);
       if (urlMatch) {
@@ -467,16 +592,16 @@ export function inspectCommand({ commandLine, cwd, sessionId }) {
   }
 
   // 3. Raw file dump utilities (cat, type, Get-Content, gc)
-  const printMatch = cleanCmd.match(/^\s*(cat|type|Get-Content|gc)(\.exe)?\b/i);
+  const printMatch = cmdNoStderrMerge.match(/^\s*(cat|type|Get-Content|gc)(\.exe)?\b/i);
   if (printMatch) {
     const hasLimiter =
-      /(-Head|-TotalCount|-First|-Tail)\s+\d+/i.test(cleanCmd) ||
-      /\|\s*(head|Select-Object|select\s+(-[a-zA-Z]+\s+)*-First|more|Out-Null|Set-Content|Out-File)/i.test(cleanCmd) ||
-      />\s*[^>]/i.test(cleanCmd);
+      /(-Head|-TotalCount|-First|-Tail)\s+\d+/i.test(cmdNoStderrMerge) ||
+      /\|\s*(head|Select-Object|select\s+(-[a-zA-Z]+\s+)*-First|more|Out-Null|Set-Content|Out-File)/i.test(cmdNoStderrMerge) ||
+      />\s*[^>]/i.test(cmdNoStderrMerge);
 
     if (hasLimiter) return { shouldDeny: false };
 
-    const argMatch = cleanCmd.match(/(?:cat|type|Get-Content|gc)(?:\.exe)?(?:\s+(?:-Path|-LiteralPath))?\s+["']?([^"'\r\n;|]+)["']?/i);
+    const argMatch = cmdNoStderrMerge.match(/(?:cat|type|Get-Content|gc)(?:\.exe)?(?:\s+(?:-Path|-LiteralPath))?\s+["']?([^"'\r\n;|]+)["']?/i);
     const rawTarget = argMatch && argMatch[1] ? argMatch[1].trim() : "";
 
     if (rawTarget.includes("*") || rawTarget.includes("?")) {
@@ -605,10 +730,16 @@ async function main() {
 
     try {
       if (fs.existsSync(absPath)) {
-        const stat = fs.statSync(absPath);
-        if (!stat.isFile()) {
+        const rawStat = fs.statSync(absPath, { bigint: true });
+        if (!rawStat.isFile()) {
           return finishAllow();
         }
+        const stat = {
+          size: Number(rawStat.size),
+          mtimeMs: Number(rawStat.mtimeNs / 1000n) / 1000,
+          ctimeMs: Number(rawStat.ctimeNs / 1000n) / 1000,
+          ino: String(rawStat.ino)
+        };
 
         // Optional sensitive credential file read guard (opt-in via config/AGY_DART_SENSITIVE_FILE_GUARD=warn|deny)
         const rawSensMode = effectiveCfg.sensitiveFileGuard || "off";
@@ -668,8 +799,8 @@ async function main() {
           return finishAllow();
         }
 
-          const isLargeFile = maxReadBytes > 0 && stat.size > maxReadBytes;
-          const isWideRange = maxLineRange > 0 && (endLine === null || (endLine - startLine) > maxLineRange);
+        const isLargeFile = maxReadBytes > 0 && stat.size > maxReadBytes;
+        const isWideRange = maxLineRange > 0 && (endLine === null || (endLine - startLine) > maxLineRange);
 
         if (isLargeFile && isWideRange) {
           const lineInstruction =
@@ -716,8 +847,9 @@ async function main() {
           dedupEnabled = getSharedStore().isReadDedupEnabled(sessionId);
         } catch {}
 
+        const hasExplicitConvId = hasExplicitConversationId(payload);
         const subagentSharesParentContext = isSubagentCall && directConvId === sessionId;
-        const canUseReadCache = dedupEnabled && !subagentSharesParentContext;
+        const canUseReadCache = dedupEnabled && hasExplicitConvId && !subagentSharesParentContext;
         const diffReadEnabled =
           canUseReadCache &&
           effectiveCfg.diffRead === true &&
@@ -726,189 +858,194 @@ async function main() {
         const diffReadMaxAgeMs = effectiveCfg.diffReadMaxAgeMs;
 
         if (canUseReadCache && stat.size >= MIN_DEDUP_FILE_BYTES && byteOffset <= 0) {
-          try {
-            const store = getSharedStore();
-            const convTurnSeq = diffReadEnabled ? store.bumpConversationTurnSeq(directConvId) : 0;
-            const dup = store.findDuplicateRead({
-              sessionId: directConvId,
-              filePath: absPath,
-              startLine,
-              endLine,
-              mtimeMs: stat.mtimeMs,
-              fileSize: stat.size
-            });
-
-            // State 2 (Unchanged covering read): 2-strike bypass
-            if (dup && Number(dup.bypass_armed) === 0) {
-              store.armReadBypass({
-                sessionId: directConvId,
-                filePath: absPath,
-                startLine: dup.start_line,
-                endLine: dup.end_line
-              });
-              const rangeLabel = endLine !== null ? `lines ${startLine}-${endLine}` : "full file";
-              const dedupReason =
-                `[agy-dart read-dedup] '${filePath}' (${rangeLabel}, ~${formatBytes(estBytes)}) was already read unchanged earlier in this session ` +
-                `(mtime & size identical). Reuse the copy already in context to save tokens; if context was compacted and you truly need a fresh copy, call ${toolName} once more to bypass.`;
-
-              recordInterception({
-                sessionId,
-                agent: agentName,
-                cwd,
-                toolName,
-                path: filePath,
-                size: estBytes,
-                reason: dedupReason,
-                kind: "dedup",
-                key: "unchanged_reread"
-              });
-
-              closeSharedStore();
-              process.stdout.write(JSON.stringify({ decision: "deny", reason: dedupReason }) + "\n");
-              process.exit(0);
-            }
-
-            let currentRangeText = null;
-            let currentSha256 = null;
-            let currentRangeBytes = 0;
-
-            const loadCurrentRange = async () => {
-              if (currentRangeText !== null) return true;
-              const rawDisk = readUtf8TextSafe(absPath);
-              if (rawDisk === null) return false;
-              const { extractLineSlice } = await ensureTextDiffModule();
-              currentRangeText = extractLineSlice(rawDisk, startLine, endLine, 1);
-              const sliceBytes = Buffer.byteLength(currentRangeText, "utf8");
-              currentRangeBytes = endLine === null && startLine === 1 ? Math.max(sliceBytes, stat.size) : sliceBytes;
-              currentSha256 = sha256Text(currentRangeText);
-              return true;
-            };
-
-            // State 3 (Modified file previously snapshotted in the SAME direct conversation within recent N turns & age)
-            if (!dup && diffReadEnabled) {
-              const snapshot = store.findFileSnapshot({
+          const readBounds = computeEffectiveReadBounds(absPath, startLine, endLine, stat.size);
+          const effectiveEndLine = readBounds.effectiveEndLine;
+          if (!readBounds.skipCache) {
+            try {
+              const store = getSharedStore();
+              const convTurnSeq = diffReadEnabled ? store.getConversationTurnSeq(directConvId) : 0;
+              const dup = store.findDuplicateRead({
                 sessionId: directConvId,
                 filePath: absPath,
                 startLine,
-                endLine,
-                maxAgeMs: diffReadMaxAgeMs
+                endLine: effectiveEndLine,
+                mtimeMs: stat.mtimeMs,
+                fileSize: stat.size,
+                ctimeMs: stat.ctimeMs,
+                ino: stat.ino
               });
 
-              const baselineFullTs = snapshot ? Number(snapshot.full_read_ts || snapshot.updated_ts || 0) : 0;
-              const baselineFullSeq = snapshot ? Number(snapshot.full_read_seq || 0) : 0;
-              const ageFresh = !snapshot || (diffReadMaxAgeMs <= 0) || (Date.now() - baselineFullTs <= diffReadMaxAgeMs);
-              const turnsFresh =
-                !snapshot ||
-                diffReadMaxTurns <= 0 ||
-                convTurnSeq - Math.max(0, baselineFullSeq) <= diffReadMaxTurns;
+              // State 2 (Unchanged covering read): 2-strike bypass
+              if (dup && Number(dup.bypass_armed) === 0) {
+                store.armReadBypass({
+                  sessionId: directConvId,
+                  filePath: absPath,
+                  startLine: dup.start_line,
+                  endLine: dup.end_line
+                });
+                const rangeLabel = effectiveEndLine !== null ? `lines ${startLine}-${effectiveEndLine}` : "full file";
+                const dedupReason =
+                  `[agy-dart read-dedup] '${filePath}' (${rangeLabel}, ~${formatBytes(estBytes)}) was already read unchanged earlier in this session ` +
+                  `(mtime & size identical). Reuse the copy already in context to save tokens; if context was compacted and you truly need a fresh copy, call ${toolName} once more to bypass.`;
 
-              if (snapshot && ageFresh && turnsFresh && (await loadCurrentRange())) {
-                const { computeUnifiedDiff, extractLineSlice } = await ensureTextDiffModule();
-                const baselineText = snapshot.isExactRange
-                  ? snapshot.content
-                  : extractLineSlice(snapshot.content, startLine, endLine, snapshot.start_line);
-                const baselineSha256 = snapshot.isExactRange ? snapshot.sha256 : sha256Text(baselineText);
+                recordInterception({
+                  sessionId,
+                  agent: agentName,
+                  cwd,
+                  toolName,
+                  path: filePath,
+                  size: estBytes,
+                  reason: dedupReason,
+                  kind: "dedup",
+                  key: "unchanged_reread"
+                });
 
-                if (currentSha256 === baselineSha256) {
-                  // Strike 2 retry after diff delivery (bypass_armed === 1) OR PostToolUse edit
-                  // invalidation with unchanged disk bytes (v1.1 compatibility) -> allow full verbatim.
-                  if (Number(snapshot.bypass_armed) === 1) {
-                    store.armSnapshotBypass({
-                      sessionId: directConvId,
-                      filePath: absPath,
-                      startLine: snapshot.start_line,
-                      endLine: snapshot.end_line,
-                      armed: 0
-                    });
-                  }
-                } else if (currentRangeBytes >= MIN_DIFF_READ_BYTES) {
-                  const diff = computeUnifiedDiff(baselineText, currentRangeText, {
-                    fileLabel: path.basename(filePath),
-                    startLine,
-                    maxDiffBytes: MAX_DIFF_READ_BYTES
-                  });
+                closeSharedStore();
+                process.stdout.write(JSON.stringify({ decision: "deny", reason: dedupReason }) + "\n");
+                process.exit(0);
+              }
 
-                  if (
-                    diff.changed &&
-                    !diff.truncated &&
-                    diff.diffBytes > 0 &&
-                    diff.diffBytes <= MAX_DIFF_READ_BYTES &&
-                    diff.diffBytes < currentRangeBytes * MAX_DIFF_READ_RATIO
-                  ) {
-                    store.saveFileSnapshot({
-                      sessionId: directConvId,
-                      filePath: absPath,
+              let currentRangeText = null;
+              let currentSha256 = null;
+              let currentRangeBytes = 0;
+
+              const loadCurrentRange = async () => {
+                if (currentRangeText !== null) return true;
+                const rawDisk = readUtf8TextSafe(absPath);
+                if (rawDisk === null) return false;
+                const { extractLineSlice } = await ensureTextDiffModule();
+                currentRangeText = extractLineSlice(rawDisk, startLine, effectiveEndLine, 1);
+                const sliceBytes = Buffer.byteLength(currentRangeText, "utf8");
+                currentRangeBytes =
+                  effectiveEndLine === null && startLine === 1 ? Math.max(sliceBytes, stat.size) : sliceBytes;
+                currentSha256 = sha256Text(currentRangeText);
+                return true;
+              };
+
+              // State 3 (Modified file previously snapshotted in the SAME direct conversation within recent N turns & age)
+              if (!dup && diffReadEnabled) {
+                const snapshot = store.findFileSnapshot({
+                  sessionId: directConvId,
+                  filePath: absPath,
+                  startLine,
+                  endLine: effectiveEndLine,
+                  ino: stat.ino,
+                  maxAgeMs: diffReadMaxAgeMs
+                });
+
+                const baselineFullTs = snapshot ? Number(snapshot.full_read_ts || snapshot.updated_ts || 0) : 0;
+                const baselineFullSeq = snapshot ? Number(snapshot.full_read_seq || 0) : 0;
+                const bypassArmed = Boolean(snapshot && Number(snapshot.bypass_armed) === 1);
+                const ageFresh = !snapshot || (diffReadMaxAgeMs <= 0) || (Date.now() - baselineFullTs <= diffReadMaxAgeMs);
+                const turnsFresh =
+                  !snapshot ||
+                  diffReadMaxTurns <= 0 ||
+                  convTurnSeq - Math.max(0, baselineFullSeq) <= diffReadMaxTurns;
+
+                // Never chain a second diff when bypass_armed === 1 (a prior diff was already delivered
+                // without a subsequent full verbatim read): fall through to full-file allow and re-anchor baseline.
+                if (snapshot && !bypassArmed && ageFresh && turnsFresh && (await loadCurrentRange())) {
+                  const { computeUnifiedDiff, extractLineSlice } = await ensureTextDiffModule();
+                  const baselineText = snapshot.isExactRange
+                    ? snapshot.content
+                    : extractLineSlice(snapshot.content, startLine, effectiveEndLine, snapshot.start_line);
+                  const baselineSha256 = snapshot.isExactRange ? snapshot.sha256 : sha256Text(baselineText);
+
+                  if (currentSha256 === baselineSha256) {
+                    // PostToolUse edit invalidation with unchanged disk bytes (v1.1 compatibility) -> allow full verbatim.
+                  } else if (currentRangeBytes >= MIN_DIFF_READ_BYTES) {
+                    const diff = computeUnifiedDiff(baselineText, currentRangeText, {
+                      fileLabel: path.basename(filePath),
                       startLine,
-                      endLine,
-                      sha256: currentSha256,
-                      mtimeMs: stat.mtimeMs,
-                      fileSize: stat.size,
-                      content: currentRangeText,
-                      bypassArmed: 1,
-                      fullReadTs: baselineFullTs || Date.now(),
-                      fullReadSeq: baselineFullSeq || convTurnSeq
+                      maxDiffBytes: MAX_DIFF_READ_BYTES
                     });
 
-                    const rangeLabel = endLine !== null ? `lines ${startLine}-${endLine}` : "full file";
-                    const pctSaved = Math.max(1, Math.round((1 - diff.diffBytes / currentRangeBytes) * 100));
-                    const baseShort = String(baselineSha256 || "").slice(0, 8) || "unknown";
-                    const baseTimeIso = baselineFullTs ? `${new Date(baselineFullTs).toISOString().slice(11, 19)}Z` : "prior";
-                    const diffReason =
-                      `[agy-dart diff-read] '${filePath}' (${rangeLabel}) changed since baseline ${baseShort} @ ${baseTimeIso} ` +
-                      `(+${diff.addedLines}/-${diff.removedLines} lines, diff ${formatBytes(diff.diffBytes)} vs full ${formatBytes(currentRangeBytes)}, -${pctSaved}%):\n` +
-                      `\`\`\`diff\n${diff.diff}\n\`\`\`\n` +
-                      `Baseline: prior full copy in this conversation (${baseShort}). Reuse the prior copy + diff above; if you need the full file verbatim (如需全文请重读, e.g. after /compact), call ${toolName} once more to bypass.`;
+                    if (
+                      diff.changed &&
+                      !diff.truncated &&
+                      diff.diffBytes > 0 &&
+                      diff.diffBytes <= MAX_DIFF_READ_BYTES &&
+                      diff.diffBytes < currentRangeBytes * MAX_DIFF_READ_RATIO
+                    ) {
+                      store.saveFileSnapshot({
+                        sessionId: directConvId,
+                        filePath: absPath,
+                        startLine,
+                        endLine: effectiveEndLine,
+                        sha256: currentSha256,
+                        mtimeMs: stat.mtimeMs,
+                        fileSize: stat.size,
+                        ino: stat.ino,
+                        content: currentRangeText,
+                        bypassArmed: 1,
+                        fullReadTs: baselineFullTs || Date.now(),
+                        fullReadSeq: baselineFullSeq || convTurnSeq
+                      });
 
-                    recordInterception({
-                      sessionId,
-                      agent: agentName,
-                      cwd,
-                      toolName,
-                      path: filePath,
-                      size: currentRangeBytes,
-                      returnedBytes: diff.diffBytes,
-                      reason: diffReason,
-                      kind: "dedup",
-                      key: "modified_diff"
-                    });
+                      const rangeLabel = effectiveEndLine !== null ? `lines ${startLine}-${effectiveEndLine}` : "full file";
+                      const pctSaved = Math.max(1, Math.round((1 - diff.diffBytes / currentRangeBytes) * 100));
+                      const baseShort = String(baselineSha256 || "").slice(0, 8) || "unknown";
+                      const baseTimeIso = baselineFullTs ? `${new Date(baselineFullTs).toISOString().slice(11, 19)}Z` : "prior";
+                      const diffReason =
+                        `[agy-dart diff-read] '${filePath}' (${rangeLabel}) changed since baseline ${baseShort} @ ${baseTimeIso} ` +
+                        `(+${diff.addedLines}/-${diff.removedLines} lines, diff ${formatBytes(diff.diffBytes)} vs full ${formatBytes(currentRangeBytes)}, -${pctSaved}%):\n` +
+                        `\`\`\`diff\n${diff.diff}\n\`\`\`\n` +
+                        `Baseline: prior full copy in this conversation (${baseShort}). Reuse the prior copy + diff above; if you need the full file verbatim (如需全文请重读, e.g. after /compact), call ${toolName} once more to bypass.`;
 
-                    closeSharedStore();
-                    process.stdout.write(JSON.stringify({ decision: "deny", reason: diffReason }) + "\n");
-                    process.exit(0);
+                      recordInterception({
+                        sessionId,
+                        agent: agentName,
+                        cwd,
+                        toolName,
+                        path: filePath,
+                        size: currentRangeBytes,
+                        returnedBytes: diff.diffBytes,
+                        reason: diffReason,
+                        kind: "dedup",
+                        key: "modified_diff"
+                      });
+
+                      closeSharedStore();
+                      process.stdout.write(JSON.stringify({ decision: "deny", reason: diffReason }) + "\n");
+                      process.exit(0);
+                    }
                   }
                 }
               }
-            }
 
-            // State 1 (First read) / Strike 2 bypass / stale baseline / large rewrite fallback:
-            // Record this allowed read (resets bypass_armed = 0) and save compressed snapshot baseline anchored to this full read.
-            store.recordFileRead({
-              sessionId: directConvId,
-              filePath: absPath,
-              startLine,
-              endLine,
-              mtimeMs: stat.mtimeMs,
-              fileSize: stat.size,
-              byteEst: estBytes
-            });
-
-            if (diffReadEnabled && (await loadCurrentRange())) {
-              store.saveFileSnapshot({
+              // State 1 (First read) / Strike 2 bypass / stale baseline / large rewrite fallback:
+              // Record this allowed read (resets bypass_armed = 0) and save compressed snapshot baseline anchored to this full read.
+              store.recordFileRead({
                 sessionId: directConvId,
                 filePath: absPath,
                 startLine,
-                endLine,
-                sha256: currentSha256,
+                endLine: effectiveEndLine,
                 mtimeMs: stat.mtimeMs,
                 fileSize: stat.size,
-                content: currentRangeText,
-                bypassArmed: 0,
-                fullReadTs: Date.now(),
-                fullReadSeq: convTurnSeq
+                ctimeMs: stat.ctimeMs,
+                ino: stat.ino,
+                byteEst: estBytes
               });
+
+              if (diffReadEnabled && (await loadCurrentRange())) {
+                store.saveFileSnapshot({
+                  sessionId: directConvId,
+                  filePath: absPath,
+                  startLine,
+                  endLine: effectiveEndLine,
+                  sha256: currentSha256,
+                  mtimeMs: stat.mtimeMs,
+                  fileSize: stat.size,
+                  ino: stat.ino,
+                  content: currentRangeText,
+                  bypassArmed: 0,
+                  fullReadTs: Date.now(),
+                  fullReadSeq: convTurnSeq
+                });
+              }
+            } catch {
+              // Fail-open on DB/diff errors
             }
-          } catch {
-            // Fail-open on DB/diff errors
           }
         }
 
@@ -930,7 +1067,11 @@ async function main() {
     } catch {}
   }
 
-  // 2. Guard run_command (transparent PreToolUse.overwrite CLI filter + unbounded dump protection)
+  // 2. Guard run_command:
+  //    2a. Trusted built-in CLI filter rewrites (e.g. bounds `git log` -> `git log -n 30`)
+  //    2b. Hard-deny unbounded raw file dumps / stdout downloads / unbounded git log (when CLI filter off)
+  //        (MUST execute BEFORE untrusted repo-level `.agy-dart/filters.json` rules!)
+  //    2c. Custom project-level declarative CLI filter rules (`.agy-dart/filters.json`)
   if (toolName === "run_command") {
     const cmdKey =
       "CommandLine" in args
@@ -939,24 +1080,24 @@ async function main() {
           ? "commandLine"
           : "command";
     const rawCommandLine = args[cmdKey] || "";
+    const trimmedCmd = String(rawCommandLine).trim();
     const isDaemon = Boolean(args.IsDaemon || args.isDaemon);
 
-    // 2a. Transparent CLI output filtering via PreToolUse.overwrite (zero extra LLM turn!)
     let cliFilterEnabled = true;
     try {
       cliFilterEnabled = getSharedStore().isCliFilterEnabled(sessionId);
     } catch {}
 
-    if (cliFilterEnabled && !isDaemon && rawCommandLine) {
-      const trimmedCmd = String(rawCommandLine).trim();
-      const rewrite = buildCliFilterRewrite(trimmedCmd, sessionId, cwd);
-      if (rewrite) {
+    // 2a. Trusted built-in CLI filter rules
+    if (cliFilterEnabled && !isDaemon && trimmedCmd) {
+      const builtinRewrite = buildCliFilterRewrite(trimmedCmd, sessionId, cwd, { builtinOnly: true });
+      if (builtinRewrite) {
         closeSharedStore();
         process.stdout.write(
           JSON.stringify({
             decision: "allow",
             overwrite: {
-              [cmdKey]: rewrite.rewrittenCommand
+              [cmdKey]: builtinRewrite.rewrittenCommand
             }
           }) + "\n"
         );
@@ -964,8 +1105,15 @@ async function main() {
       }
     }
 
-    // 2b. Hard-deny unbounded raw file dumps / stdout downloads / unbounded git log (when CLI filter off)
-    const inspection = inspectCommand({ commandLine: rawCommandLine, cwd, sessionId });
+    // 2b. Hard-deny unbounded raw file dumps / stdout downloads / unbounded git log
+    let inspection = inspectCommand({ commandLine: rawCommandLine, cwd, sessionId });
+    if (!inspection.shouldDeny && trimmedCmd && unwrapSafeCompoundCommandFn && resolveCdTargetCwdFn) {
+      const unwrapped = unwrapSafeCompoundCommandFn(trimmedCmd);
+      if (unwrapped && (unwrapped.cdPath || unwrapped.hasStderrRedirect)) {
+        const targetCwd = unwrapped.cdPath ? resolveCdTargetCwdFn(cwd, unwrapped.cdPath) : cwd;
+        inspection = inspectCommand({ commandLine: unwrapped.innerCommand, cwd: targetCwd, sessionId });
+      }
+    }
 
     if (inspection.shouldDeny) {
       recordInterception({
@@ -981,6 +1129,23 @@ async function main() {
       closeSharedStore();
       process.stdout.write(JSON.stringify({ decision: "deny", reason: inspection.reason }) + "\n");
       process.exit(0);
+    }
+
+    // 2c. Project-level declarative CLI filter rules (only after hard-deny security checks pass)
+    if (cliFilterEnabled && !isDaemon && trimmedCmd) {
+      const customRewrite = buildCliFilterRewrite(trimmedCmd, sessionId, cwd, { customOnly: true });
+      if (customRewrite) {
+        closeSharedStore();
+        process.stdout.write(
+          JSON.stringify({
+            decision: "allow",
+            overwrite: {
+              [cmdKey]: customRewrite.rewrittenCommand
+            }
+          }) + "\n"
+        );
+        process.exit(0);
+      }
     }
   }
 

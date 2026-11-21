@@ -6,6 +6,7 @@
  * (with empty `systemMessage: ""`) so alerts never mutate the model prompt prefix.
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
@@ -238,7 +239,10 @@ export function evaluateCacheAlerts(diag, { sessionId, store }) {
 
 async function main() {
   const effectiveCfg = getEffectiveConfig();
-  if (!effectiveCfg.cacheWatch && !effectiveCfg.diffRead) {
+  const resolvedDbPath = effectiveCfg.dbPath || path.join(os.homedir(), ".agy-dart", "context.db");
+  const needCompactionSweepOnly =
+    !effectiveCfg.cacheWatch && !effectiveCfg.diffRead && effectiveCfg.readDedup && fs.existsSync(resolvedDbPath);
+  if (!effectiveCfg.cacheWatch && !effectiveCfg.diffRead && !needCompactionSweepOnly) {
     process.stdout.write("{}\n");
     return;
   }
@@ -264,35 +268,22 @@ async function main() {
   let store = null;
 
   try {
-    let ContextModeStore;
-    let cacheAnalyzerMod = null;
-    if (effectiveCfg.cacheWatch) {
-      const [storeMod, caMod] = await Promise.all([
-        import("../context/lib/store.js"),
-        import("../context/lib/cache-analyzer.js")
-      ]);
-      ContextModeStore = storeMod.ContextModeStore;
-      cacheAnalyzerMod = caMod;
-    } else {
-      ({ ContextModeStore } = await import("../context/lib/store.js"));
-    }
+    const [storeMod, cacheAnalyzerMod] = await Promise.all([
+      import("../context/lib/store.js"),
+      import("../context/lib/cache-analyzer.js")
+    ]);
+    const ContextModeStore = storeMod.ContextModeStore;
 
-    store = new ContextModeStore();
+    // Hook mode: bounded SQLite busy timeout & deadline so external write locks fail-open in <1s
+    store = new ContextModeStore({ hookMode: true, maxBusyRetries: 4, maxRetryDeadlineMs: 800 });
 
     // Advance per-conversation turn sequence on every LLM turn when opt-in diff-read is active
     // so non-read turns (edits/commands/chat) accurately age diff-read baselines — even if
     // cacheWatch is disabled or alerts are paused (prevents stale diffs after unpause).
-    if (effectiveCfg.diffRead && directConvId) {
+    if (effectiveCfg.diffRead && directConvId && directConvId !== "default") {
       try {
         store.bumpConversationTurnSeq(directConvId);
       } catch {}
-    }
-
-    if (!effectiveCfg.cacheWatch || store.isPaused(sessionId)) {
-      store.close();
-      store = null;
-      process.stdout.write("{}\n");
-      return;
     }
 
     const { analyzeTranscriptCache, findTranscriptForConversation, readTranscriptTail } = cacheAnalyzerMod;
@@ -306,41 +297,39 @@ async function main() {
         transcriptPath = findTranscriptForConversation(sessionId, { exactOnly: true }) || "";
       }
     }
-    if (!transcriptPath || !fs.existsSync(transcriptPath)) {
-      store.close();
-      store = null;
-      process.stdout.write("{}\n");
-      return;
-    }
 
-    const steps = readTranscriptTail(transcriptPath, 131072);
-    if (steps.length === 0) {
-      store.close();
-      store = null;
-      process.stdout.write("{}\n");
-      return;
-    }
+    let diag = null;
+    if (transcriptPath && fs.existsSync(transcriptPath)) {
+      const steps = readTranscriptTail(transcriptPath, 131072);
+      if (steps.length > 0) {
+        const diagOpts = {};
+        if (effectiveCfg.cacheTtlSec !== null) diagOpts.ttlSec = effectiveCfg.cacheTtlSec;
+        if (effectiveCfg.windowTokens !== null) diagOpts.windowTokens = effectiveCfg.windowTokens;
+        if (effectiveCfg.warnTokens !== null) diagOpts.warnTokens = effectiveCfg.warnTokens;
+        if (effectiveCfg.criticalTokens !== null) diagOpts.criticalTokens = effectiveCfg.criticalTokens;
+        diag = analyzeTranscriptCache(steps, diagOpts);
 
-    const diagOpts = {};
-    if (effectiveCfg.cacheTtlSec !== null) diagOpts.ttlSec = effectiveCfg.cacheTtlSec;
-    if (effectiveCfg.windowTokens !== null) diagOpts.windowTokens = effectiveCfg.windowTokens;
-    if (effectiveCfg.warnTokens !== null) diagOpts.warnTokens = effectiveCfg.warnTokens;
-    if (effectiveCfg.criticalTokens !== null) diagOpts.criticalTokens = effectiveCfg.criticalTokens;
-
-    const diag = analyzeTranscriptCache(steps, diagOpts);
-
-    // Auto-invalidate file_reads & file_snapshots if compaction just occurred in this session
-    const lastBust = diag.recentBusts[diag.recentBusts.length - 1];
-    if (lastBust && lastBust.cause === "compaction_or_truncation") {
-      const lastCompactKey = `compact_invalidated:${sessionId}`;
-      const stamp = String(lastBust.at || lastBust.stepIndex);
-      if (store.getTimedMeta(lastCompactKey, "") !== stamp) {
-        store.invalidateFileReads(sessionId, null);
-        if (directConvId && directConvId !== sessionId) {
-          store.invalidateFileReads(directConvId, null);
+        // Auto-invalidate file_reads & file_snapshots on compaction even when cacheWatch is off or paused
+        const lastBust = diag.recentBusts[diag.recentBusts.length - 1];
+        if (lastBust && lastBust.cause === "compaction_or_truncation") {
+          const lastCompactKey = `compact_invalidated:${sessionId}`;
+          const stamp = String(lastBust.at || lastBust.stepIndex);
+          if (store.getTimedMeta(lastCompactKey, "") !== stamp) {
+            store.invalidateFileReads(sessionId, null);
+            if (directConvId && directConvId !== sessionId) {
+              store.invalidateFileReads(directConvId, null);
+            }
+            store.setTimedMeta(lastCompactKey, stamp);
+          }
         }
-        store.setTimedMeta(lastCompactKey, stamp);
       }
+    }
+
+    if (!effectiveCfg.cacheWatch || store.isPaused(sessionId) || !diag) {
+      store.close();
+      store = null;
+      process.stdout.write("{}\n");
+      return;
     }
 
     const alerts = evaluateCacheAlerts(diag, { sessionId, store });
@@ -379,12 +368,19 @@ async function main() {
 }
 
 const __selfPath = path.resolve(fileURLToPath(import.meta.url));
-const isDirectRun = Boolean(
-  process.argv[1] &&
-    (process.platform === "win32"
-      ? path.resolve(process.argv[1]).toLowerCase() === __selfPath.toLowerCase()
-      : path.resolve(process.argv[1]) === __selfPath)
-);
+function isSameFilePath(a, b) {
+  if (!a || !b) return false;
+  const norm = (p) => {
+    const resolved = path.resolve(p);
+    let real = resolved;
+    try {
+      real = fs.realpathSync(resolved);
+    } catch {}
+    return process.platform === "win32" ? real.toLowerCase() : real;
+  };
+  return norm(a) === norm(b);
+}
+const isDirectRun = Boolean(process.argv[1] && isSameFilePath(process.argv[1], __selfPath));
 if (isDirectRun) {
   main().catch(() => {
     process.stdout.write("{}\n");

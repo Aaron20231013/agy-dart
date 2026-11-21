@@ -19,6 +19,7 @@ import {
   createEmptySubagentBreakdown,
   DEFAULT_CACHE_TTL_SEC,
   findTranscriptForConversation,
+  isSafeConversationId,
   MIN_CACHEABLE_CONTEXT_TOKENS,
   parseTranscriptLines,
   readTranscriptTail,
@@ -27,10 +28,49 @@ import {
 
 const __selfPath = path.resolve(fileURLToPath(import.meta.url));
 const __dirname = path.dirname(__selfPath);
-const store = new ContextModeStore();
 const HTML_FILE = path.join(__dirname, "index.html");
 export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 const SIDECAR_CSRF_TOKEN = crypto.randomBytes(24).toString("hex");
+
+let _runtimeStore = null;
+let _appStartTime = null;
+let _runtimeInitialized = false;
+
+function getAppStartTime() {
+  if (_appStartTime !== null) return _appStartTime;
+  let ts = null;
+  if (process.platform === "win32") {
+    try {
+      const out = execSync(
+        'powershell -NoProfile -Command "(Get-Process -Name language_server, Antigravity | Measure-Object -Property StartTime -Minimum).Minimum.ToUniversalTime().ToString(\'yyyy-MM-ddTHH:mm:ss.fffZ\')"',
+        { encoding: "utf8", timeout: 3000, windowsHide: true }
+      );
+      const parsed = new Date(out.trim()).getTime();
+      if (!Number.isNaN(parsed) && parsed > 0) ts = parsed;
+    } catch {}
+  }
+  _appStartTime = ts || (Date.now() - Math.round(process.uptime() * 1000));
+  return _appStartTime;
+}
+
+function getRuntimeStore() {
+  if (!_runtimeStore) {
+    _runtimeStore = new ContextModeStore();
+  }
+  if (!_runtimeInitialized) {
+    _runtimeInitialized = true;
+    const startTs = getAppStartTime();
+    // Clear session-level overrides on app session restart
+    try {
+      const recordedSessionTime = _runtimeStore.getMeta("app_session_start_time");
+      if (!recordedSessionTime || recordedSessionTime !== String(startTs)) {
+        _runtimeStore.clearSessionOverrides();
+        _runtimeStore.setMeta("app_session_start_time", String(startTs));
+      }
+    } catch {}
+  }
+  return _runtimeStore;
+}
 
 const LOCAL_HOST_RE = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
 const LOCAL_ORIGIN_RE = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
@@ -171,30 +211,6 @@ function getRenderedHtml(csrfToken = SIDECAR_CSRF_TOKEN) {
   return withVer.includes("</head>") ? withVer.replace("</head>", tokenMeta) : withVer;
 }
 
-let appStartTime = null;
-if (process.platform === "win32") {
-  try {
-    const out = execSync(
-      'powershell -NoProfile -Command "(Get-Process -Name language_server, Antigravity | Measure-Object -Property StartTime -Minimum).Minimum.ToUniversalTime().ToString(\'yyyy-MM-ddTHH:mm:ss.fffZ\')"',
-      { encoding: "utf8", timeout: 3000, windowsHide: true }
-    );
-    const ts = new Date(out.trim()).getTime();
-    if (!Number.isNaN(ts) && ts > 0) appStartTime = ts;
-  } catch {}
-}
-if (!appStartTime) {
-  appStartTime = Date.now() - Math.round(process.uptime() * 1000);
-}
-
-// Clear session-level overrides on app session restart
-try {
-  const recordedSessionTime = store.getMeta("app_session_start_time");
-  if (!recordedSessionTime || recordedSessionTime !== String(appStartTime)) {
-    store.clearSessionOverrides();
-    store.setMeta("app_session_start_time", String(appStartTime));
-  }
-} catch {}
-
 function resolveTargetSession(data, defaultConvId = "default") {
   const scope = data.scope || (data.sessionId === "all" ? "lifetime" : (data.sessionId === "app" ? "app" : "conversation"));
   const convId = data.conversationId || (data.sessionId !== "all" && data.sessionId !== "app" && data.sessionId ? data.sessionId : (defaultConvId || "default"));
@@ -205,6 +221,8 @@ function resolveTargetSession(data, defaultConvId = "default") {
 }
 
 function getStatsPayload(data, defaultConvId = "default") {
+  const store = getRuntimeStore();
+  const appStartTime = getAppStartTime();
   const { scope, convId, targetSid } = resolveTargetSession(data, defaultConvId);
   let stats;
   if (scope === "lifetime" || scope === "all") {
@@ -344,7 +362,9 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
   const isSpecificConv = scope === "conversation" && convId && convId !== "default" && convId !== "all" && convId !== "app";
   let transcriptPath = null;
   if (isSpecificConv) {
-    transcriptPath = findTranscriptForConversation(convId, { exactOnly: true });
+    transcriptPath = isSafeConversationId(convId)
+      ? findTranscriptForConversation(convId, { exactOnly: true })
+      : null;
   } else {
     const now = Date.now();
     if (now - cachedLatestScan.ts < LATEST_SCAN_TTL_MS && cachedLatestScan.path && fs.existsSync(cachedLatestScan.path)) {
@@ -469,12 +489,167 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
   }
 }
 
+function collectKnownWorktrees(store, sessionId = "default", sinceTs = null) {
+  if (!store) return [];
+  const roots = new Set();
+  try {
+    if (typeof store.open === "function") store.open();
+    if (!store.db) return [];
+    const sid = sessionId || "default";
+    const isAll = sid === "all" || sid === "lifetime";
+    const isApp = sid === "app" && Number.isFinite(Number(sinceTs));
+    const sinceNum = isApp ? Number(sinceTs) : null;
+    const sinceIso = isApp ? new Date(sinceNum).toISOString() : null;
+
+    const queries = [
+      () =>
+        isAll
+          ? store.db
+              .prepare("SELECT DISTINCT worktree FROM session_checkpoints WHERE worktree != '' ORDER BY updated_ts DESC LIMIT 20")
+              .all()
+          : isApp
+            ? store.db
+                .prepare("SELECT DISTINCT worktree FROM session_checkpoints WHERE worktree != '' AND updated_ts >= ? ORDER BY updated_ts DESC LIMIT 20")
+                .all(sinceNum)
+            : store.db
+                .prepare("SELECT DISTINCT worktree FROM session_checkpoints WHERE session_id = ? AND worktree != '' LIMIT 10")
+                .all(sid),
+      () =>
+        isAll
+          ? store.db
+              .prepare("SELECT DISTINCT worktree FROM sources WHERE worktree != '' ORDER BY created_ts DESC LIMIT 20")
+              .all()
+          : isApp
+            ? store.db
+                .prepare("SELECT DISTINCT worktree FROM sources WHERE worktree != '' AND (created_ts >= ? OR created_at >= ?) ORDER BY created_ts DESC LIMIT 20")
+                .all(sinceNum, sinceIso)
+            : store.db
+                .prepare("SELECT DISTINCT worktree FROM sources WHERE session_id = ? AND worktree != '' ORDER BY created_ts DESC LIMIT 20")
+                .all(sid),
+      () =>
+        isAll
+          ? store.db
+              .prepare("SELECT DISTINCT worktree FROM events WHERE worktree != '' ORDER BY seq DESC LIMIT 20")
+              .all()
+          : isApp
+            ? store.db
+                .prepare("SELECT DISTINCT worktree FROM events WHERE worktree != '' AND created_at >= ? ORDER BY seq DESC LIMIT 20")
+                .all(sinceIso)
+            : store.db
+                .prepare("SELECT DISTINCT worktree FROM events WHERE session_id = ? AND worktree != '' ORDER BY seq DESC LIMIT 20")
+                .all(sid)
+    ];
+
+    for (const run of queries) {
+      try {
+        for (const row of run() || []) {
+          if (row?.worktree && typeof row.worktree === "string") {
+            const raw = row.worktree.trim();
+            if (!raw || raw.includes("\0") || raw.startsWith("\\\\") || raw.startsWith("//") || !path.isAbsolute(raw)) {
+              continue;
+            }
+            const resolved = path.resolve(raw);
+            if (!isUnsafeBroadRoot(resolved)) {
+              roots.add(resolved);
+            }
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+  return Array.from(roots);
+}
+
+function isFilesystemRoot(dirPath) {
+  const resolved = path.resolve(dirPath);
+  const root = path.parse(resolved).root;
+  if (!root) return false;
+  return process.platform === "win32"
+    ? resolved.toLowerCase() === root.toLowerCase()
+    : resolved === root;
+}
+
+function isPathInsideRoot(candidatePath, rootPath) {
+  const normCand = process.platform === "win32" ? candidatePath.toLowerCase() : candidatePath;
+  const normRoot = process.platform === "win32" ? rootPath.toLowerCase() : rootPath;
+  const rel = path.relative(normRoot, normCand);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function isUnsafeBroadRoot(dirPath) {
+  if (isFilesystemRoot(dirPath)) return true;
+  const resolved = path.resolve(dirPath);
+  const home = path.resolve(os.homedir());
+  let realHome = home;
+  try {
+    realHome = fs.realpathSync(home);
+  } catch {}
+  // Reject os.homedir() itself and any ancestor directory of os.homedir() (e.g. C:\Users, /Users, /home)
+  return isPathInsideRoot(home, resolved) || isPathInsideRoot(realHome, resolved);
+}
+
+/**
+ * Strictly whitelist explicit `cwd` parameters for `/api/handoff` against known workspace roots
+ * recorded in SQLite. Blocks UNC paths, relative paths, filesystem roots, home/ancestor directories,
+ * arbitrary external directories, and symlink/junction escapes before touching the filesystem or spawning `git`.
+ */
+export function resolveAllowedHandoffCwd(rawCwd, knownRoots = []) {
+  if (typeof rawCwd !== "string") return "";
+  const trimmed = rawCwd.trim();
+  if (!trimmed || trimmed.includes("\0")) return "";
+  if (trimmed.startsWith("\\\\") || trimmed.startsWith("//")) return "";
+  if (!path.isAbsolute(trimmed)) return "";
+  const resolvedCandidate = path.resolve(trimmed);
+  if (isUnsafeBroadRoot(resolvedCandidate)) return "";
+
+  for (const rawRoot of knownRoots) {
+    if (!rawRoot || typeof rawRoot !== "string") continue;
+    const trimmedRoot = rawRoot.trim();
+    if (!trimmedRoot || trimmedRoot.includes("\0") || trimmedRoot.startsWith("\\\\") || trimmedRoot.startsWith("//")) {
+      continue;
+    }
+    if (!path.isAbsolute(trimmedRoot)) continue;
+    const resolvedRoot = path.resolve(trimmedRoot);
+    if (isUnsafeBroadRoot(resolvedRoot)) continue;
+    if (!isPathInsideRoot(resolvedCandidate, resolvedRoot)) continue;
+    try {
+      const realRoot = fs.realpathSync(resolvedRoot);
+      if (isUnsafeBroadRoot(realRoot)) continue;
+      const realCand = fs.realpathSync(resolvedCandidate);
+      if (isPathInsideRoot(realCand, realRoot) && fs.statSync(realCand).isDirectory()) {
+        return realCand;
+      }
+    } catch {
+      // Unresolvable or non-directory -> reject
+    }
+  }
+  return "";
+}
+
+function getResumePayload(data = {}, defaultConvId = "default") {
+  const store = getRuntimeStore();
+  const appStartTime = getAppStartTime();
+  const { scope, convId } = resolveTargetSession(data, defaultConvId);
+  if (scope === "lifetime" || scope === "all") return store.getResumeState("all", 10);
+  if (scope === "app" || scope === "session") return store.getResumeState("app", 10, { sinceTs: appStartTime });
+  return store.getResumeState(convId, 10);
+}
+
+function getSourceChunksPayload(data = {}) {
+  const store = getRuntimeStore();
+  const sourceId = data.sourceId;
+  if (!sourceId) return { ok: false, sourceId: null, chunks: [] };
+  return { ok: true, sourceId, chunks: store.getSourceChunks(sourceId) };
+}
+
 function getHandoffPayload(data = {}, defaultConvId = "default") {
+  const store = getRuntimeStore();
+  const appStartTime = getAppStartTime();
   const { scope, convId, targetSid } = resolveTargetSession(data, defaultConvId);
   const sinceTs = scope === "app" || scope === "session" ? appStartTime : null;
   const rawCwd = typeof data.cwd === "string" ? data.cwd.trim() : "";
-  const cwd = rawCwd && !rawCwd.includes("\0")
-    ? rawCwd
+  const cwd = rawCwd
+    ? resolveAllowedHandoffCwd(rawCwd, collectKnownWorktrees(store, targetSid, sinceTs))
     : inferWorkspaceFromStore(store, targetSid, sinceTs);
   const rawMaxBytes = parseOptionalPositiveNumber(data.maxBytes);
   const maxBytes = rawMaxBytes !== undefined
@@ -507,14 +682,61 @@ function getHandoffPayload(data = {}, defaultConvId = "default") {
   };
 }
 
-const isDirectRun = Boolean(
-  process.argv[1] &&
-    (process.platform === "win32"
-      ? path.resolve(process.argv[1]).toLowerCase() === __selfPath.toLowerCase()
-      : path.resolve(process.argv[1]) === __selfPath)
-);
+export function isSameFilePath(a, b) {
+  if (!a || !b) return false;
+  const norm = (p) => {
+    const resolved = path.resolve(String(p));
+    let real = resolved;
+    try {
+      real = fs.realpathSync(resolved);
+    } catch {}
+    return process.platform === "win32" ? real.toLowerCase() : real;
+  };
+  return norm(a) === norm(b);
+}
+
+/**
+ * Only allow SidecarApp mode when ANTIGRAVITY_SIDECAR_UI_TOKEN is explicitly non-empty
+ * (sidecar_sdk fails open on authentication when its token is empty/missing).
+ */
+export function shouldUseSidecarApp(env = process.env, hasSidecarApp = true) {
+  return Boolean(
+    hasSidecarApp &&
+      typeof env?.ANTIGRAVITY_LS_ADDRESS === "string" && env.ANTIGRAVITY_LS_ADDRESS.trim() &&
+      typeof env?.ANTIGRAVITY_CSRF_TOKEN === "string" && env.ANTIGRAVITY_CSRF_TOKEN.trim() &&
+      typeof env?.ANTIGRAVITY_SIDECAR_WEB_PORT === "string" && env.ANTIGRAVITY_SIDECAR_WEB_PORT.trim() &&
+      typeof env?.ANTIGRAVITY_SIDECAR_UI_TOKEN === "string" && env.ANTIGRAVITY_SIDECAR_UI_TOKEN.trim() &&
+      env?.SIDECAR_FORCE_HTTP !== "1"
+  );
+}
+
+/**
+ * Resolve standalone HTTP port: prefer explicit PORT, then host-assigned
+ * ANTIGRAVITY_SIDECAR_WEB_PORT (so fail-closed sidecar fallback doesn't collide on 8765),
+ * and finally default to 8765.
+ */
+export function resolveStandalonePort(env = process.env) {
+  for (const raw of [env?.PORT, env?.ANTIGRAVITY_SIDECAR_WEB_PORT]) {
+    if (typeof raw === "number" && Number.isInteger(raw) && raw >= 0 && raw <= 65535) {
+      return raw === 0 ? 0 : raw;
+    }
+    if (typeof raw === "string") {
+      const trimmed = raw.trim();
+      if (/^\d+$/.test(trimmed)) {
+        const parsed = Number(trimmed);
+        if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 65535) {
+          return parsed;
+        }
+      }
+    }
+  }
+  return 8765;
+}
+
+const isDirectRun = Boolean(process.argv[1] && isSameFilePath(process.argv[1], __selfPath));
 
 function handleCutoffMutation(data, defaultConvId = "default") {
+  const store = getRuntimeStore();
   const { scope, targetSid, convId } = resolveTargetSession(data, defaultConvId);
   const cutoffBytes = data.cutoff === "none" || data.cutoff === 0 || data.cutoff === "0" ? 0 : parseInt(data.cutoff, 10);
   const saved = store.setCutoff(cutoffBytes, targetSid);
@@ -530,6 +752,7 @@ function handleCutoffMutation(data, defaultConvId = "default") {
 }
 
 function handleExemptionsMutation(data, defaultConvId = "default") {
+  const store = getRuntimeStore();
   const { scope, targetSid } = resolveTargetSession(data, defaultConvId);
   const action = data.action || "get";
   if (action === "toggleCategory" && data.category) {
@@ -561,6 +784,7 @@ function handleExemptionsMutation(data, defaultConvId = "default") {
 }
 
 function handleToggleActiveMutation(data, defaultConvId = "default") {
+  const store = getRuntimeStore();
   const { scope, targetSid } = resolveTargetSession(data, defaultConvId);
   const current = store.isPaused(targetSid);
   const newPaused =
@@ -570,6 +794,8 @@ function handleToggleActiveMutation(data, defaultConvId = "default") {
 }
 
 function handlePurgeMutation(data, defaultConvId = "default") {
+  const store = getRuntimeStore();
+  const appStartTime = getAppStartTime();
   const { scope, convId } = resolveTargetSession(data, defaultConvId);
   if (scope === "lifetime" || scope === "all") {
     return store.purge({ scope: "all" });
@@ -580,6 +806,7 @@ function handlePurgeMutation(data, defaultConvId = "default") {
 }
 
 function handleMaintenanceMutation(data) {
+  const store = getRuntimeStore();
   const action = data.action || "prune";
   const maxAgeDays = parseSafeMaxAgeDays(data.maxAgeDays, 14);
   const vacuum = action === "vacuum" || data.vacuum === true || data.vacuum === "true" || data.vacuum === "1";
@@ -587,6 +814,7 @@ function handleMaintenanceMutation(data) {
 }
 
 function handleFeatureToggleMutation(isCli, data, defaultConvId = "default") {
+  const store = getRuntimeStore();
   const { scope, targetSid } = resolveTargetSession(data, defaultConvId);
   const cur = isCli ? store.isCliFilterEnabled(targetSid) : store.isReadDedupEnabled(targetSid);
   const next = data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : !cur;
@@ -604,6 +832,15 @@ function sendJson(res, status, payload, extraHeaders = {}) {
   res.end(JSON.stringify(payload));
 }
 
+const READ_ENDPOINTS = new Set([
+  "/api/stats",
+  "/api/doctor",
+  "/api/resume",
+  "/api/source-chunks",
+  "/api/cache-diag",
+  "/api/handoff"
+]);
+
 const MUTATING_ENDPOINTS = new Set([
   "/api/cutoff",
   "/api/exemptions",
@@ -619,6 +856,7 @@ export function createStandaloneServer({
   csrfToken = crypto.randomBytes(24).toString("hex"),
   maxBodyBytes = MAX_REQUEST_BODY_BYTES
 } = {}) {
+  getRuntimeStore();
   return http.createServer(async (req, res) => {
     try {
       // 1. Anti-DNS-rebinding Host validation & anti-CSRF Origin/Sec-Fetch-Site validation
@@ -681,50 +919,49 @@ export function createStandaloneServer({
         }
       }
 
-      // 4. Authenticated read-only GET API endpoints
-      if (req.method === "GET" && url.pathname === "/api/stats") {
-        const data = Object.fromEntries(url.searchParams.entries());
-        sendJson(res, 200, getStatsPayload(data));
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/api/doctor") {
-        sendJson(res, 200, store.doctor());
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/api/resume") {
-        const data = Object.fromEntries(url.searchParams.entries());
-        const { scope, convId } = resolveTargetSession(data);
-        let resume;
-        if (scope === "lifetime" || scope === "all") {
-          resume = store.getResumeState("all", 10);
-        } else if (scope === "app" || scope === "session") {
-          resume = store.getResumeState("app", 10, { sinceTs: appStartTime });
-        } else {
-          resume = store.getResumeState(convId, 10);
+      // 4. Authenticated read-only API endpoints (POST JSON used by UI + authenticated GET with X-Agy-Dart-Token)
+      if (READ_ENDPOINTS.has(url.pathname)) {
+        if (req.method !== "GET" && req.method !== "POST") {
+          sendJson(res, 405, { error: "Method Not Allowed: use POST with application/json" }, { Allow: "POST, GET" });
+          return;
         }
-        sendJson(res, 200, resume);
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/api/source-chunks") {
-        const sourceId = url.searchParams.get("sourceId");
-        const chunks = store.getSourceChunks(sourceId);
-        sendJson(res, 200, { ok: true, sourceId, chunks });
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/api/cache-diag") {
-        const data = Object.fromEntries(url.searchParams.entries());
-        sendJson(res, 200, getCacheDiagPayload(data));
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/api/handoff") {
-        const data = Object.fromEntries(url.searchParams.entries());
-        sendJson(res, 200, getHandoffPayload(data));
-        return;
+        let data = Object.fromEntries(url.searchParams.entries());
+        if (req.method === "POST") {
+          if (!isJsonContentType(req.headers["content-type"])) {
+            sendJson(res, 415, { error: "Content-Type must be application/json" });
+            return;
+          }
+          const parsed = await readBoundedJsonBody(req, maxBodyBytes);
+          if (!parsed.ok) {
+            sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
+            return;
+          }
+          data = { ...data, ...parsed.data };
+        }
+        if (url.pathname === "/api/stats") {
+          sendJson(res, 200, getStatsPayload(data));
+          return;
+        }
+        if (url.pathname === "/api/doctor") {
+          sendJson(res, 200, getRuntimeStore().doctor());
+          return;
+        }
+        if (url.pathname === "/api/resume") {
+          sendJson(res, 200, getResumePayload(data));
+          return;
+        }
+        if (url.pathname === "/api/source-chunks") {
+          sendJson(res, 200, getSourceChunksPayload(data));
+          return;
+        }
+        if (url.pathname === "/api/cache-diag") {
+          sendJson(res, 200, getCacheDiagPayload(data));
+          return;
+        }
+        if (url.pathname === "/api/handoff") {
+          sendJson(res, 200, getHandoffPayload(data));
+          return;
+        }
       }
 
       // 5. POST-only /api/search (authenticated read-only FTS5 query, bounded JSON body)
@@ -739,7 +976,7 @@ export function createStandaloneServer({
           return;
         }
         const queries = Array.isArray(parsed.data.queries) ? parsed.data.queries : [parsed.data.query || ""];
-        sendJson(res, 200, store.search({ queries, limit: 5 }));
+        sendJson(res, 200, getRuntimeStore().search({ queries, limit: 5 }));
         return;
       }
 
@@ -799,42 +1036,42 @@ if (isDirectRun) {
     }
   }
 
-  const isSidecarEnv = Boolean(
-    process.env.ANTIGRAVITY_LS_ADDRESS &&
-    process.env.ANTIGRAVITY_CSRF_TOKEN &&
-    process.env.ANTIGRAVITY_SIDECAR_WEB_PORT &&
+  const isSidecarEnv = shouldUseSidecarApp(process.env, Boolean(SidecarApp));
+
+  if (
+    !isSidecarEnv &&
+    SidecarApp &&
+    typeof process.env.ANTIGRAVITY_LS_ADDRESS === "string" && process.env.ANTIGRAVITY_LS_ADDRESS.trim() &&
+    typeof process.env.ANTIGRAVITY_CSRF_TOKEN === "string" && process.env.ANTIGRAVITY_CSRF_TOKEN.trim() &&
+    typeof process.env.ANTIGRAVITY_SIDECAR_WEB_PORT === "string" && process.env.ANTIGRAVITY_SIDECAR_WEB_PORT.trim() &&
     process.env.SIDECAR_FORCE_HTTP !== "1" &&
-    SidecarApp
-  );
+    !(typeof process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN === "string" && process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN.trim())
+  ) {
+    console.error(
+      "[context-mode sidecar] ANTIGRAVITY_SIDECAR_UI_TOKEN is missing/empty; refusing fail-open SidecarApp mode and falling back to authenticated standalone HTTP server."
+    );
+  }
 
   if (isSidecarEnv) {
+    getRuntimeStore();
     const app = new SidecarApp();
 
     app.page("/", () => {
       return getRenderedHtml(SIDECAR_CSRF_TOKEN);
     });
 
-    // Strictly read-only GET routes
-    app.api("/api/stats", (data) => getStatsPayload(data, app.config.conversationId), "GET");
-    app.api("/api/doctor", () => store.doctor(), "GET");
-    app.api("/api/resume", (data) => {
-      const { scope, convId } = resolveTargetSession(data, app.config.conversationId);
-      if (scope === "lifetime" || scope === "all") return store.getResumeState("all", 10);
-      if (scope === "app" || scope === "session") return store.getResumeState("app", 10, { sinceTs: appStartTime });
-      return store.getResumeState(convId, 10);
-    }, "GET");
-    app.api("/api/source-chunks", (data) => {
-      const sourceId = data.sourceId;
-      if (!sourceId) return { ok: false, chunks: [] };
-      return { ok: true, sourceId, chunks: store.getSourceChunks(sourceId) };
-    }, "GET");
-    app.api("/api/cache-diag", (data) => getCacheDiagPayload(data, app.config.conversationId), "GET");
-    app.api("/api/handoff", (data) => getHandoffPayload(data, app.config.conversationId), "GET");
+    // ALL /api/* routes are POST-only in SidecarApp mode because sidecar_sdk only enforces
+    // X-Sidecar-Token validation for non-GET requests (blocks unauthenticated GET / DNS-rebinding reads).
+    app.api("/api/stats", (data) => getStatsPayload(data, app.config.conversationId), "POST");
+    app.api("/api/doctor", () => getRuntimeStore().doctor(), "POST");
+    app.api("/api/resume", (data) => getResumePayload(data, app.config.conversationId), "POST");
+    app.api("/api/source-chunks", (data) => getSourceChunksPayload(data), "POST");
+    app.api("/api/cache-diag", (data) => getCacheDiagPayload(data, app.config.conversationId), "POST");
+    app.api("/api/handoff", (data) => getHandoffPayload(data, app.config.conversationId), "POST");
 
-    // POST-only routes so sidecar_sdk always enforces X-Sidecar-Token validation (non-GET)
     app.api("/api/search", (data) => {
       const queries = Array.isArray(data.queries) ? data.queries : [data.query || ""];
-      return store.search({ queries, limit: 5 });
+      return getRuntimeStore().search({ queries, limit: 5 });
     }, "POST");
     app.api("/api/cutoff", (data) => handleCutoffMutation(data, app.config.conversationId), "POST");
     app.api("/api/exemptions", (data) => handleExemptionsMutation(data, app.config.conversationId), "POST");
@@ -848,10 +1085,12 @@ if (isDirectRun) {
     await app.run();
     console.log(`[context-mode sidecar] registered and running`);
   } else {
-    const port = process.env.PORT || 8765;
+    const port = resolveStandalonePort(process.env);
     const server = createStandaloneServer();
     server.listen(port, "127.0.0.1", () => {
-      console.log(`[context-mode dashboard] standalone server listening at http://127.0.0.1:${port}`);
+      const addr = server.address();
+      const boundPort = typeof addr === "object" && addr ? addr.port : port;
+      console.log(`[context-mode dashboard] standalone server listening at http://127.0.0.1:${boundPort}`);
     });
   }
 }

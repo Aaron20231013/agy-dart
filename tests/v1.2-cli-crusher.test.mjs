@@ -524,6 +524,118 @@ test("sub broken", () => {
     const rBadCd = runCliFilter("test-runner", 'cd "does_not_exist_dir" && node --test pass.test.mjs 2>&1');
     assert.equal(rBadCd.status, 1);
     assert.ok(rBadCd.stdout.includes("does_not_exist_dir") || rBadCd.stderr.includes("does_not_exist_dir"));
+
+    // 6. P1-4: Subdirectory-only `.agy-dart/filters.json` matched via `cd <subDir> && <cmd>` AND `execCwd` propagated to applyFilterRule & SQLite worktree
+    const isolatedRoot = path.join(tmpDir, "mono-root");
+    const subPkgDir = path.join(isolatedRoot, "sub pkg");
+    fs.mkdirSync(path.join(subPkgDir, ".agy-dart"), { recursive: true });
+    fs.writeFileSync(
+      path.join(subPkgDir, ".agy-dart", "filters.json"),
+      JSON.stringify({
+        rules: [
+          {
+            id: "subpkg-rule",
+            match: "^node\\s+subtool\\.mjs\\b",
+            keep: "SUB_ERROR|SUB_SUMMARY",
+            drop: "^trace:",
+            maxLines: 20,
+            preserveTailOnFail: true
+          }
+        ]
+      }),
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(subPkgDir, "subtool.mjs"),
+      `console.log(("trace: sub noisy payload " + "z".repeat(50) + "\\n").repeat(35) + "SUB_ERROR: subpkg failure\\nSUB_SUMMARY: 1 failed"); process.exit(7);\n`
+    );
+    fs.writeFileSync(
+      path.join(subPkgDir, "sub.test.mjs"),
+      `import test from "node:test"; import assert from "node:assert/strict"; test("sub ok", () => assert.equal(1, 1));\n`
+    );
+
+    const subCmd = 'cd "sub pkg" && node subtool.mjs 2>&1';
+    const subMatch = matchFilterRule(subCmd, { cwd: isolatedRoot });
+    assert.equal(subMatch?.rule.id, "custom:subpkg-rule", "matchFilterRule must load .agy-dart/filters.json from unwrapped cdPath");
+
+    const runCliFilterIn = (workDir, ruleId, command, sessionId) =>
+      spawnSync(
+        process.execPath,
+        [
+          path.join(ROOT, "hooks", "cli-filter.mjs"),
+          "--rule",
+          ruleId,
+          "--b64",
+          enc(command),
+          "--orig-b64",
+          enc(command),
+          "--session",
+          enc(sessionId)
+        ],
+        { cwd: workDir, encoding: "utf8", windowsHide: true, env: cleanEnv }
+      );
+
+    const subRun = runCliFilterIn(isolatedRoot, subMatch.rule.id, subMatch.effectiveCommand, "v12-subpkg-sess");
+    assert.equal(subRun.status, 7);
+    assert.ok(subRun.stdout.includes("SUB_ERROR: subpkg failure"), `Expected subpkg custom rule keep line, got: ${subRun.stdout}`);
+    assert.ok(!subRun.stdout.includes("trace: sub noisy payload"), "Expected subpkg custom rule to drop trace lines");
+
+    const subTestCmd = 'cd "sub pkg" && node --test sub.test.mjs 2>&1';
+    const subTestRun = runCliFilterIn(isolatedRoot, "test-runner", subTestCmd, "v12-subpkg-sess");
+    assert.equal(subTestRun.status, 0, subTestRun.stderr);
+
+    const subStore = new ContextModeStore({ dbPath: tmpDb });
+    try {
+      subStore.open();
+      const expectedExecCwd = path.resolve(subPkgDir);
+      const evRow = subStore.db
+        .prepare("SELECT worktree FROM events WHERE session_id = ? AND kind = 'cli_filter' ORDER BY seq DESC LIMIT 1")
+        .get("v12-subpkg-sess");
+      assert.equal(evRow?.worktree, expectedExecCwd, "cli-filter recordEvent must propagate unwrapped execCwd as worktree");
+      const srcRow = subStore.db
+        .prepare("SELECT worktree FROM sources WHERE session_id = ? ORDER BY created_ts DESC LIMIT 1")
+        .get("v12-subpkg-sess");
+      assert.equal(srcRow?.worktree, expectedExecCwd, "cli-filter indexContent must propagate unwrapped execCwd as worktree");
+      const cpRow = subStore.db
+        .prepare("SELECT worktree FROM session_checkpoints WHERE session_id = ?")
+        .get("v12-subpkg-sess");
+      assert.equal(cpRow?.worktree, expectedExecCwd, "cli-filter recordVerificationResult must propagate unwrapped execCwd as worktree");
+    } finally {
+      subStore.close();
+    }
+
+    // 7. P1-4: Rule-ID collision between parent root and cd subdir must apply the rule whose pattern matched the command
+    fs.mkdirSync(path.join(isolatedRoot, ".agy-dart"), { recursive: true });
+    fs.writeFileSync(
+      path.join(isolatedRoot, ".agy-dart", "filters.json"),
+      JSON.stringify({
+        rules: [{ id: "shared-id", match: "^node\\s+parenttool\\.mjs\\b", keep: "PARENT_KEEP_LINE", maxLines: 20 }]
+      }),
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(subPkgDir, ".agy-dart", "filters.json"),
+      JSON.stringify({
+        rules: [{ id: "shared-id", match: "^node\\s+othertool\\.mjs\\b", keep: "WRONG_SUB_KEEP", maxLines: 20 }]
+      }),
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(subPkgDir, "parenttool.mjs"),
+      `console.log("PARENT_KEEP_LINE: ok\\nWRONG_SUB_KEEP: should be dropped\\nnoise line");\n`
+    );
+    const parentFallbackCmd = 'cd "sub pkg" && node parenttool.mjs 2>&1';
+    const parentFallbackMatch = matchFilterRule(parentFallbackCmd, { cwd: isolatedRoot });
+    assert.equal(parentFallbackMatch?.rule.id, "custom:shared-id");
+    const parentFallbackRun = runCliFilterIn(
+      isolatedRoot,
+      parentFallbackMatch.rule.id,
+      parentFallbackMatch.effectiveCommand,
+      "v12-collision-sess"
+    );
+    assert.equal(parentFallbackRun.status, 0, parentFallbackRun.stderr);
+    assert.ok(parentFallbackRun.stdout.includes("PARENT_KEEP_LINE"), `Expected parent fallback rule output, got: ${parentFallbackRun.stdout}`);
+    assert.ok(!parentFallbackRun.stdout.includes("WRONG_SUB_KEEP"), "Must not apply subdir rule with colliding ID whose pattern did not match");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }

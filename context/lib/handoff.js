@@ -9,6 +9,7 @@
  */
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { redactSecrets } from "./security.js";
 
@@ -98,15 +99,42 @@ function isExistingDirectory(dirPath) {
   }
 }
 
+function isUnsafeBroadRoot(dirPath) {
+  const resolved = path.resolve(dirPath);
+  const root = path.parse(resolved).root;
+  if (root) {
+    const isFsRoot = process.platform === "win32"
+      ? resolved.toLowerCase() === root.toLowerCase()
+      : resolved === root;
+    if (isFsRoot) return true;
+  }
+  const home = path.resolve(os.homedir());
+  let realHome = home;
+  try {
+    realHome = fs.realpathSync(home);
+  } catch {}
+  const inside = (cand, anc) => {
+    const nc = process.platform === "win32" ? cand.toLowerCase() : cand;
+    const na = process.platform === "win32" ? anc.toLowerCase() : anc;
+    const rel = path.relative(na, nc);
+    return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  };
+  return inside(home, resolved) || inside(realHome, resolved);
+}
+
 function runGitReadOnly(args, workDir) {
   try {
-    const res = spawnSync("git", ["--no-optional-locks", ...args], {
-      cwd: workDir,
-      encoding: "utf8",
-      timeout: GIT_TIMEOUT_MS,
-      windowsHide: true,
-      maxBuffer: 128 * 1024
-    });
+    const res = spawnSync(
+      "git",
+      ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=", ...args],
+      {
+        cwd: workDir,
+        encoding: "utf8",
+        timeout: GIT_TIMEOUT_MS,
+        windowsHide: true,
+        maxBuffer: 128 * 1024
+      }
+    );
     if (res.error || res.status !== 0) {
       return { ok: false, stdout: "", stderr: String(res.stderr || res.error?.message || "") };
     }
@@ -245,7 +273,10 @@ export function inferWorkspaceFromStore(store, sessionId = "default", sinceTs = 
         const rows = run();
         for (const row of rows || []) {
           if (row?.worktree && isExistingDirectory(row.worktree)) {
-            return path.resolve(row.worktree);
+            const resolved = path.resolve(row.worktree);
+            if (!isUnsafeBroadRoot(resolved)) {
+              return resolved;
+            }
           }
         }
       } catch {

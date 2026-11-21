@@ -8,6 +8,7 @@
  *   3. Volatile git branch / working-tree status last
  */
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
@@ -216,7 +217,7 @@ async function main() {
       import("../context/lib/store.js"),
       import("../context/lib/repo-skeleton.js")
     ]);
-    store = new ContextModeStore();
+    store = new ContextModeStore({ hookMode: true });
     store.clearSessionOverrides();
     store.maybeRunDailyMaintenance(14);
     if (workspaceDir && effectiveCfg.repoHubs) {
@@ -281,12 +282,19 @@ async function main() {
   );
 }
 
-const isDirectRun = Boolean(
-  process.argv[1] &&
-    (process.platform === "win32"
-      ? path.resolve(process.argv[1]).toLowerCase() === __selfPath.toLowerCase()
-      : path.resolve(process.argv[1]) === __selfPath)
-);
+function isSameFilePath(a, b) {
+  if (!a || !b) return false;
+  const norm = (p) => {
+    const resolved = path.resolve(p);
+    let real = resolved;
+    try {
+      real = fs.realpathSync(resolved);
+    } catch {}
+    return process.platform === "win32" ? real.toLowerCase() : real;
+  };
+  return norm(a) === norm(b);
+}
+const isDirectRun = Boolean(process.argv[1] && isSameFilePath(process.argv[1], __selfPath));
 if (isDirectRun) {
   main().catch(() => {
     process.stdout.write(JSON.stringify({}) + "\n");

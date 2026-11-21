@@ -11,10 +11,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import {
   extractStepTokenUsage,
   findTranscriptForConversation,
+  isSubagentStep,
   parseTranscriptLines
 } from "../context/lib/cache-analyzer.js";
 import { sha256Hex, stableSortObject, stableStringify } from "../context/lib/stable-json.js";
@@ -148,15 +150,77 @@ export function calibrateTokenEstimator(samples = TOKEN_CALIBRATION_CORPUS) {
   };
 }
 
-function collectStepVisibleText(step) {
-  if (!step || typeof step !== "object") return { text: "", hasMedia: false };
-  const hasMedia = Boolean(
-    step.media ||
-      step.images ||
-      step.type === "image" ||
-      (Array.isArray(step.content) &&
-        step.content.some((p) => p && typeof p === "object" && (p.type === "image" || p.type === "image_url" || p.type === "media")))
+function hasNonEmptyValue(val) {
+  if (val === null || val === undefined || val === false) return false;
+  if (Array.isArray(val)) return val.length > 0;
+  if (typeof val === "string") return val.trim().length > 0;
+  if (typeof val === "object") return Object.keys(val).length > 0;
+  return Boolean(val);
+}
+
+function inspectStepCalibrationSignals(step) {
+  if (!step || typeof step !== "object") {
+    return {
+      text: "",
+      hasMedia: false,
+      hasToolCalls: false,
+      hasThinking: false,
+      hasSystemInjection: false,
+      hasTruncatedText: false,
+      isSubagent: false
+    };
+  }
+  const typeStr = String(step.type || "");
+  const isSubagent = Boolean(
+    isSubagentStep(step) ||
+      step.parent_conversation_id ||
+      step.parentConversationId ||
+      /subagent/i.test(typeStr)
   );
+  const hasSystemInjection = Boolean(
+    hasNonEmptyValue(step.systemMessage) ||
+      hasNonEmptyValue(step.system_message) ||
+      hasNonEmptyValue(step.injectSteps) ||
+      hasNonEmptyValue(step.system_instruction) ||
+      /^(?:SYSTEM_MESSAGE|SYSTEM_INJECTION)$/i.test(typeStr)
+  );
+  const contentArr = Array.isArray(step.content) ? step.content : null;
+  const hasMedia = Boolean(
+    hasNonEmptyValue(step.media) ||
+      hasNonEmptyValue(step.images) ||
+      typeStr.toLowerCase() === "image" ||
+      (contentArr &&
+        contentArr.some((p) => p && typeof p === "object" && (p.type === "image" || p.type === "image_url" || p.type === "media")))
+  );
+  const hasToolCalls = Boolean(
+    (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) ||
+      (Array.isArray(step.toolCalls) && step.toolCalls.length > 0) ||
+      step.function_call ||
+      step.functionCall ||
+      step.tool_use ||
+      step.toolCall ||
+      /tool_?call|function_?call|tool_?use/i.test(typeStr) ||
+      (contentArr &&
+        contentArr.some(
+          (p) => p && typeof p === "object" && (p.type === "tool_use" || p.type === "tool_call" || p.type === "function_call")
+        ))
+  );
+  const hasThinking = Boolean(
+    (typeof step.thinking === "string" && step.thinking.trim().length > 0) ||
+      (typeof step.reasoning === "string" && step.reasoning.trim().length > 0) ||
+      (typeof step.thoughts === "string" && step.thoughts.trim().length > 0) ||
+      (contentArr &&
+        contentArr.some((p) => p && typeof p === "object" && (p.type === "thinking" || p.type === "reasoning")))
+  );
+  const truncFields = Array.isArray(step.truncated_fields)
+    ? step.truncated_fields
+    : Array.isArray(step.truncatedFields)
+      ? step.truncatedFields
+      : [];
+  const hasTruncatedText = truncFields.some(
+    (f) => typeof f === "string" && /^(?:content|output|result|tool_result|text|user_input|response)$/i.test(f.trim())
+  );
+
   const parts = [];
   for (const key of ["content", "output", "result", "user_input", "text"]) {
     const val = step[key];
@@ -172,70 +236,238 @@ function collectStepVisibleText(step) {
   if (step.tool_result !== undefined) {
     parts.push(typeof step.tool_result === "string" ? step.tool_result : JSON.stringify(step.tool_result));
   }
-  return { text: parts.join("\n"), hasMedia };
+  return {
+    text: parts.join("\n"),
+    hasMedia,
+    hasToolCalls,
+    hasThinking,
+    hasSystemInjection,
+    hasTruncatedText,
+    isSubagent
+  };
+}
+
+/**
+ * Extract empirical `{ id, text, actualTokens }` calibration pairs from real transcript
+ * steps using actual provider `usageMetadata` / `input_tokens` context deltas between turns,
+ * while filtering out structurally noisy turns (uncounted tool calls, thinking-token accounting
+ * mismatches, media, system injections, truncated content, subagent interleaving, model switches, compaction).
+ */
+export function extractTranscriptCalibrationReport(steps = [], { minActualTokens = 50, minChars = 100 } = {}) {
+  const samples = [];
+  const skippedByReason = {};
+  let skippedCount = 0;
+
+  const recordSkip = (reason) => {
+    skippedCount += 1;
+    skippedByReason[reason] = (skippedByReason[reason] || 0) + 1;
+  };
+
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return { samples, skippedCount, skippedByReason };
+  }
+
+  let prevCtx = null;
+  let prevOut = 0;
+  let prevModel = null;
+  let prevNoiseReason = null;
+  let accParts = [];
+  let windowNoiseReason = null;
+
+  const flagWindowNoise = (reason) => {
+    if (!windowNoiseReason) windowNoiseReason = reason;
+  };
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (!step || typeof step !== "object") continue;
+
+    const sig = inspectStepCalibrationSignals(step);
+
+    // Direct single-step labeled sample (supports Gemini usageMetadata, Claude/OpenAI usage, and skips short samples without polluting prevCtx)
+    const isDirectLabeledStep = Boolean(
+      typeof step.text === "string" &&
+        (step.usageMetadata || step.usage || step.usage_metadata) &&
+        prevCtx === null &&
+        accParts.length === 0 &&
+        step.content === undefined &&
+        step.user_input === undefined &&
+        step.tool_result === undefined
+    );
+    if (isDirectLabeledStep) {
+      const directUsage = extractStepTokenUsage(step);
+      const directTok =
+        directUsage.contextTokens > 0
+          ? directUsage.contextTokens
+          : Number(
+              step.usageMetadata?.totalTokenCount ??
+                step.usage?.total_tokens ??
+                step.usage_metadata?.total_token_count ??
+                0
+            );
+      if (!Number.isFinite(directTok) || directTok < minActualTokens || step.text.length < minChars) {
+        continue;
+      }
+      if (sig.isSubagent) {
+        recordSkip("subagent_interleaved");
+        continue;
+      }
+      if (sig.hasMedia) {
+        recordSkip("media");
+        continue;
+      }
+      if (sig.hasSystemInjection) {
+        recordSkip("system_injection");
+        continue;
+      }
+      if (sig.hasTruncatedText) {
+        recordSkip("truncated_content");
+        continue;
+      }
+      if ((directUsage?.thinkingTokens || 0) > 0 || sig.hasThinking) {
+        recordSkip("thinking_mismatch");
+        continue;
+      }
+      if (sig.hasToolCalls) {
+        recordSkip("uncounted_tool_calls");
+        continue;
+      }
+      samples.push({
+        id: String(step.id || `step#${step.step_index ?? i}`),
+        text: step.text,
+        actualTokens: Math.round(directTok)
+      });
+      continue;
+    }
+
+    const usage = extractStepTokenUsage(step);
+    const hasUsage = Boolean(usage && usage.contextTokens > 0);
+    if (hasUsage) {
+      const currModel = typeof step.model === "string" && step.model.trim() ? step.model.trim() : null;
+      if (prevCtx !== null && accParts.length > 0) {
+        let skipReason = null;
+        if (sig.isSubagent) skipReason = "subagent_interleaved";
+        else if (sig.hasMedia) skipReason = "media";
+        else if (sig.hasSystemInjection) skipReason = "system_injection";
+        else if (sig.hasTruncatedText) skipReason = "truncated_content";
+        else if (prevNoiseReason) skipReason = prevNoiseReason;
+        else if (windowNoiseReason) skipReason = windowNoiseReason;
+        else if (prevModel && currModel && prevModel !== currModel) skipReason = "model_switch";
+        else if (usage.contextTokens <= prevCtx) skipReason = "compaction_or_reset";
+        else {
+          const text = accParts.join("\n");
+          const actualDelta = usage.contextTokens - prevCtx - prevOut;
+          if (actualDelta <= 0) {
+            skipReason = "accounting_mismatch";
+          } else if (actualDelta >= minActualTokens && text.length >= minChars) {
+            samples.push({
+              id: `turn#${step.step_index ?? i}`,
+              text,
+              actualTokens: Math.round(actualDelta)
+            });
+          }
+        }
+        if (skipReason) {
+          recordSkip(skipReason);
+        }
+      }
+
+      prevCtx = usage.contextTokens;
+      prevOut = usage.outputTokens || 0;
+      if (currModel) prevModel = currModel;
+      if (sig.isSubagent) {
+        prevNoiseReason = "subagent_interleaved";
+      } else if (sig.hasMedia) {
+        prevNoiseReason = "media";
+      } else if (sig.hasSystemInjection) {
+        prevNoiseReason = "system_injection";
+      } else if (sig.hasTruncatedText) {
+        prevNoiseReason = "truncated_content";
+      } else if ((usage.thinkingTokens || 0) > 0 || sig.hasThinking) {
+        prevNoiseReason = "thinking_mismatch";
+      } else if (sig.hasToolCalls) {
+        prevNoiseReason = "uncounted_tool_calls";
+      } else {
+        prevNoiseReason = null;
+      }
+      accParts = [];
+      windowNoiseReason = null;
+    } else {
+      if (sig.isSubagent) flagWindowNoise("subagent_interleaved");
+      if (sig.hasMedia) flagWindowNoise("media");
+      if (sig.hasToolCalls) flagWindowNoise("uncounted_tool_calls");
+      if (sig.hasThinking) flagWindowNoise("thinking_mismatch");
+      if (sig.hasSystemInjection) flagWindowNoise("system_injection");
+      if (sig.hasTruncatedText) flagWindowNoise("truncated_content");
+      if (sig.text) accParts.push(sig.text);
+    }
+  }
+
+  return { samples, skippedCount, skippedByReason };
 }
 
 /**
  * Extract empirical `{ id, text, actualTokens }` calibration pairs from real transcript
  * steps using actual provider `usageMetadata` / `input_tokens` context deltas between turns.
  */
-export function extractTranscriptCalibrationSamples(steps = [], { minActualTokens = 50, minChars = 100 } = {}) {
-  const samples = [];
-  if (!Array.isArray(steps) || steps.length === 0) return samples;
+export function extractTranscriptCalibrationSamples(steps = [], opts = {}) {
+  return extractTranscriptCalibrationReport(steps, opts).samples;
+}
 
-  let prevCtx = null;
-  let prevOut = 0;
-  let accParts = [];
-  let sawMedia = false;
+const MAX_CALIBRATION_TRANSCRIPT_BYTES = 16 * 1024 * 1024; // Cap memory when calibrating against huge transcript_full.jsonl
 
-  for (let i = 0; i < steps.length; i++) {
-    const step = steps[i];
-    if (!step || typeof step !== "object") continue;
+function readBoundedTranscriptSteps(filePath, maxBytes = MAX_CALIBRATION_TRANSCRIPT_BYTES) {
+  let fd = null;
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size === 0) return [];
+    const startOffset = stat.size > maxBytes ? stat.size - maxBytes : 0;
+    const totalToRead = stat.size - startOffset;
+    fd = fs.openSync(filePath, "r");
+    const chunkBuf = Buffer.allocUnsafe(Math.min(256 * 1024, Math.max(4096, totalToRead)));
+    const decoder = new StringDecoder("utf8");
+    const steps = [];
+    let pos = startOffset;
+    let remaining = totalToRead;
+    let carry = "";
+    let skipFirstPartial = startOffset > 0;
 
-    // Direct single-step labeled sample (e.g. `{ text, usageMetadata: { promptTokenCount } }`)
-    if (typeof step.text === "string" && step.text.length >= minChars && step.usageMetadata && !prevCtx) {
-      const directTok = Number(
-        step.usageMetadata.promptTokenCount ??
-          step.usageMetadata.input_tokens ??
-          step.usageMetadata.totalTokenCount ??
-          0
-      );
-      if (Number.isFinite(directTok) && directTok >= minActualTokens && accParts.length === 0) {
-        samples.push({
-          id: String(step.id || `step#${step.step_index ?? i}`),
-          text: step.text,
-          actualTokens: Math.round(directTok)
-        });
-        continue;
+    while (remaining > 0) {
+      const toRead = Math.min(chunkBuf.length, remaining);
+      const nRead = fs.readSync(fd, chunkBuf, 0, toRead, pos);
+      if (nRead <= 0) break;
+      pos += nRead;
+      remaining -= nRead;
+      const text = carry + decoder.write(chunkBuf.subarray(0, nRead));
+      const lines = text.split(/\r?\n/);
+      carry = lines.pop() ?? "";
+      for (const line of lines) {
+        if (skipFirstPartial) {
+          skipFirstPartial = false;
+          continue;
+        }
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed && typeof parsed === "object") steps.push(parsed);
+        } catch {}
       }
     }
-
-    const usage = extractStepTokenUsage(step);
-    const hasUsage = Boolean(usage && usage.contextTokens > 0);
-    if (hasUsage) {
-      if (prevCtx !== null && usage.contextTokens > prevCtx && accParts.length > 0 && !sawMedia) {
-        const text = accParts.join("\n");
-        const actualDelta = usage.contextTokens - prevCtx - prevOut;
-        if (actualDelta >= minActualTokens && text.length >= minChars) {
-          samples.push({
-            id: `turn#${step.step_index ?? i}`,
-            text,
-            actualTokens: Math.round(actualDelta)
-          });
-        }
-      }
-      prevCtx = usage.contextTokens;
-      prevOut = (usage.outputTokens || 0) + (usage.thinkingTokens || 0);
-      accParts = [];
-      sawMedia = false;
-    } else {
-      const { text, hasMedia } = collectStepVisibleText(step);
-      if (hasMedia) sawMedia = true;
-      if (text) accParts.push(text);
+    carry += decoder.end();
+    if (carry.trim() && !skipFirstPartial) {
+      for (const parsed of parseTranscriptLines(carry)) steps.push(parsed);
+    }
+    return steps;
+  } catch {
+    return [];
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
     }
   }
-
-  return samples;
 }
 
 /**
@@ -248,15 +480,15 @@ export function calibrateFromTranscript(transcriptPathOrSteps) {
   if (typeof transcriptPathOrSteps === "string") {
     transcriptPath = path.resolve(transcriptPathOrSteps);
     if (fs.existsSync(transcriptPath)) {
-      steps = parseTranscriptLines(fs.readFileSync(transcriptPath, "utf8"));
+      steps = readBoundedTranscriptSteps(transcriptPath);
     }
   } else if (Array.isArray(transcriptPathOrSteps)) {
     steps = transcriptPathOrSteps;
   }
 
-  const extracted = extractTranscriptCalibrationSamples(steps);
-  if (extracted.length > 0) {
-    const metrics = calibrateTokenEstimator(extracted);
+  const report = extractTranscriptCalibrationReport(steps);
+  if (report.samples.length > 0) {
+    const metrics = calibrateTokenEstimator(report.samples);
     const recommendedBand = Math.max(
       ESTIMATOR_ERROR_BAND_PCT,
       Math.min(50, Math.ceil(metrics.mapePct / 5) * 5)
@@ -265,6 +497,8 @@ export function calibrateFromTranscript(transcriptPathOrSteps) {
       source: "transcript",
       transcriptPath,
       fallbackUsed: false,
+      skippedNoisyTurns: report.skippedCount,
+      skippedByReason: report.skippedByReason,
       ...metrics,
       recommendedErrorBandPct: recommendedBand
     };
@@ -274,6 +508,8 @@ export function calibrateFromTranscript(transcriptPathOrSteps) {
     source: "reference_corpus",
     transcriptPath,
     fallbackUsed: true,
+    skippedNoisyTurns: report.skippedCount,
+    skippedByReason: report.skippedByReason,
     ...calibrateTokenEstimator(TOKEN_CALIBRATION_CORPUS)
   };
 }
@@ -638,6 +874,16 @@ async function main() {
       console.log(`  - MAPE         : ${cal.mapePct}% (max rel error: ${cal.maxRelErrorPct}%)`);
       console.log(`  - Mean bias    : ${cal.meanBiasPct >= 0 ? "+" : ""}${cal.meanBiasPct}%`);
       console.log(`  - Safety band  : ±${cal.recommendedErrorBandPct}%`);
+      if (cal.skippedNoisyTurns > 0) {
+        const reasonSummary = Object.entries(cal.skippedByReason || {})
+          .filter(([, n]) => n > 0)
+          .map(([k, n]) => `${k}=${n}`)
+          .join(", ");
+        console.log(`  - Skipped noisy: ${cal.skippedNoisyTurns} turn(s)${reasonSummary ? ` (${reasonSummary})` : ""}`);
+      }
+      if (cal.fallbackUsed && cal.transcriptPath) {
+        console.log(`  - Fallback     : reference corpus (no uncontaminated transcript turns in ${path.basename(cal.transcriptPath)})`);
+      }
     }
     return;
   }

@@ -56,13 +56,35 @@ function attachPrototypeMethods(TargetClass, ...MixinClasses) {
 
 export class ContextModeStore {
   constructor(optionsOrDbPath) {
+    const opts =
+      optionsOrDbPath && typeof optionsOrDbPath === "object" ? optionsOrDbPath : {};
     if (typeof optionsOrDbPath === "string" && optionsOrDbPath.trim()) {
       this.dbPath = optionsOrDbPath.trim();
-    } else if (optionsOrDbPath && typeof optionsOrDbPath.dbPath === "string" && optionsOrDbPath.dbPath.trim()) {
-      this.dbPath = optionsOrDbPath.dbPath.trim();
+    } else if (typeof opts.dbPath === "string" && opts.dbPath.trim()) {
+      this.dbPath = opts.dbPath.trim();
     } else {
       this.dbPath = getDefaultDbPath();
     }
+    this.hookMode = Boolean(opts.hookMode);
+    this.busyTimeoutMs =
+      Number.isFinite(opts.busyTimeoutMs) && opts.busyTimeoutMs >= 0
+        ? Math.floor(opts.busyTimeoutMs)
+        : this.hookMode
+          ? 200
+          : 5000;
+    this.maxBusyRetries =
+      Number.isFinite(opts.maxBusyRetries) && opts.maxBusyRetries >= 1
+        ? Math.floor(opts.maxBusyRetries)
+        : this.hookMode
+          ? 2
+          : 5;
+    this.maxRetryDeadlineMs =
+      Number.isFinite(opts.maxRetryDeadlineMs) && opts.maxRetryDeadlineMs >= 0
+        ? Math.floor(opts.maxRetryDeadlineMs)
+        : this.hookMode
+          ? 500
+          : 0;
+    this._hookBusyAborted = false;
     this.db = null;
     this.sourceCounter = 0;
   }
@@ -70,12 +92,33 @@ export class ContextModeStore {
   /** Open or initialize SQLite database */
   open() {
     if (this.db) return this.db;
+    if (this.hookMode && this._hookBusyAborted) {
+      const err = new Error("SQLite busy budget already exhausted in hook mode");
+      err.code = "ERR_SQLITE_ERROR";
+      throw err;
+    }
     const dbDir = path.dirname(this.dbPath);
     if (!fs.existsSync(dbDir)) {
       fs.mkdirSync(dbDir, { recursive: true });
     }
     this.db = new DatabaseSync(this.dbPath);
-    this.initSchema();
+    try {
+      this.initSchema();
+    } catch (err) {
+      try {
+        this.db.close();
+      } catch {}
+      this.db = null;
+      const msg = String(err?.message || err || "");
+      if (
+        this.hookMode &&
+        err?.code === "ERR_SQLITE_ERROR" &&
+        /database is locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(msg)
+      ) {
+        this._hookBusyAborted = true;
+      }
+      throw err;
+    }
     return this.db;
   }
 
@@ -91,20 +134,37 @@ export class ContextModeStore {
   }
 
   /** Retry helper for transient SQLITE_BUSY / database-locked contention across parallel hooks */
-  _withBusyRetry(fn, maxAttempts = 5) {
+  _withBusyRetry(fn, maxAttempts = null) {
+    if (this.hookMode && this._hookBusyAborted) {
+      const err = new Error("SQLite busy budget already exhausted in hook mode");
+      err.code = "ERR_SQLITE_ERROR";
+      throw err;
+    }
+    const effectiveMax = this.hookMode
+      ? Math.max(1, Math.min(maxAttempts ?? this.maxBusyRetries, this.maxBusyRetries))
+      : Math.max(1, maxAttempts ?? this.maxBusyRetries);
+    const deadline = this.maxRetryDeadlineMs > 0 ? Date.now() + this.maxRetryDeadlineMs : 0;
     let lastErr;
     const sleepBuf = new Int32Array(new SharedArrayBuffer(4));
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    for (let attempt = 0; attempt < effectiveMax; attempt++) {
       try {
         return fn();
       } catch (err) {
         lastErr = err;
         const msg = String(err?.message || err || "");
         const isBusy = err?.code === "ERR_SQLITE_ERROR" && /database is locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(msg);
-        if (!isBusy || attempt === maxAttempts - 1) throw err;
+        if (!isBusy) throw err;
+        if (attempt === effectiveMax - 1 || (deadline > 0 && Date.now() >= deadline)) {
+          if (this.hookMode) this._hookBusyAborted = true;
+          throw err;
+        }
         try {
           const jitter = Math.floor(Math.random() * 15);
-          Atomics.wait(sleepBuf, 0, 0, 15 * (attempt + 1) + jitter);
+          const waitMs = 15 * (attempt + 1) + jitter;
+          const remaining = deadline > 0 ? Math.max(0, deadline - Date.now()) : waitMs;
+          if (remaining > 0) {
+            Atomics.wait(sleepBuf, 0, 0, Math.min(waitMs, remaining));
+          }
         } catch {}
       }
     }

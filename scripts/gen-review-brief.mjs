@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { tokenizeJsForSpecifiers } from "./verify-package-graph.mjs";
 
 const __selfPath = path.resolve(fileURLToPath(import.meta.url));
 const __dirname = path.dirname(__selfPath);
@@ -22,7 +23,7 @@ function countLines(rootDir, relPath) {
   if (!fs.existsSync(full)) return 0;
   const txt = fs.readFileSync(full, "utf8");
   if (!txt) return 0;
-  return txt.split(/\r?\n/).length;
+  return txt.split(/\r\n?|\n/).length;
 }
 
 function getGitHeadSha(rootDir) {
@@ -30,6 +31,7 @@ function getGitHeadSha(rootDir) {
     return execFileSync("git", ["rev-parse", "--short", "HEAD"], {
       cwd: rootDir,
       encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
       windowsHide: true,
       timeout: 3000
     }).trim();
@@ -38,62 +40,50 @@ function getGitHeadSha(rootDir) {
   }
 }
 
-function stripStringsAndCommentsForTestCount(src) {
-  let out = "";
-  let i = 0;
-  const n = src.length;
-  while (i < n) {
-    const ch = src[i];
-    const next = src[i + 1];
-    if (ch === "/" && next === "/") {
-      while (i < n && src[i] !== "\n") i++;
-      continue;
-    }
-    if (ch === "/" && next === "*") {
-      i += 2;
-      while (i < n && !(src[i] === "*" && src[i + 1] === "/")) {
-        if (src[i] === "\n") out += "\n";
-        i++;
+export function countTestCasesInSource(src) {
+  const tokens = tokenizeJsForSpecifiers(src);
+  let count = 0;
+  const TEST_SUBMETHODS = new Set(["skip", "only", "todo", "it", "test"]);
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    const prev = i > 0 ? tokens[i - 1] : null;
+    const prev2 = i > 1 ? tokens[i - 2] : null;
+    const next = tokens[i + 1];
+    const isExcludedLead =
+      (prev?.type === "ident" && (prev.value === "function" || prev.value === "new" || prev.value === "return")) ||
+      (prev?.type === "punct" && prev.value === "*" && prev2?.type === "ident" && prev2.value === "function") ||
+      (prev?.type === "punct" && prev.value === ">" && prev2?.type === "punct" && prev2.value === "=");
+    const isTestRunnerIdent = tok.type === "ident" && (tok.value === "test" || tok.value === "it");
+    if (isTestRunnerIdent && !tok.isMemberProp && tok.depth === 0 && !isExcludedLead) {
+      if (next?.type === "punct" && next.value === "(") {
+        count += 1;
+      } else if (
+        next?.type === "punct" &&
+        next.value === "?" &&
+        tokens[i + 2]?.type === "punct" &&
+        tokens[i + 2].value === "." &&
+        tokens[i + 3]?.type === "punct" &&
+        tokens[i + 3].value === "("
+      ) {
+        count += 1;
+      } else if (
+        next?.type === "punct" &&
+        next.value === "." &&
+        tokens[i + 2]?.type === "ident" &&
+        TEST_SUBMETHODS.has(tokens[i + 2].value) &&
+        ((tokens[i + 3]?.type === "punct" && tokens[i + 3].value === "(") ||
+          (tokens[i + 3]?.type === "punct" &&
+            tokens[i + 3].value === "?" &&
+            tokens[i + 4]?.type === "punct" &&
+            tokens[i + 4].value === "." &&
+            tokens[i + 5]?.type === "punct" &&
+            tokens[i + 5].value === "("))
+      ) {
+        count += 1;
       }
-      i += 2;
-      continue;
     }
-    if (ch === "'" || ch === '"') {
-      const quote = ch;
-      out += quote;
-      i++;
-      while (i < n && src[i] !== quote && src[i] !== "\n") {
-        if (src[i] === "\\") {
-          i += 2;
-          continue;
-        }
-        i++;
-      }
-      if (i < n && src[i] === quote) {
-        out += quote;
-        i++;
-      }
-      continue;
-    }
-    if (ch === "`") {
-      out += "`";
-      i++;
-      while (i < n && src[i] !== "`") {
-        if (src[i] === "\\") {
-          i += 2;
-          continue;
-        }
-        if (src[i] === "\n") out += "\n";
-        i++;
-      }
-      out += "`";
-      i++;
-      continue;
-    }
-    out += ch;
-    i++;
   }
-  return out;
+  return count;
 }
 
 function countTests(rootDir) {
@@ -102,9 +92,7 @@ function countTests(rootDir) {
   const files = fs.readdirSync(testsDir).filter((f) => f.endsWith(".test.mjs")).sort();
   let cases = 0;
   for (const f of files) {
-    const src = stripStringsAndCommentsForTestCount(fs.readFileSync(path.join(testsDir, f), "utf8"));
-    const matches = src.match(/^test\s*\(/gm);
-    cases += matches ? matches.length : 0;
+    cases += countTestCasesInSource(fs.readFileSync(path.join(testsDir, f), "utf8"));
   }
   return { files: files.length, cases };
 }
@@ -150,8 +138,8 @@ const ENGINE_ENTRIES = [
   ["scripts/verify-package-graph.mjs", "静态 Import 图打包校验器（devtools）：线性 JS 词法解析器提取含/无分号（ASI）、多行、注释穿插与带属性动态导入的 ESM/CJS 依赖，证明无漏打模块且 devtools 零泄漏"],
   ["scripts/prefix-budget.mjs", "Turn-0 前缀预算、双 MCP 指纹与 `--calibrate` 跨语种 Token 估算误差校准审计（devtools，读取统一 `config.json`，超预算/非规范时非零退出码卡口 CI）"],
   ["scripts/gen-review-brief.mjs", "`AI_REVIEW_BRIEF.md` 代码行数/测试基线自动生成与 `--check` 漂移守卫（devtools）"],
-  ["sidecars/dashboard/server.mjs", "Sidecar HTTP / SidecarApp 服务：严格 `Host`/同源 `Origin`/`Sec-Fetch-Site` 白名单（拦截 `cross-site`、`same-site` 及伪造头）、`X-Frame-Options: DENY`、每实例随机 `X-Agy-Dart-Token` 覆盖全部 `/api/*`、写接口仅 POST + `application/json` + 64 KB 请求体上限与 `featureRoi`"],
-  ["sidecars/dashboard/index.html", "实时仪表盘前端：自动注入并携带 CSRF Token、全写操作 POST JSON、XSS 转义加固、1s 本地 TTL 进度条、Handoff 抽屉与上下文构成条"]
+  ["sidecars/dashboard/server.mjs", "Sidecar HTTP / SidecarApp 服务：严格 `Host`/同源 `Origin`/`Sec-Fetch-Site` 白名单（拦截 `cross-site`、`same-site` 及伪造头）、`X-Frame-Options: DENY`、独立 HTTP 全部 `/api/*` 强制随机 `X-Agy-Dart-Token`、SidecarApp 模式全部 `/api/*` 仅限 POST（强制 `X-Sidecar-Token`）、写接口与 `/api/search` 仅 POST + `application/json` + 64 KB 请求体上限与 `featureRoi`"],
+  ["sidecars/dashboard/index.html", "实时仪表盘前端：自动注入并携带 CSRF Token、全部 `/api/*` 调用统一 POST JSON、XSS 转义加固、1s 本地 TTL 进度条、Handoff 抽屉与上下文构成条"]
 ];
 
 function renderTable(rootDir, entries) {
@@ -218,14 +206,15 @@ function replaceBlock(content, startMarker, endMarker, replacement) {
 
 export function syncBriefFile(rootDir = REPO_ROOT, { write = false } = {}) {
   const briefPath = path.join(rootDir, "AI_REVIEW_BRIEF.md");
-  const current = fs.readFileSync(briefPath, "utf8");
+  const rawCurrent = fs.readFileSync(briefPath, "utf8");
+  const normalizedCurrent = rawCurrent.replace(/\r\n?/g, "\n");
   const { metaLine, codeMap, metrics } = renderGeneratedSections(rootDir);
 
-  let updated = replaceBlock(current, "<!-- AUTO:META:START -->", "<!-- AUTO:META:END -->", metaLine);
+  let updated = replaceBlock(normalizedCurrent, "<!-- AUTO:META:START -->", "<!-- AUTO:META:END -->", metaLine);
   updated = replaceBlock(updated, "<!-- AUTO:CODE_MAP:START -->", "<!-- AUTO:CODE_MAP:END -->", codeMap);
 
-  const inSync = current === updated;
-  if (write && !inSync) {
+  const inSync = normalizedCurrent === updated;
+  if (write && (!inSync || rawCurrent !== updated)) {
     fs.writeFileSync(briefPath, updated, "utf8");
   }
   return { inSync, metrics, briefPath };

@@ -74,7 +74,9 @@ function runCommandCaptured(command, unwrapFn = null) {
               stdout: "",
               stderr: `cd: not a directory: ${parts.cdPath}\n`,
               exitCode: 1,
-              truncatedCapture: false
+              truncatedCapture: false,
+              execCwd: process.cwd(),
+              innerCommand: execCmd
             });
             return;
           }
@@ -83,7 +85,9 @@ function runCommandCaptured(command, unwrapFn = null) {
             stdout: "",
             stderr: `cd: no such file or directory: ${parts.cdPath}\n`,
             exitCode: 1,
-            truncatedCapture: false
+            truncatedCapture: false,
+            execCwd: process.cwd(),
+            innerCommand: execCmd
           });
           return;
         }
@@ -135,13 +139,12 @@ function runCommandCaptured(command, unwrapFn = null) {
     child.stderr.on("data", (chunk) => {
       if (mergeStderrToStdout) {
         appendOut(chunk);
-        return;
       }
       if (errLen < MAX_CAPTURE_BYTES) {
         const take = Math.min(chunk.length, MAX_CAPTURE_BYTES - errLen);
         errChunks.push(take === chunk.length ? chunk : chunk.subarray(0, take));
         errLen += take;
-      } else {
+      } else if (!mergeStderrToStdout) {
         truncatedCapture = true;
       }
     });
@@ -161,18 +164,24 @@ function runCommandCaptured(command, unwrapFn = null) {
         stdout: "",
         stderr: `Failed to execute command: ${err.message}`,
         exitCode: 1,
-        truncatedCapture: false
+        truncatedCapture: false,
+        execCwd,
+        innerCommand: execCmd
       });
     });
 
     child.on("close", (code, signal) => {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
+      const stderrText = Buffer.concat(errChunks).toString("utf8");
       resolve({
         stdout: Buffer.concat(outChunks).toString("utf8"),
-        stderr: Buffer.concat(errChunks).toString("utf8"),
+        stderr: mergeStderrToStdout ? "" : stderrText,
+        capturedStderr: mergeStderrToStdout ? stderrText : "",
         exitCode: code !== null && code !== undefined ? code : signal ? 1 : 0,
-        truncatedCapture
+        truncatedCapture,
+        execCwd,
+        innerCommand: execCmd
       });
     });
   });
@@ -216,6 +225,7 @@ async function main() {
   const redErr = redactSecrets(res.stderr || "");
   const safeStdout = redOut.text;
   const safeStderr = redErr.text;
+  const safeCapturedStderr = res.capturedStderr ? redactSecrets(res.capturedStderr).text : "";
 
   const rawCombined =
     safeStdout +
@@ -224,14 +234,15 @@ async function main() {
 
   let sourceId = null;
   let store = null;
+  const effectiveCwd = res.execCwd || process.cwd();
 
   // Index full raw output (redacted) into SQLite FTS5 when non-trivial so filtered details stay searchable
   if (rawBytes >= 2048 || (res.exitCode !== 0 && rawBytes >= 1024)) {
     try {
-      store = new ContextModeStore();
+      store = new ContextModeStore({ hookMode: true });
       const indexed = store.indexContent({
         sessionId,
-        worktree: process.cwd(),
+        worktree: effectiveCwd,
         agent: "antigravity",
         kind: "tool_output",
         label: `cli:${ruleId || "cmd"} ${originalCommand.slice(0, 60)}`,
@@ -254,7 +265,10 @@ async function main() {
     .join("; ");
 
   const filtered = applyFilterRule(ruleId, safeStdout, safeStderr, res.exitCode, {
-    cwd: process.cwd(),
+    cwd: effectiveCwd,
+    fallbackCwd: process.cwd(),
+    command: res.innerCommand || command,
+    capturedStderr: safeCapturedStderr,
     maxBytes: MAX_FILTERED_OUTPUT_BYTES,
     note: effectiveNote || null,
     sourceId
@@ -262,11 +276,11 @@ async function main() {
 
   // Record telemetry & session verification checkpoint for Sidecar dashboard, ctx_stats & ctx_resume
   try {
-    if (!store) store = new ContextModeStore();
+    if (!store) store = new ContextModeStore({ hookMode: true });
     if (filtered.wasFiltered || rawBytes > 0) {
       store.recordEvent({
         sessionId,
-        worktree: process.cwd(),
+        worktree: effectiveCwd,
         agent: "antigravity",
         kind: "cli_filter",
         tool: "run_command",
@@ -289,7 +303,7 @@ async function main() {
         passed: res.exitCode === 0,
         summary: extractCompactVerdict(filtered.filteredText, res.exitCode),
         sourceId,
-        worktree: process.cwd()
+        worktree: effectiveCwd
       });
     }
   } catch {

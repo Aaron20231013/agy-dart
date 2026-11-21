@@ -781,7 +781,20 @@ export function createTools({
     async ctx_doctor() {
       const doc = store.doctor();
       const cfgSnap = getConfigSnapshot();
-      return {
+      let projectFilters = { exists: false, error: null, loadedCount: 0, rejectedCount: 0, rejected: [] };
+      try {
+        const { inspectProjectFilterRules } = await import("../../hooks/filter-rules.mjs");
+        const diag = inspectProjectFilterRules(getCwd());
+        projectFilters = {
+          path: diag.path,
+          exists: diag.exists,
+          error: diag.error,
+          loadedCount: diag.loadedCount,
+          rejectedCount: diag.rejectedCount,
+          rejected: diag.rejected
+        };
+      } catch {}
+      const out = {
         doctor: doc,
         features: {
           cliFilterEnabled: store.isCliFilterEnabled(getSessionId()),
@@ -801,12 +814,36 @@ export function createTools({
               .map(([k, src]) => [k, { value: cfgSnap.values[k], source: src }])
           )
         },
+        projectFilters,
         runtimes: {
           node: process.version,
           platform: process.platform,
           arch: process.arch
         }
       };
+
+      // Hard invariant: keep serialized ctx_doctor JSON (even with MCP envelope) strictly <= 8.8 KB
+      const maxDoctorBytes = Math.min(MAX_MCP_JSON_BYTES, 8400);
+      if (Buffer.byteLength(JSON.stringify(out, null, 2), "utf8") > maxDoctorBytes) {
+        const trimmedRejected = Array.isArray(out.projectFilters.rejected)
+          ? out.projectFilters.rejected.slice()
+          : [];
+        while (
+          trimmedRejected.length > 0 &&
+          Buffer.byteLength(
+            JSON.stringify({ ...out, projectFilters: { ...out.projectFilters, rejected: trimmedRejected, rejectedTruncated: true } }, null, 2),
+            "utf8"
+          ) > maxDoctorBytes
+        ) {
+          trimmedRejected.pop();
+        }
+        out.projectFilters = {
+          ...out.projectFilters,
+          rejected: trimmedRejected,
+          rejectedTruncated: true
+        };
+      }
+      return out;
     },
 
     // 8. ctx_purge

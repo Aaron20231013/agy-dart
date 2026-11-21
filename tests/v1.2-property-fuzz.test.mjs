@@ -7,12 +7,16 @@ import { computeUnifiedDiff, truncateUtf8Safe } from "../context/lib/text-diff.j
 import { capSerializedJsonField, fetchUrlText } from "../context/lib/tools.js";
 import { isPrivateOrReservedIp, validateFetchTarget } from "../context/lib/security.js";
 import {
+  applyFilterRule,
   hasUnsafeShellSyntax,
   isSafeRegex,
   matchFilterRule,
   truncateHeadTailUtf8Safe,
   unwrapSafeCompoundCommand
 } from "../hooks/filter-rules.mjs";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 // Deterministic Mulberry32 PRNG for 100% reproducible property & fuzz tests
 function createRng(seed) {
@@ -187,6 +191,94 @@ test("Property 2: ReDoS validator rejects catastrophic patterns, accepts safe pa
     "(?s:.+\\n.+\\n.+\\n.+\\n.+!)",
     "[a-z]+[A-Z]+[a-z]+[A-Z]+!",
     "[^a]+[^b]+[^c]+[^d]+!",
+    // P0-1: nested lookaround & lookaround curPrev-reset ReDoS bypasses
+    "\\w+(?=\\w+(?=\\w+(?=\\w+(?=\\w+(?=\\w+!)))))",
+    "^a+(?=a+(?=a+(?=a+(?=a+(?=a+b)))))",
+    "a+(?=a+b)",
+    "a+(?!a+b)",
+    "(?<=a+(?<=a+b))",
+    "(?=(?=a+b))",
+    "a+(?=b|a+)",
+    "a+(?:(?=a+!))",
+    // P2-2: guard rails ensuring bounded-group / barrier / space-wildcard relaxations stay ReDoS-safe
+    "\\s+.*!",
+    "a+\\s+.*!",
+    "^a|\\s+.*!",
+    "(?:^a|\\s+.*)!",
+    "(?m:^\\s+.*!)",
+    "(?s:^\\s+.*!)",
+    "^\\s+.*a?a?a?a?!",
+    "\\s+.*" + "a?".repeat(12) + "!",
+    "(?<=\\w+)\\w+!",
+    "(?=a+b)a+!",
+    "(?=(?:a+)b)a+!",
+    "(?=.*x)(?=.*y)",
+    ".*" + ":\\d*".repeat(5) + "!",
+    "a+" + "(?:a|aa)".repeat(12) + "!",
+    "(?:\\s+.*){2}",
+    "(?:\\s+.*:){2}",
+    "\\s+.*\\s+.*!",
+    "\\s+.*:\\s+.*!",
+    "(?s:\\s+.*)",
+    "\\s+(?=\\s+.*!)",
+    "(?:\\d+a\\d+){2}",
+    "(?:\\d+\\.?){2}",
+    "(?:.*:){2}",
+    ".*a.*a.*",
+    ".*:\\d+:.*:\\d+:.*:\\d+:.*:\\d+:!",
+    ".*:a+[^a]+:a+[^a]+:a+[^a]+!",
+    ".*(?:1|:)\\d+",
+    ".*(?:a|)\\d+",
+    // Unanchored/anchored variable-repeat + overlapping optional-chain ReDoS regressions
+    "a+" + "a?".repeat(8) + "!",
+    ".*" + "a?".repeat(8) + "!",
+    "\\w+" + "a?".repeat(8) + "!",
+    "a+" + "a?".repeat(4) + "!",
+    "a+" + "a{0,1}".repeat(4) + "!",
+    "a+" + "(?:a)?".repeat(4) + "!",
+    "a+" + "(?:a|)".repeat(4) + "!",
+    "a?".repeat(4) + "a+!",
+    "a?".repeat(2) + "a+" + "a?".repeat(2) + "!",
+    "b?".repeat(4) + ".*!",
+    "a+" + "(?:a|aa)".repeat(3) + "!",
+    "(?:a|aa)".repeat(3) + "a+!",
+    "^a+" + "a?".repeat(10) + "!",
+    // Group variable-repeat barrier-bypass & curPrev-wipe catastrophic ReDoS regressions
+    ".*:(?:a)+b.*:(?:a)+b.*:(?:a)+b.*:(?:a)+b.*:(?:a)+b!",
+    ".*:(?:a){1,5}b.*:(?:a){1,5}b.*:(?:a){1,5}b.*:(?:a){1,5}b.*:(?:a){1,5}b!",
+    ".*:(?:a|c)+b.*:(?:a|c)+b.*:(?:a|c)+b.*:(?:a|c)+b.*:(?:a|c)+b!",
+    "^.*:(?:a)+b.*:(?:a)+b.*:(?:a)+b.*:(?:a)+b.*:(?:a)+b!",
+    ".*:(?:a)+b.*!",
+    ".*:(?:(?:a)+|x)b.*!",
+    ".*:[^:]*:[^:]*:[^:]*:[^:]*:?:?!",
+    ".*:[^:]*:[^:]*:[^:]*:?:?!",
+    ".*:[^:]+;[^;]+:[^:]+;[^;]+!",
+    // Space-wildcard + overlapping optional-choice amplification regressions
+    "^\\s+.*\\s?\\s?!",
+    "^\\s+.*\\s?\\s?\\s?!",
+    "^\\s?\\s?\\s+.*!",
+    "^\\s?\\s?\\s?\\s+.*!",
+    "^\\s+.*(?:.|..)(?:.|..)(?:.|..)!",
+    "^\\s+[^\\n\\r]+\\s?\\s?\\s?!",
+    // Round-3 P0-1: non-/u \p{m,n} / \P{m,n} identity-escape quantifier swallowing bypasses
+    "(?:\\p{1,9})+!",
+    "^(?:\\p{1,9})+!$",
+    "(?:\\P{0,9})+!",
+    "\\p{1,1000000}",
+    // Round-3 P0-2: negated char class over-approximation collapse (\c / [^\c\D])
+    "^(?:a[^\\c]+){8}!",
+    "^" + "[^\\c\\D]+".repeat(20) + "!",
+    "^" + "a+[^\\c]+".repeat(12) + "!",
+    "[^\\c]+",
+    // Round-3 P0-3: ES2025 inline (?-i:...) case-sensitivity negation bypasses
+    "^(?-i:(?:A[^a]+){8}!)$",
+    "^(?-i:" + "[A-Z]+[^a-z]+".repeat(10) + "!)$",
+    "(?-i:a+(?i:A+))!",
+    // Round-3 P2-1: optional lookaround & self-overlapping bounded group defense-in-depth
+    "(?=a)?",
+    "(?=a+){0,1}",
+    "^a+(?:b[a-z]+){1,8}!",
+    "^a+(?:ba+){1,8}a+!",
     "unclosed(",
     "",
     "x".repeat(500)
@@ -218,10 +310,45 @@ test("Property 2: ReDoS validator rejects catastrophic patterns, accepts safe pa
     "[0-9]+:[0-9]+",
     "[^\\s]+\\s+[^\\s]+",
     "^(?:PASS|FAIL)\\s+[a-z0-9_./-]+\\.test\\.m?js$",
-    "(?:http|https)://[a-z0-9.-]+/[a-z0-9_./-]+"
+    "(?:http|https)://[a-z0-9.-]+/[a-z0-9_./-]+",
+    // P0-1: safe non-overlapping lookarounds remain accepted
+    "foo(?=\\s|$)",
+    "(?!debug)\\w+",
+    "(?<=error:\\s)\\w+",
+    "\\w+(?=\\s+failed)",
+    // P2-2: common safe log / version / duration patterns accepted with zero ReDoS risk
+    "^(?:\\d+\\.){2}\\d+$",
+    "^(?:\\d{1,3}\\.){3}\\d{1,3}$",
+    "(?:\\w+\\s+){1,3}failed",
+    "\\b(?:error|warn|fatal)\\b.*:\\d+",
+    "^\\s*(?:FAIL|PASS)\\s+.*\\(\\d+(?:\\.\\d+)?\\s*m?s\\)$",
+    "^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$",
+    "https?://[a-z0-9.-]+/[a-z0-9_./-]+",
+    "ERROR.*\\(\\d+(?:\\.\\d+)?\\s*m?s\\)",
+    "ERROR.*:\\d+:\\d+:\\d+",
+    // Round-3 P0-3 & P2-1: safe inline case-sensitive, prefix-delimited bounded groups, and top-level alternations
+    "^(?-i:[A-Z]+[a-z]+)$",
+    "^[a-z]+(?:-[a-z]+){1,5}$",
+    "^\\d+(?:\\.\\d+){1,3}$",
+    "^\\s*FAIL\\s+.*|^\\s*ERROR\\s+.*",
+    "ERROR.*:\\d+|WARN.*:\\d+|FATAL.*:\\d+|PANIC.*:\\d+",
+    "^(?:\\s*FAIL\\s+.*|\\s*ERROR\\s+.*)$"
   ];
   for (const p of mustAccept) {
     assert.equal(isSafeRegex(p), true, `Safe pattern MUST be accepted: ${p}`);
+  }
+  // Verify accepted P2-2 & unanchored optional patterns stay fast on 4,000-char adversarial lines
+  const advInputs = [
+    "1.".repeat(2000) + "x",
+    "a ".repeat(2000) + "x",
+    "error " + ":".repeat(4000) + "x",
+    "FAIL" + " ".repeat(4000) + "(123ms)!"
+  ];
+  for (const p of mustAccept.slice(-8)) {
+    const re = new RegExp(p, "i");
+    const tStart = performance.now();
+    for (const s of advInputs) re.test(s);
+    assert.ok(performance.now() - tStart < 100, `Accepted safe regex ${p} took too long on 4k adversarial inputs`);
   }
 
   const rng = createRng(0xfeedface);
@@ -468,5 +595,87 @@ test("Property 5: SSRF IPv4-mapped IPv6 bypasses & TTL=0 DNS rebinding protectio
   } finally {
     await new Promise((r) => canaryServer.close(r));
     await new Promise((r) => redirector.close(r));
+  }
+});
+
+test("Round-3 P1-5 & P2-7: Custom regex command-length & multi-line budgets + cd/BOM/cache-eviction edge cases", () => {
+  // P2-7: cd parsing edge cases
+  assert.equal(unwrapSafeCompoundCommand('cd "-" && git status'), null);
+  assert.equal(unwrapSafeCompoundCommand("cd '-' && git status"), null);
+  assert.equal(unwrapSafeCompoundCommand("cd /d && git status"), null);
+  assert.equal(unwrapSafeCompoundCommand("cd /d\\foo && git status"), null);
+  assert.equal(unwrapSafeCompoundCommand("cd /dC:\\Windows && git status"), null);
+  assert.equal(unwrapSafeCompoundCommand("cd ~otheruser && git status"), null);
+  assert.equal(unwrapSafeCompoundCommand("cd ~ && git status")?.cdPath, "~");
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-r3-budgets-"));
+  try {
+    const parentCfg = path.join(tmpDir, ".agy-dart");
+    const childDir = path.join(tmpDir, "child");
+    const childCfg = path.join(childDir, ".agy-dart");
+    fs.mkdirSync(parentCfg, { recursive: true });
+    fs.mkdirSync(childCfg, { recursive: true });
+
+    // P2-7: UTF-8 BOM filters.json loads cleanly
+    const bomJson =
+      "\uFEFF" +
+      JSON.stringify({
+        rules: [
+          {
+            id: "bar",
+            match: ".*:[^:]*:[^:]*:[^:]*!",
+            keep: ".*:[^:]*:[^:]*:[^:]*!",
+            drop: ".*:[^:]*:[^:]*:[^:]*!"
+          },
+          { id: "shared", match: "^parent-only\\b", keep: "^PARENT" }
+        ]
+      });
+    fs.writeFileSync(path.join(parentCfg, "filters.json"), bomJson, "utf8");
+    fs.writeFileSync(
+      path.join(childCfg, "filters.json"),
+      JSON.stringify({ rules: [{ id: "shared", match: "^child-only\\b", keep: "^CHILD" }] }),
+      "utf8"
+    );
+
+    // P1-5: matchFilterRule skips custom project regexes on huge commands (> 2048 chars) without stalling
+    const tCmd = performance.now();
+    const skippedLong = matchFilterRule("echo " + ":".repeat(32000), { cwd: tmpDir });
+    const dtCmd = performance.now() - tCmd;
+    assert.equal(skippedLong, null);
+    assert.ok(dtCmd < 100, `matchFilterRule on 32k command must skip fast, took ${dtCmd.toFixed(1)}ms`);
+
+    // P1-5: applyFilterRule enforces multi-line wall-clock budget and eliminates double `keep` evaluation
+    const heavyLines = Array.from({ length: 20 }, () => ":".repeat(8192)).join("\n");
+    const tLines = performance.now();
+    const heavyRes = applyFilterRule("custom:bar", heavyLines, "", 0, { cwd: tmpDir });
+    const dtLines = performance.now() - tLines;
+    assert.ok(dtLines < 600, `applyFilterRule 20x8192 lines must stay within time budget, took ${dtLines.toFixed(1)}ms`);
+    assert.ok(heavyRes.filteredBytes <= 7900);
+
+    // P2-7: applyFilterRule unwraps `cd child && ...` to select child's matching rule on duplicate id
+    const cdRes = applyFilterRule("custom:shared", "PARENT line\nCHILD line\n", "", 0, {
+      cwd: tmpDir,
+      command: "cd child && child-only run"
+    });
+    assert.ok(cdRes.filteredText.includes("CHILD line") && !cdRes.filteredText.includes("PARENT line"));
+
+    // P2-7: Stale cache entry evicted when filters.json becomes malformed with identical size & mtime
+    const staleDir = path.join(tmpDir, "stale");
+    fs.mkdirSync(path.join(staleDir, ".agy-dart"), { recursive: true });
+    const staleFile = path.join(staleDir, ".agy-dart", "filters.json");
+    const validText = '{"rules":[{"id":"ok1","match":"^foo$"}]}';
+    fs.writeFileSync(staleFile, validText, "utf8");
+    assert.ok(matchFilterRule("foo", { cwd: staleDir }), "Initial valid rule should match");
+    const origStat = fs.statSync(staleFile);
+    // Overwrite with invalid JSON of exact same byte length, then force a reload by bumping mtime + reverting
+    const invalidSameLen = "{INVALID_JSON".padEnd(validText.length - 1, " ") + "}";
+    fs.writeFileSync(staleFile, invalidSameLen, "utf8");
+    fs.utimesSync(staleFile, origStat.atime, new Date(origStat.mtimeMs + 2000));
+    assert.equal(matchFilterRule("foo", { cwd: staleDir }), null, "Invalid JSON must not match");
+    // Now restore old mtime on the invalid file — stale cache entry MUST have been deleted so it still returns null!
+    fs.utimesSync(staleFile, origStat.atime, origStat.mtime);
+    assert.equal(matchFilterRule("foo", { cwd: staleDir }), null, "Stale cache entry must be evicted on parse error");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });

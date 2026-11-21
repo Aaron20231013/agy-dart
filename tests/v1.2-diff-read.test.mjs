@@ -409,7 +409,16 @@ test("Three-state PreToolUse lifecycle: State 1/2/3, 2-strike bypass, incrementa
     assert.ok(stats.breakdown.dedupSavedBytes > 5000);
     store.close();
 
-    // Incremental v2 -> v3 WITHOUT triggering Strike 2: only line 90 delta must appear (NOT line 15!)
+    // 2-strike full-file bypass after diff delivery: immediate retry returns allow (full file verbatim)
+    // and re-anchors v2 as a real full-copy baseline (bypass_armed = 0).
+    const r3b = runHook(
+      "hooks/pre-tool-use.mjs",
+      { conversationId: "s-tri", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: modFile } } },
+      tmpDb
+    );
+    assert.equal(r3b.decision, "allow", "Strike 2 retry after diff-read must allow full file verbatim");
+
+    // Incremental v2 -> v3 AFTER v2 was read in full: only line 90 delta must appear (NOT line 15!)
     const v3Lines = [...v2Lines];
     v3Lines[89] = 'export const item_90 = "CHANGED_IN_V3_GAMMA";';
     writeAndBumpMtime(modFile, v3Lines.join("\n") + "\n", 20);
@@ -425,15 +434,20 @@ test("Three-state PreToolUse lifecycle: State 1/2/3, 2-strike bypass, incrementa
     assert.ok(r4.reason.includes("CHANGED_IN_V3_GAMMA"), "Incremental diff must show v2->v3 change");
     assert.ok(!r4.reason.includes("CHANGED_IN_V2_ALPHA"), "Incremental diff must NOT repeat v1->v2 change");
 
-    // 2-strike full-file bypass after diff delivery: immediate retry returns allow (full file verbatim)!
+    // P1-2: Consecutive edit (v3 -> v3b) while bypass_armed === 1 MUST NOT chain a second diff;
+    // must fall through to full-file allow and re-anchor v3b as the new full-copy baseline!
+    const v3bLines = [...v3Lines];
+    v3bLines[95] = 'export const item_96 = "CONSECUTIVE_EDIT_NO_CHAIN";';
+    writeAndBumpMtime(modFile, v3bLines.join("\n") + "\n", 25);
+
     const r5 = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "s-tri", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: modFile } } },
       tmpDb
     );
-    assert.equal(r5.decision, "allow", "Strike 2 retry after diff-read must allow full file verbatim");
+    assert.equal(r5.decision, "allow", "Consecutive edit while bypass_armed === 1 must allow full file instead of chaining a second diff");
 
-    // Subsequent unchanged read after Strike 2 bypass re-enters State 2 [agy-dart read-dedup]
+    // Subsequent unchanged read after full-file allow re-enters State 2 [agy-dart read-dedup]
     const r6 = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "s-tri", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: modFile } } },
@@ -443,7 +457,7 @@ test("Three-state PreToolUse lifecycle: State 1/2/3, 2-strike bypass, incrementa
     assert.ok(r6.reason.includes("[agy-dart read-dedup]"));
 
     // Superset snapshot (1..-1) -> subset modified read (lines 20..80) with accurate 1-based line numbers
-    const v4Lines = [...v3Lines];
+    const v4Lines = [...v3bLines];
     v4Lines[34] = 'export const item_35 = "SUBSET_MODIFIED_LINE_35";';
     writeAndBumpMtime(modFile, v4Lines.join("\n") + "\n", 30);
 
