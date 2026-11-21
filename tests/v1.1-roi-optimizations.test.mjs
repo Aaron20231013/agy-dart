@@ -741,6 +741,97 @@ test("Opt 5: Enhanced ctx_resume structured sessionCheckpoint (0 new MCP tools, 
   }
 });
 
+test("Shared MCP server per-call sessionId isolation (AsyncLocalStorage prevents cross-tab leak, recovers checkpoint & scopes purge)", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-shared-mcp-"));
+  const tmpDb = path.join(tmpDir, "context.db");
+  const convA = "conv-alpha-1111";
+  const convB = "conv-beta-2222";
+
+  try {
+    // Seed two concurrent conversations (simulating Hooks writing per-UUID checkpoints/events/file_reads)
+    const seed = new ContextModeStore({ dbPath: tmpDb });
+    seed.recordModifiedFiles(convA, [path.join(tmpDir, "alpha.js")], { worktree: tmpDir, tool: "edit_file" });
+    seed.recordModifiedFiles(convB, [path.join(tmpDir, "beta.js")], { worktree: tmpDir, tool: "edit_file" });
+    seed.recordFileRead({ sessionId: convA, filePath: path.join(tmpDir, "alpha.js"), startLine: 1, endLine: 10, mtimeMs: 1, fileSize: 2048, byteEst: 2048 });
+    seed.recordFileRead({ sessionId: convB, filePath: path.join(tmpDir, "beta.js"), startLine: 1, endLine: 10, mtimeMs: 1, fileSize: 2048, byteEst: 2048 });
+    seed.recordEvent({ sessionId: convA, kind: "interception", tool: "read_file", key: "blocked", path: "alpha.js", sandboxBytes: 20000, returnedBytes: 0, ok: 1 });
+    seed.recordEvent({ sessionId: convB, kind: "interception", tool: "read_file", key: "blocked", path: "beta.js", sandboxBytes: 30000, returnedBytes: 0, ok: 1 });
+    seed.recordEvent({ sessionId: "default", kind: "execution", tool: "ctx_execute", key: "nodejs", path: null, sandboxBytes: 10000, returnedBytes: 500, ok: 1 });
+    seed.close();
+
+    // Launch ONE shared context/server.js WITHOUT ANTIGRAVITY_CONVERSATION_ID or initialize.sessionId
+    const client = createPersistentMcpClient(path.join(ROOT, "context", "server.js"), {
+      AGY_DART_DB_PATH: tmpDb,
+      ANTIGRAVITY_CONVERSATION_ID: "",
+      ANTIGRAVITY_ROOT_CONVERSATION_ID: "",
+      ANTIGRAVITY_PARENT_CONVERSATION_ID: "",
+      CONVERSATION_ID: ""
+    });
+    try {
+      await client.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "shared-host", version: "1.0" }
+      });
+
+      // Verify optional sessionId is exposed in schema for ctx_resume, ctx_stats, ctx_purge
+      const listResp = await client.request("tools/list", {});
+      const byName = Object.fromEntries(listResp.result.tools.map((t) => [t.name, t]));
+      assert.equal(byName.ctx_resume.inputSchema.properties.sessionId.type, "string");
+      assert.equal(byName.ctx_stats.inputSchema.properties.sessionId.type, "string");
+      assert.equal(byName.ctx_purge.inputSchema.properties.sessionId.type, "string");
+
+      // 1. Explicit ctx_resume({ sessionId: convA }) recovers convA's checkpoint & clears ONLY convA's file_reads
+      const resA = JSON.parse(
+        (await client.request("tools/call", { name: "ctx_resume", arguments: { sessionId: convA } })).result.content[0].text
+      );
+      assert.equal(resA.sessionId, convA);
+      assert.deepEqual(resA.sessionCheckpoint.modifiedFiles, ["alpha.js"]);
+      assert.equal(resA.hint, undefined);
+
+      // 2. Subsequent call WITHOUT sessionId MUST revert to 'default' (zero global currentSessionId leak!) and include hint
+      const resDefault = JSON.parse(
+        (await client.request("tools/call", { name: "ctx_resume", arguments: {} })).result.content[0].text
+      );
+      assert.equal(resDefault.sessionId, "default", "Previous per-call sessionId must NOT leak into subsequent calls");
+      assert.equal(resDefault.sessionCheckpoint.modifiedFileCount, 0);
+      assert.ok(typeof resDefault.hint === "string" && resDefault.hint.includes("sessionId"), "Empty default resume must provide actionable hint when UUID checkpoints exist");
+
+      // 3. Interleaved concurrent calls to convA & convB stay isolated via AsyncLocalStorage
+      const [statsAOut, statsBOut] = await Promise.all([
+        client.request("tools/call", { name: "ctx_stats", arguments: { sessionId: convA } }),
+        client.request("tools/call", { name: "ctx_stats", arguments: { sessionId: convB } })
+      ]);
+      const statsA = JSON.parse(statsAOut.result.content[0].text);
+      const statsB = JSON.parse(statsBOut.result.content[0].text);
+      assert.equal(statsA.stats.sessionId, convA);
+      assert.equal(statsA.stats.totalRawBytes, 20000);
+      assert.equal(statsB.stats.sessionId, convB);
+      assert.equal(statsB.stats.totalRawBytes, 30000);
+
+      // 4. Scoped ctx_purge({ scope: "session", sessionId: convA }) purges ONLY convA (convB & default stay intact)
+      await client.request("tools/call", { name: "ctx_purge", arguments: { scope: "session", sessionId: convA } });
+      const checkA = JSON.parse(
+        (await client.request("tools/call", { name: "ctx_resume", arguments: { sessionId: convA } })).result.content[0].text
+      );
+      const checkB = JSON.parse(
+        (await client.request("tools/call", { name: "ctx_resume", arguments: { sessionId: convB } })).result.content[0].text
+      );
+      assert.equal(checkA.sessionCheckpoint.modifiedFileCount, 0);
+      assert.deepEqual(checkB.sessionCheckpoint.modifiedFiles, ["beta.js"]);
+    } finally {
+      await client.close();
+    }
+
+    // Verify convB's file_reads survived convA's ctx_resume, and default's event survived convA's ctx_purge
+    const verify = new ContextModeStore({ dbPath: tmpDb });
+    assert.equal(verify.getStats("default").totalRawBytes, 10000, "Scoped purge of convA must not touch 'default'");
+    verify.close();
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
 test("Opt 6: read_slices({ slices }) bounded 4MB/256KB cache + apply_edits invalidation + recentTurns(15)/Top-3/ASCII/Sidecar chart", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-opt6-"));
   const tmpDb = path.join(tmpDir, "context.db");

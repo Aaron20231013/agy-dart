@@ -628,8 +628,12 @@ export function createTools({
     },
 
     // 5. ctx_resume
-    async ctx_resume({ seq = null } = {}) {
-      const sessionId = getSessionId();
+    async ctx_resume({ seq = null, sessionId: argSessionId = null } = {}) {
+      const explicitSid =
+        typeof argSessionId === "string" && argSessionId.trim() && argSessionId.trim().length <= 128 && !/[\x00-\x1f\x7f\\/]/.test(argSessionId.trim())
+          ? argSessionId.trim()
+          : null;
+      const sessionId = explicitSid || getSessionId();
       if (seq !== null && seq !== undefined) {
         const ev = store.getEventBySeq(seq);
         if (!ev) throw new Error(`Event sequence #${seq} not found`);
@@ -653,9 +657,10 @@ export function createTools({
       try {
         store.invalidateFileReads(sessionId, null);
         const directConvId =
-          typeof getDirectConversationId === "function"
+          explicitSid ||
+          (typeof getDirectConversationId === "function"
             ? getDirectConversationId()
-            : process.env.ANTIGRAVITY_CONVERSATION_ID || null;
+            : process.env.ANTIGRAVITY_CONVERSATION_ID || null);
         if (directConvId && directConvId !== sessionId) {
           store.invalidateFileReads(directConvId, null);
         }
@@ -673,6 +678,10 @@ export function createTools({
           }
         : null;
 
+      const isCheckpointEmpty =
+        !checkpoint ||
+        (checkpoint.modifiedFileCount === 0 && !checkpoint.lastTest && !checkpoint.lastBuild && !checkpoint.updatedAt);
+
       const resumePayload = {
         sessionId,
         stats: {
@@ -685,6 +694,16 @@ export function createTools({
         recentSources: Array.isArray(state.recentSources) ? [...state.recentSources] : [],
         recentEvents: Array.isArray(state.recentEvents) ? [...state.recentEvents] : []
       };
+
+      if (
+        sessionId === "default" &&
+        isCheckpointEmpty &&
+        typeof store.hasNonDefaultCheckpoints === "function" &&
+        store.hasNonDefaultCheckpoints()
+      ) {
+        resumePayload.hint =
+          "Shared MCP server resolved sessionId='default' (no host conversationId env). Pass sessionId: '<your Conversation ID>' to recover this conversation's PostToolUse checkpoint & isolated stats.";
+      }
 
       // Strictly guarantee <= 8.8 KB UTF-8 inline cap even with adversarial CJK paths/commands
       const MAX_RESUME_JSON_BYTES = 8500;
@@ -736,8 +755,12 @@ export function createTools({
     },
 
     // 6. ctx_stats
-    async ctx_stats({ reset = false } = {}) {
-      const sessionId = getSessionId();
+    async ctx_stats({ reset = false, sessionId: argSessionId = null } = {}) {
+      const explicitSid =
+        typeof argSessionId === "string" && argSessionId.trim() && argSessionId.trim().length <= 128 && !/[\x00-\x1f\x7f\\/]/.test(argSessionId.trim())
+          ? argSessionId.trim()
+          : null;
+      const sessionId = explicitSid || getSessionId();
       if (reset) {
         store.purge({ scope: "session", sessionId });
       }
@@ -847,8 +870,12 @@ export function createTools({
     },
 
     // 8. ctx_purge
-    async ctx_purge({ scope = "session", olderThanDays = 14, vacuum = false } = {}) {
-      const sessionId = getSessionId();
+    async ctx_purge({ scope = "session", olderThanDays = 14, vacuum = false, sessionId: argSessionId = null } = {}) {
+      const explicitSid =
+        typeof argSessionId === "string" && argSessionId.trim() && argSessionId.trim().length <= 128 && !/[\x00-\x1f\x7f\\/]/.test(argSessionId.trim())
+          ? argSessionId.trim()
+          : null;
+      const sessionId = explicitSid || getSessionId();
       const cwd = getCwd();
       return store.purge({ scope, sessionId, worktree: cwd, olderThanDays, vacuum });
     }

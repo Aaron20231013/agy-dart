@@ -556,7 +556,7 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
     getTwoLevelTree(workspaceDir),
     getProjectManifestSummary(workspaceDir)
   ]);
-  const header = `[agy-fast startup snapshot] Workspace: ${workspaceDir}`;
+  const header = `[agy-dart startup snapshot] Workspace: ${workspaceDir}`;
   const sections = [header, gitSummary, projectSummary, treeSummary].filter(
     (s) => Boolean(s)
   );

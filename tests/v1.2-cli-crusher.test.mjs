@@ -11,11 +11,14 @@ import { ContextModeStore } from "../context/lib/store.js";
 import { createTools } from "../context/lib/tools.js";
 import {
   applyFilterRule,
+  hasUnsafeShellSyntax,
   isSafeRegex,
   loadProjectFilterRules,
   matchFilterRule,
+  parseGitSubcommand,
   unwrapSafeCompoundCommand
 } from "../hooks/filter-rules.mjs";
+import { inspectCommand } from "../hooks/pre-tool-use.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -718,4 +721,79 @@ test("ctx_execute structurally crushes >30 KB JSON API dump to <= 8.8 KB while i
     store.close();
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
+});
+
+test("Git global option parsing (-C, --no-pager, -P, --git-dir, --work-tree) covers CLI filters, caret guard & hard-deny", () => {
+  // 1. Positive parsing & transparent CLI filter matching
+  const mLogC = matchFilterRule("git -C e:\\work\\agy-dart log");
+  assert.equal(mLogC?.rule.id, "git-log");
+  assert.equal(mLogC?.effectiveCommand, "git -C e:\\work\\agy-dart log -n 30");
+  assert.equal(mLogC?.note, "bounded unbounded git log to -n 30");
+
+  const mLogQuoted = matchFilterRule('git -C "C:\\my repo" --no-pager log --oneline');
+  assert.equal(mLogQuoted?.rule.id, "git-log");
+  assert.equal(mLogQuoted?.effectiveCommand, 'git -C "C:\\my repo" --no-pager log -n 30 --oneline');
+
+  // Path containing `..` or `-10` before `log` must NOT falsely mark git log as bounded!
+  const mDotPath = matchFilterRule("git -C e:\\foo..bar log");
+  assert.equal(mDotPath?.rule.id, "git-log");
+  assert.equal(mDotPath?.effectiveCommand, "git -C e:\\foo..bar log -n 30");
+
+  // Explicit bound AFTER `log` stays untouched (no duplicate -n 30)
+  const mBounded = matchFilterRule("git -C e:\\work\\agy-dart log -n 5");
+  assert.equal(mBounded?.rule.id, "git-log");
+  assert.equal(mBounded?.effectiveCommand, "git -C e:\\work\\agy-dart log -n 5");
+  assert.equal(mBounded?.note, null);
+
+  // `-C` value named `log` must NOT misidentify subcommand as `log`
+  const mDirNamedLog = matchFilterRule("git -C log status");
+  assert.equal(mDirNamedLog?.rule.id, "git-status");
+  assert.equal(mDirNamedLog?.effectiveCommand, "git -C log status");
+
+  // Multiple safe leading options + parent revspec caret after `diff`
+  const mDiffCaret = matchFilterRule('git -P --git-dir="C:\\my repo\\.git" --work-tree=. diff HEAD^1..HEAD');
+  assert.equal(mDiffCaret?.rule.id, "git-diff");
+  assert.equal(hasUnsafeShellSyntax('git -P --git-dir="C:\\my repo\\.git" --work-tree=. diff HEAD^1..HEAD'), false);
+
+  // Skip flags after subcommand still disable rewriting
+  assert.equal(matchFilterRule("git -C e:\\work\\agy-dart log -p"), null);
+  assert.equal(matchFilterRule("git -C e:\\work\\agy-dart status --porcelain"), null);
+
+  // 2. Negative / security boundary checks
+  // Caret `^` inside `-C` directory path MUST remain rejected (cmd.exe escape risk)
+  assert.equal(hasUnsafeShellSyntax("git -C bad^dir diff HEAD"), true);
+  assert.equal(matchFilterRule("git -C bad^dir diff HEAD"), null);
+  // Unknown/risky leading global flags (`-c`, `--exec-path`, `--paginate`, `--version`) fail open (not rewritten)
+  assert.equal(parseGitSubcommand("git -c core.pager=cat log"), null);
+  assert.equal(matchFilterRule("git -c core.pager=cat log"), null);
+  assert.equal(parseGitSubcommand("git --exec-path=/tmp log"), null);
+  assert.equal(parseGitSubcommand("git --version"), null);
+  assert.equal(parseGitSubcommand('git -C "unclosed log'), null);
+  assert.equal(parseGitSubcommand("git -C repo | log"), null);
+
+  // 3. Hard-deny inspectCommand (when CLI filter is off or bypassed) catches unbounded `git -C ... log`
+  const denyUnbounded = inspectCommand({ commandLine: "git -C e:\\work\\agy-dart log", cwd: ROOT, sessionId: "s-git" });
+  assert.equal(denyUnbounded.shouldDeny, true);
+  assert.ok(denyUnbounded.reason.includes("[agy-dart protection]"));
+
+  const denyDotPath = inspectCommand({ commandLine: "git -C e:\\foo..bar --no-pager log", cwd: ROOT, sessionId: "s-git" });
+  assert.equal(denyDotPath.shouldDeny, true);
+
+  // Bounded variants (count limiter or pipe to head/Select-Object) are allowed
+  assert.equal(
+    inspectCommand({ commandLine: "git -C e:\\work\\agy-dart log -n 10", cwd: ROOT, sessionId: "s-git" }).shouldDeny,
+    false
+  );
+  assert.equal(
+    inspectCommand({ commandLine: "git -C e:\\work\\agy-dart log -n5", cwd: ROOT, sessionId: "s-git" }).shouldDeny,
+    false
+  );
+  assert.equal(
+    inspectCommand({ commandLine: "git -C e:\\work\\agy-dart log | head -n 5", cwd: ROOT, sessionId: "s-git" }).shouldDeny,
+    false
+  );
+  assert.equal(
+    inspectCommand({ commandLine: "git -C log status", cwd: ROOT, sessionId: "s-git" }).shouldDeny,
+    false
+  );
 });

@@ -208,6 +208,19 @@ export class CheckpointMethods {
     };
   }
 
+  /** Returns true if at least one non-default conversation checkpoint exists (shared MCP server hint) */
+  hasNonDefaultCheckpoints() {
+    this.open();
+    try {
+      const row = this.db
+        .prepare("SELECT 1 AS hit FROM session_checkpoints WHERE session_id != 'default' LIMIT 1")
+        .get();
+      return Boolean(row && row.hit === 1);
+    } catch {
+      return false;
+    }
+  }
+
   /** Read git-HEAD-keyed workspace skeleton cache */
   getRepoCache(workspaceDir, headSha, kind, maxAgeMs = 7 * 24 * 3600 * 1000) {
     this.open();

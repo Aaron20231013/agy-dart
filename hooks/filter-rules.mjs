@@ -113,6 +113,103 @@ function sanitizeDiagText(val, maxBytes = 80) {
 }
 
 /**
+ * Linear O(N) tokenizer for `git` / `git.exe` invocations with safe leading global options.
+ * Supports `-C <path>`, `-C<path>`, `--no-pager`, `-P`, `--git-dir <path>` / `--git-dir=<path>`,
+ * and `--work-tree <path>` / `--work-tree=<path>`.
+ * Rejects unclosed quotes, unknown/unsafe leading flags (e.g. `-c`, `--exec-path`, `--paginate`,
+ * `--help`, `--version`), and unquoted shell operators before the subcommand.
+ */
+export function parseGitSubcommand(cmd) {
+  if (typeof cmd !== "string" || !cmd.trim()) return null;
+  const len = cmd.length;
+  let i = 0;
+
+  const readToken = () => {
+    while (i < len && /\s/.test(cmd[i])) i++;
+    if (i >= len) return null;
+    const start = i;
+    let unquoted = "";
+    let hasQuote = false;
+    while (i < len && !/\s/.test(cmd[i])) {
+      const ch = cmd[i];
+      if (ch === '"' || ch === "'") {
+        hasQuote = true;
+        const quote = ch;
+        i++;
+        let closed = false;
+        while (i < len) {
+          if (cmd[i] === quote) {
+            i++;
+            closed = true;
+            break;
+          }
+          unquoted += cmd[i];
+          i++;
+        }
+        if (!closed) return { invalid: true };
+      } else {
+        if (/[|;&<>`$()\r\n\0]/.test(ch)) {
+          if (i === start) return { operator: true };
+          break;
+        }
+        unquoted += ch;
+        i++;
+      }
+    }
+    return {
+      raw: cmd.slice(start, i),
+      value: unquoted,
+      hasQuote,
+      start,
+      end: i
+    };
+  };
+
+  const first = readToken();
+  if (!first || first.invalid || first.operator || first.hasQuote) return null;
+  if (!/^git(?:\.exe)?$/i.test(first.value)) return null;
+
+  const MAX_GLOBAL_OPTS = 16;
+  for (let optionCount = 0; optionCount <= MAX_GLOBAL_OPTS; optionCount++) {
+    const tok = readToken();
+    if (!tok || tok.invalid || tok.operator) return null;
+
+    if (!tok.hasQuote && (tok.value === "--no-pager" || tok.value === "-P")) {
+      continue;
+    }
+    if (!tok.hasQuote && (tok.value === "-C" || tok.value === "--git-dir" || tok.value === "--work-tree")) {
+      const arg = readToken();
+      if (!arg || arg.invalid || arg.operator || !arg.value) return null;
+      continue;
+    }
+    const startsQuoted = tok.raw.startsWith('"') || tok.raw.startsWith("'");
+    if (
+      !startsQuoted &&
+      (/^--(?:git-dir|work-tree)=.+/.test(tok.value) || /^-C.+/.test(tok.value))
+    ) {
+      continue;
+    }
+
+    if (tok.hasQuote || tok.value.startsWith("-")) {
+      return null;
+    }
+
+    if (!/^[a-z][a-z0-9-]*$/i.test(tok.value)) {
+      return null;
+    }
+
+    return {
+      subcommand: tok.value.toLowerCase(),
+      subcommandStart: tok.start,
+      subcommandEnd: tok.end,
+      rest: cmd.slice(tok.end)
+    };
+  }
+
+  return null;
+}
+
+/**
  * Returns true if the command contains shell pipelines, redirections, chaining,
  * subshells, newlines, NUL bytes, cmd.exe expansion/escape characters (`%`, `!`,
  * non-git-rev `^`), or PowerShell script blocks/splatting (`{`, `}`, leading `@` / `@(` / `@{`).
@@ -125,8 +222,11 @@ export function hasUnsafeShellSyntax(cmd) {
   if (/(?:^|\s)@|@[({"']/.test(cmd)) return true;
   // Caret `^`: cmd.exe escape char. Only allow benign git parent-revspec suffixes (e.g. `git diff HEAD^`, `HEAD^1..HEAD`).
   if (cmd.includes("^")) {
-    if (!/^\s*git(?:\.exe)?\s+(?:diff|log|show)\b/i.test(cmd)) return true;
-    const strippedGitRefs = cmd.replace(/(?<=[A-Za-z0-9_.-])\^+(?:\d+)?(?=\s|\.\.|$)/g, "");
+    const gitParsed = parseGitSubcommand(cmd);
+    if (!gitParsed || !["diff", "log", "show"].includes(gitParsed.subcommand)) return true;
+    // Never allow `^` inside leading git global option arguments (e.g. `-C bad^dir`), only in revspecs after subcommand.
+    if (cmd.slice(0, gitParsed.subcommandEnd).includes("^")) return true;
+    const strippedGitRefs = gitParsed.rest.replace(/(?<=[A-Za-z0-9_.-])\^+(?:\d+)?(?=\s|\.\.|$)/g, "");
     if (strippedGitRefs.includes("^")) return true;
   }
   return false;
@@ -1808,26 +1908,43 @@ export const FILTER_RULES = [
   {
     id: "git-status",
     pattern: /^git(?:\.exe)?\s+status(?:\s|$)/i,
+    match(cmd) {
+      const parsed = parseGitSubcommand(cmd);
+      return parsed && parsed.subcommand === "status" ? { matched: true, skipTarget: parsed.rest } : false;
+    },
     filter: filterGitStatus
   },
   {
     id: "git-diff",
     pattern: /^git(?:\.exe)?\s+diff(?:\s|$)/i,
+    match(cmd) {
+      const parsed = parseGitSubcommand(cmd);
+      return parsed && parsed.subcommand === "diff" ? { matched: true, skipTarget: parsed.rest } : false;
+    },
     filter: filterGitDiff
   },
   {
     id: "git-log",
     pattern: /^git(?:\.exe)?\s+log(?:\s|$)/i,
+    match(cmd) {
+      const parsed = parseGitSubcommand(cmd);
+      return parsed && parsed.subcommand === "log" ? { matched: true, skipTarget: parsed.rest } : false;
+    },
     // Never strip diff hunks or custom graph/raw views when user explicitly asks for patches
     skipFlags: /(?:^|\s)(?:-p|--patch|-u|--raw|--graph|--cc)(?=\s|$)/,
     filter: filterGitLog,
     prepareCommand(cmd) {
+      const parsed = parseGitSubcommand(cmd);
+      const rest = parsed && parsed.subcommand === "log" ? parsed.rest : cmd;
       const hasBound =
         /(?:^|\s)(?:-n\s*\d+|-\d+|--max-count(?:=|\s)\d+|--since(?:=|\s)\S+|--after(?:=|\s)\S+|\S+\.\.\S+)(?=\s|$)/i.test(
-          cmd
+          rest
         );
       if (hasBound) return { effectiveCommand: cmd, note: null };
-      const bounded = cmd.replace(/^git(?:\.exe)?\s+log\b/i, "$& -n 30");
+      const bounded =
+        parsed && parsed.subcommand === "log"
+          ? `${cmd.slice(0, parsed.subcommandEnd)} -n 30${cmd.slice(parsed.subcommandEnd)}`
+          : cmd.replace(/^git(?:\.exe)?\s+log\b/i, "$& -n 30");
       return { effectiveCommand: bounded, note: "bounded unbounded git log to -n 30" };
     }
   },
@@ -1910,8 +2027,13 @@ export function matchFilterRule(commandLine, options = {}) {
 
   if (!options.customOnly) {
     for (const rule of FILTER_RULES) {
-      if (rule.pattern.test(inner)) {
-        if (rule.skipFlags && rule.skipFlags.test(inner)) {
+      const matchResult = typeof rule.match === "function" ? rule.match(inner) : rule.pattern.test(inner);
+      if (matchResult) {
+        const skipTarget =
+          typeof matchResult === "object" && typeof matchResult.skipTarget === "string"
+            ? matchResult.skipTarget
+            : inner;
+        if (rule.skipFlags && rule.skipFlags.test(skipTarget)) {
           return null;
         }
         if (typeof rule.prepareCommand === "function") {

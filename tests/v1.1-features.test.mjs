@@ -480,7 +480,7 @@ test("P1 Heading-aware Markdown chunking + DB TTL pruning/VACUUM + git-HEAD-cach
 
     // 4. Prefix-stable SessionStart ordering (Static note -> Project -> Layout -> Hubs -> Volatile Git)
     const sampleSnapshot = [
-      "[agy-fast startup snapshot] Workspace: /repo",
+      "[agy-dart startup snapshot] Workspace: /repo",
       "Git: branch `main`",
       "Modified (2): a.js, b.js",
       "Project:",
@@ -495,6 +495,15 @@ test("P1 Heading-aware Markdown chunking + DB TTL pruning/VACUUM + git-HEAD-cach
     const idxHubs = assembled.indexOf("Core hubs");
     const idxGit = assembled.indexOf("Git: branch");
     assert.ok(idxStatic < idxProject && idxProject < idxLayout && idxLayout < idxHubs && idxHubs < idxGit);
+    assert.ok(assembled.includes("[agy-dart startup snapshot] Workspace: /repo"));
+
+    // Backward-compatibility: legacy [agy-fast startup snapshot] headers still assemble in prefix-stable order
+    const legacyAssembled = assemblePrefixStableStartup(
+      sampleSnapshot.replace("[agy-dart startup snapshot]", "[agy-fast startup snapshot]"),
+      "Core hubs (5 src files): src/core.js (3)"
+    );
+    assert.ok(legacyAssembled.includes("[agy-fast startup snapshot] Workspace: /repo"));
+    assert.ok(legacyAssembled.indexOf("Project:") < legacyAssembled.indexOf("Git: branch"));
 
     // Real SessionStart hook deterministic check (2 runs byte-identical)
     const ss1 = runHook("hooks/session-start.mjs", { cwd: ROOT, workspacePaths: [ROOT], hookEventName: "SessionStart" }, tmpDb);

@@ -161,7 +161,7 @@ export function assemblePrefixStableStartup(snapshotText, hotspotsLine = "", opt
 
   let section = "header";
   for (const line of lines) {
-    if (line.startsWith("[agy-fast startup snapshot]")) {
+    if (line.startsWith("[agy-dart startup snapshot]") || line.startsWith("[agy-fast startup snapshot]")) {
       section = "header";
       headerLines.push(line);
     } else if (line.startsWith("Git:") || line.startsWith("Working tree:") || line.startsWith("Modified (") || line.startsWith("Recent commits:")) {

@@ -580,6 +580,17 @@ test("P1-7.3: Standalone Sidecar HTTP /api/handoff + /api/cache-diag (serverNowM
 
     sandbox.syncKvTtlState(null);
     assert.equal(activeTimers.size, timersBefore, "Clearing TTL state must clear the 1s interval (no leak)");
+
+    // 6. EN <-> ZH bilingual i18n toggle verification
+    assert.ok(html.includes('id="lang-toggle"') && html.includes('id="lang-zh-btn"') && html.includes('id="lang-en-btn"'));
+    sandbox.setLanguage("zh");
+    assert.equal(mockElements.get("active-text").innerText, "运行中");
+    assert.equal(mockElements.get("purge-btn").innerText, "清空当前对话");
+    assert.equal(mockElements.get("toggle-cli-filter-btn").innerText, "CLI 过滤：开");
+    sandbox.setLanguage("en");
+    assert.equal(mockElements.get("active-text").innerText, "Active");
+    assert.equal(mockElements.get("purge-btn").innerText, "Clear Conversation");
+    assert.equal(mockElements.get("toggle-cli-filter-btn").innerText, "CLI Filter: ON");
   } finally {
     await new Promise((resolve) => {
       if (serverProc.exitCode !== null) return resolve();
@@ -826,6 +837,7 @@ test("P1-7.5: install.mjs packages runtime-only by default and all v1.2 devtools
     // 6. Boot sidecars/dashboard/server.mjs directly from installed target (verifies handoff.js static import & endpoints)
     const port = 39920 + Math.floor(Math.random() * 250);
     serverProc = spawn(process.execPath, [path.join(installDir, "sidecars", "dashboard", "server.mjs")], {
+      cwd: installDir,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       env: {
@@ -868,6 +880,22 @@ test("P1-7.5: install.mjs packages runtime-only by default and all v1.2 devtools
     ).json();
     assert.equal(handoffResp.ok, true);
     assert.ok(handoffResp.markdown.includes("Call ctx_resume({}) after /compact"));
+
+    // 7. Live in-place upgrade while Sidecar holds CWD lock on installDir (Windows EBUSY regression)
+    //    Switching from --with-devtools back to runtime-only must succeed and prune stale devtools files.
+    const liveReinstall = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "scripts", "install.mjs"), "install", "--target", installDir],
+      {
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, AGY_DART_DISABLE_COMPILE_CACHE: "1" }
+      }
+    );
+    assert.equal(liveReinstall.status, 0, `Live in-place reinstall under CWD lock failed: ${liveReinstall.stderr}`);
+    assert.equal(fs.existsSync(path.join(installDir, "fast", "mcp-server.mjs")), true);
+    assert.equal(fs.existsSync(path.join(installDir, "scripts", "cache-audit.mjs")), false, "Stale devtools file must be pruned");
+    assert.equal(fs.existsSync(path.join(installDir, "fast", "benchmark.mjs")), false, "Stale benchmark CLI must be pruned");
   } finally {
     if (serverProc) {
       await new Promise((resolve) => {

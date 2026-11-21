@@ -29,4 +29,4 @@
 - `ctx_execute`: `{ language?: "javascript"|"nodejs"|"python"|"shell"|"powershell"|"cmd", code?, file?, args?: string[], intent? }`
 - `ctx_index`: `{ path?, url?, content?, label? }`
 - `ctx_search`: `{ queries: string[], sourceId?, scope?: "session"|"worktree"|"all", limit?: int, offset?: int }`
-- `ctx_resume`: `{ seq?: int }` · `ctx_stats`: `{ reset?: boolean }` · `ctx_doctor`: `{}` · `ctx_purge`: `{ scope?: "session"|"worktree"|"all"|"stale", olderThanDays?: int, vacuum?: boolean }`
+- `ctx_resume`: `{ seq?: int, sessionId?: string }` · `ctx_stats`: `{ reset?: boolean, sessionId?: string }` · `ctx_doctor`: `{}` · `ctx_purge`: `{ scope?: "session"|"worktree"|"all"|"stale", sessionId?: string, olderThanDays?: int, vacuum?: boolean }` *(pass current Conversation ID as `sessionId` in shared MCP hosts)*

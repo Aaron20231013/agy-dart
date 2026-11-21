@@ -153,7 +153,7 @@ test("P1-5A: isSubagentPayload and assemblePrefixStableStartup(omitVolatileGit) 
 
   // assemblePrefixStableStartup backward-compatible 2-arg call vs omitVolatileGit: true
   const sampleSnapshot = [
-    "[agy-fast startup snapshot] Workspace: /demo",
+    "[agy-dart startup snapshot] Workspace: /demo",
     "Git: branch `main`",
     "Working tree: clean",
     "Modified (2): M src/a.js, M src/b.js",
@@ -176,7 +176,7 @@ test("P1-5A: isSubagentPayload and assemblePrefixStableStartup(omitVolatileGit) 
 
   const stableOnly = assemblePrefixStableStartup(sampleSnapshot, hubs, { omitVolatileGit: true });
   assert.ok(stableOnly.startsWith(STATIC_COOP_NOTE));
-  assert.ok(stableOnly.includes("[agy-fast startup snapshot] Workspace: /demo"));
+  assert.ok(stableOnly.includes("[agy-dart startup snapshot] Workspace: /demo"));
   assert.ok(stableOnly.includes("Project:\n  - package.json (demo) scripts: test"));
   assert.ok(stableOnly.includes("Layout (2 levels):\n  src/ (a.js, b.js)\n  package.json"));
   assert.ok(stableOnly.includes(hubs));

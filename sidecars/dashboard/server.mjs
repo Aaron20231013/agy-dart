@@ -1048,7 +1048,7 @@ if (isDirectRun) {
     !(typeof process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN === "string" && process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN.trim())
   ) {
     console.error(
-      "[context-mode sidecar] ANTIGRAVITY_SIDECAR_UI_TOKEN is missing/empty; refusing fail-open SidecarApp mode and falling back to authenticated standalone HTTP server."
+      "[agy-dart sidecar] ANTIGRAVITY_SIDECAR_UI_TOKEN is missing/empty; refusing fail-open SidecarApp mode and falling back to authenticated standalone HTTP server."
     );
   }
 
@@ -1083,14 +1083,14 @@ if (isDirectRun) {
     app.api("/api/read-dedup", (data) => handleFeatureToggleMutation(false, data, app.config.conversationId), "POST");
 
     await app.run();
-    console.log(`[context-mode sidecar] registered and running`);
+    console.log(`[agy-dart sidecar] registered and running`);
   } else {
     const port = resolveStandalonePort(process.env);
     const server = createStandaloneServer();
     server.listen(port, "127.0.0.1", () => {
       const addr = server.address();
       const boundPort = typeof addr === "object" && addr ? addr.port : port;
-      console.log(`[context-mode dashboard] standalone server listening at http://127.0.0.1:${boundPort}`);
+      console.log(`[agy-dart dashboard] standalone server listening at http://127.0.0.1:${boundPort}`);
     });
   }
 }

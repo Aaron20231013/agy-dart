@@ -638,7 +638,7 @@ function extractAgyFastToolName(call) {
 function sessionHasStartupSnapshot(steps) {
   for (const step of steps) {
     if (typeof step.content !== "string") continue;
-    if (!step.content.includes("[agy-fast startup snapshot]")) continue;
+    if (!step.content.includes("[agy-dart startup snapshot]") && !step.content.includes("[agy-fast startup snapshot]")) continue;
     if (step.type === "SYSTEM_MESSAGE") return true;
     if (step.type === "USER_INPUT" && step.content.includes("SessionStart")) {
       return true;

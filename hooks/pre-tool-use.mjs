@@ -31,6 +31,7 @@ let ContextModeStoreClass = null;
 let matchFilterRuleFn = null;
 let unwrapSafeCompoundCommandFn = null;
 let resolveCdTargetCwdFn = null;
+let parseGitSubcommandFn = null;
 let securityModule = null;
 let textDiffModule = null;
 
@@ -46,7 +47,8 @@ async function ensureFilterRules() {
     ({
       matchFilterRule: matchFilterRuleFn,
       unwrapSafeCompoundCommand: unwrapSafeCompoundCommandFn,
-      resolveCdTargetCwd: resolveCdTargetCwdFn
+      resolveCdTargetCwd: resolveCdTargetCwdFn,
+      parseGitSubcommand: parseGitSubcommandFn
     } = await import("./filter-rules.mjs"));
   }
   return matchFilterRuleFn;
@@ -549,9 +551,17 @@ export function inspectCommand({ commandLine, cwd, sessionId }) {
   const maxReadBytes = getMaxReadBytes(sessionId);
   const exemptExtensions = getExemptExtensions(sessionId);
 
-  // 1. Unbounded git log
-  if (/^\s*git\s+log\b/i.test(cleanCmd)) {
-    const isLimited = /(-n\s+\d+|-\d+|--max-count|\s*\|\s*(head|Select-Object|select|more))/i.test(cleanCmd);
+  // 1. Unbounded git log (supports safe leading global git options like `-C <path>`, `--no-pager`, `-P`, `--git-dir`, `--work-tree`)
+  const gitParsed = parseGitSubcommandFn ? parseGitSubcommandFn(cleanCmd) : null;
+  const isGitLog =
+    (gitParsed && gitParsed.subcommand === "log") ||
+    (!parseGitSubcommandFn && /^\s*git(?:\.exe)?\s+log\b/i.test(cleanCmd));
+  if (isGitLog) {
+    const gitLogArgs = gitParsed ? gitParsed.rest : cleanCmd;
+    const isLimited =
+      /(?:^|\s)(?:-n\s*\d+|-\d+|--max-count(?:=|\s)\d+|--since(?:=|\s)\S+|--after(?:=|\s)\S+|\S+\.\.\S+)(?=\s|$)|\s*\|\s*(?:head|Select-Object|select|more)\b/i.test(
+        gitLogArgs
+      );
     if (!isLimited) {
       return {
         shouldDeny: true,

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
@@ -24,20 +25,32 @@ try {
 
 const store = new ContextModeStore();
 let currentCwd = process.cwd();
-let currentSessionId = null;
+let initSessionId = null;
+const callContext = new AsyncLocalStorage();
+
+function normalizeCallSessionId(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128) return null;
+  if (/[\x00-\x1f\x7f\\/]/.test(trimmed)) return null;
+  return trimmed;
+}
 
 const tools = createTools({
   store,
   getCwd: () => currentCwd,
   getSessionId: () =>
-    currentSessionId ||
+    callContext.getStore()?.sessionId ||
+    initSessionId ||
     process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
     process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID ||
     process.env.ANTIGRAVITY_CONVERSATION_ID ||
     process.env.CONVERSATION_ID ||
     "default",
   getDirectConversationId: () =>
-    currentSessionId ||
+    callContext.getStore()?.directConversationId ||
+    callContext.getStore()?.sessionId ||
+    initSessionId ||
     process.env.ANTIGRAVITY_CONVERSATION_ID ||
     process.env.CONVERSATION_ID ||
     "default"
@@ -96,6 +109,7 @@ const RAW_TOOL_DEFINITIONS = [
       type: "object",
       properties: {
         scope: { type: "string", enum: ["session", "worktree", "all", "stale"] },
+        sessionId: { type: "string", description: "Optional conversationId for scope='session' (avoids purging shared 'default')" },
         olderThanDays: { type: "integer", description: "TTL age in days for scope='stale' (default 14)" },
         vacuum: { type: "boolean", description: "Run SQLite VACUUM when scope='stale'" }
       }
@@ -103,11 +117,12 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_resume",
-    description: "Recover indexed sources/events after /compact (also clears session read-dedup cache).",
+    description: "Recover indexed sources/events and PostToolUse checkpoint after /compact (pass current Conversation ID as sessionId in shared MCP hosts).",
     inputSchema: {
       type: "object",
       properties: {
-        seq: { type: "integer", description: "Optional event sequence #" }
+        seq: { type: "integer", description: "Optional event sequence #" },
+        sessionId: { type: "string", description: "Optional conversationId to recover this conversation's PostToolUse checkpoint" }
       }
     }
   },
@@ -132,7 +147,8 @@ const RAW_TOOL_DEFINITIONS = [
     inputSchema: {
       type: "object",
       properties: {
-        reset: { type: "boolean", description: "Reset session stats" }
+        reset: { type: "boolean", description: "Reset session stats" },
+        sessionId: { type: "string", description: "Optional conversationId for per-conversation stats" }
       }
     }
   }
@@ -185,7 +201,8 @@ rl.on("line", async (line) => {
     switch (method) {
       case "initialize": {
         if (params?.rootPath) currentCwd = params.rootPath;
-        if (params?.sessionId) currentSessionId = params.sessionId;
+        const initSid = normalizeCallSessionId(params?.sessionId);
+        if (initSid) initSessionId = initSid;
         sendResponse(id, {
           protocolVersion: params?.protocolVersion || "2024-11-05",
           capabilities: { tools: {} },
@@ -210,12 +227,23 @@ rl.on("line", async (line) => {
       case "tools/call": {
         const toolName = params?.name;
         const toolArgs = params?.arguments || {};
-        const callSessionId =
-          toolArgs.sessionId ||
-          params?._meta?.conversationId ||
-          params?._meta?.sessionId ||
-          params?.sessionId;
-        if (callSessionId) currentSessionId = callSessionId;
+        // Strictly per-call session isolation via AsyncLocalStorage: never mutate process-global
+        // session state across concurrent conversations sharing one long-lived MCP stdio server.
+        const callSessionId = normalizeCallSessionId(
+          toolArgs.sessionId ??
+            toolArgs.conversationId ??
+            params?._meta?.rootConversationId ??
+            params?._meta?.conversationId ??
+            params?._meta?.sessionId ??
+            params?.sessionId
+        );
+        const callDirectConvId = normalizeCallSessionId(
+          toolArgs.conversationId ??
+            toolArgs.sessionId ??
+            params?._meta?.conversationId ??
+            params?._meta?.sessionId ??
+            params?.sessionId
+        );
 
         if (!tools[toolName]) {
           sendError(id, -32601, `Unknown tool: ${toolName}`);
@@ -223,7 +251,10 @@ rl.on("line", async (line) => {
         }
 
         try {
-          const result = await tools[toolName](toolArgs);
+          const result = await callContext.run(
+            { sessionId: callSessionId, directConversationId: callDirectConvId },
+            () => tools[toolName](toolArgs)
+          );
           sendResponse(id, {
             content: [
               {

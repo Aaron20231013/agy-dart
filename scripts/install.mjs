@@ -475,6 +475,45 @@ async function runDoctor(targetDir) {
   }
 }
 
+async function pruneStaleEntries(dstRoot, keepRelSet) {
+  const lockedDirs = [];
+  async function walk(dir, relPrefix) {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      const relPosix = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        await walk(fullPath, relPosix);
+        try {
+          const remaining = await fs.readdir(fullPath);
+          if (remaining.length === 0) {
+            await fs.rmdir(fullPath);
+          }
+        } catch (err) {
+          if (err && (err.code === "EBUSY" || err.code === "EPERM" || err.code === "ENOTEMPTY")) {
+            lockedDirs.push(relPosix);
+          }
+        }
+      } else if (!keepRelSet.has(process.platform === "win32" ? relPosix.toLowerCase() : relPosix)) {
+        try {
+          await fs.rm(fullPath, { force: true });
+        } catch (err) {
+          if (err && (err.code === "EBUSY" || err.code === "EPERM")) {
+            lockedDirs.push(relPosix);
+          }
+        }
+      }
+    }
+  }
+  await walk(dstRoot, "");
+  return lockedDirs;
+}
+
 async function runInstall(opts) {
   checkNodeAndSqlite();
   await import("node:sqlite");
@@ -484,10 +523,12 @@ async function runInstall(opts) {
   const manifest = opts.withDevtools ? FILES_TO_COPY : RUNTIME_FILES;
 
   if (srcRoot !== dstRoot) {
-    if (await pathExists(dstRoot)) {
-      await fs.rm(dstRoot, { recursive: true, force: true });
-    }
+    // Copy/overwrite all manifest files in-place FIRST, then prune stale entries.
+    // On Windows, running Antigravity MCP/Sidecar processes hold CWD handles on dstRoot
+    // (causing `fs.rm(dstRoot, { recursive: true })` to throw EBUSY after partially deleting files).
+    // In-place sync + stale pruning is atomic-safe for live upgrades while Antigravity is running.
     await fs.mkdir(dstRoot, { recursive: true });
+    const keepRelSet = new Set();
     for (const rel of manifest) {
       const src = path.join(srcRoot, rel);
       const dst = path.join(dstRoot, rel);
@@ -496,8 +537,14 @@ async function runInstall(opts) {
       }
       await fs.mkdir(path.dirname(dst), { recursive: true });
       await fs.copyFile(src, dst);
+      const normRel = rel.replace(/\\/g, "/");
+      keepRelSet.add(process.platform === "win32" ? normRel.toLowerCase() : normRel);
     }
+    const locked = await pruneStaleEntries(dstRoot, keepRelSet);
     console.log(`Installed agy-dart (${opts.withDevtools ? "runtime+devtools" : "runtime-only"}, ${manifest.length} files) to ${dstRoot}`);
+    if (locked.length > 0) {
+      console.log(`  - Note          : Skipped removing busy path(s) held by a running process (${locked.join(", ")}); restart Antigravity to complete cleanup.`);
+    }
   }
 
   const modeCfg = await applyMode(dstRoot, opts.mode, opts.isCustomTarget);
@@ -542,8 +589,18 @@ async function main() {
         throw new Error("Refusing to delete source repository directory.");
       }
       if (await pathExists(opts.targetDir)) {
-        await fs.rm(opts.targetDir, { recursive: true, force: true });
-        console.log(`Removed agy-dart from ${opts.targetDir}`);
+        try {
+          await fs.rm(opts.targetDir, { recursive: true, force: true });
+          console.log(`Removed agy-dart from ${opts.targetDir}`);
+        } catch (err) {
+          if (err && (err.code === "EBUSY" || err.code === "EPERM")) {
+            throw new Error(
+              `Cannot remove ${opts.targetDir} because a running Antigravity process holds a lock (${err.code}). ` +
+                `Disable agy-dart or close Antigravity first, then re-run 'npm run uninstall:plugin'.`
+            );
+          }
+          throw err;
+        }
       } else {
         console.log(`Not installed at ${opts.targetDir}`);
       }
