@@ -4,375 +4,170 @@
 
 # agy-dart
 
-**All-in-One Latency Accelerator & Context-Window Guard Plugin for Google Antigravity**
+**Save tokens · Improve cache hits · Keep cache warm automatically · Protect context quota · Rescue crashed sessions**
 
-Zero Runtime Dependencies · Dual-Engine Co-op · Hard `<= 8.8 KB` No-Spill Budget · Built-in Live Sidecar Dashboard · Optional Auto `rg` Setup
+No extra dependencies · Works automatically in the background · Built-in side panel
 
-[简体中文](README.zh-CN.md) · English · [Community Feedback & Improvements](#community-feedback--improvements) · [Third-Party Notices](THIRD_PARTY_NOTICES.md)
+[简体中文](README.zh-CN.md) · English · [How to Install](#how-to-install) · [Changelog](#changelog) · [Third-Party Notices](THIRD_PARTY_NOTICES.md)
 
 </div>
 
 ---
 
-## Why `agy-dart`?
+## What does this plugin do?
 
-Long coding sessions in Google Antigravity (Desktop 2.0 / IDE / CLI) hit two compounding bottlenecks:
-1. **Round-trip & check latency**: per-turn TTFT, split `edit_file` calls, serial shell searches, and Antigravity's ~10 KB MCP `output.txt` disk spill causing extra turns.
-2. **Context bloat & agent amnesia**: multi-megabyte build logs, giant JSON/CSV payloads, and un-paged file dumps flooding the prompt.
+Saves tokens, improves cache hit rates, automatically keeps your cache warm, protects context quota, and rescues sessions when context overflows or freezes.
 
-Installing separate acceleration and context-guard plugins naively causes friction (over-eager 8 KB read blocks fighting local 7ms `read_file`, conflicting `AGENTS.md` routing rules, MCP previews spilling past 10 KB, and missing Sidecar assets from npm installs).
+Once installed, it runs automatically in the background — no new commands to learn, just chat and code as usual:
 
-**`agy-dart`** fuses both capabilities into **one clean native Antigravity plugin** with unified zero-conflict routing, single-process lifecycle hooks, an isolated SQLite store (`~/.agy-dart/context.db`), and a live Aux Pane dashboard.
+### 1. Combine actions
+When the AI needs to search several terms, it runs them in one batch; when it edits multiple files, it edits them together and runs tests in the same step instead of resending your full chat context across half a dozen turns.
 
-> **Tip**: Google Antigravity evolves fast — click **Star** or **Watch → Releases only** so you don't miss compatibility fixes and new cache strategies.
+### 2. Block noise
+If a test run prints 3,000 lines of logs, the plugin passes only the lines that matter to the AI (e.g., line 42 failed, the other 199 passed) and stores the full log locally for lookup. On multi-thousand-line code files, it pulls the outline first and reads only the target lines.
 
----
+### 3. Improve cache hits, keep cache warm automatically
+Keeps prompt headers steady for higher cache hit rates, and stops the AI from re-reading unchanged files repeatedly within short spans. When you step away and your cache is close to expiring, it can pop up a desktop alert or send a lightweight ping right before expiry to keep the cache warm (up to 3 times per chat by default, resetting to 0 on your next message).
 
-## What's New in v1.5.4 (Click-to-Jump Across Desktop Alerts & Sidecar + Per-Conversation KV-Cache Auto-Keepalive)
+### 4. Side panel & crash/hang rescue
+The right-sidebar panel shows: remaining context space, minutes until cache expiry, and total noise blocked.
+With multiple project windows open, if a background window is nearly out of context or stuck spinning with zero output, a desktop popup names that exact project and chat — click the popup to jump straight there. If a session crashes from blown-out context or hangs completely, click once in the panel to copy a progress summary and paste it into a new chat to continue.
 
-1. **Clickable Desktop Notifications + Cross-Window Foreground Activation (`pendingJump` Bridge)**:
-   - Upgraded `buildDesktopNotificationCommand` & `sendDesktopNotification` in `context/lib/watchdog.js` with a non-blocking WinForms message pump (`BalloonTipClicked` / `BalloonTipClosed`), stdout fast-path click signaling, exit-code `42` protocol, and strict env-only Win32 `AgyDartWinFocus` scoring (`convTitle > cwd leaf > workspaceLabel > Antigravity main window`, filtering out `DWMWA_CLOAKED` ghost windows, launchers, and browsers without shrinking maximized windows).
-   - Wired all 3 desktop alerts (TTL Expiring, Critical Watermark, Session Stalled) to record a `20s`-TTL `watchdog:pending_jump` ticket on click while preserving `title <= 60B`, `body <= 220B`, zero `lastUserInput` exposure, and **0 `fs.statSync` calls** on idle ticks.
-2. **Clickable Sidecar Alert Pills & Multi-Window Session Switcher**:
-   - Extended `POST /api/watchdog/action` in `sidecars/dashboard/server.mjs` with `focusConversation` (including read-only `conversation_summaries.db` fallback + cross-window OS focus) and idempotent `ackJump`.
-   - Upgraded `#wd-other-alerts` in `sidecars/dashboard/index.html` with click + `Enter/Space` keyboard jump, added `#wd-session-switcher` for multi-window primary sessions, and implemented `window.sidecar.getWorkspaceUris()` **0ms workspace-matched `pendingJump` claiming** (`1.2s` fallback when unmatched) invoking `window.sidecar.ui.toggleConversation(conversationId)`.
-3. **Per-Conversation KV-Cache TTL Auto-Keepalive (`0/3` Default Cap) & Band-1 Current Context Spotlight**:
-   - Added background idle TTL keepalive (`_evaluateIdleTtlKeepalive` in `context/lib/watchdog.js`, `sendSidecarKeepaliveMessage` in `sidecars/dashboard/server.mjs`, and `#kv-keepalive-group` controls in `sidecars/dashboard/index.html`): sends a minimal OK-only keepalive ~`30s` before prompt-cache expiry (`1..20` configurable cap, default `3` per primary conversation, rollback on RPC failure, suppressed during `stopped_bg_pending` / subagents, and coordinated with desktop TTL alerts), while clamping empirical TTL calibration to `>= profile.ttlSec` so sub-5m replica/routing misses never shrink TTL or trigger premature keepalives.
-   - `hooks/pre-invocation.mjs` & `context/lib/watchdog-lease.js` recognize `[agy-dart TTL Keepalive]` / `[agy-dart TTL保活]` turns across both `SYSTEM_MESSAGE` (`agentapi send-message` with carried-over `lastUserInput`) and `USER_INPUT` without overwriting `lastUserInput`, wiping post-`/compact` reads, or aging `conv_turn_seq`, and automatically reset `usedCount` to `0` on your next genuine message.
-   - Promoted `#kv-cache-card` (`#ctx-overview-box` / `#ctx-spotlight-box`) to **Band 1** with a distinct tinted card surface, prominent `CURRENT CONTEXT` hero readout + live window bar, synthesized guard-savings KPI, and streamlined conversation-focused telemetry (`currentScope = 'conversation'`).
+### Other built-in features
+1. **Restore context clues after `/compact`**: Records modified files, latest test/build pass status, and saved reference IDs in the background so the AI can pick back up right after `/compact`.
+2. **Local search for long docs & web pages**: Stores multi-thousand-word docs or web pages by section in a local database and fetches only matching sections by keyword.
+3. **Local script filtering for giant logs & tables**: On multi-MB logs, CSVs, or huge JSON dumps, the AI runs a short local script to compute counts or extract rows (e.g., top 5 failing endpoints) and returns only the result; large JSON outputs also surface error rows automatically.
+4. **Workspace layout on new chats**: Supplies a compact directory, script, and core-file summary at the start of a new conversation.
+5. **Loop warnings**: Shows a UI-only note (not injected into model context) when the AI repeats `edit → fail → revert → fail` cycles or calls the same tool with no progress.
+6. **Secret masking & sensitive-file blocking**: Masks API keys and tokens in logs or fetched pages, and can block accidental reads of `.env` files.
+7. **Hard 8.8 KB response cap**: Antigravity spills tool outputs above ~10 KB into a temp file that costs an extra read turn; all plugin responses stay within 8.8 KB.
+8. **Detailed panel breakdown & offline simulation**: Inspect context usage across file reads, terminal output, and subagents, check 15-turn cache hit trends and miss causes, optionally read only changed lines after edits (off by default), or replay past chat history via CLI to measure cache hit rates and keepalive cost.
 
-## What's New in v1.5.3 (Multi-Window Workspace/Subproject + Conversation Title Attribution & Critical-Context Desktop Alert)
-
-1. **Multi-Window Workspace / Subproject & Official Conversation Title Attribution**:
-   - Added `formatWorkspaceWindowLabel` and read-only `lookupConversationSummary` / `lookupConversationTitle` in `context/lib/watchdog-lease.js`: automatically disambiguates numeric/generic leaf directories (`e:\故事\1` → `故事/1`, `d:\proj\v2` → `proj/v2`), refines umbrella workspaces (`e:\work` + single active subproject → `work/agy-dart`), and reads Antigravity's official short conversation title + fallback `workspace_uris` from `conversation_summaries.db` with **zero raw user-prompt leakage**.
-   - Upgraded desktop OS notifications (TTL Expiring + Session Stalled), `PreInvocation` UI-only `metadata.user_markdown` banners (`systemMessage: ""`), and Sidecar `wd-other-alerts` cross-session pills to display `workspaceLabel` + `convTitle` within Windows `NotifyIcon` byte caps (`title <= 60B`, `body <= 220B`, zero UTF-8 splitting).
-2. **"Context Almost Full" (`critical` Watermark) Desktop Notification (Zero `statSync`)**:
-   - Added `_evaluateWatermarkNotifications` (`watermarkDesktopNotify`, `AGY_DART_WATERMARK_DESKTOP_NOTIFY`, default `null` auto-following `ttlDesktopNotify || watchdogDesktopNotify`) so background/multi-window primary sessions crossing into `critical` context watermark emit a single deduplicated OS desktop reminder (`agy-dart [work/agy-dart]: Context Almost Full` / `：上下文快满了`) with automatic reset after `/compact` drops back to `ok`, strictly maintaining **0 `fs.statSync` calls** on idle ticks.
-
-## What's New in v1.5.2 (Hot-Path Hook & SQLite Fast-Skip, HTML/Dart Outlines, UTF-8 Pipes & Concurrent Sidecar Polling)
-
-1. **Hook & SQLite Cold-Start Acceleration**:
-   - Memoized per-invocation `realpathSync`, `<= 2 MB` file buffers, and slice byte counts in `hooks/pre-tool-use.mjs` (`createFileReadContext`), cutting full-file disk reads from `4–6` down to **at most `1`** per `read_file` call and wrapping `isBinaryFile` file descriptors in `try/finally`.
-   - Added `PRAGMA user_version` + `sqlite_master` column-signature verification in `context/lib/store/schema.js` (`initSchema`), skipping redundant 9-table DDL, 4 `PRAGMA table_info` scans, and FTS5 re-init on warm hook invocations while preserving automatic self-healing on legacy/dropped tables, plus `idx_events_tool_sandbox` indexing.
-   - Switched `hooks/session-start.mjs` to run `buildWorkspaceSnapshot` concurrently **in-process** (eliminating the extra child `node` spawn and **all 4 wasted `git` spawns** on subagents/`stablePrefixOnly`) and added Dart/Flutter `pubspec.yaml` manifest detection.
-2. **HTML/Astro & Dart 3 Symbol Outlines + Windows UTF-8 Pipe Safety**:
-   - Upgraded `agy-dart_fast` `read_slices({ outlines })` to extract indented `<style>`, `<body>` landmarks, and `<script>` JS functions/classes in `.html`/`.htm`/`.astro` files (including 5,000+ line dashboards) as well as Dart 3 `class`/`mixin`/`extension`, nullable return types, and expression-body functions in `.dart`.
-   - Enforced UTF-8 pipe output in `context/lib/executor.js` (`ctx_execute`) for Python (`PYTHONIOENCODING=utf-8`, `PYTHONUTF8=1`) and Windows PowerShell (`[Console]::OutputEncoding = UTF8`, preserving leading `param(...)` blocks and exit codes).
-3. **Sidecar Dashboard Concurrency & Query Deduplication**:
-   - Parallelized the 5 independent `/api/*` `POST` requests in `refreshData()` via `Promise.all` with `autoRefreshInFlight` anti-overlap and `document.hidden` background tab suspension (`visibilitychange` instant resume); deduplicated `getGhostStats()` inside `/api/stats`, short-circuited heavy full-table scans once `starPrompt` is resolved, cached `index.html` by `mtimeMs`, and batched `"app"` scope `/api/search` source filtering into a single `WHERE id IN (...)` query.
-
-## What's New in v1.5.1 (Windowed Ghost Recall Calibration & Zero-Residual Chinese UI Polish)
-
-1. **10-Minute Edit-Aware Ghost Recall Window & Host-45K Cutoff Guidance**:
-   - Scoped Ghost Registry recall tracking (`ghost_interceptions.recall_closed`) to immediate (`<= 10m`) pre-edit paged slices (`PostToolUse` closes the window on `edit_file`/`write_file`/`apply_edits`) and distinguished tight cutoffs (`< 45 KiB` → `raise_to_host_45k`) from host-aligned cutoffs (`>= 45 KiB` → `use_outlines_or_exempt`).
-2. **100% Localized Chinese (`zh`) Sidecar Experience**:
-   - Eliminated residual English strings across Ghost efficiency recommendations, cutoff dropdown labels, TTL calibration sources, Loop Watch badges, and cache-bust attribution tooltips when `zh` mode is active.
-
-## What's New in v1.5.0 (Cross-Session Empirical TTL Calibration, Opt-In Expiry Alert & Keep-Alive Replay)
-
-1. **Cross-Session Per-Model Empirical TTL Calibration (`ttl_calibration:v1:<profileId>`)**:
-   - Learns real server-side KV-cache idle windows (e.g., 5m vs 10m vs 15m on Gemini 4 / Claude tiers) across conversations from bounded 14-day warm-hit lower bounds and pure-idle cold-miss upper bounds (`estimateCalibratedTtl`, bidirectional downward convergence when backend TTL shrinks, zero `ttl_idle_expiry` circular lock-in, `explicit > session/history > profile` precedence) while keeping `cache-analyzer.js` pure and backward-compatible (`diag.ttlCalibration`).
-2. **Opt-In High-Context TTL Expiry Desktop Alert (Zero `statSync`)**:
-   - Added `ttlDesktopNotify` (`AGY_DART_TTL_DESKTOP_NOTIFY`, Sidecar `TTL Alert` toggle, **OFF by default**), `ttlNotifyLeadSec` (`60s`), and `ttlNotifyMinTokens` (`60000`): fires a single debounced OS notification when an `IDLE` primary conversation with `>= 60k` tokens enters its final expiry window (`0 < remSec <= 60s`), strictly maintaining **0 `fs.statSync` calls**, sleep-wake suppression, and decoupled operation even when `stallWatchdog` is disabled.
-3. **Counterfactual Keep-Alive Policy Replay in `npm run cache:simulate`**:
-   - Expanded offline policy simulation to **9 policies** with `keepalive-1x` and `keepalive-unlimited` (`--keepalive-tail <sec>`, marked `hypothetical: true` so they never hijack `recommendedPolicy`), quantifying ping cache-read overhead, end-of-session walk-away waste, and apparent vs real user-turn hit rates (`userTurnHitRate`).
-
-## What's New in v1.4.0 (Sidecar Stall Watchdog & Jailbreak-Free Rescue Loop)
-
-1. **Dual-Source Fusion Stall Watchdog (5 Hooks + Sidecar + `transcript.jsonl` Self-Healing)**:
-   - Added lightweight, fail-open `hooks/stop.mjs` (`Stop` hook in `hooks.json`) alongside `PreInvocation`, `PreToolUse`, and `PostToolUse` (now also covering `run_command` completion) writing direct-conversation-isolated execution leases (`watchdog_lease:<convId>`) into SQLite `meta` via ultra-lightweight `context/lib/watchdog-lease.js` (<1 ms load, 0-SQLite fast path preserved, 0-byte `stderr`).
-   - Built `context/lib/watchdog.js` (`WatchdogMonitor`) running inside the persistent Aux Pane Sidecar (`sidecars/dashboard/server.mjs`): performs low-frequency polling with **zero `statSync` overhead when all conversations are `IDLE`**, **dual silence verification** (if `transcript.jsonl` `mtimeMs`/`size` is still growing, silence resets automatically), and **transcript tail self-healing** (detects completed/aborted terminal turns to heal missed `Stop` hooks without hiding newly hung turns).
-2. **State-Aware Dynamic Timeout Matrix (Zero False Positives)**:
-   - Distinguishes `IDLE`, `LLM_INFLIGHT` (`<120k` normal `120s`, `>=120k` or `/compact` `240s`, `>=150k` multimodal `360s`), `TOOL_RUNNING` (`read_file`/fast MCP `90s` vs sync `run_command`/`ctx_execute`/`run_checks` `300s`), and `SUBAGENT_BG` (async background tasks/subagents `600s`) with two-tier **yellow (`suspect`, 60%) → red (`stalled`, 100%)** alerting, all configurable via `~/.agy-dart/config.json` and `AGY_DART_WATCHDOG_*` env vars.
-3. **Jailbreak-Free Rescue Loop & Engineering Safeguards**:
-   - Auto-pre-generates a redacted **Rescue Handoff Brief** (`context/lib/handoff.js` `stallContext` snapshot: phase, silent duration, last tool/command, last user input, suspected root cause, modified files, last test/build & FTS5 handles) and surfaces **1–2 targeted troubleshooting steps** across 6 attribution buckets (`auto_compact_deadlock`, `terminal_eof_or_interactive`, `mcp_tool_blocked`, `host_tool_blocked`, `subagent_or_bg_stalled`, `oauth_ghost_or_network`) inside the Sidecar Watchdog card (with 1s local silence timer, Snooze/Mark-Idle actions, and opt-in debounced OS desktop notifications — **OFF by default**).
-   - Hardened with **Sleep Drift Guard** (lid-close / OS suspend wall-vs-monotonic clock jump compensation), strict multi-session & subagent isolation, Sidecar restart cleanup of stale prior-app leases, `POST`-only CSRF-hardened `/api/watchdog` & `/api/watchdog/action` endpoints, zero CDP access, and zero host process killing.
-
-## What's New in v1.3.1 (Long-Horizon & Zero-Latency Compaction Hardening)
-
-1. **Zero-Latency Compaction Detection & Same-Turn Invalidation**:
-   - Unified 4 compaction/pruning signals into `cache-analyzer.js` (`latestCompactionEvent` + `inspectTranscriptCompaction`): severe `compaction_or_truncation` bust, decoupled context shrink (even alongside `model_switch` or mild selective pruning `>= 15%` & `>= 8k` tokens from `>= 12k`), explicit compaction/summary steps, and `/compact` user commands.
-   - Upgraded `PreInvocation` to react immediately to `/compact` `lastUserInput` (idempotent across `invocationNum >= 1` mid-turn tool loops) and `initialNumSteps` rollbacks; added a zero-normal-overhead slow-path check in `PreToolUse` (`statSync` size/mtime fast-skip + 128 KB tail scan) that catches silent auto-compaction on the very first post-compaction `read_file` call (0 wasted turns while preserving files newly read after the compaction step via `invalidateFileReadsBefore`).
-2. **Full-Scope Turn Decay, Small-File Anti-Backfire Threshold & Failure Error Anchors**:
-   - Added turn-based `readDedup` decay (`readDedupMaxTurns: 12`, `AGY_DART_READ_DEDUP_MAX_TURNS`, `file_reads.read_turn_seq`) driven by `PreInvocation` even when payloads omit `stepIdx`, plus automatic allow on `stepIdx` / `turnSeq` rollback.
-   - Raised minimum `readDedup` threshold to configurable **`4096 B` (4 KB)** (`readDedupMinBytes`, `AGY_DART_READ_DEDUP_MIN_BYTES`) evaluated against the **actual requested slice size** (preventing 2-strike backfire on small configs or 15-line slices) and added isolated `dedup_bypass` telemetry in `featureRoi.features.read_dedup`.
-   - Upgraded `hooks/filter-rules.mjs` with `compactFailureWithErrorAnchors` so oversized (`> 7.9 KB`) failing command outputs preserve head/tail summaries plus `±3`-line context around middle-of-log error anchors (`AssertionError`, `Traceback`, `ERROR`, `✖`, `not ok`, etc.) within `<= 7.9 KB` (`<= 8.8 KB` total), reducing extra `ctx_search` round-trips.
-
-## What's New in v1.3.0
-
-1. **4-Tier Host-Aligned Read Guard & Review Workflow First-Class Support**:
-   - Aligned default source-file cutoff to **`45 KiB` (`46,080 B` / `<= 800` lines, `host-45k` mode)** matching Antigravity's native `read_file` cap with **2-strike soft guard** (5-branch session/subagent/anonymous TTL key isolation) so large source files and MCP-less subagents never deadlock, while keeping high-noise logs/locks/minified bundles at **`16 KB`** (`noiseMaxReadBytes`) and `.patch`/`.diff` code-review files at **`128 KB`** (`reviewMaxReadBytes`) with native `ByteOffset` / open-ended `StartLine` pagination continuation.
-   - Decoupled `read_file` size exemptions (`exemptExtensions`, linear ReDoS-proof `exemptPaths`, `readGuardMode: "soft"|"strict"|"off"`) from **both** `readDedup`/`diffRead` (exempt text files still enjoy duplicate-read protection) and `run_command` (which now uses an independent `shellDumpMaxBytes = 16 KB` and no longer allows `cat huge.png` / `curl .../archive.zip` bypasses).
-   - Fixed pre-1a read-cache priority (eliminating the 3-strike trap), `measureLineRangeBytes` `>2 MB && startLine > 1` blind spot, multi-line prose mislabeling as minified, `sensitive_read_confirm` TTL/isolation, `getExemptExtensions` split-state bug, Sidecar `/api/purge` `"conversation"` scope error, dynamic custom cutoff dropdown echo, and bidirectional upgrade migration (`cutoff:source` migrates legacy `16384` default while preserving custom cutoffs).
-2. **Native Diff Outlines & 3-Stage Context-Preserving `git diff` / `gh pr diff` Filter**:
-   - Added zero-dependency `.patch`/`.diff` outline parser (`extractDiffSymbols`) to `agy-dart_fast` `read_slices({ outlines })` mapping changed files (`+add/-del`) and `@@` hunks.
-   - Upgraded `filterGitDiff` to 3-stage context fidelity (Stage 1 lossless within `<= 7.9 KB` budget → Stage 2 `-U`/`--unified`/`-W`/`--word-diff` context-preserved cap → Stage 3 1-line context before compact `+/-`, plus mailbox `From <sha>` / `---` support) and fixed `filterGhCli` so `gh pr view` with Markdown diff fences is never wiped.
-
-## What's New in v1.2.2
-
-1. **Long-Task Continuity & Anti-Premature-Handoff Protections**:
-   - Removed mid-task `/compact` prompts from `rules/AGENTS.md` and routed `>60s` builds/tests + background tasks (`WaitMsBeforeAsync <= 2000`, `cliFilterAsyncBypassMs`) directly to native `run_command` (preserving live streaming logs and attaching read-only `permissionOverrides` for plugin scripts on sync `overwrite`).
-   - Raised `ctx_execute` default timeout to `120s` (`execTimeoutMs`, per-call `timeoutSec: 1..300`) with `timedOut: true` guidance, added workspace `cwd` support across `agy-dart_context` tools + MCP `initialize` `workspaceFolders`/`rootUri`, suppressed mid-turn tool-loop (`invocationNum >= 1`) TTL/cold-compact banners in `PreInvocation` (scaling 1M-window `ttlMinContext` to `300k`), and added step-based read-dedup decay (`readDedupMaxSteps: 40`).
-2. **Second-Round Deep Audit, Cross-Platform CI & Protocol Hardening (42 Verified Fixes)**:
-   - **Access-Control, SSRF, ReDoS & Windows Shell Fidelity**: Enforced end-to-end `sensitiveFileGuard=deny` (including symlinked files, `.envrc`/`*.env`, and `\\?\` ADS paths) across `PreToolUse`, `fast/mcp-server.mjs`, `ctx_index`, and `ctx_execute` (`P1-03`); forced `-n` on `git remote show` to block network SSRF (`P1-04`); hardened `install.mjs` against internal symlinks/NTFS junctions, UNC shares, and `.git` clones/worktrees while supporting self-`uninstall` (`P1-05`/`P1-06`); respected per-directory `PATHEXT` precedence and PowerShell `,`/`--`/`"` safety in `cli-filter` (`P1-07`); and capped serialized `fast` JSON-RPC payloads `<= 8.8 KB` with mixed `\n\n`/`\r\n\r\n` frame safety, dangling-symlink rollback, and bounded glob/regex/Markdown linear parsers (`P1-09`–`P1-13`).
-   - **Session Isolation, Process-Group Teardown & Multi-Provider Accuracy**: Enforced strict session/worktree/lifetime isolation in Sidecar `/api/search` and MCP `ctx_search`/`ctx_resume` (`P1-01`); added POSIX `detached` process-group + Windows `taskkill /T /F` teardown, linear JS ESM `--input-type=module` lexer, recursive subshell inspection, and graceful Windows `413` socket close; wrapped `pruneByTtl` in transactions, computed per-turn USD cost across `model_switch`, fixed OpenAI gateway cached-token double-counting, and anchored 1h implicit-write replay deltas (126/126 tests across Linux & Windows on Node 22/24).
-
-## What's New in v1.2.1
-
-1. **Full-Repository Security & Stability Hardening (76 Audited Fixes)**:
-   - Split `apply_edits` temp-file write from `rename` fallback with guaranteed rollback (`C-1`), attached `child.stdin`/`stdout`/`stderr` error handlers and `close`-drained capture in `context/lib/executor.js` (`C-2`/`H-10`), hardened PowerShell `-Command` argument passing via env-var indirection (`M-21`), closed read-only `git branch`/`tag` `OPTARG` bypasses (`H-1`), hardened Windows `\\?\`/`\\.\`/8.3 path canonicalization (`H-2`/`H-3`), and eliminated $O(N^4)$ CSS/SFC outline ReDoS (`H-7`).
-
-## What's New in v1.2.0
-
-1. **Sidecar Security Hardening & Unified Config (`~/.agy-dart/config.json`)**:
-   - Standalone HTTP Sidecar requires per-process `X-Agy-Dart-Token` across all `/api/*` endpoints (while `SidecarApp` mode enforces `POST` + `X-Sidecar-Token`); `/api/search` and all mutating endpoints (`/api/purge`, `/api/toggle-active`, `/api/cutoff`, `/api/exemptions`, `/api/maintenance`, `/api/cli-filter`, `/api/read-dedup`) are strictly `POST`-only with `Content-Type: application/json`, `Host`/`Origin`/`Sec-Fetch-Site` anti-DNS-rebinding guards, a `64 KB` request body cap, and XSS-safe DOM rendering.
-   - Consolidated 20+ `AGY_DART_*` toggles into `~/.agy-dart/config.json` (with `AGY_DART_*` env vars always overriding); `doctor` and `ctx_doctor` print effective flags and override provenance.
-2. **SmartCrusher, Expanded CLI Rules & Hardened Shell Guard**:
-   - Reversible zero-dep JSON/JSONL structural compactor (`context/lib/json-crusher.js`) extracts schema, head/tail samples, and prioritized anomalies (`status >= 400`, `ok: false`, fatal/error rows) while indexing raw output into FTS5.
-   - Added built-in CLI rules for `gh`, `kubectl`, `terraform`, and `playwright`, project-level declarative `.agy-dart/filters.json` (with ReDoS validator), safe `cd [/d] <path> && <cmd> [2>&1]` unwrapping, and stricter cmd/PowerShell metacharacter rejection (`%`, `!`, `{}`, `@`, non-git `^`).
-3. **Opt-In Three-State Diff-Read Cache (Safe by Default)**:
-   - Compact unified-diff re-reads on modified files are **OFF by default** (`diffRead: true` in `~/.agy-dart/config.json` or `AGY_DART_ENABLE_DIFF_READ=1` to opt in), scoped strictly to direct `conversationId` (zero parent↔subagent baseline leaks), bounded by recency (`diffReadMaxTurns` / `diffReadMaxAgeMs`), and carry baseline SHA/timestamp + 2-strike full-file bypass hints.
-4. **KV-Cache Diagnostics, Policy Replay, Handoff Brief & Persistent L2 Caches**:
-   - Added `npm run cache:audit` (global Prompt Cache audit), `npm run cache:simulate` (7-policy offline replay comparing 5m vs 1h TTL, cold-boundary compact, and cutoffs), Sidecar **Handoff Brief** + live 1s TTL countdown, 7-bucket `contextComposition` & `subagentBreakdown`, subagent Turn-0 stable-prefix sharing, persistent SQLite L2 `outline_cache`, per-feature ROI telemetry (`featureRoi`), and cross-Node 22/24 zero-`stderr` SQLite warning suppression.
-5. **Modular Store & Lean Runtime Install**:
-   - Split `context/lib/store.js` into focused `context/lib/store/` submodules and `context/lib/cache/profiles.js`; default `scripts/install.mjs install` copies **runtime files only** (pass `--with-devtools` to also copy offline benchmark/audit CLIs), verified automatically by `npm run verify:pkg`.
-
-## What's New in v1.1.0
-
-1. **Transparent CLI Output Filtering (`PreToolUse.overwrite`)**: Automatically wraps safe noisy dev commands (`git status/diff/log`, `npm/pnpm/yarn/node/pytest/cargo/go/dotnet` tests, `tsc/eslint/ruff/mypy/vite/cargo` builds, package installs, `docker build`) through zero-dependency `hooks/cli-filter.mjs` in **1 turn** (zero deny/retry overhead!), preserving exact exit codes, stripping ANSI/spinners, capping inline output `<= 8.8 KB`, and indexing raw output in SQLite FTS5.
-2. **Server-Side KV-Cache Protection & Diagnostics**:
-   - Deterministic prefix-stable `SessionStart` ordering (static routing line → semi-static Project/Layout + `git HEAD`-cached import hubs → volatile `git status` last) and slimmed canonical Turn-0 MCP tool schemas (`npm run prefix:budget` ~2,832–2,950 est. tokens).
-   - Model-aware dynamic watermarks, idle TTL, and cost-discount estimation (`resolveModelProfile` across Claude / Gemini / GPT / DeepSeek / Qwen tiers, with env overrides) + **Doom-Loop / Oscillation Watch** (`edit↔fail` cycles & normalized tool-call repeat rate).
-   - Zero-prefix-pollution `PreInvocation` hook using Antigravity's UI-only `metadata.user_markdown` (`systemMessage: ""`) for dynamic context watermark, hot-cache compact-delay, idle TTL expiry, multimodal TTFT cliff, and convergence alerts.
-   - Deep `transcript.jsonl` cache-bust attribution, last-15-turns ASCII hit-rate trend, and Top-3 context-growth tool attribution in both `fast/benchmark.mjs cache` and the live Sidecar Dashboard (with mini hit-rate bar chart).
-3. **2-Strike Session Read Deduplication, Bounded Slice Cache & Structured `ctx_resume` Checkpoint**:
-   - Tracks `(session, file, range, mtime, size)` in SQLite to prevent redundant unchanged re-reads while automatically invalidating on edits or compaction (`ctx_resume`), and maintains a compact `sessionCheckpoint` ledger (modified files + latest test/build status) returned by `ctx_resume` with zero extra MCP tools.
-   - Cross-call `(mtimeMs, size)` LRU caches in `agy-dart_fast` for both `read_slices({ outlines })` (128 entries) and `read_slices({ slices })` (bounded <= 4 MB total / <= 256 KB per file, actively invalidated by `apply_edits`).
-4. **Security Hardening & DB Maintenance**:
-   - SSRF-hardened `ctx_index(url)` (`http:`/`https:` whitelist, max 5 redirects with relative `Location` resolution, per-hop DNS & IPv4/IPv6 private/loopback/link-local blocking with DNS pinning), configurable secret redaction before indexing/return (`AGY_DART_DISABLE_SECRET_REDACTION=1` to opt out), and optional sensitive-file read guard (`AGY_DART_SENSITIVE_FILE_GUARD=warn|deny`).
-   - Heading-aware Markdown chunking, SHA-256 content dedup, daily TTL pruning, `ctx_purge({ scope: "stale", vacuum: true })`, and one-click **Prune & Vacuum** in the Sidecar Dashboard.
+> Antigravity updates frequently — click **Star** at the top right to follow compatibility updates.
 
 ---
 
-## Community Feedback & Improvements
+## How to Install
 
-This dedicated section tracks real-world friction reported by the community (preserving the original feedback), along with the exact engineering fixes and underlying design principles shipped in response.
+Requires **Node.js 22 or newer** (no `npm install` needed).
 
-### `[v1.5.0]` 15-Minute Idle KV-Cache Expiry vs. Automatic Keep-Alive Pings
+### Option 1: Let Antigravity install it
 
-#### 1. Original Community Feedback
+Send this to Antigravity:
 
-> *"`@billy88lsh`: Looking at my records, my cache hit rate is 97%. Your problem is that you keep timing out — once past 15 minutes the cache is gone. The way to improve it is to have the program automatically ping/activate the cache after each turn."*
->
-> *(Original Chinese: 「@billy88lsh: 我看的记录，我的缓存是97。你的问题是你总是超时，超过15分钟就缓存没了。提升的办法就是回答完一轮，程序自动激活一下缓存」)*
+```text
+Clone https://github.com/zou172866/agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
+```
 
-Auditing both Antigravity's plugin sandbox boundaries and prompt-cache billing math clarified why idle timeouts dominate average hit-rate drops — and why blind auto-pinging backfires:
-1. **Hard 300s static profile TTL missed real ~15m server windows**: `v1.4.x` defaulted Gemini 3/4 and unknown tiers to `300s` (5m) and forgot empirical calibration on every new conversation, causing premature expiry warnings and zero downward adaptation when backend LRU windows shrank.
-2. **Plugin-layer auto-keep-alive is impossible without prefix/UI pollution**: Server KV-cache keys bind to the host's full raw request prefix (hidden system prompt, tool schemas, thinking signatures, auth routing). `Stop` hooks are synchronous (`5s` cap), Sidecars lack silent 1-token RPCs, and synthetic messages pollute history and violate zero-prefix-pollution invariants.
-3. **Narrow break-even & Goodhart's Law**: Each keep-alive ping still pays `0.10x`–`0.25x` cached-read cost + output/thinking/request quota. 10 pings at 90% discount (or 4 at 75% discount) already cost as much as a full cold re-prefill, and walk-away sessions burn 100% wasted quota while artificially inflating apparent hit-rate metrics.
+### Option 2: Install from terminal
 
-#### 2. Solution Shipped (`v1.4.x` → `v1.5.0`)
+**Windows (PowerShell):**
 
-| Area | Before (`v1.4.x`) | After (`v1.5.0`) |
-| :--- | :--- | :--- |
-| **TTL Estimation** | Static `300s` reset on every new conversation; upward-only single-session floor | **Cross-Session Per-Model Calibration (`ttl_calibration:v1:<profileId>`)**: 14-day bounded ring buffer of warm lower bounds & pure-idle cold upper bounds (`estimateCalibratedTtl`), bidirectional downward convergence, `explicit > session/history > profile` precedence |
-| **Idle Expiry Awareness** | Only in-pane countdown bar; missed when user switches apps | **Opt-In High-Context TTL Desktop Alert**: `ttlDesktopNotify` (`>= 60k` tokens, `(0, 60s]` lead window, debounced 1x per idle anchor + 60s global cooldown, **0 `statSync`**, sleep-jump guarded, works even with `stallWatchdog=false`) |
-| **Keep-Alive Economics** | No way to test whether auto-pinging saves or wastes money on real usage | **`cache:simulate` Keep-Alive Replay**: Added `keepalive-1x` & `keepalive-unlimited` (`--keepalive-tail <sec>`, `hypothetical: true`), reporting both apparent `projectedHitRate` and `userTurnHitRate` plus wasted walk-away pings |
-
-### `[v1.4.0]` Multi-Turn Silent Hang ("Working Forever With Zero Output")
-
-#### 1. Original Community Feedback
-
-> *"After multiple turns of conversation, it very easily stays 'working' forever without outputting anything and just freezes — isn't there an automatic summarization/compaction feature?"*
->
-> *(Original Chinese: 「我在多轮对话之后很容易一直工作中却不输出任何东西，直接卡住了，难道没有自动总结压缩的功能么？」)*
-
-Analyzing Antigravity's multi-turn execution lifecycle revealed **4 distinct real-world hang modes** that all look identical in the UI (an endless spinner with zero streamed output):
-1. **High-context / background auto-compaction deadlock**: At `>= 120k` tokens (or `>= 150k` with images), silent auto-compaction or cold prefill can hang indefinitely with no user-visible timeout or progress bar.
-2. **Windows terminal EOF / interactive prompt blocking**: A synchronous `run_command` waiting on `[y/N]`, a pager (`less`/`more`), or a Windows PowerShell/CMD stdin EOF never finishes and blocks the entire turn.
-3. **OAuth Ghost Session / proxy disconnect**: Silent network drops or stale OAuth sessions leave the request spinning at 0 streamed bytes.
-4. **Blocked MCP tool call**: A wedged MCP server leaves the agent waiting indefinitely while the user has no visibility into which phase or tool actually froze.
-
-#### 2. Solution Shipped (`v1.3.x` → `v1.4.0`)
-
-| Area | Before (`v1.3.x`) | After (`v1.4.0`) |
-| :--- | :--- | :--- |
-| **Execution Visibility** | No active turn/tool state tracking; users stare at an endless spinner | **Dual-Source Fusion State Machine**: `PreInvocation` / `PreToolUse` / `PostToolUse` (`+run_command`) / `Stop` hooks write per-conversation leases (`watchdog_lease:<convId>`) into SQLite `meta`, fused with Sidecar `transcript.jsonl` `mtimeMs`/`size` & tail self-healing |
-| **Stall Detection** | None (or naive flat timer prone to false alarms on long builds / 150k turns) | **State-Aware Dynamic Timeout Matrix**: `IDLE` (0 `statSync`) · `LLM_INFLIGHT` (`<120k` 120s / `>=120k` or `/compact` 240s / `>=150k` multimodal 360s) · `TOOL_RUNNING` (`read_file`/fast MCP 90s vs sync `run_command`/`ctx_execute` 300s) · `SUBAGENT_BG` (600s), yellow `suspect` + red `stalled`, dual-silence growth extension |
-| **Recovery Workflow** | Manual guesswork; stopping a hung turn risks losing context & progress | **Jailbreak-Free Rescue Loop**: Entering red `stalled` auto-pre-generates a redacted **Rescue Handoff Brief** (phase, silent duration, last tool/command, last user input, git diff stat, checkpoint & FTS5 handles) + 1–2 root-cause tips across 6 causes, 1s local Sidecar timer, Snooze/Mark-Idle, and opt-in debounced desktop notify (OFF by default) |
-| **Robustness & Security** | N/A | **Sleep Drift Guard** (lid-close/suspend jump compensation), multi-session & subagent isolation, Sidecar restart stale-lease cleanup, `hookMode: true` fail-open, `POST`-only CSRF-hardened `/api/watchdog*`, zero CDP, zero host process killing |
-
-#### 3. Underlying Design Principles
-
-1. **Sidecar Watchdog + Lifecycle Hooks beats fragile CDP/process-killing**: Injecting into the host via CDP or force-killing `language_server` risks corrupting active trajectories and breaks across Antigravity updates. Running a zero-dependency monitor inside the existing `restart_policy: always` Sidecar + fail-open hooks is 100% jailbreak-free and leaves cancellation firmly under user control.
-2. **Never alert on one noisy signal alone**: Hooks alone can miss a `Stop` event; `transcript.jsonl` alone doesn't distinguish `IDLE` from a silent Turn-1 hang. Fusing SQLite leases with transcript growth checks and timestamp-guarded tail self-healing achieves both zero false alarms on active streaming and instant self-healing on missed `Stop` hooks.
-3. **Separate hook hot-path latency from Sidecar analytics**: Splitting ultra-lightweight `watchdog-lease.js` (<1 ms load) from `watchdog.js` keeps `PreToolUse` 0-SQLite fast paths and latency budgets untouched while giving Sidecar full transcript/handoff/attribution richness.
-4. **Zero background disk I/O when idle & immune to laptop sleep**: When all conversations are `IDLE`, `WatchdogMonitor.tick()` executes zero `statSync` calls; when a laptop resumes from sleep, wall-vs-monotonic clock drift detection automatically compensates active leases instead of firing false red alerts.
-
-### `[v1.3.0]` 16 KB Default Read Guard Blocking Code Review (`.patch`) & MCP-less Subagents
-
-#### 1. Original Community Feedback
-
-> *"Claude doesn't have this limit — it reads large files in chunks without stopping. This 16 KB limit isn't built into Antigravity either; it's a pre-read check (`agy-dart protection`) from your local config. Relaxing it or exempting the review directory fixes it — is a 16 KB single-file read/write limit seriously the default config?"*
->
-> *(Original Chinese: 「Claude 没有这个限制。大文件它会分段读完，不会因此停下来。这个 16 KB 的限制也不是 Antigravity 自带的，而是你那台机器上 Antigravity 配置里加的一道读前检查（agy-dart protection），放宽它或者给评审目录开个例外就能解决，16kb 单文件读写居然是默认配置吗」)*
-
-> *"`@xcq`: I use it as a reviewer in my workflow and hit this exact issue — git `.patch` files get rejected directly because a single patch easily exceeds 16 KB and fails under the default config, so I fell back to `AGY_DART_DISABLE_READ_HOOK=1`."*
->
-> *(Original Chinese: 「@xcq: 我是让他做我工作流的 reviewer，会碰到这种情况，git 的 patch 文件直接拒绝读写，因为单个 patch 文件随便就超过 16kb 了碰到现在的默认设置就会失败，我走了 `AGY_DART_DISABLE_READ_HOOK=1`」)*
-
-*(Note: `agy-dart` never restricts writes—only pre-read guards—but blocking `.patch` reads is enough to stall a review workflow.)*
-
-End-to-end codebase auditing against these reports exposed **5 deeper root causes in `v1.2.2`**:
-1. **Permanent hard-deny at 35% of the host's native cap**: Antigravity's native `read_file` already caps each call at `46,080 B` (45 KiB) / 800 lines with native pagination, yet `v1.2.2` inherited a 16 KB hard-deny with no 2-strike bypass (unlike `read-dedup` and `diff-read` in the same file).
-2. **Valid host pagination blocked by the hook itself**: `ByteOffset` was parsed *after* the size guard, open-ended `StartLine` continuations hit `isWideRange`, and wide multi-line prose/logs exceeding 36 KB were mislabeled as `"giant single-line/minified content"`.
-3. **Broken code-review fallback chain**: `agy-dart_fast` `read_slices({ outlines })` had no `.patch`/`.diff` parser, while `filterGitDiff` stripped all `' '` context lines from `git diff` and `gh pr diff` (and `filterGhCli` wiped `gh pr view` metadata whenever a PR body contained a Markdown diff fence).
-4. **MCP-less subagent deadlock (same class as upstream `context-mode#1311`)**: Reviewer/research subagents without `agy-dart_context` tools stalled when hard-denied with MCP-only instructions.
-5. **Cross-channel coupling**: Text extension exemptions short-circuited before `readDedup`, and `run_command` (`cat`/`curl`) shared `maxReadBytes` and `exemptExtensions`, meaning disabling the read cutoff or adding exemptions could inadvertently punch holes through shell dump protection.
-
-#### 2. Solution Shipped (`v1.2.2` → `v1.3.0`)
-
-| Area | Before (`v1.2.2`) | After (`v1.3.0`) |
-| :--- | :--- | :--- |
-| **Read Threshold Model** | Flat `16 KB / 410 lines` permanent hard `deny` | **4-Tier Risk Model + 2-Strike Soft Guard (default `host-45k`)**:<br>• Tier 0 (attachments / instructions / binaries): 0-SQLite allow<br>• Tier 1 (high-noise logs / lockfiles / minified): **`16 KB`** (`noiseMaxReadBytes`)<br>• Tier 2 (source code / docs): **`45 KiB` (`46,080 B`) / 800 lines** + 2-strike<br>• Tier 3 (`.patch` / `.diff` review): **`128 KB`** (`reviewMaxReadBytes`) direct allow, 2-strike above |
-| **Pagination & Anti-Deadlock** | Blocked `ByteOffset` & open-ended `StartLine`; stalled MCP-less subagents | Pre-guard `ByteOffset` remaining-bytes check & valid continuation allow; split minified vs wide multi-line slices (computing `suggestedLines`); 5-branch session/subagent/anonymous TTL isolation + pre-1a read-cache priority (eliminates 3-strike trap); subagent 2-strike native fallback |
-| **Channel Decoupling & Security** | Exemptions skipped `readDedup` & leaked into `cat`/`curl` | `read_file` size exemptions skip Section 1a only (**preserving `readDedup`/`diffRead`**); `run_command` uses independent `shellDumpMaxBytes = 16 KB` with `exemptExtensions` removed; `realpathSync` symlink checks & strict integer `parseLineArg` |
-| **First-Class Code Review** | No `.patch` outliner; `git diff` stripped context | Native zero-dep `.patch`/`.diff` parser (`extractDiffSymbols`) in `read_slices({ outlines })`; **3-stage context-preserving `filterGitDiff`** inside `<= 7.9 KB` (lossless within budget → `-U`/`-W` preserved cap → 1-line context before compact `+/-`) + fixed `gh pr view` detection |
-| **Trusted Config & Upgrade** | Required `AGY_DART_DISABLE_READ_HOOK=1` | `~/.agy-dart/config.json` adds `readGuardMode` (`soft`/`strict`/`off`), per-tier cutoffs, `exemptExtensions`, and linear ReDoS-proof `exemptPaths`; `cutoff:source` migrates legacy `16384` default to `46080` while preserving user-chosen cutoffs |
-
-#### 3. Underlying Design Principles
-
-1. **Align with the host's physical ceiling to eliminate negative-ROI blocks**: Because Antigravity's host `read_file` already caps single responses at `46,080 B` (~11.5K tokens) / 800 lines, hard-blocking `16 KB–45 KiB` files saves minimal tokens while paying an extra full-prefix LLM round trip (negative ROI). Aligning source defaults to `45 KiB` guarantees 1-turn lossless reads below the cap and intervenes only when multi-turn paging is actually unavoidable.
-2. **Tier by signal-to-noise ratio and reading mode, not flat file size**: Logs, lockfiles, and minified bundles rarely benefit from sequential reading (`ctx_execute` cuts >90%, keeping `16 KB`); source code aligns to `45 KiB`; sequential code-review `.patch`/`.diff` files need linear inspection to catch logic bugs (`128 KB` direct allow + native Diff Outline above).
-3. **Soft 2-strike guardrails over permanent deadlocks**: Hooks cannot assume every subagent has MCP tools. A 2-strike retry path (bounded by the host's 45 KiB ceiling) preserves Turn-1 guidance while guaranteeing zero deadlocks—backed by 5-branch TTL key isolation, TTL refresh across continuation pages, and read-cache priority so retries never loop into 3-strike chains.
-4. **Strictly decouple host-capped channels from uncapped channels**: `read_file` has a 45 KiB host cap, whereas `cat`, `curl`, and `git diff` do not. Relaxing `read_file` must never relax shell dump guards (`shellDumpMaxBytes`) or bypass `cli-filter.mjs` via `skipFlags` (which would expose unbounded 5 MB diffs without secret redaction), and skipping first-read size checks must never disable `readDedup`.
-5. **Preserve the security threat model**: `exemptPaths` and `exemptExtensions` are loaded exclusively from trusted user-level `~/.agy-dart/config.json` and env vars (never from untrusted repo configs), run strictly after `sensitiveFileGuard`, validate symlink targets via `fs.realpathSync`, and use linear segment matching to eliminate ReDoS.
-
-### `[v1.2.2]` Premature Handoffs & Interrupted Long-Running Tasks
-
-#### 1. Original Community Feedback
-
-> *"After enabling dart (`agy-dart`), it becomes very hard to run long tasks — it automatically hands off within a very short time."*
->
-> *(Original Chinese: 「使用了dart之后，就很难进行长任务了，会自动在很短的时间内交接」)*
-
-Auditing Antigravity's executor loop alongside `v1.2.1` revealed that "premature automatic handoffs" reflected both **early turn termination yielding control back to the user** and **frequent `Handoff Brief` / `/compact` banners firing after just a few minutes**, driven by **5 concrete root causes**:
-1. **Imperative phase-boundary `/compact` rule inducing self-handoffs**: `rules/AGENTS.md` instructed the agent to *"compact at cold/phase boundaries then call `ctx_resume`"*. Because `/compact` is a UI-only slash command that the model cannot invoke via tools, obedient models following `<user_rules>` stopped calling tools at the end of Phase 1 (within minutes) and handed control back to the user asking them to run `/compact`.
-2. **Hardcoded `30s` MCP sandbox kill on long scripts**: While native `run_command` transitions seamlessly into asynchronous background tasks after `WaitMsBeforeAsync`, `ctx_execute` hardcoded a `30,000 ms` kill timer (`exitCode: 124`) with no timeout parameter (and `run_checks` defaulted to `60s`), killing long builds or batch scripts within 30–60s and forcing an error handoff.
-3. **`PreToolUse.overwrite` friction with Terminal Sandbox & async background streams**: `cli-filter.mjs` buffered stdout/stderr until process exit (leaving `manage_task(status)` blank during background runs). Worse, under `Default`/`Auto` Terminal Sandbox presets, `~/.gemini/config/plugins/agy-dart` sits outside the workspace mount—causing rewritten commands to fail inside the sandbox, request unsandboxed execution, and pause for manual user approval.
-4. **Mid-turn tool-loop & 1M-window false `Handoff Brief` alerts**: `PreInvocation` did not distinguish user idle time from long tool/subagent execution gaps (`invocationNum >= 1`), firing 5-minute TTL handoff banners mid-task; meanwhile `ttlMinContext` was clamped via `Math.min(..., 60000)` to `60k`—just 6% of a 1M-token window.
-5. **Unbounded `read-dedup` burning `MAX_INVOCATIONS` budget**: In deep 50+ step tasks, re-verifying a file read dozens of steps earlier still triggered a Strike-1 `deny`, consuming extra model invocations against the host's per-turn `MAX_INVOCATIONS` ceiling.
-
-#### 2. Solution Shipped (`v1.2.1` → `v1.2.2`)
-
-| Area | Before (`v1.2.1`) | After (`v1.2.2`) |
-| :--- | :--- | :--- |
-| **Phase-Boundary Rule (`AGENTS.md`)** | Imperative prompt to compact at cold/phase boundaries | **Strictly passive rule**: never pause mid-task to ask for `/compact`; keep long tasks continuous and call `ctx_resume` only after user compaction; route `>60s` & async commands to native `run_command` |
-| **MCP Sandbox Timeout** | Hardcoded `30s` kill in `ctx_execute` with no parameter | Raised default to **`120s`** (`execTimeoutMs`), exposed per-call `timeoutSec: 1..300`, and added explicit `timedOut: true` + native background `run_command` fallback guidance |
-| **Sandbox & Async Stream Bypass** | Rewrote async commands (buffering live logs); lacked sandbox read grant; orphan shells on kill | Bypass `cli-filter` when `WaitMsBeforeAsync <= 2000ms` (`cliFilterAsyncBypassMs`) or `IsDaemon: true`; attach read-only `permissionOverrides` (`read_file(<PLUGIN_ROOT>)`) on sync `overwrite`; full Windows `taskkill /T /F` & POSIX `detached` process-group teardown |
-| **Mid-Turn & 1M Watermark Alerts** | Fired TTL/handoff banners mid-loop and at `60k` on 1M models | Suppress idle TTL & cold-compact handoff banners during mid-turn tool loops (`invocationNum >= 1` & `diag.inToolLoop`); scale `ttlMinContext` to model `coldCompactTokens` (`60k` on 200k models, **`300k`** on 1M models) |
-| **Step-Decayed Read Dedup** | Session-wide dedup regardless of trajectory depth | Track `read_step` in `file_reads` and auto-allow re-reads after `readDedupMaxSteps` (default **`40` steps**), preserving `MAX_INVOCATIONS` budget in deep tasks |
-
-#### 3. Underlying Design Principles
-
-1. **Never put user-only actions as imperative commands inside `<user_rules>`**: Antigravity injects `AGENTS.md` as highest-priority mandatory instructions. Because an agent cannot execute UI slash commands like `/compact`, any imperative to "compact at phase boundaries" forces compliant models to halt execution and hand off to the human. Framing compaction strictly as a post-hoc recovery hook (`ctx_resume` after user action) keeps multi-phase execution uninterrupted.
-2. **Separate synchronous data filtering from asynchronous lifecycle management**: MCP `tools/call` is inherently synchronous and bounded by RPC/stream idle timeouts—ideal for `<=120s` sandbox data reduction (`ctx_execute`), whereas long builds, test suites, and daemons rely on Antigravity's native background task streaming (`manage_task`) and reactive wakeup. Routing by `WaitMsBeforeAsync <= 2000ms` and `>60s` preserves both fast inline filtering and multi-hour background durability.
-3. **Least-privilege sandbox bridging (read-only code vs. isolated DB state)**: Mounting `~/.agy-dart` read-write into the Terminal Sandbox would let untrusted repo test scripts tamper with `context.db`. Granting only `read_file(<PLUGIN_ROOT>)` via `permissionOverrides` exposes immutable plugin JS so rewritten commands never trigger unsandboxed approval prompts, while `cli-filter.mjs` degrades gracefully in memory whenever SQLite writes are sandbox-restricted.
-4. **Distinguish turn-entry user idle from mid-turn tool execution**: When `invocationNum >= 1` inside an active tool loop (`inToolLoop`), elapsed time since `lastPlannerAt` reflects a long tool or subagent run—not human inactivity—and the user cannot run `/compact` mid-turn anyway. Scaling `ttlMinContext` to `30%` of the active model's window (`coldCompactTokens`) keeps alerts meaningful across both 200k and 1M context models.
-5. **Balance attention decay against `MAX_INVOCATIONS` step budgets**: Blocking duplicate reads within `<= 40` steps eliminates pure token waste, but 40+ steps into a complex refactor, re-reading a target file before editing prevents stale-context hallucinations without burning extra `deny`/retry turns.
-
----
-
-## Credits & Open-Source Inspirations
-
-`agy-dart` is 100% MIT-licensed with zero runtime npm dependencies (full upstream notices and compliance boundaries are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)):
-
-| Project | License | What Was Reused / Inspired | What `agy-dart` Built / Improved |
-| :--- | :---: | :--- | :--- |
-| **[INK-Q/agy-fast](https://github.com/INK-Q/agy-fast)** | MIT | Reused 4-tool batching engine (`batch_search`, `apply_edits`, `read_slices`, `run_checks`), `SessionStart` snapshot, `<= 8.8 KB` no-spill rule, and `benchmark.mjs` | Bundled as `agy-dart_fast`, prefix-stabilized startup hook, extended `benchmark.mjs` with KV-cache bust attribution & `cache` CLI |
-| **[Domush/antigravity-plugin-context-mode](https://github.com/Domush/antigravity-plugin-context-mode)** | MIT | Reused & adapted `node:sqlite` FTS5 engine, 8 `ctx_*` tools, `PreToolUse` guard, and Aux Pane Sidecar dashboard | `${PLUGIN_ROOT}` paths, isolated `~/.agy-dart/context.db`, 16 KB / 410-line cutoff, `<= 8.8 KB` cap, `SKILL.md` exemptions, heading-aware MD chunking, DB TTL/Vacuum, and live KV-cache card |
-| **MIT Pattern References** (`mpecan/tokf`, `uuie/agent-cache-optimizer`, `rkolesnichenko/ccdrift`, `ooples/token-optimizer-mcp`, `tobi/qmd`, `DeusData/codebase-memory-mcp`, `tirth8205/code-review-graph`, `lennartschoch/opencode-cache-compact`) | MIT | Clean-room pattern inspiration for declarative CLI filters, prefix stability, cache-bust attribution, read dedup, MD heading chunking, `git HEAD`-cached import hubs, and compaction handoff briefs | Pure zero-dep Node.js ESM implementation integrated natively with Antigravity `PreToolUse.overwrite`, `PostToolUse`, `PreInvocation`, and Sidecar |
-| **Architectural Inspiration Only** (`mksglu/context-mode`, `rtk-ai/rtk`, `opencode-dynamic-context-pruning`, `the-cybersapien/claude-cache`, `huiliyi37/Tianshu-harness`) | Non-MIT / Apache-2.0 (**zero code included**) | High-level conceptual inspiration only (Thinking in Code, transparent CLI hook rewriting, duplicate-read awareness, KV-cache TTL continuity, versioned V8 compile cache, SHA-256 dedup, prefix budget audit, Ghost efficiency feedback, SessionWarmth compact-delay) | Strictly zero source code reused; 100% clean-room MIT implementation |
-
----
-
-## Dual-Engine Routing Overview
-
-| Workload | Designated Tool | Why |
-| :--- | :--- | :--- |
-| Multi-query code search / glob / read-only `git` | `agy-dart_fast` → `batch_search` | Up to 20 concurrent queries via `rg`/Node, `<= 8.8 KB` inline |
-| Unknown large source / `.patch` (>300 lines) | `agy-dart_fast` → `read_slices({ outlines })` + parallel `read_file` | Map symbols or diff files/hunks once, then read exact ranges with 7ms local `read_file` |
-| Source files (<45 KiB) & diffs (<128 KB) | Built-in `read_file` (parallel, `<= 800` lines) | 0 remote checks (~7ms), 45 KiB host cap, 2-strike soft guard above cutoff |
-| Multi-hunk / multi-file edits + verify | `agy-dart_fast` → `apply_edits` | Atomic commits, `bestEffort`, inline `verify` saves full turns |
-| Concurrent build / lint / test checks | `agy-dart_fast` → `run_checks` | True concurrency pool with noise stripping (never sequential `ctx_batch`) |
-| **Large logs (>16 KB – MBs), giant JSON/CSV, API dumps** | `agy-dart_context` → `ctx_execute` | Run local Node/Python/Shell filter scripts; return only concise answers (`<= 8.8 KB`) |
-| **Long docs, web URLs, or repeatedly queried logs** | `agy-dart_context` → `ctx_index` + `ctx_search` | Local SQLite FTS5 BM25 + Trigram RRF; use `ctx_resume` after `/compact` |
-
----
-
-## Quick Install
-
-Requires **Node.js >= 22** (uses built-in `node:sqlite`; **no `npm install` needed**).
-
-### Windows (PowerShell)
 ```powershell
 git clone https://github.com/zou172866/agy-dart.git
 cd agy-dart
 
-# Install with host-aligned 45 KiB soft guard + live doctor check
 .\install.ps1
-
-# Recommended: also auto-install official ripgrep (rg.exe) to ~/.local/bin
+# Also auto-install ripgrep (rg) for faster search (recommended)
 .\install.ps1 -InstallRg
 ```
 
-### macOS / Linux
+**macOS / Linux:**
+
 ```bash
 git clone https://github.com/zou172866/agy-dart.git
 cd agy-dart
 ./install.sh
 ```
 
-### Cross-Platform CLI
+**Other commands:**
+
 ```bash
-node scripts/install.mjs install                           # default host-45k (preserves custom cutoffs on upgrade)
-node scripts/install.mjs install --with-devtools             # also install offline audit/benchmark CLIs
-node scripts/install.mjs install --project /path/to/repo   # workspace-scoped
-node scripts/install.mjs doctor
-node scripts/install.mjs mode fast-32k                     # host-45k | fast-32k | balanced-16k | strict-8k | no-read-hook
-node scripts/install.mjs uninstall
+node scripts/install.mjs install                        # Global install
+node scripts/install.mjs install --project /repo/path   # Single-project install
+node scripts/install.mjs doctor                         # Check install health
+node scripts/install.mjs uninstall                      # Uninstall
 ```
 
-### Let Antigravity Install It For You
-
-Paste this prompt into Antigravity:
-
-```text
-Clone https://github.com/zou172866/agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
-```
-
-Restart Antigravity (or reload window) and start a new conversation. If you previously installed standalone `agy-fast` or `antigravity-plugin-context-mode`, disable or remove them under **Customizations → Installed** to avoid duplicate MCP servers/hooks.
+Restart or reload Antigravity after installing and open a new chat. If you previously installed standalone `agy-fast` or `antigravity-plugin-context-mode`, disable the old ones in your plugin list.
 
 ---
 
-## Testing & Benchmarking
+## Settings
+
+Nothing needs tuning day to day. Open the **agy-dart Context** panel in the right sidebar to toggle auto-keepalive, desktop alerts, protection pause, local cleanup, or file-size limits.
+
+Preset modes via CLI:
 
 ```bash
-# Run full test suite (integration, v1.1, v1.2, security hardening & property/fuzz tests)
-npm test
+node scripts/install.mjs mode host-45k      # Default: direct read up to 45 KB code / 128 KB patches, block >16 KB noisy logs
+node scripts/install.mjs mode balanced-16k  # Outline first above 16 KB
+node scripts/install.mjs mode fast-32k      # Raise normal file limit to 32 KB
+node scripts/install.mjs mode strict-8k     # Block above 8 KB
+node scripts/install.mjs mode no-read-hook  # Never block file reads, only trim noisy terminal output
+```
 
-# Verify static runtime import graph & zero devtools leakage
-npm run verify:pkg
+---
 
-# Audit Turn-0 prefix budget, MCP schema determinism & token estimator calibration
-npm run prefix:budget
-node scripts/prefix-budget.mjs --calibrate
+## Changelog
 
-# Audit global Antigravity Prompt Cache hygiene & simulate 7 cache policies locally
+### v1.5.4
+- **Click alerts to jump to that chat**: Clicking a desktop popup or cross-window panel alert brings the matching project window to the front and opens that conversation; added a multi-window session switcher bar in the panel.
+- **Automatic cache keepalive**: Sends a lightweight keepalive ping shortly before cache expiry, with per-chat toggle and count controls at the top of the panel (default cap 3, resets on your next message).
+- Moved current context usage, cache countdown, and blocked noise volume into a larger top card in the panel.
+
+### v1.5.3
+- **Project & chat titles on multi-window alerts**: Desktop popups and panel alerts show folder names (e.g., `work/agy-dart`) and short chat titles without exposing message text.
+- **"Context Almost Full" desktop alert**: Pops up once near the limit and resets after `/compact`.
+
+### v1.5.2
+- Faster file reads and chat startup; added code outlines for multi-thousand-line `.html` / `.astro` and `.dart` files; fixed Windows Python / PowerShell encoding garbling and paused panel refreshes while hidden.
+
+### v1.5.1
+- Filled in untranslated strings in Chinese UI mode; tuned post-edit file-limit suggestions.
+
+### v1.5.0
+- **Read actual model cache expiry time**: Reads the active model's real cache lifetime (such as 5m or 15m) from recent usage and carries it into new chats.
+- Added optional 1-minute cache-expiry desktop reminder and CLI keepalive cost simulation.
+
+### v1.4.0
+- **Hang detection & rescue summary**: Flags chats stuck spinning with zero output (ignoring long builds and laptop sleep), points to the stalled step in the panel, and prepares a one-click progress summary (modified files, last command, current step) to continue in a new chat.
+
+### v1.3.1
+- Allow immediate file re-reads right after `/compact`; skip dedup prompts on slices under 4 KB; preserve mid-log error lines in long failure outputs.
+
+### v1.3.0
+- **Tiered file-read limits**: Raised direct reads to 45 KB (800 lines) for normal code and 128 KB for `.patch` files while keeping noisy logs at 16 KB; second-try reads pass through so patch reviews and subagents don't stall.
+- Added `.patch` file outlines and kept context lines when trimming `git diff`.
+
+### v1.2.2
+- **Uninterrupted long tasks**: Removed mid-task `/compact` prompts and routed >60s builds, tests, and background servers straight to Antigravity's native background runner.
+- Blocked `.env` reads and fixed 42 Windows shell, isolation, and orphan-process issues.
+
+### v1.2.1
+- Automatic rollback on failed multi-file edits and 76 path/argument stability fixes.
+
+### v1.2.0
+- Unified settings in `~/.agy-dart/config.json`; added local panel request checks; **automatic structure, sample, and error extraction for huge JSON files**; added `gh`, `kubectl`, `terraform`, and `playwright` output trimming plus handoff summaries.
+
+### v1.1.0
+- **Automatic terminal output trimming**: Strips progress bars and repetitive noise from `git`, test, build, and install commands while saving full logs locally.
+- Unchanged-file duplicate-read protection, edit-fail loop notes, internal-URL SSRF blocking, log secret masking, and one-click panel cleanup.
+
+---
+
+## Local Checks
+
+```bash
+npm test                                    # Run full test suite
+npm run verify:pkg                          # Verify installer file list
+npm run prefix:budget                       # Check default prompt token size
 npm run cache:audit -- --workspace . --no-live
 npm run cache:simulate
 ```
 
-## License
+---
 
-[MIT](LICENSE). Upstream MIT notices and compliance boundaries are preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+## Credits & License
+
+[MIT License](LICENSE). Incorporates and adapts MIT-licensed code from [INK-Q/agy-fast](https://github.com/INK-Q/agy-fast) and [Domush/antigravity-plugin-context-mode](https://github.com/Domush/antigravity-plugin-context-mode); full third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
