@@ -24,7 +24,39 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 
 **`agy-dart`** fuses both capabilities into **one clean native Antigravity plugin** with unified zero-conflict routing, single-process lifecycle hooks, an isolated SQLite store (`~/.agy-dart/context.db`), and a live Aux Pane dashboard.
 
+> **Tip**: Google Antigravity evolves fast — click **Star** or **Watch → Releases only** so you don't miss compatibility fixes and new cache strategies.
+
 ---
+
+## What's New in v1.5.0 (Cross-Session Empirical TTL Calibration, Opt-In Expiry Alert & Keep-Alive Replay)
+
+1. **Cross-Session Per-Model Empirical TTL Calibration (`ttl_calibration:v1:<profileId>`)**:
+   - Learns real server-side KV-cache idle windows (e.g., 5m vs 10m vs 15m on Gemini 4 / Claude tiers) across conversations from bounded 14-day warm-hit lower bounds and pure-idle cold-miss upper bounds (`estimateCalibratedTtl`, bidirectional downward convergence when backend TTL shrinks, zero `ttl_idle_expiry` circular lock-in, `explicit > session/history > profile` precedence) while keeping `cache-analyzer.js` pure and backward-compatible (`diag.ttlCalibration`).
+2. **Opt-In High-Context TTL Expiry Desktop Alert (Zero `statSync`)**:
+   - Added `ttlDesktopNotify` (`AGY_DART_TTL_DESKTOP_NOTIFY`, Sidecar `TTL Alert` toggle, **OFF by default**), `ttlNotifyLeadSec` (`60s`), and `ttlNotifyMinTokens` (`60000`): fires a single debounced OS notification when an `IDLE` primary conversation with `>= 60k` tokens enters its final expiry window (`0 < remSec <= 60s`), strictly maintaining **0 `fs.statSync` calls**, sleep-wake suppression, and decoupled operation even when `stallWatchdog` is disabled.
+3. **Counterfactual Keep-Alive Policy Replay in `npm run cache:simulate`**:
+   - Expanded offline policy simulation to **9 policies** with `keepalive-1x` and `keepalive-unlimited` (`--keepalive-tail <sec>`, marked `hypothetical: true` so they never hijack `recommendedPolicy`), quantifying ping cache-read overhead, end-of-session walk-away waste, and apparent vs real user-turn hit rates (`userTurnHitRate`).
+
+## What's New in v1.4.0 (Sidecar Stall Watchdog & Jailbreak-Free Rescue Loop)
+
+1. **Dual-Source Fusion Stall Watchdog (5 Hooks + Sidecar + `transcript.jsonl` Self-Healing)**:
+   - Added lightweight, fail-open `hooks/stop.mjs` (`Stop` hook in `hooks.json`) alongside `PreInvocation`, `PreToolUse`, and `PostToolUse` (now also covering `run_command` completion) writing direct-conversation-isolated execution leases (`watchdog_lease:<convId>`) into SQLite `meta` via ultra-lightweight `context/lib/watchdog-lease.js` (<1 ms load, 0-SQLite fast path preserved, 0-byte `stderr`).
+   - Built `context/lib/watchdog.js` (`WatchdogMonitor`) running inside the persistent Aux Pane Sidecar (`sidecars/dashboard/server.mjs`): performs low-frequency polling with **zero `statSync` overhead when all conversations are `IDLE`**, **dual silence verification** (if `transcript.jsonl` `mtimeMs`/`size` is still growing, silence resets automatically), and **transcript tail self-healing** (detects completed/aborted terminal turns to heal missed `Stop` hooks without hiding newly hung turns).
+2. **State-Aware Dynamic Timeout Matrix (Zero False Positives)**:
+   - Distinguishes `IDLE`, `LLM_INFLIGHT` (`<120k` normal `120s`, `>=120k` or `/compact` `240s`, `>=150k` multimodal `360s`), `TOOL_RUNNING` (`read_file`/fast MCP `90s` vs sync `run_command`/`ctx_execute`/`run_checks` `300s`), and `SUBAGENT_BG` (async background tasks/subagents `600s`) with two-tier **yellow (`suspect`, 60%) → red (`stalled`, 100%)** alerting, all configurable via `~/.agy-dart/config.json` and `AGY_DART_WATCHDOG_*` env vars.
+3. **Jailbreak-Free Rescue Loop & Engineering Safeguards**:
+   - Auto-pre-generates a redacted **Rescue Handoff Brief** (`context/lib/handoff.js` `stallContext` snapshot: phase, silent duration, last tool/command, last user input, suspected root cause, modified files, last test/build & FTS5 handles) and surfaces **1–2 targeted troubleshooting steps** across 6 attribution buckets (`auto_compact_deadlock`, `terminal_eof_or_interactive`, `mcp_tool_blocked`, `host_tool_blocked`, `subagent_or_bg_stalled`, `oauth_ghost_or_network`) inside the Sidecar Watchdog card (with 1s local silence timer, Snooze/Mark-Idle actions, and opt-in debounced OS desktop notifications — **OFF by default**).
+   - Hardened with **Sleep Drift Guard** (lid-close / OS suspend wall-vs-monotonic clock jump compensation), strict multi-session & subagent isolation, Sidecar restart cleanup of stale prior-app leases, `POST`-only CSRF-hardened `/api/watchdog` & `/api/watchdog/action` endpoints, zero CDP access, and zero host process killing.
+
+## What's New in v1.3.1 (Long-Horizon & Zero-Latency Compaction Hardening)
+
+1. **Zero-Latency Compaction Detection & Same-Turn Invalidation**:
+   - Unified 4 compaction/pruning signals into `cache-analyzer.js` (`latestCompactionEvent` + `inspectTranscriptCompaction`): severe `compaction_or_truncation` bust, decoupled context shrink (even alongside `model_switch` or mild selective pruning `>= 15%` & `>= 8k` tokens from `>= 12k`), explicit compaction/summary steps, and `/compact` user commands.
+   - Upgraded `PreInvocation` to react immediately to `/compact` `lastUserInput` (idempotent across `invocationNum >= 1` mid-turn tool loops) and `initialNumSteps` rollbacks; added a zero-normal-overhead slow-path check in `PreToolUse` (`statSync` size/mtime fast-skip + 128 KB tail scan) that catches silent auto-compaction on the very first post-compaction `read_file` call (0 wasted turns while preserving files newly read after the compaction step via `invalidateFileReadsBefore`).
+2. **Full-Scope Turn Decay, Small-File Anti-Backfire Threshold & Failure Error Anchors**:
+   - Added turn-based `readDedup` decay (`readDedupMaxTurns: 12`, `AGY_DART_READ_DEDUP_MAX_TURNS`, `file_reads.read_turn_seq`) driven by `PreInvocation` even when payloads omit `stepIdx`, plus automatic allow on `stepIdx` / `turnSeq` rollback.
+   - Raised minimum `readDedup` threshold to configurable **`4096 B` (4 KB)** (`readDedupMinBytes`, `AGY_DART_READ_DEDUP_MIN_BYTES`) evaluated against the **actual requested slice size** (preventing 2-strike backfire on small configs or 15-line slices) and added isolated `dedup_bypass` telemetry in `featureRoi.features.read_dedup`.
+   - Upgraded `hooks/filter-rules.mjs` with `compactFailureWithErrorAnchors` so oversized (`> 7.9 KB`) failing command outputs preserve head/tail summaries plus `±3`-line context around middle-of-log error anchors (`AssertionError`, `Traceback`, `ERROR`, `✖`, `not ok`, etc.) within `<= 7.9 KB` (`<= 8.8 KB` total), reducing extra `ctx_search` round-trips.
 
 ## What's New in v1.3.0
 
@@ -85,6 +117,36 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 ## Community Feedback & Improvements
 
 This dedicated section tracks real-world friction reported by the community (preserving the original feedback), along with the exact engineering fixes and underlying design principles shipped in response.
+
+### `[v1.4.0]` Multi-Turn Silent Hang ("Working Forever With Zero Output")
+
+#### 1. Original Community Feedback
+
+> *"After multiple turns of conversation, it very easily stays 'working' forever without outputting anything and just freezes — isn't there an automatic summarization/compaction feature?"*
+>
+> *(Original Chinese: 「我在多轮对话之后很容易一直工作中却不输出任何东西，直接卡住了，难道没有自动总结压缩的功能么？」)*
+
+Analyzing Antigravity's multi-turn execution lifecycle revealed **4 distinct real-world hang modes** that all look identical in the UI (an endless spinner with zero streamed output):
+1. **High-context / background auto-compaction deadlock**: At `>= 120k` tokens (or `>= 150k` with images), silent auto-compaction or cold prefill can hang indefinitely with no user-visible timeout or progress bar.
+2. **Windows terminal EOF / interactive prompt blocking**: A synchronous `run_command` waiting on `[y/N]`, a pager (`less`/`more`), or a Windows PowerShell/CMD stdin EOF never finishes and blocks the entire turn.
+3. **OAuth Ghost Session / proxy disconnect**: Silent network drops or stale OAuth sessions leave the request spinning at 0 streamed bytes.
+4. **Blocked MCP tool call**: A wedged MCP server leaves the agent waiting indefinitely while the user has no visibility into which phase or tool actually froze.
+
+#### 2. Solution Shipped (`v1.3.x` → `v1.4.0`)
+
+| Area | Before (`v1.3.x`) | After (`v1.4.0`) |
+| :--- | :--- | :--- |
+| **Execution Visibility** | No active turn/tool state tracking; users stare at an endless spinner | **Dual-Source Fusion State Machine**: `PreInvocation` / `PreToolUse` / `PostToolUse` (`+run_command`) / `Stop` hooks write per-conversation leases (`watchdog_lease:<convId>`) into SQLite `meta`, fused with Sidecar `transcript.jsonl` `mtimeMs`/`size` & tail self-healing |
+| **Stall Detection** | None (or naive flat timer prone to false alarms on long builds / 150k turns) | **State-Aware Dynamic Timeout Matrix**: `IDLE` (0 `statSync`) · `LLM_INFLIGHT` (`<120k` 120s / `>=120k` or `/compact` 240s / `>=150k` multimodal 360s) · `TOOL_RUNNING` (`read_file`/fast MCP 90s vs sync `run_command`/`ctx_execute` 300s) · `SUBAGENT_BG` (600s), yellow `suspect` + red `stalled`, dual-silence growth extension |
+| **Recovery Workflow** | Manual guesswork; stopping a hung turn risks losing context & progress | **Jailbreak-Free Rescue Loop**: Entering red `stalled` auto-pre-generates a redacted **Rescue Handoff Brief** (phase, silent duration, last tool/command, last user input, git diff stat, checkpoint & FTS5 handles) + 1–2 root-cause tips across 6 causes, 1s local Sidecar timer, Snooze/Mark-Idle, and opt-in debounced desktop notify (OFF by default) |
+| **Robustness & Security** | N/A | **Sleep Drift Guard** (lid-close/suspend jump compensation), multi-session & subagent isolation, Sidecar restart stale-lease cleanup, `hookMode: true` fail-open, `POST`-only CSRF-hardened `/api/watchdog*`, zero CDP, zero host process killing |
+
+#### 3. Underlying Design Principles
+
+1. **Sidecar Watchdog + Lifecycle Hooks beats fragile CDP/process-killing**: Injecting into the host via CDP or force-killing `language_server` risks corrupting active trajectories and breaks across Antigravity updates. Running a zero-dependency monitor inside the existing `restart_policy: always` Sidecar + fail-open hooks is 100% jailbreak-free and leaves cancellation firmly under user control.
+2. **Never alert on one noisy signal alone**: Hooks alone can miss a `Stop` event; `transcript.jsonl` alone doesn't distinguish `IDLE` from a silent Turn-1 hang. Fusing SQLite leases with transcript growth checks and timestamp-guarded tail self-healing achieves both zero false alarms on active streaming and instant self-healing on missed `Stop` hooks.
+3. **Separate hook hot-path latency from Sidecar analytics**: Splitting ultra-lightweight `watchdog-lease.js` (<1 ms load) from `watchdog.js` keeps `PreToolUse` 0-SQLite fast paths and latency budgets untouched while giving Sidecar full transcript/handoff/attribution richness.
+4. **Zero background disk I/O when idle & immune to laptop sleep**: When all conversations are `IDLE`, `WatchdogMonitor.tick()` executes zero `statSync` calls; when a laptop resumes from sleep, wall-vs-monotonic clock drift detection automatically compensates active leases instead of firing false red alerts.
 
 ### `[v1.3.0]` 16 KB Default Read Guard Blocking Code Review (`.patch`) & MCP-less Subagents
 

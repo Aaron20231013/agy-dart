@@ -16,6 +16,7 @@ param(
   [string]$Mode = "host-45k",
   [switch]$InstallRg,
   [switch]$WithDevtools,
+  [switch]$Json,
   [string]$Project = ""
 )
 
@@ -37,6 +38,8 @@ if ($Command -eq "install") {
   if ($WithDevtools) { $nodeArgs += "--with-devtools" }
 } elseif ($Command -eq "mode") {
   $nodeArgs += $Mode
+} elseif ($Command -eq "doctor") {
+  if ($Json) { $nodeArgs += "--json" }
 }
 if ($Project) {
   $nodeArgs += @("--project", $Project)

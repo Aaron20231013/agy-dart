@@ -24,9 +24,19 @@ import {
 import { FtsMethods } from "./store/fts.js";
 import { CheckpointMethods } from "./store/checkpoints.js";
 import { ReadMethods } from "./store/reads.js";
-import { SettingsMaintenanceMethods } from "./store/settings-maintenance.js";
+import {
+  CACHE_AUDIT_PASSED_META_KEY,
+  STAR_PROMPT_META_KEY,
+  STAR_PROMPT_MIN_SAVED_BYTES,
+  STAR_PROMPT_MIN_SESSIONS,
+  STAR_PROMPT_STATES,
+  STAR_PROMPT_TERMINAL_STATES,
+  SettingsMaintenanceMethods,
+  normalizeStarPromptState
+} from "./store/settings-maintenance.js";
 
 export {
+  CACHE_AUDIT_PASSED_META_KEY,
   DEFAULT_ACTIVE_CATEGORIES,
   DEFAULT_CUTOFF_BYTES,
   DEFAULT_EXEMPT_EXTENSIONS,
@@ -39,8 +49,14 @@ export {
   MAX_SNAPSHOT_BYTES,
   RRF_K,
   SNIPPET_MAX_BYTES,
+  STAR_PROMPT_META_KEY,
+  STAR_PROMPT_MIN_SAVED_BYTES,
+  STAR_PROMPT_MIN_SESSIONS,
+  STAR_PROMPT_STATES,
+  STAR_PROMPT_TERMINAL_STATES,
   STATE_BUDGET,
   getDefaultDbPath,
+  normalizeStarPromptState,
   sanitizeFtsQuery,
   sanitizeTrigramQuery,
   truncateUtf8Bytes

@@ -83,7 +83,9 @@ export class ReadMethods {
     ino = null,
     maxAgeMs = DEFAULT_FILE_READ_MAX_AGE_MS,
     currentStepIdx = null,
-    maxStepGap = 0
+    maxStepGap = 0,
+    currentTurnSeq = null,
+    maxTurnGap = 0
   }) {
     this.open();
     const sid = sessionId || "default";
@@ -97,19 +99,31 @@ export class ReadMethods {
     const hasCtime = ctimeMs !== null && ctimeMs !== undefined && Number.isFinite(Number(ctimeMs));
     const normCtime = hasCtime ? Number(ctimeMs) : null;
     const normIno = ino !== null && ino !== undefined && String(ino) !== "" ? String(ino) : null;
-    const hasStepCheck =
+    const hasCurrStep =
       currentStepIdx !== null &&
       currentStepIdx !== undefined &&
+      currentStepIdx !== "" &&
+      typeof currentStepIdx !== "boolean" &&
       Number.isFinite(Number(currentStepIdx)) &&
-      Number(currentStepIdx) >= 0 &&
-      Number.isFinite(Number(maxStepGap)) &&
-      Number(maxStepGap) > 0;
-    const normCurrStep = hasStepCheck ? Math.floor(Number(currentStepIdx)) : null;
-    const normMaxGap = hasStepCheck ? Math.floor(Number(maxStepGap)) : 0;
+      Number(currentStepIdx) >= 0;
+    const normCurrStep = hasCurrStep ? Math.floor(Number(currentStepIdx)) : null;
+    const normMaxGap =
+      Number.isFinite(Number(maxStepGap)) && Number(maxStepGap) > 0 ? Math.floor(Number(maxStepGap)) : 0;
+
+    const hasCurrTurn =
+      currentTurnSeq !== null &&
+      currentTurnSeq !== undefined &&
+      currentTurnSeq !== "" &&
+      typeof currentTurnSeq !== "boolean" &&
+      Number.isFinite(Number(currentTurnSeq)) &&
+      Number(currentTurnSeq) >= 0;
+    const normCurrTurn = hasCurrTurn ? Math.floor(Number(currentTurnSeq)) : null;
+    const normMaxTurnGap =
+      Number.isFinite(Number(maxTurnGap)) && Number(maxTurnGap) > 0 ? Math.floor(Number(maxTurnGap)) : 0;
 
     const rows = this.db
       .prepare(`
-        SELECT start_line, end_line, mtime_ms, file_size, ctime_ms, ino, byte_est, read_ts, bypass_armed, read_step
+        SELECT start_line, end_line, mtime_ms, file_size, ctime_ms, ino, byte_est, read_ts, bypass_armed, read_step, read_turn_seq
         FROM file_reads
         WHERE session_id = ? AND file_path = ?
       `)
@@ -132,14 +146,34 @@ export class ReadMethods {
       }
       if (hasCutoff && Number(row.read_ts) < minTs) continue;
       if (
-        hasStepCheck &&
-        Number(row.bypass_armed) !== 1 &&
+        hasCurrStep &&
         row.read_step !== null &&
         row.read_step !== undefined &&
-        Number.isFinite(Number(row.read_step)) &&
-        normCurrStep - Number(row.read_step) > normMaxGap
+        Number.isFinite(Number(row.read_step))
       ) {
-        continue;
+        const readStep = Number(row.read_step);
+        if (normCurrStep < readStep) {
+          // Step rolled back / trajectory rewound -> allow fresh read immediately
+          continue;
+        }
+        if (normMaxGap > 0 && Number(row.bypass_armed) !== 1 && normCurrStep - readStep > normMaxGap) {
+          continue;
+        }
+      }
+      if (
+        hasCurrTurn &&
+        row.read_turn_seq !== null &&
+        row.read_turn_seq !== undefined &&
+        Number.isFinite(Number(row.read_turn_seq))
+      ) {
+        const readTurn = Number(row.read_turn_seq);
+        if (normCurrTurn < readTurn) {
+          // Turn sequence rolled back -> allow fresh read immediately
+          continue;
+        }
+        if (normMaxTurnGap > 0 && Number(row.bypass_armed) !== 1 && normCurrTurn - readTurn > normMaxTurnGap) {
+          continue;
+        }
       }
       const coversStart = Number(row.start_line) <= reqStart;
       const coversEnd = Number(row.end_line) === -1 || (reqEnd !== -1 && Number(row.end_line) >= reqEnd);
@@ -185,7 +219,8 @@ export class ReadMethods {
     ctimeMs = null,
     ino = null,
     byteEst = 0,
-    stepIdx = null
+    stepIdx = null,
+    turnSeq = null
   }) {
     this.open();
     const sid = sessionId || "default";
@@ -197,8 +232,12 @@ export class ReadMethods {
     const normCtime = hasCtime ? Number(ctimeMs) : null;
     const normIno = ino !== null && ino !== undefined && String(ino) !== "" ? String(ino) : null;
     const normStep =
-      stepIdx !== null && stepIdx !== undefined && Number.isFinite(Number(stepIdx)) && Number(stepIdx) >= 0
+      stepIdx !== null && stepIdx !== undefined && stepIdx !== "" && typeof stepIdx !== "boolean" && Number.isFinite(Number(stepIdx)) && Number(stepIdx) >= 0
         ? Math.floor(Number(stepIdx))
+        : null;
+    const normTurnSeq =
+      turnSeq !== null && turnSeq !== undefined && turnSeq !== "" && typeof turnSeq !== "boolean" && Number.isFinite(Number(turnSeq)) && Number(turnSeq) >= 0
+        ? Math.floor(Number(turnSeq))
         : null;
     const now = Date.now();
 
@@ -254,8 +293,8 @@ export class ReadMethods {
 
       this.db
         .prepare(`
-          INSERT INTO file_reads (session_id, file_path, start_line, end_line, mtime_ms, file_size, ctime_ms, ino, byte_est, read_ts, bypass_armed, read_step)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+          INSERT INTO file_reads (session_id, file_path, start_line, end_line, mtime_ms, file_size, ctime_ms, ino, byte_est, read_ts, bypass_armed, read_step, read_turn_seq)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
           ON CONFLICT(session_id, file_path, start_line, end_line) DO UPDATE SET
             mtime_ms = excluded.mtime_ms,
             file_size = excluded.file_size,
@@ -264,9 +303,10 @@ export class ReadMethods {
             byte_est = excluded.byte_est,
             read_ts = excluded.read_ts,
             bypass_armed = 0,
-            read_step = excluded.read_step
+            read_step = excluded.read_step,
+            read_turn_seq = excluded.read_turn_seq
         `)
-        .run(sid, norm, reqStart, reqEnd, mtimeMs, fileSize, normCtime, normIno, byteEst, now, normStep);
+        .run(sid, norm, reqStart, reqEnd, mtimeMs, fileSize, normCtime, normIno, byteEst, now, normStep, normTurnSeq);
     });
   }
 
@@ -304,6 +344,36 @@ export class ReadMethods {
   }
 
   /**
+   * Invalidate pre-compaction file_reads (read_step IS NULL OR read_step <= maxStep) and
+   * corresponding file_snapshots while preserving any files already read AFTER the compaction boundary.
+   * Falls back to a full session invalidation when maxStep is omitted or invalid.
+   */
+  invalidateFileReadsBefore(sessionId, { maxStep = null } = {}) {
+    this.open();
+    const sid = sessionId || "default";
+    const hasMaxStep =
+      maxStep !== null &&
+      maxStep !== undefined &&
+      maxStep !== "" &&
+      typeof maxStep !== "boolean" &&
+      Number.isFinite(Number(maxStep)) &&
+      Number(maxStep) >= 0;
+    if (!hasMaxStep) {
+      return this.invalidateFileReads(sid, null);
+    }
+    const cutoffStep = Math.floor(Number(maxStep));
+    return this._withWriteTx(() => {
+      const res = this.db
+        .prepare("DELETE FROM file_reads WHERE session_id = ? AND (read_step IS NULL OR read_step <= ?)")
+        .run(sid, cutoffStep);
+      this.db
+        .prepare("DELETE FROM file_snapshots WHERE session_id = ? AND (read_step IS NULL OR read_step <= ?)")
+        .run(sid, cutoffStep);
+      return res.changes || 0;
+    });
+  }
+
+  /**
    * Save a gzip-compressed baseline snapshot of a text range (<= 256 KB) for compact
    * unified-diff re-reads when the file is later modified in the same session.
    * Enforces per-session LRU cap so SQLite stays lean.
@@ -321,6 +391,7 @@ export class ReadMethods {
     bypassArmed = 0,
     fullReadTs = null,
     fullReadSeq = null,
+    readStep = null,
     maxSnapshotsPerSession = MAX_SNAPSHOTS_PER_SESSION
   }) {
     this.open();
@@ -345,6 +416,15 @@ export class ReadMethods {
       Number.isFinite(fullReadSeq) && fullReadSeq >= 0
         ? Math.floor(fullReadSeq)
         : this.getConversationTurnSeq(sid);
+    const normReadStep =
+      readStep !== null &&
+      readStep !== undefined &&
+      readStep !== "" &&
+      typeof readStep !== "boolean" &&
+      Number.isFinite(Number(readStep)) &&
+      Number(readStep) >= 0
+        ? Math.floor(Number(readStep))
+        : null;
     const cap = Number.isFinite(maxSnapshotsPerSession) && maxSnapshotsPerSession > 0
       ? Math.floor(maxSnapshotsPerSession)
       : MAX_SNAPSHOTS_PER_SESSION;
@@ -365,8 +445,8 @@ export class ReadMethods {
       this.db
         .prepare(`
           INSERT INTO file_snapshots (
-            session_id, file_path, start_line, end_line, sha256, mtime_ms, file_size, ino, raw_bytes, content_gz, updated_ts, bypass_armed, full_read_ts, full_read_seq
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            session_id, file_path, start_line, end_line, sha256, mtime_ms, file_size, ino, raw_bytes, content_gz, updated_ts, bypass_armed, full_read_ts, full_read_seq, read_step
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(session_id, file_path, start_line, end_line) DO UPDATE SET
             sha256 = excluded.sha256,
             mtime_ms = excluded.mtime_ms,
@@ -377,9 +457,10 @@ export class ReadMethods {
             updated_ts = excluded.updated_ts,
             bypass_armed = excluded.bypass_armed,
             full_read_ts = excluded.full_read_ts,
-            full_read_seq = excluded.full_read_seq
+            full_read_seq = excluded.full_read_seq,
+            read_step = excluded.read_step
         `)
-        .run(sid, norm, reqStart, reqEnd, digest, mtimeMs, fileSize, normIno, rawBytes, contentGz, now, armed, effFullReadTs, effFullReadSeq);
+        .run(sid, norm, reqStart, reqEnd, digest, mtimeMs, fileSize, normIno, rawBytes, contentGz, now, armed, effFullReadTs, effFullReadSeq, normReadStep);
 
       // Enforce bounded per-session LRU snapshot cap
       const countRow = this.db
@@ -436,7 +517,7 @@ export class ReadMethods {
 
     const rows = this.db
       .prepare(`
-        SELECT start_line, end_line, sha256, mtime_ms, file_size, ino, raw_bytes, content_gz, updated_ts, bypass_armed, full_read_ts, full_read_seq
+        SELECT start_line, end_line, sha256, mtime_ms, file_size, ino, raw_bytes, content_gz, updated_ts, bypass_armed, full_read_ts, full_read_seq, read_step
         FROM file_snapshots
         WHERE session_id = ? AND file_path = ?
       `)
@@ -483,6 +564,10 @@ export class ReadMethods {
           bypass_armed: Number(row.bypass_armed),
           full_read_ts: Number(row.full_read_ts || row.updated_ts || 0),
           full_read_seq: Number(row.full_read_seq || 0),
+          read_step:
+            row.read_step !== null && row.read_step !== undefined && Number.isFinite(Number(row.read_step))
+              ? Number(row.read_step)
+              : null,
           content,
           isExactRange: Number(row.start_line) === reqStart && Number(row.end_line) === reqEnd
         };

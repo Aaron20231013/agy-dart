@@ -7,6 +7,66 @@ import {
   FILE_CATEGORIES
 } from "./schema.js";
 
+export const STAR_PROMPT_META_KEY = "star_prompt";
+export const CACHE_AUDIT_PASSED_META_KEY = "cache_audit:passed_at";
+export const STAR_PROMPT_STATES = Object.freeze(["pending", "clicked", "dismissed", "copied_cli"]);
+export const STAR_PROMPT_TERMINAL_STATES = Object.freeze(["clicked", "dismissed", "copied_cli"]);
+export const STAR_PROMPT_MIN_SAVED_BYTES = 100 * 1024;
+export const STAR_PROMPT_MIN_SESSIONS = 3;
+
+export function normalizeStarPromptState(raw) {
+  const defaults = {
+    state: "pending",
+    triggeredAt: null,
+    resolvedAt: null,
+    milestoneSavedBytes: 0
+  };
+  let obj = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return { ...defaults };
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      return { ...defaults };
+    }
+  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    return { ...defaults };
+  }
+  let src = obj;
+  if (Object.prototype.hasOwnProperty.call(obj, "starPrompt")) {
+    src =
+      obj.starPrompt && typeof obj.starPrompt === "object" && !Array.isArray(obj.starPrompt)
+        ? obj.starPrompt
+        : null;
+  }
+  if (!src || typeof src !== "object" || Array.isArray(src)) {
+    return { ...defaults };
+  }
+  const state =
+    typeof src.state === "string" && STAR_PROMPT_STATES.includes(src.state) ? src.state : "pending";
+  const normIso = (v) => {
+    if (typeof v !== "string") return null;
+    const t = v.trim();
+    return t && t.length <= 64 ? t : null;
+  };
+  let milestoneSavedBytes = 0;
+  const rawBytes = src.milestoneSavedBytes;
+  if (typeof rawBytes === "number" || (typeof rawBytes === "string" && rawBytes.trim() !== "")) {
+    const n = Number(rawBytes);
+    if (Number.isFinite(n) && n >= 0) {
+      milestoneSavedBytes = Math.floor(n);
+    }
+  }
+  return {
+    state,
+    triggeredAt: normIso(src.triggeredAt),
+    resolvedAt: normIso(src.resolvedAt),
+    milestoneSavedBytes
+  };
+}
+
 export class SettingsMaintenanceMethods {
   /** Calculate token savings & statistics */
   getStats(sessionId, options = {}) {
@@ -27,6 +87,7 @@ export class SettingsMaintenanceMethods {
           SUM(returned_bytes) AS total_returned_bytes,
           SUM(MAX(0, MAX(sandbox_bytes, bytes, returned_bytes) - returned_bytes)) AS total_kept_out_bytes
         FROM events
+        WHERE COALESCE(key, '') != 'dedup_bypass'
       `).get();
 
       sourceStats = this.db.prepare(`
@@ -55,7 +116,7 @@ export class SettingsMaintenanceMethods {
           SUM(returned_bytes) AS total_returned_bytes,
           SUM(MAX(0, MAX(sandbox_bytes, bytes, returned_bytes) - returned_bytes)) AS total_kept_out_bytes
         FROM events
-        WHERE created_at >= ?
+        WHERE created_at >= ? AND COALESCE(key, '') != 'dedup_bypass'
       `).get(sinceIso);
 
       sourceStats = this.db.prepare(`
@@ -86,7 +147,7 @@ export class SettingsMaintenanceMethods {
           SUM(returned_bytes) AS total_returned_bytes,
           SUM(MAX(0, MAX(sandbox_bytes, bytes, returned_bytes) - returned_bytes)) AS total_kept_out_bytes
         FROM events
-        WHERE session_id = ?
+        WHERE session_id = ? AND COALESCE(key, '') != 'dedup_bypass'
       `).get(sid);
 
       sourceStats = this.db.prepare(`
@@ -125,19 +186,19 @@ export class SettingsMaintenanceMethods {
         breakdownRows = this.db.prepare(`
           SELECT kind, COUNT(*) AS cnt,
             COALESCE(SUM(MAX(0, MAX(sandbox_bytes, bytes, returned_bytes) - returned_bytes)), 0) AS saved_bytes
-          FROM events GROUP BY kind
+          FROM events WHERE COALESCE(key, '') != 'dedup_bypass' GROUP BY kind
         `).all();
       } else if (sid === "app" && sinceIso) {
         breakdownRows = this.db.prepare(`
           SELECT kind, COUNT(*) AS cnt,
             COALESCE(SUM(MAX(0, MAX(sandbox_bytes, bytes, returned_bytes) - returned_bytes)), 0) AS saved_bytes
-          FROM events WHERE created_at >= ? GROUP BY kind
+          FROM events WHERE created_at >= ? AND COALESCE(key, '') != 'dedup_bypass' GROUP BY kind
         `).all(sinceIso);
       } else {
         breakdownRows = this.db.prepare(`
           SELECT kind, COUNT(*) AS cnt,
             COALESCE(SUM(MAX(0, MAX(sandbox_bytes, bytes, returned_bytes) - returned_bytes)), 0) AS saved_bytes
-          FROM events WHERE session_id = ? GROUP BY kind
+          FROM events WHERE session_id = ? AND COALESCE(key, '') != 'dedup_bypass' GROUP BY kind
         `).all(sid);
       }
     } catch {}
@@ -225,8 +286,10 @@ export class SettingsMaintenanceMethods {
       b.savedBytes += Number(r.saved_bytes || 0);
     };
 
+    let dedupBypasses = 0;
     for (const r of rows) {
       if (r.kind === "cli_filter") add("cli_filter", r);
+      else if (r.kind === "dedup" && r.key === "dedup_bypass") dedupBypasses += Number(r.cnt || 0);
       else if (r.kind === "dedup" && r.key === "modified_diff") add("diff_read", r);
       else if (r.kind === "dedup") add("read_dedup", r);
       else if (r.kind === "interception") add("large_file_guard", r);
@@ -253,6 +316,12 @@ export class SettingsMaintenanceMethods {
         avgSavedBytesPerCall,
         reductionPct,
         status,
+        ...(name === "read_dedup"
+          ? {
+              bypasses: dedupBypasses,
+              bypassRate: b.calls > 0 ? Number((dedupBypasses / b.calls).toFixed(4)) : 0
+            }
+          : {}),
         ...(name === "large_file_guard"
           ? { evictionEfficiency: ghost.evictionEfficiency, ghostRecalls: ghost.ghostRecalls }
           : {})
@@ -285,7 +354,7 @@ export class SettingsMaintenanceMethods {
           DELETE FROM outline_cache;
           DELETE FROM ghost_interceptions;
           DELETE FROM session_checkpoints;
-          DELETE FROM meta WHERE key LIKE 'large_read_confirm:%' OR key LIKE 'sensitive_read_confirm:%';
+          DELETE FROM meta WHERE key LIKE 'large_read_confirm:%' OR key LIKE 'sensitive_read_confirm:%' OR key LIKE 'watchdog_lease:%';
         `);
       });
       try {
@@ -361,9 +430,10 @@ export class SettingsMaintenanceMethods {
         const escSid = String(sid).replace(/[\\%_]/g, "\\$&");
         this.db
           .prepare(
-            "DELETE FROM meta WHERE key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\'"
+            "DELETE FROM meta WHERE key = ? OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\'"
           )
           .run(
+            `watchdog_lease:${sid}`,
             `large_read_confirm:conv:${escSid}:%`,
             `large_read_confirm:sub:${escSid}:%`,
             `sensitive_read_confirm:${escSid}:%`,
@@ -440,6 +510,27 @@ export class SettingsMaintenanceMethods {
   deleteMeta(key) {
     this.open();
     this.db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+  }
+
+  /** List meta rows matching an exact key prefix (safe LIKE escaping) */
+  listMetaByPrefix(prefix) {
+    if (!prefix || typeof prefix !== "string") return [];
+    this.open();
+    const esc = prefix.replace(/[\\%_]/g, "\\$&");
+    return this.db
+      .prepare("SELECT key, value FROM meta WHERE key LIKE ? ESCAPE '\\' ORDER BY key ASC")
+      .all(`${esc}%`);
+  }
+
+  /** Delete all meta rows matching an exact key prefix (safe LIKE escaping) */
+  deleteMetaByPrefix(prefix) {
+    if (!prefix || typeof prefix !== "string") return 0;
+    this.open();
+    const esc = prefix.replace(/[\\%_]/g, "\\$&");
+    const res = this.db
+      .prepare("DELETE FROM meta WHERE key LIKE ? ESCAPE '\\'")
+      .run(`${esc}%`);
+    return res.changes || 0;
   }
 
   /** Read a timestamped meta value with optional TTL enforcement (backward compatible with 2-arg calls) */
@@ -933,6 +1024,365 @@ export class SettingsMaintenanceMethods {
     return boolVal;
   }
 
+  /** Check if Sidecar Stall Watchdog is enabled (env > sqlite toggle > config > default true) */
+  isWatchdogEnabled() {
+    const snap = getConfigSnapshot();
+    if (snap.sources.stallWatchdog === "env") {
+      return Boolean(snap.values.stallWatchdog);
+    }
+    this.open();
+    const raw = this.getMeta("watchdog:enabled", null);
+    if (raw !== null) {
+      return raw !== "false" && raw !== "0";
+    }
+    return Boolean(snap.values.stallWatchdog);
+  }
+
+  /** Enable or disable Sidecar Stall Watchdog in SQLite meta */
+  setWatchdogEnabled(enabled) {
+    this.open();
+    const boolVal = Boolean(enabled && enabled !== "false" && enabled !== "0");
+    this.setMeta("watchdog:enabled", boolVal ? "true" : "false");
+    return boolVal;
+  }
+
+  /** Check if opt-in desktop stall notifications are enabled (default OFF; env > sqlite toggle > config) */
+  isWatchdogDesktopNotifyEnabled() {
+    const snap = getConfigSnapshot();
+    if (snap.sources.watchdogDesktopNotify === "env") {
+      return Boolean(snap.values.watchdogDesktopNotify);
+    }
+    this.open();
+    const raw = this.getMeta("watchdog:desktop_notify", null);
+    if (raw !== null) {
+      return raw === "true" || raw === "1";
+    }
+    return Boolean(snap.values.watchdogDesktopNotify);
+  }
+
+  /** Enable or disable opt-in desktop stall notifications in SQLite meta */
+  setWatchdogDesktopNotifyEnabled(enabled) {
+    this.open();
+    const boolVal = Boolean(enabled && enabled !== "false" && enabled !== "0");
+    this.setMeta("watchdog:desktop_notify", boolVal ? "true" : "false");
+    return boolVal;
+  }
+
+  /** Check if opt-in high-context KV-cache TTL expiry desktop alerts are enabled (default OFF; env > sqlite > config) */
+  isTtlDesktopNotifyEnabled() {
+    const snap = getConfigSnapshot();
+    if (snap.sources.ttlDesktopNotify === "env") {
+      return Boolean(snap.values.ttlDesktopNotify);
+    }
+    this.open();
+    const raw = this.getMeta("cache:ttl_desktop_notify", null);
+    if (raw !== null) {
+      return raw === "true" || raw === "1";
+    }
+    return Boolean(snap.values.ttlDesktopNotify);
+  }
+
+  /** Enable or disable opt-in high-context KV-cache TTL expiry desktop alerts in SQLite meta */
+  setTtlDesktopNotifyEnabled(enabled) {
+    this.open();
+    const boolVal = Boolean(enabled && enabled !== "false" && enabled !== "0");
+    this.setMeta("cache:ttl_desktop_notify", boolVal ? "true" : "false");
+    return boolVal;
+  }
+
+  /** Read cross-session empirical TTL calibration ring buffer for a single model profile */
+  getModelTtlCalibration(profileId, nowMs = Date.now()) {
+    if (typeof profileId !== "string") return null;
+    const cleanId = profileId.trim();
+    if (!cleanId || cleanId.length > 64 || !/^[A-Za-z0-9._-]+$/.test(cleanId)) return null;
+    this.open();
+    const raw = this.getMeta(`ttl_calibration:v1:${cleanId}`, null);
+    if (!raw || typeof raw !== "string") return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return null;
+      const maxAgeMs = 14 * 24 * 3600 * 1000;
+      const safeNow = Number.isFinite(nowMs) ? nowMs : Date.now();
+      const updatedTs = Number.isFinite(parsed.updatedTs) ? Math.floor(parsed.updatedTs) : 0;
+      if (updatedTs > 0 && safeNow - updatedTs > maxAgeMs) return null;
+      const filterSamples = (arr, minSec) => {
+        if (!Array.isArray(arr)) return [];
+        const out = [];
+        for (const item of arr) {
+          if (!item || typeof item !== "object") continue;
+          const gapSec = Number(item.gapSec);
+          const atMs = Number.isFinite(item.atMs) ? Math.floor(item.atMs) : 0;
+          if (!Number.isFinite(gapSec) || gapSec < minSec || gapSec > 14400) continue;
+          if (atMs > 0 && safeNow - atMs > maxAgeMs) continue;
+          out.push({
+            gapSec: Math.round(gapSec),
+            atMs,
+            conv: typeof item.conv === "string" ? item.conv.slice(0, 96) : ""
+          });
+        }
+        return out.slice(-20);
+      };
+      return {
+        v: 1,
+        profileId: cleanId,
+        warm: filterSamples(parsed.warm, 180),
+        cold: filterSamples(parsed.cold, 120),
+        seen1hWrite: Boolean(parsed.seen1hWrite),
+        updatedTs
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Read all fresh (<=14d) cross-session empirical TTL calibration records keyed by profileId */
+  getAllModelTtlCalibrations(nowMs = Date.now()) {
+    this.open();
+    const out = {};
+    try {
+      const rows = this.db
+        .prepare("SELECT key, value FROM meta WHERE key LIKE 'ttl_calibration:v1:%' ORDER BY key ASC")
+        .all();
+      const safeNow = Number.isFinite(nowMs) ? nowMs : Date.now();
+      const maxAgeMs = 14 * 24 * 3600 * 1000;
+      for (const row of rows || []) {
+        if (!row || typeof row.key !== "string" || typeof row.value !== "string") continue;
+        const pid = row.key.slice("ttl_calibration:v1:".length).trim();
+        if (!pid || pid.length > 64 || !/^[A-Za-z0-9._-]+$/.test(pid)) continue;
+        try {
+          const parsed = JSON.parse(row.value);
+          if (!parsed || typeof parsed !== "object") continue;
+          const updatedTs = Number.isFinite(parsed.updatedTs) ? Math.floor(parsed.updatedTs) : 0;
+          if (updatedTs > 0 && safeNow - updatedTs > maxAgeMs) continue;
+          const filterSamples = (arr, minSec) => {
+            if (!Array.isArray(arr)) return [];
+            const list = [];
+            for (const item of arr) {
+              if (!item || typeof item !== "object") continue;
+              const gapSec = Number(item.gapSec);
+              const atMs = Number.isFinite(item.atMs) ? Math.floor(item.atMs) : 0;
+              if (!Number.isFinite(gapSec) || gapSec < minSec || gapSec > 14400) continue;
+              if (atMs > 0 && safeNow - atMs > maxAgeMs) continue;
+              list.push({
+                gapSec: Math.round(gapSec),
+                atMs,
+                conv: typeof item.conv === "string" ? item.conv.slice(0, 96) : ""
+              });
+            }
+            return list.slice(-20);
+          };
+          const warm = filterSamples(parsed.warm, 180);
+          const cold = filterSamples(parsed.cold, 120);
+          const seen1hWrite = Boolean(parsed.seen1hWrite);
+          if (warm.length > 0 || cold.length > 0 || seen1hWrite) {
+            out[pid] = {
+              v: 1,
+              profileId: pid,
+              warm,
+              cold,
+              seen1hWrite,
+              updatedTs
+            };
+          }
+        } catch {}
+      }
+    } catch {}
+    return out;
+  }
+
+  /** Append deduplicated warm/cold TTL observations into bounded (<=20 each) SQLite meta ring buffers */
+  recordModelTtlObservations(observations, convId = "", nowMs = Date.now()) {
+    if (!observations || typeof observations !== "object") return { updatedProfiles: 0 };
+    this.open();
+    const safeNow = Number.isFinite(nowMs) ? Math.floor(nowMs) : Date.now();
+    const safeConv =
+      typeof convId === "string" ? convId.trim().replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 96) : "";
+    const maxAgeMs = 14 * 24 * 3600 * 1000;
+    let updatedProfiles = 0;
+
+    for (const [rawPid, obs] of Object.entries(observations)) {
+      if (!obs || typeof obs !== "object") continue;
+      const pid = String(obs.profileId || rawPid || "").trim();
+      if (!pid || pid.length > 64 || !/^[A-Za-z0-9._-]+$/.test(pid)) continue;
+
+      const existing = this.getModelTtlCalibration(pid, safeNow) || {
+        v: 1,
+        profileId: pid,
+        warm: [],
+        cold: [],
+        seen1hWrite: false,
+        updatedTs: 0
+      };
+
+      const mergeRing = (prevList, incomingList, minSec) => {
+        const merged = [];
+        const seen = new Set();
+        let addedNew = false;
+        for (const item of prevList) {
+          if (item.atMs > 0 && safeNow - item.atMs > maxAgeMs) continue;
+          const k = `${item.conv || ""}:${item.atMs}:${item.gapSec}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          merged.push(item);
+        }
+        for (const rawItem of Array.isArray(incomingList) ? incomingList : []) {
+          if (!rawItem || typeof rawItem !== "object") continue;
+          const gapSec = Number(rawItem.gapSec);
+          if (!Number.isFinite(gapSec) || gapSec < minSec || gapSec > 14400) continue;
+          const roundedGap = Math.round(gapSec);
+          const atMs = Number.isFinite(rawItem.atMs) && rawItem.atMs > 0 ? Math.floor(rawItem.atMs) : safeNow;
+          if (safeNow - atMs > maxAgeMs) continue;
+          const itemConv =
+            typeof rawItem.conv === "string" && rawItem.conv.trim()
+              ? rawItem.conv.trim().replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 96)
+              : safeConv;
+          const k = `${itemConv}:${atMs}:${roundedGap}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          addedNew = true;
+          merged.push({ gapSec: roundedGap, atMs, conv: itemConv });
+        }
+        merged.sort((a, b) => a.atMs - b.atMs);
+        return { list: merged.slice(-20), addedNew };
+      };
+
+      const warmRes = mergeRing(existing.warm, obs.warm, 180);
+      const coldRes = mergeRing(existing.cold, obs.cold, 120);
+      const next1h = Boolean(existing.seen1hWrite || obs.seen1hWrite);
+      const changed = warmRes.addedNew || coldRes.addedNew || next1h !== existing.seen1hWrite;
+      if (!changed) continue;
+
+      const record = {
+        v: 1,
+        profileId: pid,
+        warm: warmRes.list,
+        cold: coldRes.list,
+        seen1hWrite: next1h,
+        updatedTs: safeNow
+      };
+      this.setMeta(`ttl_calibration:v1:${pid}`, JSON.stringify(record));
+      updatedProfiles += 1;
+    }
+
+    return { updatedProfiles };
+  }
+
+  /** Read normalized one-time GitHub Star milestone prompt state from SQLite meta */
+  getStarPromptState() {
+    this.open();
+    return normalizeStarPromptState(this.getMeta(STAR_PROMPT_META_KEY, null));
+  }
+
+  /** Count distinct non-sentinel sessions across recorded events and sources */
+  getDistinctSessionCount() {
+    this.open();
+    const row = this.db
+      .prepare(`
+        SELECT COUNT(DISTINCT sid) AS cnt FROM (
+          SELECT session_id AS sid FROM events
+          WHERE session_id IS NOT NULL AND TRIM(session_id) != ''
+            AND session_id NOT IN ('all', 'lifetime', 'app')
+            AND COALESCE(key, '') != 'dedup_bypass'
+          UNION
+          SELECT session_id AS sid FROM sources
+          WHERE session_id IS NOT NULL AND TRIM(session_id) != ''
+            AND session_id NOT IN ('all', 'lifetime', 'app')
+        )
+      `)
+      .get();
+    const cnt = Number(row?.cnt || 0);
+    return Number.isFinite(cnt) && cnt >= 0 ? Math.floor(cnt) : 0;
+  }
+
+  /** Record a passing cache:audit run in SQLite meta */
+  recordCacheAuditPassed(atIso = new Date().toISOString()) {
+    this.open();
+    this.setMeta(CACHE_AUDIT_PASSED_META_KEY, String(atIso));
+  }
+
+  /** Check whether cache:audit has passed at least once */
+  hasCacheAuditPassed() {
+    this.open();
+    return Boolean(this.getMeta(CACHE_AUDIT_PASSED_META_KEY, null));
+  }
+
+  /** Evaluate whether the one-time GitHub Star milestone banner should be shown */
+  evaluateStarPrompt({ markTriggered = false, nowIso = null } = {}) {
+    this.open();
+    const current = this.getStarPromptState();
+    const lifetimeStats = this.getStats("all");
+    const lifetimeSavedBytes = Math.max(0, Math.floor(Number(lifetimeStats?.keptOutBytes || 0)));
+    const lifetimeTokensSaved = Math.max(
+      0,
+      Math.floor(Number(lifetimeStats?.tokensKeptOut ?? Math.round(lifetimeSavedBytes / 4)))
+    );
+    const sessionCount = this.getDistinctSessionCount();
+    const cacheAuditPassed = this.hasCacheAuditPassed();
+    const savingsMilestoneMet =
+      lifetimeSavedBytes >= STAR_PROMPT_MIN_SAVED_BYTES && sessionCount >= STAR_PROMPT_MIN_SESSIONS;
+    const milestoneReached = savingsMilestoneMet || cacheAuditPassed;
+    const triggerReason = savingsMilestoneMet
+      ? "savings_milestone"
+      : (cacheAuditPassed ? "cache_audit" : null);
+    const shouldShow = current.state === "pending" && milestoneReached;
+
+    let effective = current;
+    if (shouldShow && markTriggered && !current.triggeredAt) {
+      const next = {
+        state: "pending",
+        triggeredAt:
+          typeof nowIso === "string" && nowIso.trim() ? nowIso.trim() : new Date().toISOString(),
+        resolvedAt: null,
+        milestoneSavedBytes: Math.max(current.milestoneSavedBytes, lifetimeSavedBytes)
+      };
+      this.setMeta(STAR_PROMPT_META_KEY, JSON.stringify(next));
+      effective = next;
+    }
+
+    return {
+      state: effective.state,
+      triggeredAt: effective.triggeredAt,
+      resolvedAt: effective.resolvedAt,
+      milestoneSavedBytes: effective.milestoneSavedBytes,
+      shouldShow,
+      triggerReason,
+      lifetimeSavedBytes,
+      lifetimeTokensSaved,
+      sessionCount,
+      cacheAuditPassed,
+      thresholds: {
+        minSavedBytes: STAR_PROMPT_MIN_SAVED_BYTES,
+        minSessions: STAR_PROMPT_MIN_SESSIONS
+      }
+    };
+  }
+
+  /** Persist a terminal starPrompt state ('clicked' | 'dismissed' | 'copied_cli') permanently */
+  setStarPromptState(nextState, { nowIso = null } = {}) {
+    if (typeof nextState !== "string" || !STAR_PROMPT_TERMINAL_STATES.includes(nextState)) {
+      return {
+        ok: false,
+        error: "Invalid 'state' value: expected 'clicked', 'dismissed', or 'copied_cli'"
+      };
+    }
+    this.open();
+    const current = this.getStarPromptState();
+    if (current.state !== "pending") {
+      return { ok: true, starPrompt: current, alreadyResolved: true };
+    }
+    const ts = typeof nowIso === "string" && nowIso.trim() ? nowIso.trim() : new Date().toISOString();
+    const lifetimeStats = this.getStats("all");
+    const lifetimeSavedBytes = Math.max(0, Math.floor(Number(lifetimeStats?.keptOutBytes || 0)));
+    const saved = {
+      state: nextState,
+      triggeredAt: current.triggeredAt || ts,
+      resolvedAt: ts,
+      milestoneSavedBytes: Math.max(current.milestoneSavedBytes, lifetimeSavedBytes)
+    };
+    this.setMeta(STAR_PROMPT_META_KEY, JSON.stringify(saved));
+    return { ok: true, starPrompt: saved, alreadyResolved: false };
+  }
+
   /**
    * TTL-based database maintenance & optional VACUUM (inspired by antigravity-panel).
    * Keeps ~/.agy-dart/context.db lean across months of heavy usage.
@@ -979,12 +1429,13 @@ export class SettingsMaintenanceMethods {
       const outlineRes = this.db.prepare("DELETE FROM outline_cache WHERE updated_ts < ?").run(cutoffTs);
       this.db.prepare("DELETE FROM repo_cache WHERE updated_ts < ?").run(repoCacheCutoffTs);
 
-      // Prune stale per-session PreInvocation alert/compaction/sensitive-file/large-read-confirm meta keys so meta stays bounded
+      // Prune stale per-session PreInvocation alert/compaction/sensitive-file/large-read-confirm/watchdog meta keys so meta stays bounded
       try {
         const confirmCutoffTs = now - 10 * 60 * 1000;
+        const leaseCutoffTs = Math.min(cutoffTs, now - 24 * 3600 * 1000);
         const metaRows = this.db
           .prepare(
-            "SELECT key, value FROM meta WHERE key LIKE 'cache_alert:%' OR key LIKE 'compact_invalidated:%' OR key LIKE 'sensitive_read_confirm:%' OR key LIKE 'large_read_confirm:%' OR key LIKE 'conv_turn_seq:%'"
+            "SELECT key, value FROM meta WHERE key LIKE 'cache_alert:%' OR key LIKE 'compact_invalidated:%' OR key LIKE 'sensitive_read_confirm:%' OR key LIKE 'large_read_confirm:%' OR key LIKE 'conv_turn_seq:%' OR key LIKE 'watchdog_lease:%' OR key LIKE 'ttl_calibration:%'"
           )
           .all();
         const delMetaStmt = this.db.prepare("DELETE FROM meta WHERE key = ?");
@@ -993,13 +1444,19 @@ export class SettingsMaintenanceMethods {
           if (typeof row.value === "string" && row.value.startsWith("{")) {
             try {
               const p = JSON.parse(row.value);
-              if (p && Number.isFinite(p.ts)) entryTs = p.ts;
+              if (p && Number.isFinite(p.updatedTs)) entryTs = p.updatedTs;
+              else if (p && Number.isFinite(p.ts)) entryTs = p.ts;
             } catch {}
           }
           const isShortConfirm =
             row.key.startsWith("large_read_confirm:") || row.key.startsWith("sensitive_read_confirm:");
+          const isWatchdogLease = row.key.startsWith("watchdog_lease:");
           if (isShortConfirm) {
             if (entryTs <= 0 || entryTs < confirmCutoffTs) {
+              delMetaStmt.run(row.key);
+            }
+          } else if (isWatchdogLease) {
+            if (entryTs <= 0 || entryTs < (days === 0 ? cutoffTs : leaseCutoffTs)) {
               delMetaStmt.run(row.key);
             }
           } else if (entryTs > 0 && entryTs < cutoffTs) {

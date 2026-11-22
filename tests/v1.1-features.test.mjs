@@ -321,11 +321,14 @@ test("P1 Read Dedup (2-strike bypass) + PostToolUse edit/ctx_resume invalidation
   fs.writeFileSync(srcFile, Array.from({ length: 120 }, (_, i) => `export const v${i} = "${"a".repeat(30)}";`).join("\n"));
 
   try {
+    const minBytesEnv = { AGY_DART_READ_DEDUP_MIN_BYTES: "1024" };
+
     // 1. First read of lines 1-80 -> allow
     const r1 = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "dedup-s1", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: srcFile, StartLine: 1, EndLine: 80 } } },
-      tmpDb
+      tmpDb,
+      minBytesEnv
     );
     assert.equal(r1.decision, "allow");
 
@@ -333,7 +336,8 @@ test("P1 Read Dedup (2-strike bypass) + PostToolUse edit/ctx_resume invalidation
     const r2 = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "dedup-s1", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: srcFile, StartLine: 10, EndLine: 50 } } },
-      tmpDb
+      tmpDb,
+      minBytesEnv
     );
     assert.equal(r2.decision, "deny");
     assert.ok(r2.reason.includes("[agy-dart read-dedup]"));
@@ -342,7 +346,8 @@ test("P1 Read Dedup (2-strike bypass) + PostToolUse edit/ctx_resume invalidation
     const r3 = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "dedup-s1", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: srcFile, StartLine: 10, EndLine: 50 } } },
-      tmpDb
+      tmpDb,
+      minBytesEnv
     );
     assert.equal(r3.decision, "allow");
 

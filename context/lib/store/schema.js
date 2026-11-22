@@ -174,6 +174,7 @@ export class SchemaMethods {
         read_ts INTEGER NOT NULL,
         bypass_armed INTEGER NOT NULL DEFAULT 0,
         read_step INTEGER,
+        read_turn_seq INTEGER,
         PRIMARY KEY (session_id, file_path, start_line, end_line)
       );
 
@@ -194,6 +195,7 @@ export class SchemaMethods {
         bypass_armed INTEGER NOT NULL DEFAULT 0,
         full_read_ts INTEGER NOT NULL DEFAULT 0,
         full_read_seq INTEGER NOT NULL DEFAULT 0,
+        read_step INTEGER,
         PRIMARY KEY (session_id, file_path, start_line, end_line)
       );
 
@@ -261,7 +263,8 @@ export class SchemaMethods {
       for (const colDef of [
         { name: "ctime_ms", sql: "ALTER TABLE file_reads ADD COLUMN ctime_ms REAL;" },
         { name: "ino", sql: "ALTER TABLE file_reads ADD COLUMN ino TEXT;" },
-        { name: "read_step", sql: "ALTER TABLE file_reads ADD COLUMN read_step INTEGER;" }
+        { name: "read_step", sql: "ALTER TABLE file_reads ADD COLUMN read_step INTEGER;" },
+        { name: "read_turn_seq", sql: "ALTER TABLE file_reads ADD COLUMN read_turn_seq INTEGER;" }
       ]) {
         if (!readCols.some((c) => c.name === colDef.name)) {
           try {
@@ -272,12 +275,13 @@ export class SchemaMethods {
         }
       }
 
-      // Idempotent schema upgrade: ensure file_snapshots tracks full_read_ts, full_read_seq & ino
+      // Idempotent schema upgrade: ensure file_snapshots tracks full_read_ts, full_read_seq, ino & read_step
       const snapCols = this.db.prepare("PRAGMA table_info(file_snapshots)").all();
       for (const colDef of [
         { name: "full_read_ts", sql: "ALTER TABLE file_snapshots ADD COLUMN full_read_ts INTEGER NOT NULL DEFAULT 0;" },
         { name: "full_read_seq", sql: "ALTER TABLE file_snapshots ADD COLUMN full_read_seq INTEGER NOT NULL DEFAULT 0;" },
-        { name: "ino", sql: "ALTER TABLE file_snapshots ADD COLUMN ino TEXT;" }
+        { name: "ino", sql: "ALTER TABLE file_snapshots ADD COLUMN ino TEXT;" },
+        { name: "read_step", sql: "ALTER TABLE file_snapshots ADD COLUMN read_step INTEGER;" }
       ]) {
         if (!snapCols.some((c) => c.name === colDef.name)) {
           try {

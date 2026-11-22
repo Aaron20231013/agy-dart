@@ -886,8 +886,9 @@ test("P0-Hardening 2: Diff-read is OFF by default, enforces direct conversation 
       const stA = fs.statSync(atomicFile, { bigint: true });
       const origMtimeSec = Number(stA.mtimeNs) / 1e9;
 
+      const atomicEnv = { ...cleanEnv, AGY_DART_DISABLE_DIFF_READ: "1", AGY_DART_READ_DEDUP_MIN_BYTES: "1024" };
       const rAt1 = JSON.parse(
-        runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "atomic-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: atomicFile } } }, tmpDb, { ...cleanEnv, AGY_DART_DISABLE_DIFF_READ: "1" }).stdout
+        runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "atomic-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: atomicFile } } }, tmpDb, atomicEnv).stdout
       );
       assert.equal(rAt1.decision, "allow");
 
@@ -898,7 +899,7 @@ test("P0-Hardening 2: Diff-read is OFF by default, enforces direct conversation 
       fs.utimesSync(tmpSwap, origMtimeSec, origMtimeSec);
       fs.renameSync(tmpSwap, atomicFile);
       const rAt2 = JSON.parse(
-        runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "atomic-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: atomicFile } } }, tmpDb, { ...cleanEnv, AGY_DART_DISABLE_DIFF_READ: "1" }).stdout
+        runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "atomic-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: atomicFile } } }, tmpDb, atomicEnv).stdout
       );
       assert.equal(rAt2.decision, "allow", "Atomic replace with identical size & mtime must invalidate dedup via ino/ctime_ms");
 
@@ -909,13 +910,13 @@ test("P0-Hardening 2: Diff-read is OFF by default, enforces direct conversation 
       fs.writeFileSync(atomicFile, contentC, "utf8");
       fs.utimesSync(atomicFile, origMtimeSec, origMtimeSec);
       const rAt3 = JSON.parse(
-        runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "atomic-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: atomicFile } } }, tmpDb, { ...cleanEnv, AGY_DART_DISABLE_DIFF_READ: "1" }).stdout
+        runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "atomic-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: atomicFile } } }, tmpDb, atomicEnv).stdout
       );
       assert.equal(rAt3.decision, "allow", "Preserved-mtime in-place edit must invalidate dedup via ctime_ms");
 
       // Unchanged subsequent read DOES deduplicate cleanly
       const rAt4 = JSON.parse(
-        runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "atomic-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: atomicFile } } }, tmpDb, { ...cleanEnv, AGY_DART_DISABLE_DIFF_READ: "1" }).stdout
+        runHookRaw("hooks/pre-tool-use.mjs", { conversationId: "atomic-conv", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: atomicFile } } }, tmpDb, atomicEnv).stdout
       );
       assert.equal(rAt4.decision, "deny");
       assert.ok(rAt4.reason.includes("[agy-dart read-dedup]"));
@@ -1145,7 +1146,7 @@ test("P1-Hardening 3: Static import-graph verification proves RUNTIME_FILES comp
       'test.skip("case 3", () => {});'
     ].join("\n");
     assert.equal(countTestCasesInSource(briefCounterSample), 3, "countTestCasesInSource must ignore regex quotes/`/*`/templates/comments/function* decls and count top-level tests + modifiers accurately");
-    assert.equal(computeBriefMetrics(ROOT).testCases, 132, "computeBriefMetrics(ROOT).testCases must match the exact 132 tests executed by npm test");
+    assert.equal(computeBriefMetrics(ROOT).testCases, 160, "computeBriefMetrics(ROOT).testCases must match the exact 160 tests executed by npm test");
 
     // P0-3: syncBriefFile normalizes CRLF checkouts on Windows CI and .gitattributes enforces LF/CRLF policy
     const gitAttrsPath = path.join(ROOT, ".gitattributes");

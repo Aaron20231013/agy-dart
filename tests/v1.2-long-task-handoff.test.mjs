@@ -662,11 +662,14 @@ test("Long-Task 5: Step-decayed read deduplication (readDedupMaxSteps=40) & Post
   fs.writeFileSync(targetFile, "// module content\nexport const x = 1;\n".repeat(80), "utf8"); // ~3 KB (>= 1 KB)
 
   try {
+    const stepDedupEnv = { AGY_DART_READ_DEDUP_MIN_BYTES: "1024" };
+
     // 1. Initial read at stepIdx=10 -> allow
     const r1 = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "s-step", stepIdx: 10, cwd: tmpDir, toolCall: { name: "read_file", args: { Path: targetFile } } },
-      dbPath
+      dbPath,
+      stepDedupEnv
     );
     assert.equal(r1.decision, "allow");
 
@@ -674,7 +677,8 @@ test("Long-Task 5: Step-decayed read deduplication (readDedupMaxSteps=40) & Post
     const r2 = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "s-step", stepIdx: 35, cwd: tmpDir, toolCall: { name: "read_file", args: { Path: targetFile } } },
-      dbPath
+      dbPath,
+      stepDedupEnv
     );
     assert.equal(r2.decision, "deny");
     assert.match(r2.reason, /read-dedup/);
@@ -683,7 +687,8 @@ test("Long-Task 5: Step-decayed read deduplication (readDedupMaxSteps=40) & Post
     const r3 = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "s-step", stepIdx: 36, cwd: tmpDir, toolCall: { name: "read_file", args: { Path: targetFile } } },
-      dbPath
+      dbPath,
+      stepDedupEnv
     );
     assert.equal(r3.decision, "allow");
 
@@ -691,7 +696,8 @@ test("Long-Task 5: Step-decayed read deduplication (readDedupMaxSteps=40) & Post
     const r4 = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "s-step", stepIdx: 80, cwd: tmpDir, toolCall: { name: "read_file", args: { Path: targetFile } } },
-      dbPath
+      dbPath,
+      stepDedupEnv
     );
     assert.equal(r4.decision, "allow", "Read >40 steps after previous read must auto-allow without wasting a deny turn");
 
@@ -699,7 +705,8 @@ test("Long-Task 5: Step-decayed read deduplication (readDedupMaxSteps=40) & Post
     const r5 = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "s-step", stepIdx: 90, cwd: tmpDir, toolCall: { name: "read_file", args: { Path: targetFile } } },
-      dbPath
+      dbPath,
+      stepDedupEnv
     );
     assert.equal(r5.decision, "deny");
     // Reset confirm flag by completing 2nd strike at step 91
@@ -707,7 +714,8 @@ test("Long-Task 5: Step-decayed read deduplication (readDedupMaxSteps=40) & Post
       runHook(
         "hooks/pre-tool-use.mjs",
         { conversationId: "s-step", stepIdx: 91, cwd: tmpDir, toolCall: { name: "read_file", args: { Path: targetFile } } },
-        dbPath
+        dbPath,
+        stepDedupEnv
       ).decision,
       "allow"
     );
@@ -725,7 +733,8 @@ test("Long-Task 5: Step-decayed read deduplication (readDedupMaxSteps=40) & Post
     const afterSeqResume = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "s-step", stepIdx: 95, cwd: tmpDir, toolCall: { name: "read_file", args: { Path: targetFile } } },
-      dbPath
+      dbPath,
+      stepDedupEnv
     );
     assert.equal(afterSeqResume.decision, "deny", "Read-only ctx_resume({ seq }) must preserve session read cache");
 
@@ -742,7 +751,8 @@ test("Long-Task 5: Step-decayed read deduplication (readDedupMaxSteps=40) & Post
     const afterSiblingEdit = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "s-step", stepIdx: 96, cwd: tmpDir, toolCall: { name: "read_file", args: { Path: targetFile } } },
-      dbPath
+      dbPath,
+      stepDedupEnv
     );
     assert.equal(afterSiblingEdit.decision, "allow", "Sibling session edit must invalidate stale read-dedup entry");
 
@@ -757,7 +767,8 @@ test("Long-Task 5: Step-decayed read deduplication (readDedupMaxSteps=40) & Post
         cwd: tmpDir,
         toolCall: { name: "read_file", args: { Path: targetFile } }
       },
-      dbPath
+      dbPath,
+      stepDedupEnv
     );
     assert.equal(subRead.decision, "allow", "Subagent first read must not collide with parent session read-dedup");
   } finally {

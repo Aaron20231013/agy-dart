@@ -20,6 +20,8 @@ export const CONFIG_DEFAULTS = Object.freeze({
   readGuardMode: "soft",
   readDedup: true,
   readDedupMaxSteps: 40,
+  readDedupMaxTurns: 12,
+  readDedupMinBytes: 4096,
   diffRead: false, // Opt-in until multi-turn/fork baseline freshness is battle-tested
   diffReadMaxTurns: 12,
   diffReadMaxAgeMs: 15 * 60 * 1000,
@@ -43,7 +45,21 @@ export const CONFIG_DEFAULTS = Object.freeze({
   criticalTokens: null,
   secretRedaction: true,
   sensitiveFileGuard: "off",
-  allowPrivateUrls: false
+  allowPrivateUrls: false,
+  stallWatchdog: true,
+  watchdogPollMs: 5000,
+  watchdogSuspectRatio: 0.6,
+  watchdogLlmLowSec: 120,
+  watchdogLlmHighSec: 240,
+  watchdogLlmMultimodalSec: 360,
+  watchdogToolCmdSec: 300,
+  watchdogToolFastSec: 90,
+  watchdogSubagentSec: 600,
+  watchdogDesktopNotify: false,
+  watchdogNotifyCooldownSec: 300,
+  ttlDesktopNotify: false,
+  ttlNotifyLeadSec: 60,
+  ttlNotifyMinTokens: 60000
 });
 
 let cachedFileState = {
@@ -99,6 +115,12 @@ function parseNonNegativeInt(raw) {
 function clampInt(n, min, max) {
   if (n === undefined) return undefined;
   return Math.min(max, Math.max(min, Math.floor(n)));
+}
+
+function parseRatio(raw, min = 0.25, max = 0.95) {
+  const n = parsePositiveNumber(raw);
+  if (n === undefined) return undefined;
+  return Math.min(max, Math.max(min, Number(n.toFixed(3))));
 }
 
 function parseGuardMode(raw) {
@@ -278,6 +300,16 @@ export function getConfigSnapshot(options = {}) {
     clampInt(parseNonNegativeInt(env?.AGY_DART_READ_DEDUP_MAX_STEPS), 0, 10000),
     clampInt(parseNonNegativeInt(cfg.readDedupMaxSteps), 0, 10000)
   );
+  pick(
+    "readDedupMaxTurns",
+    clampInt(parseNonNegativeInt(env?.AGY_DART_READ_DEDUP_MAX_TURNS), 0, 10000),
+    clampInt(parseNonNegativeInt(cfg.readDedupMaxTurns), 0, 10000)
+  );
+  pick(
+    "readDedupMinBytes",
+    clampInt(parseNonNegativeInt(env?.AGY_DART_READ_DEDUP_MIN_BYTES), 0, 10 * 1024 * 1024),
+    clampInt(parseNonNegativeInt(cfg.readDedupMinBytes), 0, 10 * 1024 * 1024)
+  );
   let diffEnv;
   if (parseEnvBool(env?.AGY_DART_DISABLE_DIFF_READ) === true) {
     diffEnv = false;
@@ -379,6 +411,82 @@ export function getConfigSnapshot(options = {}) {
   );
   pick("allowPrivateUrls", parseEnvBool(env?.AGY_DART_ALLOW_PRIVATE_URLS), cfgBool("allowPrivateUrls"));
 
+  // 7. Sidecar Stall Watchdog (lease state machine, dynamic thresholds, opt-in desktop notify)
+  let watchdogEnv;
+  if (parseEnvBool(env?.AGY_DART_DISABLE_STALL_WATCHDOG) === true) {
+    watchdogEnv = false;
+  } else {
+    watchdogEnv =
+      parseEnvBool(env?.AGY_DART_STALL_WATCHDOG) ??
+      parseDisableEnvFlag(env?.AGY_DART_DISABLE_STALL_WATCHDOG);
+  }
+  pick("stallWatchdog", watchdogEnv, cfgBool("stallWatchdog"));
+  pick(
+    "watchdogPollMs",
+    clampInt(parsePositiveInt(env?.AGY_DART_WATCHDOG_POLL_MS), 1000, 60000),
+    clampInt(parsePositiveInt(cfg.watchdogPollMs), 1000, 60000)
+  );
+  pick(
+    "watchdogSuspectRatio",
+    parseRatio(env?.AGY_DART_WATCHDOG_SUSPECT_RATIO, 0.25, 0.95),
+    parseRatio(cfg.watchdogSuspectRatio, 0.25, 0.95)
+  );
+  pick(
+    "watchdogLlmLowSec",
+    clampInt(parsePositiveInt(env?.AGY_DART_WATCHDOG_LLM_LOW_SEC), 15, 3600),
+    clampInt(parsePositiveInt(cfg.watchdogLlmLowSec), 15, 3600)
+  );
+  pick(
+    "watchdogLlmHighSec",
+    clampInt(parsePositiveInt(env?.AGY_DART_WATCHDOG_LLM_HIGH_SEC), 30, 7200),
+    clampInt(parsePositiveInt(cfg.watchdogLlmHighSec), 30, 7200)
+  );
+  pick(
+    "watchdogLlmMultimodalSec",
+    clampInt(parsePositiveInt(env?.AGY_DART_WATCHDOG_LLM_MULTIMODAL_SEC), 30, 7200),
+    clampInt(parsePositiveInt(cfg.watchdogLlmMultimodalSec), 30, 7200)
+  );
+  pick(
+    "watchdogToolCmdSec",
+    clampInt(parsePositiveInt(env?.AGY_DART_WATCHDOG_TOOL_CMD_SEC), 30, 7200),
+    clampInt(parsePositiveInt(cfg.watchdogToolCmdSec), 30, 7200)
+  );
+  pick(
+    "watchdogToolFastSec",
+    clampInt(parsePositiveInt(env?.AGY_DART_WATCHDOG_TOOL_FAST_SEC), 15, 3600),
+    clampInt(parsePositiveInt(cfg.watchdogToolFastSec), 15, 3600)
+  );
+  pick(
+    "watchdogSubagentSec",
+    clampInt(parsePositiveInt(env?.AGY_DART_WATCHDOG_SUBAGENT_SEC), 60, 14400),
+    clampInt(parsePositiveInt(cfg.watchdogSubagentSec), 60, 14400)
+  );
+  pick(
+    "watchdogDesktopNotify",
+    parseEnvBool(env?.AGY_DART_WATCHDOG_DESKTOP_NOTIFY),
+    cfgBool("watchdogDesktopNotify")
+  );
+  pick(
+    "watchdogNotifyCooldownSec",
+    clampInt(parsePositiveInt(env?.AGY_DART_WATCHDOG_NOTIFY_COOLDOWN_SEC), 30, 3600),
+    clampInt(parsePositiveInt(cfg.watchdogNotifyCooldownSec), 30, 3600)
+  );
+  pick(
+    "ttlDesktopNotify",
+    parseEnvBool(env?.AGY_DART_TTL_DESKTOP_NOTIFY),
+    cfgBool("ttlDesktopNotify")
+  );
+  pick(
+    "ttlNotifyLeadSec",
+    clampInt(parsePositiveInt(env?.AGY_DART_TTL_NOTIFY_LEAD_SEC), 15, 300),
+    clampInt(parsePositiveInt(cfg.ttlNotifyLeadSec), 15, 300)
+  );
+  pick(
+    "ttlNotifyMinTokens",
+    clampInt(parsePositiveInt(env?.AGY_DART_TTL_NOTIFY_MIN_TOKENS), 4000, 500000),
+    clampInt(parsePositiveInt(cfg.ttlNotifyMinTokens), 4000, 500000)
+  );
+
   return {
     configPath: loaded.path,
     fileExists: loaded.exists,
@@ -408,6 +516,7 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra
     "diffRead",
     "cliFilter",
     "cacheWatch",
+    "stallWatchdog",
     "stablePrefixOnly",
     "outlineDb",
     "secretRedaction",
@@ -444,6 +553,20 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra
     `  - Read guard    : mode=${values.readGuardMode} (${sources.readGuardMode}), source=${fmtKb(effSourceCutoff)} (${effSourceProv}), ` +
       `noise=${fmtKb(values.noiseMaxReadBytes)}, review=${fmtKb(values.reviewMaxReadBytes)}, shellDump=${fmtKb(values.shellDumpMaxBytes)}` +
       (exemptSummary ? `, ${exemptSummary}` : "")
+  );
+  lines.push(
+    `  - Read dedup    : enabled=${values.readDedup} (${sources.readDedup}), minBytes=${fmtKb(values.readDedupMinBytes)}, ` +
+      `maxSteps=${values.readDedupMaxSteps || "off"}, maxTurns=${values.readDedupMaxTurns || "off"}`
+  );
+  lines.push(
+    `  - Stall watchdog: enabled=${values.stallWatchdog} (${sources.stallWatchdog}), ` +
+      `llm=${values.watchdogLlmLowSec}s/${values.watchdogLlmHighSec}s/${values.watchdogLlmMultimodalSec}s, ` +
+      `tool=${values.watchdogToolFastSec}s/${values.watchdogToolCmdSec}s, bg=${values.watchdogSubagentSec}s, ` +
+      `desktopNotify=${values.watchdogDesktopNotify} (${sources.watchdogDesktopNotify})`
+  );
+  lines.push(
+    `  - TTL alert     : desktopNotify=${values.ttlDesktopNotify} (${sources.ttlDesktopNotify}), ` +
+      `lead=${values.ttlNotifyLeadSec}s, minTokens=${values.ttlNotifyMinTokens}`
   );
 
   const overrides = Object.keys(sources)

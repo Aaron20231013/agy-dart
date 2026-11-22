@@ -24,7 +24,39 @@
 
 **`agy-dart`** 将两者深度整合为 **1 个原生 Antigravity 插件**：一套零冲突路由规则、一套单进程合并钩子、一套可一键切换阈值的实时仪表盘，开箱即用。
 
+> **提示**：谷歌 Antigravity 工具链与服务端缓存策略变化较快，建议在右上角点一下 **Star / Watch (Releases only)**，方便第一时间收到新版兼容修复与降噪策略更新。
+
 ---
+
+## v1.5.0 核心升级（跨会话实证 TTL 校准、高上下文临期提醒与 Keep-Alive 账本回放）
+
+1. **跨会话按模型实证 TTL 区间校准（`ttl_calibration:v1:<profileId>`）**：
+   - 基于 14 天有界 Ring Buffer 跨会话累计同模型档位（如 `gemini-4-512k`、`claude-200k`）的真实热命中下界与纯空闲冷失效上界（`estimateCalibratedTtl` 支持后端 TTL 缩短时双向向下收敛、规避 `ttl_idle_expiry` 循环依赖，严格遵守 `explicit > session/history > profile` 优先级），新开会话即继承校准窗口并实时同步至 Sidecar 与 `PreInvocation`。
+2. **高上下文空闲 TTL 临期桌面提醒（Opt-in 默认关闭，零 `statSync`）**：
+   - 新增 `ttlDesktopNotify`（`AGY_DART_TTL_DESKTOP_NOTIFY` 与面板「临期提醒」开关，默认关闭）、`ttlNotifyLeadSec`（`60s`）与 `ttlNotifyMinTokens`（`60000`）：主对话处于 `IDLE`、`>= 60k` tokens 且距过期剩余 `(0, 60s]` 时发送一次脱敏防抖桌面通知，全程保持 **`0` 次 `statSync`**、休眠唤醒防误弹，且在 `stallWatchdog=false` 时仍可独立运行。
+3. **`npm run cache:simulate` 新增 Keep-Alive 反事实策略回放**：
+   - 离线回放扩充至 **9 套策略**，新增 `keepalive-1x` 与 `keepalive-unlimited`（支持 `--keepalive-tail <sec>`，标记 `hypothetical: true` 不抢占 `recommendedPolicy`），直接用真实历史轨迹核算自动保活 Ping 读成本、离座尾窗浪费以及表面刷高命中率 vs 真实用户轮命中率（`userTurnHitRate`）。
+
+## v1.4.0 核心升级（Sidecar 卡死看门狗与免越狱救援闭环）
+
+1. **双源融合状态机（5 大钩子 + Sidecar 巡检 + `transcript.jsonl` 尾步自愈）**：
+   - 新增轻量 Fail-Open `hooks/stop.mjs`（注册至 `hooks.json` 的 `Stop` 事件），复用 `PreInvocation`、`PreToolUse`、`PostToolUse`（新增覆盖 `run_command` 完成态），通过极速模块 `context/lib/watchdog-lease.js`（<1ms 加载、完整保留 0-SQLite 快路径与 0 字节 `stderr`）向 SQLite `meta` 写入按 `directConversationId` 严格隔离的执行态租约 `watchdog_lease:<convId>`。
+   - 新增 `context/lib/watchdog.js`（`WatchdogMonitor`）常驻于 Aux Pane Sidecar（`sidecars/dashboard/server.mjs`）：后台低频巡检（**全部对话空闲时零 `statSync` 开销**）、**双静默判定**（只要 `transcript.jsonl` 的 `mtimeMs`/`size` 仍在增长即自动顺延计时）与**尾步终态自愈纠偏**（防 `Stop` 钩子漏触发，同时通过时间戳与文件增长边界保护避免误把新卡死轮次当成旧轮次结束）。
+2. **状态感知动态超时矩阵（黄灯/红灯两级、零误报）**：
+   - 精确区分 `IDLE`、`LLM_INFLIGHT`（中低上下文 `<120k` `120s` / 高上下文 `>=120k` 或 `/compact` `240s` / 高上下文多模态 `>=150k` `360s`）、`TOOL_RUNNING`（`read_file`/常规 MCP `90s` vs 同步 `run_command`/`ctx_execute`/`run_checks` `300s`）与 `SUBAGENT_BG`（后台任务/子代理 `600s`），采用 **黄灯 `suspect`（60%）→ 红灯 `stalled`（100%）** 两级预警，全部阈值与开关收敛至 `~/.agy-dart/config.json` 与 `AGY_DART_WATCHDOG_*` 环境变量。
+3. **免越狱救援闭环与工程级防护**：
+   - 进入红灯 `stalled` 时自动预生成附带“卡死现场快照（阶段、静默时长、末步工具/命令、最后用户输入、疑似根因、Git Diff 摘要、检查点与 FTS5 句柄）”的脱敏**抢救版 Handoff Brief**（复用 `context/lib/handoff.js`），按 6 类根因（后台自动压缩死锁 / Windows 终端 EOF 或交互阻塞 / MCP 工具阻塞 / 文件读取或宿主工具阻塞 / 后台任务或子代理无响应 / OAuth Ghost Session 或网络断连）输出 1–2 条精准排障指引；Sidecar 面板提供 1s 本地静默计时、一键复制抢救简报、延后/标为空闲操作以及**默认关闭（Opt-in）且防抖**的 OS 桌面提醒。
+   - 内置**休眠/合盖时钟跳变防护（Sleep Drift Guard）**、多会话与子代理严格隔离、Sidecar 重启清理陈旧历史租约、严格沿用 `POST`-only + CSRF Token 安全模型（新增 `/api/watchdog` 与 `/api/watchdog/action`），**绝不碰 CDP 且绝不强杀宿主进程**。
+
+## v1.3.1 长程抗反噬与压缩零延迟补强
+
+1. **零延迟压缩检测与首轮即时失效**：
+   - 在 `context/lib/cache-analyzer.js` 中统一 4 类压缩/裁剪信号（`latestCompactionEvent` + 轻量化 `inspectTranscriptCompaction`）：原有 `compaction_or_truncation` 骤降、解耦上下文萎缩（即使同轮伴随 `model_switch` 或轻度裁剪 `>= 15%` 且降幅 `>= 8k` tokens）、显式压缩/摘要步骤、以及 `/compact` 用户指令。
+   - `PreInvocation` 新增 `lastUserInput` `/compact` 即时清库（以 `initialNumSteps` 幂等落戳并保护工具循环中段 `invocationNum >= 1` 新读记录）与 `initialNumSteps` 回退检测；`PreToolUse` 在即将触发 `read-dedup`/`diff-read` 的慢路径上零常规开销兜底（`statSync` 字节数快跳过 + 尾部 128 KB 扫描），压缩后第 1 轮重读即直接放行（0 浪费轮次，且通过 `invalidateFileReadsBefore` 保全同轮已读新文件）。
+2. **全域轮次衰减、小文件/窄切片防反噬与失败报错锚点保真**：
+   - 新增 `readDedupMaxTurns`（默认 **`12`** 轮，`AGY_DART_READ_DEDUP_MAX_TURNS`，`file_reads.read_turn_seq`），即使宿主载荷不含 `stepIdx` 也由 `PreInvocation` 轮次时钟自动衰减放行，并在 `stepIdx` / `turnSeq` 回退时直接放行。
+   - 新增可配置 `readDedupMinBytes`（默认 **`4096 B` = 4 KB**，`AGY_DART_READ_DEDUP_MIN_BYTES`），按**本次请求实际字节数**判定，避免小配置或 15 行窄切片触发 2-strike 反噬；Strike 2 绕过写入独立 `dedup_bypass` 遥测（透出至 `featureRoi.features.read_dedup.bypasses` / `bypassRate` 且不污染去重节省统计）。
+   - `hooks/filter-rules.mjs` 新增 `compactFailureWithErrorAnchors`：失败命令输出超 `7.9 KB` 时自动提取藏在日志**中段**的 `AssertionError`/`Traceback`/`ERROR`/`✖`/`not ok` 等报错锚点及上下 `±3` 行上下文（优先保留首个根因块 + 末尾报错块 + 头尾摘要），死守 `<= 7.9 KB`（总输出 `<= 8.8 KB` 零溢盘），大幅降低被迫额外 `ctx_search` 的概率。
 
 ## v1.3.0 核心升级（四层读守卫 + 评审一等公民 + Diff 三阶段保真）
 
@@ -85,6 +117,34 @@
 ## 社区反馈与改进（Community Feedback & Improvements）
 
 本区域专门记录来自社区真实工作流的吐槽、痛点原文，以及对应的工程改造方案与底层设计原理。欢迎继续通过 GitHub Issue 或评论区反馈真实踩坑场景。
+
+### `[v1.4.0]` 多轮对话后持续“工作中”却零输出、直接卡死
+
+#### 1. 社区反馈原文
+
+> 「我在多轮对话之后很容易一直工作中却不输出任何东西，直接卡住了，难道没有自动总结压缩的功能么？」
+
+复盘 Antigravity 多轮对话执行链路后，发现前端看起来完全一样的“一直转圈但不吐字”，背后其实集中在 **4 类真实卡死场景**：
+1. **高上下文 / 后台自动压缩死锁**：上下文进入 `>= 120k`（或 `>= 150k` 伴随图片/截图）后，后台自动压缩或冷 Prefill 偶发长时间无响应，界面没有任何静默计时或逃生入口。
+2. **Windows 终端 EOF 或交互阻塞**：同步 `run_command` 遇到 `[y/N]` 确认、分页器（`less`/`more`）或 Windows PowerShell/CMD 标准输入等待 EOF，导致整轮执行挂死。
+3. **OAuth Ghost Session / 代理网络断连**：静默断流或 OAuth 会话失效后，连接停在 0 字节输出且不会自行报错退出。
+4. **MCP 工具调用阻塞**：外部 MCP 服务卡死时，用户无法分辨当前到底卡在模型思考、终端命令还是某个 MCP 工具。
+
+#### 2. 改进方案（`v1.3.x` → `v1.4.0`）
+
+| 维度 | 旧版 `v1.3.x` | 新版 `v1.4.0` 改造 |
+| :--- | :--- | :--- |
+| **执行态可观测性** | 无执行态租约，只能盯着空白转圈干等 | **双源融合状态机**：`PreInvocation` / `PreToolUse` / `PostToolUse`（补齐 `run_command`）+ 新增轻量 `Stop` Hook 写入按 `directConversationId` 隔离的 `watchdog_lease:<convId>`，由常驻 Sidecar 融合 `transcript.jsonl` 的 `mtimeMs`/`size` 与尾步终态自愈纠偏 |
+| **卡死判定与防误报** | 无（若用固定超时会在长构建或高上下文推理时疯狂误报） | **状态感知动态超时矩阵**：`IDLE`（零 `statSync`）· `LLM_INFLIGHT`（`<120k` 120s / `>=120k` 或 `/compact` 240s / `>=150k` 多模态 360s）· `TOOL_RUNNING`（`read_file`/常规 MCP 90s vs 同步 `run_command`/`ctx_execute` 300s）· `SUBAGENT_BG`（600s），黄灯 `suspect` + 红灯 `stalled` 两级，轨迹持续增长自动顺延计时 |
+| **救援闭环与排障** | 强停易丢上下文与改动线索，排障靠猜 | **免越狱救援闭环**：进入红灯自动预生成附带卡死现场（阶段、末步工具/命令、最后用户输入、静默时长）的脱敏**抢救版 Handoff Brief**，按 6 类根因输出 1–2 条精准排障指引；Sidecar 1s 本地计时、一键复制/延后/标为空闲 + 默认关闭（Opt-in）防抖桌面提醒 |
+| **工程防护与安全** | — | **休眠/合盖时钟跳变防护（Sleep Drift Guard）**、多会话/子代理严格隔离、Sidecar 重启清理陈旧历史租约、`hookMode: true` Fail-Open、全站沿用 `POST` + CSRF Token 安全模型，**不碰 CDP、不强杀宿主进程** |
+
+#### 3. 底层设计原理（为什么采用独立 Sidecar 看门狗，而非 CDP 或强杀进程）
+
+1. **免越狱常驻守护最稳**：利用 Antigravity 原生插件已有的 `restart_policy: always` Aux Pane Sidecar 与生命周期 Hooks，无需开启调试端口（CDP）、无需篡改宿主二进制、也不会因强杀 `language_server` 导致对话轨迹损坏，把“停止并带现场续接”的控制权完整交给用户。
+2. **双源融合消灭单源盲区**：单靠 Hook 会遇到异常中断漏发 `Stop` 导致假告警；单靠扫 `transcript.jsonl` 无法区分正常空闲和首轮卡死。将 SQLite 租约与 `transcript.jsonl` 增长检测、时间戳受控的尾步终态自愈结合，既能杜绝活跃流式输出误报，又能自动纠正漏触发的 `Stop`。
+3. **热路径零退化**：将写入租约的 `watchdog-lease.js`（<1ms 加载）与重型诊断模块 `watchdog.js` 解耦，保持 `PreToolUse` 0-SQLite 快路径与 p50/p95 延迟预算不受任何影响。
+4. **空闲零磁盘 I/O 与休眠免疫**：所有会话处于 `IDLE` 时巡检零 `statSync`；笔记本合盖/休眠唤醒产生大跨度时钟跳变时，由 wall-clock vs monotonic-clock 差值自动补偿宽限期，彻底杜绝唤醒瞬间的误报红灯。
 
 ### `[v1.3.0]` 16 KB 默认读拦截误伤代码评审（`.patch`）与无 MCP 子代理
 

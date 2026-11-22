@@ -984,6 +984,12 @@ export function createTools({
           exemptPathsCount: Array.isArray(cfgSnap.values.exemptPaths) ? cfgSnap.values.exemptPaths.length : 0,
           exemptExtensionsCount: Array.isArray(cfgSnap.values.exemptExtensions) ? cfgSnap.values.exemptExtensions.length : 0
         },
+        readDedup: {
+          enabled: store.isReadDedupEnabled(getSessionId()),
+          minBytes: cfgSnap.values.readDedupMinBytes,
+          maxSteps: cfgSnap.values.readDedupMaxSteps,
+          maxTurns: cfgSnap.values.readDedupMaxTurns
+        },
         config: {
           path: cfgSnap.configPath,
           loaded: cfgSnap.fileExists && !cfgSnap.configError,

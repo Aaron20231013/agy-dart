@@ -16,6 +16,10 @@ const COLD_COMPACT_MAX_TOKENS = 25000;
 const EMPIRICAL_TTL_TRIGGER_RATIO = 1.1;
 const RECOMMEND_MIN_SAVINGS_RATIO = 0.01;
 const MAX_INLINE_SUMMARY_BYTES = 8800;
+const DEFAULT_KEEPALIVE_MIN_TOKENS = 60000;
+const DEFAULT_KEEPALIVE_TAIL_SEC = 1800;
+const DEFAULT_PING_OVERHEAD_TOKENS = 16;
+const DEFAULT_MAX_PINGS_PER_GAP = 24;
 
 export const CUTOFF_POLICY_SPECS = Object.freeze([
   {
@@ -226,7 +230,31 @@ function parseOptions(options = {}) {
         ? opts.cacheWrite1hMultiplier
         : null,
     explicitInputPricePer1M:
-      Number.isFinite(opts.inputPricePer1M) && opts.inputPricePer1M > 0 ? opts.inputPricePer1M : null
+      Number.isFinite(opts.inputPricePer1M) && opts.inputPricePer1M > 0 ? opts.inputPricePer1M : null,
+    keepaliveMinTokens:
+      Number.isFinite(opts.keepaliveMinTokens) && opts.keepaliveMinTokens > 0
+        ? Math.max(MIN_CACHEABLE_CONTEXT_TOKENS, Math.floor(opts.keepaliveMinTokens))
+        : DEFAULT_KEEPALIVE_MIN_TOKENS,
+    keepaliveTailSec:
+      opts.keepaliveTailSec !== undefined &&
+      opts.keepaliveTailSec !== null &&
+      typeof opts.keepaliveTailSec !== "boolean" &&
+      Number.isFinite(Number(opts.keepaliveTailSec)) &&
+      Number(opts.keepaliveTailSec) >= 0
+        ? Math.floor(Number(opts.keepaliveTailSec))
+        : DEFAULT_KEEPALIVE_TAIL_SEC,
+    pingOverheadTokens:
+      opts.pingOverheadTokens !== undefined &&
+      opts.pingOverheadTokens !== null &&
+      typeof opts.pingOverheadTokens !== "boolean" &&
+      Number.isFinite(Number(opts.pingOverheadTokens)) &&
+      Number(opts.pingOverheadTokens) >= 0
+        ? Math.floor(Number(opts.pingOverheadTokens))
+        : DEFAULT_PING_OVERHEAD_TOKENS,
+    maxPingsPerGap:
+      Number.isFinite(opts.maxPingsPerGap) && opts.maxPingsPerGap >= 1
+        ? Math.min(1000, Math.floor(opts.maxPingsPerGap))
+        : DEFAULT_MAX_PINGS_PER_GAP
   };
 }
 
@@ -998,6 +1026,227 @@ function replayCutoffPolicy(traces, observedCostUsd, { id, label, cutoffBytes, s
   });
 }
 
+/**
+ * Counterfactual Host/Proxy-Only Keep-Alive Policy Replay (`keepalive-1x` & `keepalive-unlimited`).
+ * Quantifies ping cache-read overhead, end-of-session walk-away waste, and apparent vs real-turn hit rates.
+ */
+function replayKeepAlivePolicy(traces, parsedOpts, observedCostUsd, { id, label, mode }) {
+  let totalCached = 0;
+  let totalInput = 0;
+  let userCached = 0;
+  let userInput = 0;
+  let totalBusts = 0;
+  let totalWasted = 0;
+  let totalCostUsd = 0;
+  let interTurnPings = 0;
+  let tailPings = 0;
+  let wastedPings = 0;
+  let avoidedIdleBusts = 0;
+  let cappedGapCount = 0;
+
+  for (const trace of traces) {
+    const pingIntervalSec = Math.max(60, Math.floor(trace.effectiveTtlSec * 0.85));
+    const isExplicitWriteModel = trace.baseWriteMult > 1.0 || trace.longWriteMult > 1.0;
+
+    let sessCached = 0;
+    let sessUncached = 0;
+    let sessWrite = 0;
+    let sessCostRaw = 0;
+    let prevSimCtx = 0;
+    let prevDiscountRate = trace.cacheDiscountRate;
+    let prevInputPricePer1M = trace.inputPricePer1M;
+    let prevObsWriteMult = trace.obsWriteMult;
+
+    for (let idx = 0; idx < trace.turns.length; idx++) {
+      const turn = trace.turns[idx];
+      const simCtx = turn.ctxTokens;
+      const sameModel = !turn.prevModel || !turn.model || turn.model === turn.prevModel;
+      const isCompaction = turn.obsBustCause === "compaction_or_truncation";
+      const isNonTtlObsBust =
+        turn.obsWasBust &&
+        turn.obsBustCause !== "ttl_idle_expiry" &&
+        sameModel &&
+        !isCompaction;
+
+      let bridgedByKeepAlive = false;
+
+      if (
+        idx > 0 &&
+        prevSimCtx >= parsedOpts.keepaliveMinTokens &&
+        sameModel &&
+        !isCompaction &&
+        turn.gapSec !== null &&
+        turn.gapSec >= trace.effectiveTtlSec
+      ) {
+        const pingDiscount = turn.discountRate ?? prevDiscountRate ?? trace.cacheDiscountRate;
+        const pingPrice = turn.inputPricePer1M ?? prevInputPricePer1M ?? trace.inputPricePer1M;
+        const pingWriteMult = turn.obsWriteMult ?? prevObsWriteMult ?? trace.obsWriteMult;
+
+        if (mode === "1x") {
+          interTurnPings += 1;
+          const pingRead = prevSimCtx;
+          const pingUncached = parsedOpts.pingOverheadTokens;
+          sessCached += pingRead;
+          sessUncached += pingUncached;
+          sessCostRaw += computeTokenCostUsd(
+            pingRead,
+            pingUncached,
+            0,
+            pingDiscount,
+            pingWriteMult,
+            pingPrice
+          );
+          if (turn.gapSec < trace.effectiveTtlSec + pingIntervalSec && !isNonTtlObsBust) {
+            bridgedByKeepAlive = true;
+            if (turn.obsWasBust && turn.obsBustCause === "ttl_idle_expiry") {
+              avoidedIdleBusts += 1;
+            }
+          } else {
+            wastedPings += 1;
+          }
+        } else {
+          const rawNeeded = Math.max(1, Math.floor(turn.gapSec / pingIntervalSec));
+          if (rawNeeded > parsedOpts.maxPingsPerGap) {
+            cappedGapCount += 1;
+          }
+          const nPings = Math.min(parsedOpts.maxPingsPerGap, rawNeeded);
+          interTurnPings += nPings;
+          const pingRead = prevSimCtx * nPings;
+          const pingUncached = parsedOpts.pingOverheadTokens * nPings;
+          sessCached += pingRead;
+          sessUncached += pingUncached;
+          sessCostRaw += computeTokenCostUsd(
+            pingRead,
+            pingUncached,
+            0,
+            pingDiscount,
+            pingWriteMult,
+            pingPrice
+          );
+          const maxReachableSec = nPings * pingIntervalSec + trace.effectiveTtlSec;
+          if (turn.gapSec < maxReachableSec && !isNonTtlObsBust) {
+            bridgedByKeepAlive = true;
+            if (turn.obsWasBust && turn.obsBustCause === "ttl_idle_expiry") {
+              avoidedIdleBusts += 1;
+            }
+          } else {
+            wastedPings += nPings;
+          }
+        }
+      }
+
+      let simRead = 0;
+      let simWrite = 0;
+      let simUncached = 0;
+
+      if (bridgedByKeepAlive) {
+        simRead = Math.min(prevSimCtx, simCtx);
+        const newTokens = Math.max(0, simCtx - simRead);
+        if (isExplicitWriteModel) {
+          if (trace.hasExplicitCacheCreation) {
+            const tail = Math.min(turn.uncachedTokens, newTokens);
+            simWrite = Math.max(0, newTokens - tail);
+            simUncached = tail;
+          } else {
+            simWrite = newTokens;
+            simUncached = 0;
+          }
+        } else {
+          simWrite = 0;
+          simUncached = newTokens;
+        }
+      } else {
+        simRead = turn.cacheReadTokens;
+        simWrite = turn.cacheCreationTokens;
+        simUncached = turn.uncachedTokens;
+        if (turn.obsWasBust) {
+          totalBusts += 1;
+          totalWasted += Math.max(0, Math.min(turn.prevCtxTokens, turn.ctxTokens) - turn.cacheReadTokens);
+        }
+      }
+
+      userCached += simRead;
+      userInput += simRead + simWrite + simUncached;
+      sessCached += simRead;
+      sessWrite += simWrite;
+      sessUncached += simUncached;
+      const tDiscount = turn.discountRate ?? trace.cacheDiscountRate;
+      const tWriteMult = turn.obsWriteMult ?? trace.obsWriteMult;
+      const tPrice = turn.inputPricePer1M ?? trace.inputPricePer1M;
+      sessCostRaw += computeTokenCostUsd(simRead, simUncached, simWrite, tDiscount, tWriteMult, tPrice);
+
+      prevSimCtx = simCtx;
+      prevDiscountRate = tDiscount;
+      prevObsWriteMult = tWriteMult;
+      prevInputPricePer1M = tPrice;
+    }
+
+    const lastTurn = trace.turns[trace.turns.length - 1];
+    if (
+      lastTurn &&
+      lastTurn.ctxTokens >= parsedOpts.keepaliveMinTokens &&
+      parsedOpts.keepaliveTailSec > 0
+    ) {
+      const nTail =
+        mode === "1x"
+          ? 1
+          : Math.min(parsedOpts.maxPingsPerGap, Math.floor(parsedOpts.keepaliveTailSec / pingIntervalSec));
+      if (nTail > 0) {
+        tailPings += nTail;
+        wastedPings += nTail;
+        const pingRead = lastTurn.ctxTokens * nTail;
+        const pingUncached = parsedOpts.pingOverheadTokens * nTail;
+        sessCached += pingRead;
+        sessUncached += pingUncached;
+        sessCostRaw += computeTokenCostUsd(
+          pingRead,
+          pingUncached,
+          0,
+          prevDiscountRate,
+          prevObsWriteMult,
+          prevInputPricePer1M
+        );
+      }
+    }
+
+    totalCached += sessCached;
+    totalInput += sessCached + sessUncached + sessWrite;
+    totalCostUsd += roundUsd(sessCostRaw);
+  }
+
+  const keepalivePings = interTurnPings + tailPings;
+  const userTurnHitRate = userInput > 0 ? roundRate(userCached / userInput) : 0;
+  let notes;
+  if (traces.length === 0) {
+    notes = "Host/proxy-only (excl. out/thinking); no usage turns to replay.";
+  } else {
+    const capSuffix =
+      cappedGapCount > 0 ? `, ${cappedGapCount} gap(s) capped at ${parsedOpts.maxPingsPerGap}x` : "";
+    notes = `Host/proxy-only (excl. out/thinking); ${keepalivePings} ping(s) (${wastedPings} wasted), avoids ${avoidedIdleBusts} idle bust(s), real-turn hit ${(userTurnHitRate * 100).toFixed(1)}%${capSuffix}.`;
+  }
+
+  return {
+    ...buildPolicyResult({
+      id,
+      label,
+      cachedTokens: totalCached,
+      totalInputTokens: totalInput,
+      busts: totalBusts,
+      wastedTokens: totalWasted,
+      costUsd: totalCostUsd,
+      observedCostUsd,
+      notes
+    }),
+    hypothetical: true,
+    userTurnHitRate,
+    keepalivePings,
+    interTurnPings,
+    tailPings,
+    wastedPings,
+    avoidedIdleBusts
+  };
+}
+
 function selectRecommendation(policies, observedDiag, traces = []) {
   const obsPolicy = policies.find((p) => p.id === "observed");
   const ttl5m = policies.find((p) => p.id === "ttl-5m");
@@ -1015,7 +1264,7 @@ function selectRecommendation(policies, observedDiag, traces = []) {
   }
 
   const qualifying = policies
-    .filter((p) => p.id !== "observed")
+    .filter((p) => p.id !== "observed" && !p.hypothetical)
     .filter((p) => (obsCost - p.projectedInputCostUsd) / obsCost >= RECOMMEND_MIN_SAVINGS_RATIO)
     .sort((a, b) => {
       const diff = a.projectedInputCostUsd - b.projectedInputCostUsd;
@@ -1076,6 +1325,21 @@ function selectRecommendation(policies, observedDiag, traces = []) {
     if (bestCutoff) {
       parts.push(
         `Tighter output cutoff (\`${bestCutoff.id}\`) would trim ${formatUsd(Math.abs(bestCutoff.deltaUsdVsObserved))} (${Math.abs(bestCutoff.deltaPctVsObserved).toFixed(1)}%) from oversized tool payloads.`
+      );
+    }
+  }
+
+  const keepUnlim = policies.find((p) => p.id === "keepalive-unlimited");
+  if (keepUnlim && obsPolicy && keepUnlim.projectedHitRate > obsPolicy.projectedHitRate) {
+    if (keepUnlim.projectedInputCostUsd > obsCost + 0.0005) {
+      const extraUsd = roundUsd(keepUnlim.projectedInputCostUsd - obsCost);
+      parts.push(
+        `Counterfactual \`keepalive-unlimited\` inflates apparent hit rate to ${(keepUnlim.projectedHitRate * 100).toFixed(1)}% (real-turn ${(keepUnlim.userTurnHitRate * 100).toFixed(1)}%), but ${keepUnlim.keepalivePings} auto-ping(s) (${keepUnlim.wastedPings} wasted) cost +${formatUsd(extraUsd)} over observed baseline.`
+      );
+    } else if (coldCompact && keepUnlim.projectedInputCostUsd > coldCompact.projectedInputCostUsd + 0.0005) {
+      const extraVsCompact = roundUsd(keepUnlim.projectedInputCostUsd - coldCompact.projectedInputCostUsd);
+      parts.push(
+        `Counterfactual \`keepalive-unlimited\` reaches ${(keepUnlim.projectedHitRate * 100).toFixed(1)}% apparent hit rate via ${keepUnlim.keepalivePings} ping(s) (${keepUnlim.wastedPings} wasted), costing +${formatUsd(extraVsCompact)} more than \`cold-boundary-compact\`.`
       );
     }
   }
@@ -1149,12 +1413,26 @@ export function simulateCachePolicies(sessions, options = {}) {
     replayCutoffPolicy(traces, observedCostUsd, spec)
   );
 
+  const keepalive1xPolicy = replayKeepAlivePolicy(traces, parsedOpts, observedCostUsd, {
+    id: "keepalive-1x",
+    label: "Keep-Alive (1x Capped)",
+    mode: "1x"
+  });
+
+  const keepaliveUnlimitedPolicy = replayKeepAlivePolicy(traces, parsedOpts, observedCostUsd, {
+    id: "keepalive-unlimited",
+    label: "Keep-Alive (Unlimited Auto)",
+    mode: "unlimited"
+  });
+
   const policies = [
     observedPolicy,
     ttl5mPolicy,
     ttl1hPolicy,
     coldCompactPolicy,
-    ...cutoffPolicies
+    ...cutoffPolicies,
+    keepalive1xPolicy,
+    keepaliveUnlimitedPolicy
   ];
 
   const { recommendedPolicy, rationale } = selectRecommendation(policies, observedDiag, traces);
@@ -1208,7 +1486,7 @@ export function formatSimulationMarkdown(report) {
   ];
 
   for (const p of policies) {
-    const marker = p.id === recommendedPolicy ? " **(rec)**" : "";
+    const marker = p.id === recommendedPolicy ? " **(rec)**" : p.hypothetical ? " *(sim-only)*" : "";
     let deltaCell;
     if (p.id === "observed") {
       deltaCell = "baseline";

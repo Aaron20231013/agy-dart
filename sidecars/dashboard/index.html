@@ -493,6 +493,80 @@
       border-color: var(--danger-border);
     }
 
+    a.btn {
+      text-decoration: none;
+    }
+
+    .star-link-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      height: 30px;
+      padding: 0 9px;
+      border-radius: var(--radius-md);
+      background: var(--bg-subtle);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 500;
+      text-decoration: none;
+      white-space: nowrap;
+      transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+    }
+
+    .star-link-tag:hover {
+      background: var(--bg-hover);
+      border-color: var(--border-strong);
+      color: var(--text-primary);
+    }
+
+    .star-link-glyph {
+      color: var(--warn);
+      font-size: 12px;
+      line-height: 1;
+    }
+
+    .star-banner {
+      padding: 10px 18px;
+      background: var(--accent-soft);
+      border-bottom: 1px solid var(--accent-border);
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .star-banner-msg {
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--text-primary);
+    }
+
+    .star-banner-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .star-cli-link {
+      font-size: 11.5px;
+      color: var(--text-muted);
+      padding: 3px 6px;
+      border-radius: var(--radius-sm);
+      transition: background-color 150ms ease, color 150ms ease;
+    }
+
+    .star-cli-link:hover {
+      color: var(--text-primary);
+      background: rgba(17, 24, 39, 0.05);
+    }
+
+    .star-banner-feedback {
+      font-size: 11.5px;
+      color: var(--ok-text);
+      font-weight: 500;
+    }
+
     .btn-icon {
       width: 14px;
       height: 14px;
@@ -916,6 +990,65 @@
       user-select: text;
     }
 
+    /* Stall Watchdog Rescue Panel */
+    .wd-rescue-box {
+      padding: 10px 12px;
+      border-radius: var(--radius-md);
+      background: var(--warn-soft);
+      border: 1px solid var(--warn-border);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .wd-rescue-box.is-stalled {
+      background: var(--danger-soft);
+      border-color: var(--danger-border);
+    }
+
+    .wd-cause-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--warn-text);
+    }
+
+    .wd-rescue-box.is-stalled .wd-cause-title {
+      color: var(--danger-text);
+    }
+
+    .wd-tips-list {
+      margin: 0;
+      padding-left: 16px;
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--text-primary);
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .wd-actions-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      margin-top: 2px;
+    }
+
+    .wd-other-alerts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      font-size: 11.5px;
+      color: var(--text-muted);
+    }
+
+    .wd-status-hint {
+      font-size: 11.5px;
+      color: var(--text-muted);
+      line-height: 1.4;
+    }
+
     /* Search & Inputs */
     .input-row {
       display: flex;
@@ -1292,6 +1425,10 @@
         </div>
 
         <div class="header-actions">
+          <a id="github-star-link" class="star-link-tag" href="https://github.com/zou172866/agy-dart" target="_blank" rel="noopener noreferrer" onclick="handleHeaderStarClick()" data-i18n-title="starHeaderTip" title="Star or Watch Releases on GitHub for Antigravity compatibility fixes">
+            <span class="star-link-glyph" aria-hidden="true">★</span>
+            <span data-i18n="starHeaderLabel">Star</span>
+          </a>
           <div id="lang-toggle" class="segmented" title="Switch Language / 切换界面语言">
             <button id="lang-zh-btn" onclick="setLanguage('zh')" class="seg-btn" title="切换为中文界面">中文</button>
             <button id="lang-en-btn" onclick="setLanguage('en')" class="seg-btn is-active" title="Switch to English UI">EN</button>
@@ -1369,19 +1506,78 @@
       </div>
     </section>
 
+    <!-- One-Time GitHub Star Milestone Banner (Hidden by default; shown at most once lifetime) -->
+    <section id="star-milestone-banner" class="star-banner hidden" role="region" aria-label="GitHub Star Milestone">
+      <div id="star-banner-msg" class="star-banner-msg"></div>
+      <div id="star-banner-actions" class="star-banner-actions">
+        <a id="star-banner-open-btn" href="https://github.com/zou172866/agy-dart" target="_blank" rel="noopener noreferrer" onclick="handleStarBannerOpen()" class="btn btn-primary btn-sm" data-i18n="starBannerOpenBtn">★ Star on GitHub</a>
+        <button id="star-banner-dismiss-btn" onclick="handleStarBannerDismiss()" class="btn btn-ghost btn-sm" data-i18n="starBannerDismissBtn">Dismiss</button>
+        <button id="star-banner-copy-cli-btn" onclick="handleStarBannerCopyCli()" class="star-cli-link" data-i18n="starBannerCopyCliBtn" data-i18n-title="starBannerCopyCliTip" title="Copy gh command to clipboard (never executed automatically)">Copy gh command</button>
+        <span id="star-banner-feedback" class="star-banner-feedback hidden"></span>
+      </div>
+    </section>
+
+    <!-- Band 1b: Sidecar Stall Guard (Dual-Source State Machine & Rescue Brief) -->
+    <section id="watchdog-card" class="band">
+      <div class="band-head">
+        <div class="band-title-group">
+          <span class="band-title" data-i18n="wdCardTitle">Stall Guard</span>
+        </div>
+        <div class="band-actions">
+          <button id="wd-notify-btn" onclick="toggleWatchdogNotify()" class="toggle-chip" data-enabled="0" data-i18n-title="wdNotifyTip" title="Opt-in OS desktop alert when a session appears hung (debounced, OFF by default)">Desktop Alert: OFF</button>
+          <button id="wd-enable-btn" onclick="toggleWatchdogEnabled()" class="toggle-chip is-on" data-enabled="1" data-i18n-title="wdEnableTip" title="Toggle Sidecar Stall Guard monitoring">Guard: ON</button>
+        </div>
+      </div>
+
+      <div class="meta-strip">
+        <span id="wd-severity-badge" class="meta-tag is-ok">Ready</span>
+        <span id="wd-status-hint" class="wd-status-hint">Idle · Auto-alerts &amp; prepares a rescue handoff if a turn hangs</span>
+        <span id="wd-phase-badge" class="meta-tag hidden">Idle</span>
+        <span id="wd-bucket-badge" class="meta-tag hidden">--</span>
+        <span id="wd-tool-badge" class="meta-tag is-info hidden">--</span>
+        <span id="wd-meta-extra" class="meta-tag hidden">--</span>
+      </div>
+
+      <div id="wd-timer-row" class="ttl-row hidden">
+        <div class="ttl-head">
+          <span id="wd-timer-label" class="progress-label" data-i18n="wdSilenceLabel">Silent Time</span>
+          <span id="wd-timer-text" class="ttl-text-ok">0s / 2m</span>
+        </div>
+        <div id="wd-bar-track" class="ttl-track">
+          <div id="wd-bar-fill" class="ttl-fill" style="width: 0%;"></div>
+        </div>
+      </div>
+
+      <div id="wd-rescue-box" class="wd-rescue-box hidden">
+        <div id="wd-cause-title" class="wd-cause-title">--</div>
+        <ol id="wd-tips-list" class="wd-tips-list"></ol>
+        <div class="wd-actions-row">
+          <button id="wd-copy-rescue-btn" onclick="copyWatchdogRescueBrief()" class="btn btn-primary btn-sm" data-i18n="wdCopyRescueBtn">Copy Rescue Brief</button>
+          <button id="wd-open-rescue-btn" onclick="openWatchdogRescueDrawer()" class="btn btn-secondary btn-sm" data-i18n="wdViewBriefBtn">View Brief</button>
+          <button id="wd-snooze-btn" onclick="snoozeWatchdogAlert()" class="btn btn-ghost btn-sm" data-i18n="wdSnoozeBtn">Snooze 5m</button>
+          <button id="wd-clear-btn" onclick="markWatchdogIdle()" class="btn btn-ghost btn-sm" data-i18n="wdMarkIdleBtn">Mark Idle</button>
+        </div>
+      </div>
+
+      <div id="wd-other-alerts" class="wd-other-alerts hidden"></div>
+    </section>
+
     <!-- Band 2: KV-Cache & Context Watermark + Prominent Handoff Action -->
     <section id="kv-cache-card" class="band">
       <div class="band-head">
         <div class="band-title-group">
           <span class="band-title" data-i18n="kvCardTitle">KV-Cache &amp; Context Watermark</span>
         </div>
-        <button id="kv-handoff-btn" onclick="toggleHandoffDrawer()" class="btn btn-secondary btn-sm" title="Generate cache-friendly compaction / session-switch Handoff Brief">
-          <svg class="btn-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-          </svg>
-          <span data-i18n="handoffBrief">Handoff Brief</span>
-          <span id="kv-handoff-cue" class="hidden"></span>
-        </button>
+        <div class="band-actions">
+          <button id="kv-ttl-notify-btn" onclick="toggleTtlNotify()" class="toggle-chip" data-enabled="0" data-i18n-title="kvTtlNotifyTip" title="Opt-in OS desktop alert when high-context (&gt;=60k) idle cache is about to expire (never auto-sends messages or burns quota)">TTL Alert: OFF</button>
+          <button id="kv-handoff-btn" onclick="toggleHandoffDrawer()" class="btn btn-secondary btn-sm" title="Generate cache-friendly compaction / session-switch Handoff Brief">
+            <svg class="btn-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+            </svg>
+            <span data-i18n="handoffBrief">Handoff Brief</span>
+            <span id="kv-handoff-cue" class="hidden"></span>
+          </button>
+        </div>
       </div>
 
       <div class="meta-strip">
@@ -1854,8 +2050,11 @@
         modelTip: 'Model: {model} | Window: {win}k ({src}) | Discount: {disc}% | Write: {mult}x',
         savingsTip: 'Est. input cost: {cost} | Saved: {saved} | Write mult: {mult}x{writes}',
         savingsWritesPart: ' | Writes: {k}k tok',
-        ttlTip: 'Effective TTL: {ttl} (source: {src}){gap}',
+        ttlTip: 'Effective TTL: {ttl} (source: {src}){gap}{cal}',
         ttlGapPart: ' | Max warm gap: {gap}',
+        ttlCalPart: ' | Calibrated ({origin}): {w} warm / {c} cold{bounds}',
+        kvTtlNotifyLabel: 'TTL Alert',
+        kvTtlNotifyTip: 'Opt-in OS desktop alert when high-context (>=60k) idle cache is about to expire (never auto-sends messages or burns quota)',
         confirmResetExempt: 'Reset file categories to defaults and clear custom extensions?',
         confirmPurgeConv: 'Clear indexed chunks and metrics for this conversation?',
         confirmPurgeApp: 'Clear indexed chunks and metrics recorded during this application session?',
@@ -1864,7 +2063,55 @@
         alertRemoveExemptFail: 'Failed to remove exemption: {msg}',
         alertResetExemptFail: 'Failed to reset exemptions: {msg}',
         alertMaintFail: 'Maintenance failed: {msg}',
-        alertPurgeFail: 'Purge failed: {msg}'
+        alertPurgeFail: 'Purge failed: {msg}',
+        wdCardTitle: 'Stall Guard',
+        wdEnableLabel: 'Guard',
+        wdNotifyLabel: 'Desktop Alert',
+        wdEnableTip: 'Toggle Sidecar Stall Guard monitoring',
+        wdNotifyTip: 'Opt-in OS desktop alert when a session appears hung (debounced, OFF by default)',
+        wdSilenceLabel: 'Silent Time',
+        wdSevIdle: 'Ready',
+        wdSevActive: 'Monitoring',
+        wdSevSuspect: 'Slow Response',
+        wdSevStalled: 'Likely Hung',
+        wdSevSnoozed: 'Snoozed',
+        wdSevOff: 'Paused',
+        wdPhaseIdle: 'Idle',
+        wdPhaseLlm: 'AI Thinking',
+        wdPhaseTool: 'Running Tool',
+        wdPhaseBg: 'Background / Subagent',
+        wdHintIdle: 'Idle · Auto-alerts & prepares a rescue handoff if a turn hangs',
+        wdHintIdleBg: 'Main turn done · Background tasks still running',
+        wdHintOff: 'Monitoring paused · Click Guard switch above to resume',
+        wdBucketLlmLow: 'Standard chat',
+        wdBucketLlmHigh: 'High context',
+        wdBucketLlmCompact: 'Compacting',
+        wdBucketLlmMedia: 'High-ctx + images',
+        wdBucketToolCmd: 'Shell command',
+        wdBucketToolMcpLong: 'Long MCP task',
+        wdBucketToolMcpFast: 'MCP tool',
+        wdBucketToolRead: 'Reading file',
+        wdBucketToolHost: 'Host tool',
+        wdBucketBg: 'Background task',
+        wdTranscriptGrowing: 'Still writing',
+        wdSleepGuardTag: 'Sleep time adjusted',
+        wdSubagentTag: 'subagent',
+        wdCopyRescueBtn: 'Copy Rescue Brief',
+        wdViewBriefBtn: 'View Brief',
+        wdSnoozeBtn: 'Snooze 5m',
+        wdMarkIdleBtn: 'Mark Idle',
+        wdOtherAlertPrefix: 'Other active alerts:',
+        wdTimerFmt: '{silent} silent / {thresh} hang limit (warn {warn})',
+        starHeaderLabel: 'Star',
+        starHeaderTip: 'Star or Watch Releases on GitHub for Antigravity compatibility fixes',
+        starBannerMsgSavings: 'Saved {savedText} of context bloat so far. Antigravity updates fast — Star or Watch releases on GitHub so you never miss compatibility fixes.',
+        starBannerMsgAudit: 'Your Prompt Cache audit passed. Antigravity updates fast — Star or Watch releases on GitHub so you never miss compatibility fixes.',
+        starBannerOpenBtn: '★ Star on GitHub',
+        starBannerDismissBtn: 'Dismiss',
+        starBannerCopyCliBtn: 'Copy gh command',
+        starBannerCopyCliTip: 'Copy gh api -X PUT /user/starred/zou172866/agy-dart to clipboard (never executed automatically)',
+        starBannerCopiedNotice: 'Copied — run it manually in your terminal.',
+        starBannerCopyFailedNotice: 'Copy failed — run manually: {cmd}'
       },
       zh: {
         pageTitle: 'agy-dart 上下文检查器',
@@ -2092,8 +2339,11 @@
         modelTip: '模型：{model} | 窗口：{win}k（{src}）| 折扣：{disc}% | 写倍率：{mult}x',
         savingsTip: '预计输入成本：{cost} | 已省：{saved} | 写倍率：{mult}x{writes}',
         savingsWritesPart: ' | 缓存写入：{k}k tok',
-        ttlTip: '生效 TTL：{ttl}（来源：{src}）{gap}',
+        ttlTip: '生效 TTL：{ttl}（来源：{src}）{gap}{cal}',
         ttlGapPart: ' | 最大热命中间隔：{gap}',
+        ttlCalPart: ' | 实证校准（{origin}）：{w} 热 / {c} 冷样本{bounds}',
+        kvTtlNotifyLabel: '临期提醒',
+        kvTtlNotifyTip: '默认关闭：仅在高上下文（≥60k）空闲即将过期时弹一次系统提醒，绝不自动发消息烧额度',
         confirmResetExempt: '确认恢复默认文件分组并清空所有自定义扩展名？',
         confirmPurgeConv: '确认清空当前对话的索引分块与统计指标？',
         confirmPurgeApp: '确认清空本次应用启动以来记录的索引分块与统计指标？',
@@ -2102,7 +2352,55 @@
         alertRemoveExemptFail: '移除豁免失败：{msg}',
         alertResetExemptFail: '重置豁免失败：{msg}',
         alertMaintFail: '维护操作失败：{msg}',
-        alertPurgeFail: '清理失败：{msg}'
+        alertPurgeFail: '清理失败：{msg}',
+        wdCardTitle: '防卡死监测',
+        wdEnableLabel: '防卡死',
+        wdNotifyLabel: '桌面弹窗',
+        wdEnableTip: '开关防卡死监测：开启后 AI 长时间卡住无输出会自动预警并准备交接简报',
+        wdNotifyTip: '默认关闭：勾选后，判定疑似卡死时弹出系统桌面通知',
+        wdSilenceLabel: '已无新输出',
+        wdSevIdle: '正常待命',
+        wdSevActive: '正常监测中',
+        wdSevSuspect: '响应偏慢',
+        wdSevStalled: '疑似卡死',
+        wdSevSnoozed: '已延后提醒',
+        wdSevOff: '已关闭',
+        wdPhaseIdle: '空闲',
+        wdPhaseLlm: 'AI 思考/输出中',
+        wdPhaseTool: '执行工具中',
+        wdPhaseBg: '后台任务/子代理',
+        wdHintIdle: '对话空闲中 · AI 长时间无输出时会自动预警并备好交接简报',
+        wdHintIdleBg: '主对话已结束 · 后台任务仍在运行',
+        wdHintOff: '已暂停卡死监测 · 点击右上角开关可重新开启',
+        wdBucketLlmLow: '常规对话',
+        wdBucketLlmHigh: '高上下文',
+        wdBucketLlmCompact: '压缩上下文中',
+        wdBucketLlmMedia: '高上下文含图片',
+        wdBucketToolCmd: '终端命令',
+        wdBucketToolMcpLong: '长耗时 MCP',
+        wdBucketToolMcpFast: 'MCP 工具',
+        wdBucketToolRead: '读取文件',
+        wdBucketToolHost: '编辑器工具',
+        wdBucketBg: '后台任务',
+        wdTranscriptGrowing: '正在持续输出',
+        wdSleepGuardTag: '已扣减休眠时间',
+        wdSubagentTag: '子代理',
+        wdCopyRescueBtn: '复制抢救简报',
+        wdViewBriefBtn: '展开简报',
+        wdSnoozeBtn: '延后 5 分钟',
+        wdMarkIdleBtn: '标为空闲',
+        wdOtherAlertPrefix: '其他会话告警：',
+        wdTimerFmt: '已等 {silent} / 超 {thresh} 判定卡死（{warn} 提醒）',
+        starHeaderLabel: 'Star',
+        starHeaderTip: '去 GitHub 点 Star / Watch Releases 跟进 Antigravity 兼容修复',
+        starBannerMsgSavings: '已为你累计拦下 {savedText} 冗余上下文。Antigravity 更新频繁，去 GitHub 点个 Star / Watch 防下次失效找不到修复版。',
+        starBannerMsgAudit: 'Prompt Cache 体检已通过。Antigravity 更新频繁，去 GitHub 点个 Star / Watch 防下次失效找不到修复版。',
+        starBannerOpenBtn: '★ 去 GitHub 点 Star',
+        starBannerDismissBtn: '不再提示',
+        starBannerCopyCliBtn: '复制 gh 命令',
+        starBannerCopyCliTip: '仅将 gh api -X PUT /user/starred/zou172866/agy-dart 复制到剪贴板，绝不自动执行',
+        starBannerCopiedNotice: '已复制，需自行在终端运行',
+        starBannerCopyFailedNotice: '复制失败，可手动执行：{cmd}'
       }
     };
 
@@ -2156,6 +2454,10 @@
     let cachedDisconnectedErr = null;
     let cachedConvId = '';
     let cachedHandoffData = null;
+    let cachedWatchdog = null;
+    let wdLiveState = null;
+    let wdLiveTimer = null;
+    let wdCopyResetTimer = null;
     let isProtectionPaused = false;
     let kvTtlState = null;
     let kvTtlTimer = null;
@@ -2165,6 +2467,11 @@
     let handoffCopyResetTimer = null;
     let handoffFetchSeq = 0;
     let refreshSeq = 0;
+    const GITHUB_REPO_URL = 'https://github.com/zou172866/agy-dart';
+    const GH_STAR_CLI_CMD = 'gh api -X PUT /user/starred/zou172866/agy-dart';
+    let cachedStarPrompt = null;
+    let starPromptResolvedLocally = false;
+    let starCopyHideTimer = null;
 
     function t(key, vars) {
       const dict = I18N[currentLang] || I18N.en;
@@ -2367,6 +2674,28 @@
       } else if (kvTtlState) {
         renderLocalTtlCountdown();
       }
+      if (cachedWatchdog) {
+        renderWatchdogCard(cachedWatchdog);
+      } else {
+        const wdEnableBtn = document.getElementById('wd-enable-btn');
+        const wdNotifyBtn = document.getElementById('wd-notify-btn');
+        const kvTtlNotifyBtn = document.getElementById('kv-ttl-notify-btn');
+        updateFeaturePill('wd-enable-btn', t('wdEnableLabel'), wdEnableBtn?.dataset?.enabled !== '0');
+        updateFeaturePill('wd-notify-btn', t('wdNotifyLabel'), wdNotifyBtn?.dataset?.enabled === '1');
+        updateFeaturePill('kv-ttl-notify-btn', t('kvTtlNotifyLabel'), kvTtlNotifyBtn?.dataset?.enabled === '1');
+        const sevBadge = document.getElementById('wd-severity-badge');
+        const phaseBadge = document.getElementById('wd-phase-badge');
+        const statusHint = document.getElementById('wd-status-hint');
+        if (sevBadge) {
+          sevBadge.className = 'meta-tag is-ok';
+          sevBadge.textContent = t('wdSevIdle');
+        }
+        if (phaseBadge) phaseBadge.classList.add('hidden');
+        if (statusHint) {
+          statusHint.textContent = t('wdHintIdle');
+          statusHint.classList.remove('hidden');
+        }
+      }
       if (cachedHandoffData) {
         renderHandoffMeta();
       }
@@ -2374,6 +2703,131 @@
       if (previewEl && lastHandoffMarkdown) {
         previewEl.textContent = lastHandoffMarkdown;
       }
+      if (cachedStats && cachedStats.starPrompt) {
+        renderStarMilestoneBanner(cachedStats.starPrompt);
+      }
+    }
+
+    function renderStarMilestoneBanner(sp) {
+      const banner = document.getElementById('star-milestone-banner');
+      if (!banner) return;
+      if (!sp || typeof sp !== 'object') {
+        if (starCopyHideTimer === null) banner.classList.add('hidden');
+        return;
+      }
+      cachedStarPrompt = sp;
+      if (sp.state && sp.state !== 'pending') {
+        starPromptResolvedLocally = true;
+      }
+      if (starPromptResolvedLocally || !sp.shouldShow || sp.state !== 'pending') {
+        if (starCopyHideTimer === null) banner.classList.add('hidden');
+        return;
+      }
+      const msgEl = document.getElementById('star-banner-msg');
+      if (msgEl) {
+        const savedBytes = Number(sp.lifetimeSavedBytes || sp.milestoneSavedBytes || 0);
+        msgEl.textContent =
+          savedBytes > 0
+            ? t('starBannerMsgSavings', { savedText: formatBytes(savedBytes) })
+            : t('starBannerMsgAudit');
+      }
+      banner.classList.remove('hidden');
+    }
+
+    async function persistStarPromptState(state) {
+      try {
+        const res = await apiFetch('/api/star-prompt', {
+          method: 'POST',
+          body: JSON.stringify({ state })
+        });
+        if (res && res.ok) {
+          const data = await res.json();
+          if (data && data.starPrompt) {
+            cachedStarPrompt = data.starPrompt;
+            if (cachedStats) cachedStats.starPrompt = data.starPrompt;
+          }
+        }
+      } catch {}
+    }
+
+    function hideStarBannerNow() {
+      const banner = document.getElementById('star-milestone-banner');
+      if (banner) banner.classList.add('hidden');
+    }
+
+    function handleHeaderStarClick() {
+      if (cachedStarPrompt && cachedStarPrompt.state === 'pending' && !starPromptResolvedLocally) {
+        starPromptResolvedLocally = true;
+        if (starCopyHideTimer !== null) {
+          clearTimeout(starCopyHideTimer);
+          starCopyHideTimer = null;
+        }
+        hideStarBannerNow();
+        persistStarPromptState('clicked');
+      }
+    }
+
+    function handleStarBannerOpen() {
+      starPromptResolvedLocally = true;
+      if (starCopyHideTimer !== null) {
+        clearTimeout(starCopyHideTimer);
+        starCopyHideTimer = null;
+      }
+      hideStarBannerNow();
+      persistStarPromptState('clicked');
+    }
+
+    function handleStarBannerDismiss() {
+      starPromptResolvedLocally = true;
+      if (starCopyHideTimer !== null) {
+        clearTimeout(starCopyHideTimer);
+        starCopyHideTimer = null;
+      }
+      hideStarBannerNow();
+      persistStarPromptState('dismissed');
+    }
+
+    async function handleStarBannerCopyCli() {
+      starPromptResolvedLocally = true;
+      let copied = false;
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        try {
+          await navigator.clipboard.writeText(GH_STAR_CLI_CMD);
+          copied = true;
+        } catch {}
+      }
+      if (!copied && typeof document.createElement === 'function' && document.body) {
+        const ta = document.createElement('textarea');
+        ta.value = GH_STAR_CLI_CMD;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '-9999px';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try {
+          copied = Boolean(document.execCommand('copy'));
+        } catch {
+          copied = false;
+        } finally {
+          document.body.removeChild(ta);
+        }
+      }
+      persistStarPromptState('copied_cli');
+      const fb = document.getElementById('star-banner-feedback');
+      if (fb) {
+        fb.textContent = copied
+          ? t('starBannerCopiedNotice')
+          : t('starBannerCopyFailedNotice', { cmd: GH_STAR_CLI_CMD });
+        fb.classList.remove('hidden');
+      }
+      if (starCopyHideTimer !== null) clearTimeout(starCopyHideTimer);
+      starCopyHideTimer = setTimeout(() => {
+        starCopyHideTimer = null;
+        if (fb) fb.classList.add('hidden');
+        hideStarBannerNow();
+      }, 2500);
     }
 
     function updateActiveBadge(isPaused) {
@@ -2963,6 +3417,7 @@
         const s = await statsRes.json();
         if (isStale()) return;
         cachedStats = s;
+        renderStarMilestoneBanner(s.starPrompt);
 
         updateCutoffDropdown(s);
         updateExemptionsList(s);
@@ -3049,6 +3504,20 @@
             if (isStale()) return;
             cachedKv = kv;
             renderKvCacheCard(kv);
+          }
+        } catch {}
+
+        try {
+          const wdRes = await apiFetch('/api/watchdog', {
+            method: 'POST',
+            body: JSON.stringify({ scope: reqScope, conversationId: convId })
+          });
+          if (isStale()) return;
+          if (wdRes.ok) {
+            const wd = await wdRes.json();
+            if (isStale()) return;
+            cachedWatchdog = wd;
+            renderWatchdogCard(wd);
           }
         } catch {}
 
@@ -3465,7 +3934,13 @@
       }
       try {
         const params = new URLSearchParams(window.location.search);
-        const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
+        const explicitConv = window.sidecar?.conversationId || params.get('conversationId') || '';
+        const convId =
+          explicitConv ||
+          (currentScope !== 'conversation' &&
+          (cachedWatchdog?.current?.severity === 'stalled' || cachedWatchdog?.current?.severity === 'suspect')
+            ? cachedWatchdog.current.conversationId || ''
+            : '');
         const res = await apiFetch('/api/handoff', {
           method: 'POST',
           body: JSON.stringify({ scope: currentScope, conversationId: convId })
@@ -3702,6 +4177,10 @@
       const deltasRowEl = document.getElementById('kv-top-deltas-row');
       const causesEl = document.getElementById('kv-bust-causes');
 
+      if (kv.ttlDesktopNotifyEnabled !== undefined) {
+        updateFeaturePill('kv-ttl-notify-btn', t('kvTtlNotifyLabel'), kv.ttlDesktopNotifyEnabled === true);
+      }
+
       if (!kv.transcriptFound || !kv.turnsWithUsage) {
         if (hitEl) hitEl.innerText = '--%';
         if (ctxEl) { ctxEl.innerText = '0 tok'; ctxEl.title = ''; }
@@ -3844,7 +4323,21 @@
           ttlEl.innerText = t('ttlColdBadge');
         }
         const gapTip = kv.maxWarmHitGapSec ? t('ttlGapPart', { gap: fmtSec(kv.maxWarmHitGapSec) }) : '';
-        ttlEl.title = t('ttlTip', { ttl: fmtSec(kv.cacheTtlSec), src: ttlSrc, gap: gapTip });
+        let calTip = '';
+        const cal = kv.ttlCalibration;
+        if (cal && (cal.warmSamples > 0 || cal.coldSamples > 0 || cal.origin === 'history' || cal.origin === 'session')) {
+          const boundParts = [];
+          if (cal.maxWarmGapSec) boundParts.push(`>=${fmtSec(cal.maxWarmGapSec)}`);
+          if (cal.minColdMissGapSec) boundParts.push(`<${fmtSec(cal.minColdMissGapSec)}`);
+          const boundsTxt = boundParts.length > 0 ? ` [${boundParts.join(', ')}]` : '';
+          calTip = t('ttlCalPart', {
+            origin: cal.origin || ttlSrc,
+            w: cal.warmSamples || 0,
+            c: cal.coldSamples || 0,
+            bounds: boundsTxt
+          });
+        }
+        ttlEl.title = t('ttlTip', { ttl: fmtSec(kv.cacheTtlSec), src: ttlSrc, gap: gapTip, cal: calTip });
       }
 
       updateHandoffButtonStyle(kv.compactAdvice);
@@ -3949,6 +4442,410 @@
       }
     }
 
+    function stopWdLiveTimer() {
+      if (wdLiveTimer !== null) {
+        clearInterval(wdLiveTimer);
+        wdLiveTimer = null;
+      }
+    }
+
+    function renderWatchdogLocalTick() {
+      const timerRow = document.getElementById('wd-timer-row');
+      const timerText = document.getElementById('wd-timer-text');
+      const barTrack = document.getElementById('wd-bar-track');
+      const barFill = document.getElementById('wd-bar-fill');
+      const sevBadge = document.getElementById('wd-severity-badge');
+
+      if (!wdLiveState || !wdLiveState.stalledSec || wdLiveState.phase === 'IDLE') {
+        if (timerRow) timerRow.classList.add('hidden');
+        stopWdLiveTimer();
+        return;
+      }
+
+      const nowClientMs = Date.now();
+      if (Number.isFinite(wdLiveState.lastTickClientMs)) {
+        const tickDeltaMs = nowClientMs - wdLiveState.lastTickClientMs;
+        if (tickDeltaMs > 15000 || tickDeltaMs < -5000) {
+          // Guard client tab against OS sleep/resume wall-clock jumps until Sidecar poll reconciles
+          wdLiveState.sleepJumpOffsetMs = (wdLiveState.sleepJumpOffsetMs || 0) + (tickDeltaMs - 1000);
+        }
+      }
+      wdLiveState.lastTickClientMs = nowClientMs;
+      const elapsedLocalSec = Math.max(
+        0,
+        Math.round((nowClientMs - wdLiveState.syncedAtClientMs - (wdLiveState.sleepJumpOffsetMs || 0)) / 1000)
+      );
+      const silentSec = Math.max(0, (wdLiveState.baseSilentSec || 0) + elapsedLocalSec);
+      const suspectSec = wdLiveState.suspectSec || Math.max(5, Math.round(wdLiveState.stalledSec * 0.6));
+      const stalledSec = wdLiveState.stalledSec;
+      const pct = Math.max(0, Math.min(100, (silentSec / stalledSec) * 100));
+
+      let liveSev = wdLiveState.severity || 'active';
+      if (liveSev !== 'snoozed') {
+        if (silentSec >= stalledSec) liveSev = 'stalled';
+        else if (silentSec >= suspectSec) liveSev = 'suspect';
+        else liveSev = 'active';
+      }
+
+      if (timerRow) timerRow.classList.remove('hidden');
+      if (timerText) {
+        timerText.textContent = t('wdTimerFmt', {
+          silent: fmtSec(silentSec),
+          thresh: fmtSec(stalledSec),
+          warn: fmtSec(suspectSec)
+        });
+        timerText.className = liveSev === 'stalled' ? 'ttl-text-danger' : liveSev === 'suspect' ? 'ttl-text-warn' : 'ttl-text-ok';
+      }
+      if (barFill) {
+        barFill.style.width = `${pct.toFixed(1)}%`;
+        barFill.className = liveSev === 'stalled' ? 'ttl-fill is-expired' : liveSev === 'suspect' ? 'ttl-fill is-expiring' : 'ttl-fill';
+      }
+      if (barTrack) {
+        barTrack.className = liveSev === 'stalled' ? 'ttl-track is-expired' : liveSev === 'suspect' ? 'ttl-track is-expiring' : 'ttl-track';
+      }
+      if (sevBadge && wdLiveState.enabled) {
+        if (liveSev === 'stalled') {
+          sevBadge.className = 'meta-tag is-danger';
+          sevBadge.textContent = t('wdSevStalled');
+        } else if (liveSev === 'suspect') {
+          sevBadge.className = 'meta-tag is-warn';
+          sevBadge.textContent = t('wdSevSuspect');
+        } else if (liveSev === 'snoozed') {
+          sevBadge.className = 'meta-tag is-info';
+          sevBadge.textContent = t('wdSevSnoozed');
+        } else {
+          sevBadge.className = 'meta-tag is-ok';
+          sevBadge.textContent = t('wdSevActive');
+        }
+      }
+    }
+
+    const WD_BUCKET_I18N_KEYS = {
+      llm_low_ctx: 'wdBucketLlmLow',
+      llm_high_ctx: 'wdBucketLlmHigh',
+      llm_compact: 'wdBucketLlmCompact',
+      llm_multimodal_high_ctx: 'wdBucketLlmMedia',
+      tool_sync_cmd: 'wdBucketToolCmd',
+      tool_mcp_long: 'wdBucketToolMcpLong',
+      tool_mcp_fast: 'wdBucketToolMcpFast',
+      tool_read: 'wdBucketToolRead',
+      tool_host: 'wdBucketToolHost',
+      subagent_bg: 'wdBucketBg'
+    };
+
+    function formatWdBucketLabel(bucket, fallback) {
+      const key = bucket && WD_BUCKET_I18N_KEYS[bucket];
+      if (key) return t(key);
+      return fallback || bucket || '';
+    }
+
+    function formatWdPhaseLabel(phase) {
+      if (phase === 'LLM_INFLIGHT') return t('wdPhaseLlm');
+      if (phase === 'TOOL_RUNNING') return t('wdPhaseTool');
+      if (phase === 'SUBAGENT_BG') return t('wdPhaseBg');
+      return t('wdPhaseIdle');
+    }
+
+    function renderWatchdogCard(wd) {
+      if (!wd) return;
+      const sevBadge = document.getElementById('wd-severity-badge');
+      const statusHint = document.getElementById('wd-status-hint');
+      const phaseBadge = document.getElementById('wd-phase-badge');
+      const bucketBadge = document.getElementById('wd-bucket-badge');
+      const toolBadge = document.getElementById('wd-tool-badge');
+      const metaExtra = document.getElementById('wd-meta-extra');
+      const timerRow = document.getElementById('wd-timer-row');
+      const rescueBox = document.getElementById('wd-rescue-box');
+      const causeTitle = document.getElementById('wd-cause-title');
+      const tipsList = document.getElementById('wd-tips-list');
+      const otherAlerts = document.getElementById('wd-other-alerts');
+
+      updateFeaturePill('wd-enable-btn', t('wdEnableLabel'), wd.enabled !== false);
+      updateFeaturePill('wd-notify-btn', t('wdNotifyLabel'), wd.desktopNotifyEnabled === true);
+      if (wd.ttlDesktopNotifyEnabled !== undefined) {
+        updateFeaturePill('kv-ttl-notify-btn', t('kvTtlNotifyLabel'), wd.ttlDesktopNotifyEnabled === true);
+      }
+
+      if (wd.enabled === false) {
+        wdLiveState = null;
+        stopWdLiveTimer();
+        if (sevBadge) { sevBadge.className = 'meta-tag'; sevBadge.textContent = t('wdSevOff'); }
+        if (phaseBadge) phaseBadge.classList.add('hidden');
+        if (statusHint) { statusHint.textContent = t('wdHintOff'); statusHint.classList.remove('hidden'); }
+        if (bucketBadge) bucketBadge.classList.add('hidden');
+        if (toolBadge) toolBadge.classList.add('hidden');
+        if (metaExtra) metaExtra.classList.add('hidden');
+        if (timerRow) timerRow.classList.add('hidden');
+        if (rescueBox) rescueBox.classList.add('hidden');
+        if (otherAlerts) otherAlerts.classList.add('hidden');
+        return;
+      }
+
+      const cur = wd.current || null;
+      if (!cur || cur.phase === 'IDLE') {
+        wdLiveState = null;
+        stopWdLiveTimer();
+        if (sevBadge) { sevBadge.className = 'meta-tag is-ok'; sevBadge.textContent = t('wdSevIdle'); }
+        if (phaseBadge) phaseBadge.classList.add('hidden');
+        if (statusHint) {
+          statusHint.textContent = cur?.subphase === 'stopped_bg_pending' ? t('wdHintIdleBg') : t('wdHintIdle');
+          statusHint.classList.remove('hidden');
+        }
+        if (bucketBadge) bucketBadge.classList.add('hidden');
+        if (toolBadge) toolBadge.classList.add('hidden');
+        if (metaExtra) {
+          if (wd.sleepGuard?.triggeredCount > 0) {
+            metaExtra.textContent = t('wdSleepGuardTag');
+            metaExtra.className = 'meta-tag is-info';
+            metaExtra.classList.remove('hidden');
+          } else {
+            metaExtra.classList.add('hidden');
+          }
+        }
+        if (timerRow) timerRow.classList.add('hidden');
+        if (rescueBox) rescueBox.classList.add('hidden');
+      } else {
+        if (statusHint) {
+          statusHint.textContent = '';
+          statusHint.classList.add('hidden');
+        }
+        if (phaseBadge) {
+          phaseBadge.textContent = formatWdPhaseLabel(cur.phase);
+          phaseBadge.className = cur.phase === 'SUBAGENT_BG' ? 'meta-tag is-info' : 'meta-tag';
+        }
+        if (bucketBadge) {
+          const ctxPart = cur.contextTokens > 0 ? ` · ${Math.round(cur.contextTokens / 1000)}k` : '';
+          const subPart = cur.isSubagent ? ` · ${t('wdSubagentTag')}` : '';
+          const bucketText = formatWdBucketLabel(cur.bucket, cur.subphase || cur.phase);
+          bucketBadge.textContent = `${bucketText}${ctxPart}${subPart}`;
+          bucketBadge.classList.remove('hidden');
+        }
+        if (toolBadge) {
+          if (cur.activeTool) {
+            const sum = cur.activeToolSummary ? `: ${cur.activeToolSummary.slice(0, 42)}` : '';
+            toolBadge.textContent = `${cur.activeTool}${sum}`;
+            toolBadge.title = cur.activeToolSummary || cur.activeTool;
+            toolBadge.classList.remove('hidden');
+          } else {
+            toolBadge.classList.add('hidden');
+          }
+        }
+        if (metaExtra) {
+          if (cur.transcriptGrowing) {
+            metaExtra.textContent = t('wdTranscriptGrowing');
+            metaExtra.className = 'meta-tag is-ok';
+            metaExtra.classList.remove('hidden');
+          } else if (wd.sleepGuard?.triggeredCount > 0) {
+            metaExtra.textContent = t('wdSleepGuardTag');
+            metaExtra.className = 'meta-tag is-info';
+            metaExtra.classList.remove('hidden');
+          } else {
+            metaExtra.classList.add('hidden');
+          }
+        }
+
+        const syncedAtClientMs = Number.isFinite(wd._syncedAtClientMs) ? wd._syncedAtClientMs : Date.now();
+        wd._syncedAtClientMs = syncedAtClientMs;
+        wdLiveState = {
+          enabled: true,
+          conversationId: cur.conversationId,
+          phase: cur.phase,
+          severity: cur.severity,
+          baseSilentSec: Number(cur.silentSec || 0),
+          suspectSec: Number(cur.suspectSec || 0),
+          stalledSec: Number(cur.stalledSec || 0),
+          syncedAtClientMs,
+          lastTickClientMs: Date.now(),
+          sleepJumpOffsetMs: 0
+        };
+        renderWatchdogLocalTick();
+        if (wdLiveTimer === null) {
+          wdLiveTimer = setInterval(renderWatchdogLocalTick, 1000);
+        }
+
+        if (rescueBox && (cur.severity === 'suspect' || cur.severity === 'stalled')) {
+          rescueBox.className = cur.severity === 'stalled' ? 'wd-rescue-box is-stalled' : 'wd-rescue-box';
+          const diag = cur.diagnosis || null;
+          if (causeTitle) {
+            const label = diag ? (currentLang === 'zh' ? diag.labelZh : diag.label) : formatWdPhaseLabel(cur.phase);
+            causeTitle.textContent = `${cur.severity === 'stalled' ? '!' : '~'} ${label}`;
+          }
+          if (tipsList) {
+            const tips = diag ? (currentLang === 'zh' ? diag.tipsZh : diag.tips) : [];
+            tipsList.innerHTML = (Array.isArray(tips) ? tips : [])
+              .slice(0, 2)
+              .map((tip) => `<li>${escapeHtml(tip)}</li>`)
+              .join('');
+          }
+        } else if (rescueBox) {
+          rescueBox.classList.add('hidden');
+        }
+      }
+
+      if (otherAlerts) {
+        const curId = cur?.conversationId || '';
+        const others = (Array.isArray(wd.alertingSessions) ? wd.alertingSessions : []).filter(
+          (s) => s.conversationId && s.conversationId !== curId
+        );
+        if (others.length > 0) {
+          otherAlerts.classList.remove('hidden');
+          otherAlerts.innerHTML =
+            `<span>${escapeHtml(t('wdOtherAlertPrefix'))}</span>` +
+            others
+              .map((s) => {
+                const shortId = escapeHtml(String(s.conversationId).slice(0, 10));
+                const sevTag = escapeHtml(s.severity === 'stalled' ? t('wdSevStalled') : t('wdSevSuspect'));
+                const cls = s.severity === 'stalled' ? 'meta-tag is-danger' : 'meta-tag is-warn';
+                const subMark = s.isSubagent ? ` (${escapeHtml(t('wdSubagentTag'))})` : '';
+                return `<span class="${cls}">${shortId}${subMark}: ${sevTag} ${escapeHtml(fmtSec(s.silentSec))}</span>`;
+              })
+              .join('');
+        } else {
+          otherAlerts.classList.add('hidden');
+          otherAlerts.innerHTML = '';
+        }
+      }
+    }
+
+    async function copyWatchdogRescueBrief() {
+      const btn = document.getElementById('wd-copy-rescue-btn');
+      let md = cachedWatchdog?.current?.rescueBrief?.markdown || '';
+      if (!md) {
+        try {
+          const params = new URLSearchParams(window.location.search);
+          const convId = cachedWatchdog?.current?.conversationId || window.sidecar?.conversationId || params.get('conversationId') || '';
+          const res = await apiFetch('/api/handoff', {
+            method: 'POST',
+            body: JSON.stringify({ scope: currentScope, conversationId: convId, includeStall: true })
+          });
+          if (res.ok) {
+            const data = await res.json();
+            md = typeof data.markdown === 'string' ? data.markdown : '';
+          }
+        } catch {}
+      }
+      if (!md) return;
+      let copied = false;
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        try {
+          await navigator.clipboard.writeText(md);
+          copied = true;
+        } catch {}
+      }
+      if (!copied) {
+        const ta = document.createElement('textarea');
+        ta.value = md;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '-9999px';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try {
+          copied = Boolean(document.execCommand('copy'));
+        } catch {
+          copied = false;
+        } finally {
+          document.body.removeChild(ta);
+        }
+      }
+      if (btn) {
+        btn.textContent = copied ? t('copiedBtn') : t('copyFailedBtn');
+        if (wdCopyResetTimer !== null) clearTimeout(wdCopyResetTimer);
+        wdCopyResetTimer = setTimeout(() => {
+          btn.textContent = t('wdCopyRescueBtn');
+          wdCopyResetTimer = null;
+        }, 2000);
+      }
+    }
+
+    function openWatchdogRescueDrawer() {
+      const brief = cachedWatchdog?.current?.rescueBrief || null;
+      if (brief && brief.markdown) {
+        cachedHandoffData = brief;
+        lastHandoffMarkdown = brief.markdown;
+        const drawer = document.getElementById('kv-handoff-drawer');
+        const previewEl = document.getElementById('kv-handoff-preview');
+        if (previewEl) previewEl.textContent = brief.markdown;
+        renderHandoffMeta();
+        if (drawer) {
+          handoffDrawerOpen = true;
+          drawer.classList.remove('hidden');
+          if (typeof drawer.scrollIntoView === 'function') {
+            drawer.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+          }
+        }
+        return;
+      }
+      toggleHandoffDrawer(true);
+    }
+
+    async function sendWatchdogAction(payload) {
+      ++refreshSeq;
+      const params = new URLSearchParams(window.location.search);
+      const convId = cachedWatchdog?.current?.conversationId || window.sidecar?.conversationId || params.get('conversationId') || '';
+      const res = await apiFetch('/api/watchdog/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: currentScope, conversationId: convId, ...payload })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data && data.status) {
+        cachedWatchdog = data.status;
+        renderWatchdogCard(data.status);
+      } else {
+        refreshData(false);
+      }
+    }
+
+    async function snoozeWatchdogAlert() {
+      try {
+        await sendWatchdogAction({ action: 'ack', snoozeSec: 300 });
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function markWatchdogIdle() {
+      try {
+        await sendWatchdogAction({ action: 'clear' });
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function toggleWatchdogEnabled() {
+      const btn = document.getElementById('wd-enable-btn');
+      const next = btn?.dataset?.enabled !== '1';
+      try {
+        await sendWatchdogAction({ action: 'setEnabled', enabled: next });
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function toggleWatchdogNotify() {
+      const btn = document.getElementById('wd-notify-btn');
+      const next = btn?.dataset?.enabled !== '1';
+      try {
+        await sendWatchdogAction({ action: 'setDesktopNotify', enabled: next });
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function toggleTtlNotify() {
+      const btn = document.getElementById('kv-ttl-notify-btn');
+      const next = btn?.dataset?.enabled !== '1';
+      try {
+        await sendWatchdogAction({ action: 'setTtlDesktopNotify', enabled: next });
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
     async function runMaintenanceVacuum() {
       const btn = document.getElementById('vacuum-btn');
       if (btn) btn.innerText = t('vacuumingBtn');
@@ -4001,6 +4898,7 @@
     pollTimer = setInterval(() => refreshData(false), 3000);
     window.addEventListener('beforeunload', () => {
       stopKvTtlTimer();
+      stopWdLiveTimer();
       if (pollTimer !== null) {
         clearInterval(pollTimer);
         pollTimer = null;
@@ -4008,6 +4906,14 @@
       if (handoffCopyResetTimer !== null) {
         clearTimeout(handoffCopyResetTimer);
         handoffCopyResetTimer = null;
+      }
+      if (wdCopyResetTimer !== null) {
+        clearTimeout(wdCopyResetTimer);
+        wdCopyResetTimer = null;
+      }
+      if (starCopyHideTimer !== null) {
+        clearTimeout(starCopyHideTimer);
+        starCopyHideTimer = null;
       }
     });
   </script>

@@ -8,9 +8,11 @@
  * `file_reads` and `file_snapshots` for the session.
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
+import { getEffectiveConfig } from "../context/lib/config.js";
 
 function readStdin(timeoutMs = 1500) {
   return new Promise((resolve) => {
@@ -343,14 +345,22 @@ async function main() {
   const responseIsError = extractResponseIsError(payload);
   const verifySignal = extractVerificationSignal(toolName, args, responseText);
 
-  if (clearAllSession || paths.length > 0 || verifySignal) {
+  const effectiveCfg = getEffectiveConfig();
+  const resolvedDbPath = effectiveCfg.dbPath || path.join(os.homedir(), ".agy-dart", "context.db");
+  const shouldTouchWatchdog =
+    Boolean(effectiveCfg.stallWatchdog) &&
+    Boolean(directConvId && directConvId !== "default") &&
+    (clearAllSession || paths.length > 0 || Boolean(verifySignal) || fs.existsSync(resolvedDbPath));
+
+  if (clearAllSession || paths.length > 0 || verifySignal || shouldTouchWatchdog) {
     let store = null;
     try {
-      const [{ ContextModeStore }, { redactSecrets }] = await Promise.all([
+      const [{ ContextModeStore }, { redactSecrets }, watchdogLeaseMod] = await Promise.all([
         import("../context/lib/store.js"),
-        import("../context/lib/security.js")
+        import("../context/lib/security.js"),
+        shouldTouchWatchdog ? import("../context/lib/watchdog-lease.js") : Promise.resolve(null)
       ]);
-      store = new ContextModeStore({ hookMode: true });
+      store = new ContextModeStore({ hookMode: true, maxBusyRetries: 4, maxRetryDeadlineMs: 800 });
       if (clearAllSession) {
         store.invalidateFileReads(sessionId, null);
         if (directConvId && directConvId !== sessionId) {
@@ -389,6 +399,23 @@ async function main() {
           summary: safeSummary,
           worktree: cwd
         });
+      }
+      if (
+        shouldTouchWatchdog &&
+        watchdogLeaseMod?.recordHookLeaseTransition &&
+        (typeof store.isWatchdogEnabled !== "function" || store.isWatchdogEnabled())
+      ) {
+        try {
+          watchdogLeaseMod.recordHookLeaseTransition(store, "PostToolUse", payload, {
+            directConvId,
+            rootSessionId: sessionId,
+            cwd,
+            toolName,
+            toolArgs: args,
+            responseText,
+            asyncBypassMs: effectiveCfg.cliFilterAsyncBypassMs ?? 2000
+          });
+        } catch {}
       }
     } catch {
       // Fail-open: never block PostToolUse

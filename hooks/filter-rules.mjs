@@ -27,7 +27,17 @@ const MAX_CUSTOM_MATCH_CMD_CHARS = 2048;
 const MAX_CUSTOM_FILTER_MS = 150;
 const CUSTOM_RULE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,47}$/;
 const FAIL_ERROR_LINE_RE =
-  /(?:^|\b)(?:error|err!|fail(?:ed|ure)?|fatal|panic|exception|traceback|assertionerror|syntaxerror|typeerror|referenceerror|enoent|eacces|econnrefused|not ok|✖|✗)(?:\b|:|$)/i;
+  /(?:(?:^|\b)(?:error|err!|fail(?:ed|ure)?|fatal|panic|exception|traceback|assertionerror|syntaxerror|typeerror|referenceerror|rangeerror|enoent|eacces|econnrefused|not ok|segmentation fault|segfault)(?:\b|:|$)|(?:^|\s)[✖✗](?:\s|$)|\bERR_[A-Z0-9_]{3,}\b)/i;
+const PASCAL_ERROR_CLASS_RE = /\b[A-Z][A-Za-z0-9_]*(?:Error|Exception)\b(?:\s*[:\[(]|$)/;
+const ZERO_ERROR_CLAUSE_RE =
+  /\b(?:0\s+(?:errors?|fail(?:ed|ures?)?)|(?:errors?|fail(?:ed|ures?)?)\s*[:=]?\s*0)\b/gi;
+
+function isFailureAnchorLine(line) {
+  if (!line || !line.trim()) return false;
+  const cleaned = line.replace(ZERO_ERROR_CLAUSE_RE, " ");
+  if (!cleaned.trim()) return false;
+  return FAIL_ERROR_LINE_RE.test(cleaned) || PASCAL_ERROR_CLASS_RE.test(cleaned);
+}
 
 const projectRulesCache = new Map();
 
@@ -75,6 +85,269 @@ export function truncateHeadTailUtf8Safe(text, maxBytes) {
   const head = truncateUtf8Safe(text, headBudget).replace(/\s+$/, "");
   const tail = truncateTailUtf8Safe(text, tailBudget).replace(/^\s+/, "");
   return `${head}${marker}${tail}`;
+}
+
+/**
+ * Compact oversized failing command output while preserving error anchor blocks (±3 lines)
+ * hidden anywhere in the output (including the middle of 30 KB+ logs), prioritizing:
+ *   1. First root-cause error block
+ *   2. Last error block
+ *   3. Head command summary & Tail exit/test summary
+ * Strictly enforces <= maxBytes UTF-8 without splitting multi-byte characters.
+ * Returns null if no error anchors are found so callers fall back to head/tail truncation.
+ */
+export function compactFailureWithErrorAnchors(text, maxBytes) {
+  if (!text || typeof text !== "string" || !Number.isFinite(maxBytes) || maxBytes < 450) {
+    return null;
+  }
+  const normalized = text.includes("\r") ? text.replace(/\r\n/g, "\n").replace(/\r/g, "\n") : text;
+  if (Buffer.byteLength(normalized, "utf8") <= maxBytes) {
+    return normalized;
+  }
+
+  const lines = normalized.split("\n");
+  if (lines.length < 10) {
+    return null;
+  }
+
+  // 1. Locate error anchor lines (stripping zero-count clauses like "0 failed" / "0 errors" / "fail 0")
+  const anchors = [];
+  const anchorSet = new Set();
+  for (let i = 0; i < lines.length; i++) {
+    if (isFailureAnchorLine(lines[i])) {
+      anchors.push(i);
+      anchorSet.add(i);
+    }
+  }
+  if (anchors.length === 0) {
+    return null;
+  }
+
+  // 2. Build merged ±3 line windows around error anchors while retaining exact anchor indices per block
+  const CTX_RADIUS = 3;
+  const blocks = [];
+  for (const a of anchors) {
+    const start = Math.max(0, a - CTX_RADIUS);
+    const end = Math.min(lines.length - 1, a + CTX_RADIUS);
+    if (blocks.length > 0 && start <= blocks[blocks.length - 1].end + 1) {
+      const prev = blocks[blocks.length - 1];
+      prev.end = Math.max(prev.end, end);
+      prev.anchors.push(a);
+    } else {
+      blocks.push({ start, end, anchors: [a] });
+    }
+  }
+
+  const markerStr = (omitted) => `... [${omitted} lines omitted] ...`;
+  const CLIP_SUFFIX = " ...[clipped]";
+  const CLIP_SUFFIX_BYTES = Buffer.byteLength(CLIP_SUFFIX, "utf8");
+
+  // Map<lineIdx, { text, prio, bytes }> where smaller prio = higher retention priority
+  const chosen = new Map();
+  let usedBytes = 0;
+
+  const clipLineText = (rawLine, maxLineBytes, fromTail = false) => {
+    const cap = Math.max(16, Math.floor(maxLineBytes));
+    if (Buffer.byteLength(rawLine, "utf8") <= cap) return rawLine;
+    if (cap <= CLIP_SUFFIX_BYTES + 16) {
+      return fromTail ? truncateTailUtf8Safe(rawLine, cap) : truncateUtf8Safe(rawLine, cap);
+    }
+    const innerCap = cap - CLIP_SUFFIX_BYTES;
+    return fromTail
+      ? `...[clipped] ${truncateTailUtf8Safe(rawLine, innerCap)}`
+      : `${truncateUtf8Safe(rawLine, innerCap)}${CLIP_SUFFIX}`;
+  };
+
+  const trySelectLine = (idx, budgetCap, prio, { allowClip = false, maxLineShare = 0, fromTail = false } = {}) => {
+    if (idx < 0 || idx >= lines.length) return false;
+    if (chosen.has(idx)) {
+      const existing = chosen.get(idx);
+      if (prio < existing.prio) existing.prio = prio;
+      return true;
+    }
+    const rem = budgetCap - usedBytes;
+    if (rem < 2) return false;
+    const raw = lines[idx];
+    const rawBytes = Buffer.byteLength(raw, "utf8") + 1;
+    const effectiveLineCap =
+      allowClip && maxLineShare > 0 ? Math.min(rem - 1, Math.max(120, maxLineShare)) : rem - 1;
+    if (rawBytes <= rem && (!allowClip || maxLineShare <= 0 || rawBytes - 1 <= effectiveLineCap)) {
+      chosen.set(idx, { text: raw, prio, bytes: rawBytes });
+      usedBytes += rawBytes;
+      return true;
+    }
+    if (allowClip && effectiveLineCap >= 48) {
+      const clipped = clipLineText(raw, effectiveLineCap, fromTail);
+      const cb = Buffer.byteLength(clipped, "utf8") + 1;
+      if (cb <= rem) {
+        chosen.set(idx, { text: clipped, prio, bytes: cb });
+        usedBytes += cb;
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const addRangeWithBudget = (start, end, allocBudget, prio, fromTail = false) => {
+    if (allocBudget <= 0 || start > end) return 0;
+    const startUsed = usedBytes;
+    const cap = startUsed + allocBudget;
+    let addedAny = false;
+    const step = fromTail ? -1 : 1;
+    for (let i = fromTail ? end : start; fromTail ? i >= start : i <= end; i += step) {
+      if (chosen.has(i)) {
+        const ex = chosen.get(i);
+        if (prio < ex.prio) ex.prio = prio;
+        addedAny = true;
+        continue;
+      }
+      const rem = cap - usedBytes;
+      if (rem < 24) break;
+      const lineShare = Math.min(rem - 1, Math.max(160, Math.floor(allocBudget * 0.65)));
+      const effPrio =
+        fromTail && (anchorSet.has(i) || i === lines.length - 1) ? Math.min(prio, 2) : prio;
+      if (!trySelectLine(i, cap, effPrio, { allowClip: !addedAny || rem >= 96, maxLineShare: lineShare, fromTail })) {
+        break;
+      }
+      addedAny = true;
+    }
+    return usedBytes - startUsed;
+  };
+
+  const addErrorBlockWithBudget = (block, allocBudget, anchorPrio, ctxPrio, { fromLastAnchor = false } = {}) => {
+    if (allocBudget <= 0 || !block) return 0;
+    const startUsed = usedBytes;
+    const cap = startUsed + allocBudget;
+    const singleLineCap = Math.max(180, Math.floor(allocBudget * 0.55));
+    const orderedAnchors = fromLastAnchor ? block.anchors.slice().reverse() : block.anchors;
+
+    for (const a of orderedAnchors) {
+      if (cap - usedBytes < 32) break;
+      // Pass 1 for this anchor: anchor line itself + immediate following stack lines
+      trySelectLine(a, cap, anchorPrio, { allowClip: true, maxLineShare: singleLineCap, fromTail: false });
+      const followEnd = Math.min(block.end, a + CTX_RADIUS);
+      for (let i = a + 1; i <= followEnd; i++) {
+        if (cap - usedBytes < 32) break;
+        const p = anchorSet.has(i) ? anchorPrio : anchorPrio + 0.5;
+        trySelectLine(i, cap, p, { allowClip: true, maxLineShare: singleLineCap, fromTail: false });
+      }
+      // Pass 2 for this anchor: preceding ±3 context lines (avoids fragmented tiny omission markers)
+      const prevStart = Math.max(block.start, a - CTX_RADIUS);
+      for (let i = prevStart; i < a; i++) {
+        if (cap - usedBytes < 32) break;
+        if (chosen.has(i)) continue;
+        trySelectLine(i, cap, ctxPrio, { allowClip: false });
+      }
+    }
+    return usedBytes - startUsed;
+  };
+
+  // Reserve space for omitted-line markers (head, first error, last error, tail)
+  const BASE_MARKER_RESERVE = 200;
+  const EXTRA_BLOCK_MARKER_COST = 42;
+  const contentBudget = Math.max(220, maxBytes - BASE_MARKER_RESERVE);
+
+  // Priority A: Tail exit/test summary (last 15 lines, up to 24% of budget)
+  const tailStart = Math.max(0, lines.length - 15);
+  addRangeWithBudget(tailStart, lines.length - 1, Math.floor(contentBudget * 0.24), 3, true);
+
+  // Priority B: Head command overview (first 6 lines, up to 12% of budget)
+  const headEnd = Math.min(lines.length - 1, 5);
+  addRangeWithBudget(0, headEnd, Math.floor(contentBudget * 0.12), 5, false);
+
+  // Priority C: Error anchor blocks (first root-cause block + last error block + intermediate blocks)
+  const remAfterHeadTail = Math.max(0, contentBudget - usedBytes);
+  if (blocks.length === 1) {
+    if (blocks[0].anchors.length >= 2) {
+      const leadBudget = Math.floor(remAfterHeadTail * 0.55);
+      addErrorBlockWithBudget(blocks[0], leadBudget, 1, 4, { fromLastAnchor: false });
+      const tailAnchorBudget = Math.max(0, contentBudget - usedBytes);
+      addErrorBlockWithBudget(blocks[0], tailAnchorBudget, 2, 4, { fromLastAnchor: true });
+    } else {
+      addErrorBlockWithBudget(blocks[0], remAfterHeadTail, 1, 4, { fromLastAnchor: false });
+    }
+  } else {
+    const firstBlockBudget = Math.floor(remAfterHeadTail * 0.52);
+    addErrorBlockWithBudget(blocks[0], firstBlockBudget, 1, 4);
+
+    const lastBlock = blocks[blocks.length - 1];
+    const remBeforeLast = Math.max(0, contentBudget - usedBytes);
+    const lastBlockBudget = blocks.length === 2 ? remBeforeLast : Math.floor(remBeforeLast * 0.55);
+    addErrorBlockWithBudget(lastBlock, lastBlockBudget, 2, 4, { fromLastAnchor: true });
+
+    for (let bi = 1; bi < blocks.length - 1; bi++) {
+      const rem = contentBudget - usedBytes - EXTRA_BLOCK_MARKER_COST;
+      if (rem < 120) break;
+      const added = addErrorBlockWithBudget(
+        blocks[bi],
+        Math.min(rem, Math.floor(contentBudget * 0.25)),
+        6,
+        6.5
+      );
+      if (added > 0) {
+        usedBytes += EXTRA_BLOCK_MARKER_COST;
+      }
+    }
+  }
+
+  // Priority D: Expand tail context upward if substantial unused budget remains
+  const unusedBudget = contentBudget - usedBytes;
+  if (unusedBudget > 400) {
+    addRangeWithBudget(Math.max(0, lines.length - 60), lines.length - 1, unusedBudget, 7, true);
+  }
+
+  if (chosen.size === 0) {
+    return null;
+  }
+
+  const assembleSelected = () => {
+    const sortedIdx = Array.from(chosen.keys()).sort((a, b) => a - b);
+    const outParts = [];
+    if (sortedIdx[0] > 0) {
+      outParts.push(markerStr(sortedIdx[0]));
+    }
+    for (let k = 0; k < sortedIdx.length; k++) {
+      const idx = sortedIdx[k];
+      if (k > 0 && idx > sortedIdx[k - 1] + 1) {
+        outParts.push(markerStr(idx - sortedIdx[k - 1] - 1));
+      }
+      outParts.push(chosen.get(idx).text);
+    }
+    const lastChosen = sortedIdx[sortedIdx.length - 1];
+    if (lastChosen < lines.length - 1) {
+      outParts.push(markerStr(lines.length - 1 - lastChosen));
+    }
+    return outParts.join("\n");
+  };
+
+  let assembled = assembleSelected();
+  // Exact priority-preserving trim: drop lowest-priority lines first so middle root-cause anchors are NEVER sliced out
+  while (Buffer.byteLength(assembled, "utf8") > maxBytes && chosen.size > 1) {
+    let victimIdx = -1;
+    let worstPrio = -1;
+    let worstBytes = -1;
+    for (const [idx, entry] of chosen.entries()) {
+      if (entry.prio > worstPrio || (entry.prio === worstPrio && entry.bytes > worstBytes)) {
+        worstPrio = entry.prio;
+        worstBytes = entry.bytes;
+        victimIdx = idx;
+      }
+    }
+    if (victimIdx < 0) break;
+    chosen.delete(victimIdx);
+    assembled = assembleSelected();
+  }
+  if (Buffer.byteLength(assembled, "utf8") > maxBytes && chosen.size === 1) {
+    const [[onlyIdx, entry]] = chosen.entries();
+    const overhead = Buffer.byteLength(assembled, "utf8") - Buffer.byteLength(entry.text, "utf8");
+    const clipped = clipLineText(entry.text, Math.max(16, maxBytes - overhead), false);
+    chosen.set(onlyIdx, { ...entry, text: clipped, bytes: Buffer.byteLength(clipped, "utf8") + 1 });
+    assembled = assembleSelected();
+  }
+  if (Buffer.byteLength(assembled, "utf8") > maxBytes) {
+    assembled = truncateUtf8Safe(assembled, maxBytes);
+  }
+  return assembled;
 }
 
 /** Strip ANSI CSI/OSC sequences and collapse carriage-return progress spinner overwrites */
@@ -2687,8 +2960,8 @@ export function applyFilterRule(ruleId, rawStdout, rawStderr, exitCode = 0, opti
     : "";
 
   const reserveFooter = Math.max(
-    220,
-    140 +
+    240,
+    160 +
       Buffer.byteLength(String(ruleId || ""), "utf8") +
       Buffer.byteLength(noteParts.join(", "), "utf8") +
       Buffer.byteLength(sourceHint, "utf8")
@@ -2759,10 +3032,28 @@ export function applyFilterRule(ruleId, rawStdout, rawStderr, exitCode = 0, opti
   }
 
   const keepTail = exitCode !== 0 && (Boolean(rule?.preserveTailOnFail) || Boolean(rule?.custom));
-  if (Buffer.byteLength(filtered, "utf8") > maxBytes - reserveFooter) {
-    filtered = keepTail
-      ? truncateHeadTailUtf8Safe(filtered, maxBytes - reserveFooter)
-      : truncateUtf8Safe(filtered, maxBytes - reserveFooter);
+  const effectiveReserve = Math.max(
+    reserveFooter,
+    (exitCode !== 0 ? 200 : 180) +
+      Buffer.byteLength(String(ruleId || ""), "utf8") +
+      Buffer.byteLength(noteParts.join(", "), "utf8") +
+      Buffer.byteLength(sourceHint, "utf8")
+  );
+  const bodyBudget = Math.max(0, maxBytes - effectiveReserve);
+  if (Buffer.byteLength(filtered, "utf8") > bodyBudget) {
+    if (exitCode !== 0) {
+      const anchored = compactFailureWithErrorAnchors(filtered, bodyBudget);
+      if (anchored !== null) {
+        filtered = anchored;
+        noteParts.push("error-anchors");
+      } else {
+        filtered = keepTail
+          ? truncateHeadTailUtf8Safe(filtered, bodyBudget)
+          : truncateUtf8Safe(filtered, bodyBudget);
+      }
+    } else {
+      filtered = truncateUtf8Safe(filtered, bodyBudget);
+    }
     truncated = true;
   }
 

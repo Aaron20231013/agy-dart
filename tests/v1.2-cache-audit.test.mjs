@@ -187,14 +187,17 @@ test("1. Clean healthy agy-dart setup scores 100 (Grade A) with live dual-MCP ve
     assert.equal(fastSrv.rawSha256, fastSrv.rawSha256Run2);
     assert.equal(ctxSrv.rawSha256, ctxSrv.rawSha256Run2);
 
-    // Check 3: agy-dart PreInvocation recognized as UI-only safe (zero prefix pollution), zero hook warnings
-    assert.equal(report.hooks.hookCount, 4);
+    // Check 3: agy-dart PreInvocation recognized as UI-only safe (zero prefix pollution), Stop hook clean, zero hook warnings
+    assert.equal(report.hooks.hookCount, 5);
     const preInv = report.hooks.entries.find((e) => e.event === "PreInvocation");
     assert.ok(preInv, "PreInvocation hook should be audited");
     assert.equal(preInv.uiOnlySafe, true);
     assert.equal(preInv.status, "ui_only_safe");
     assert.equal(preInv.writesNonEmptySystemMessage, false);
     assert.equal(preInv.injectsDynamicSystemMessage, false);
+    const stopHook = report.hooks.entries.find((e) => e.event === "Stop");
+    assert.ok(stopHook, "Stop hook should be audited");
+    assert.equal(stopHook.writesNonEmptySystemMessage, false);
   } finally {
     env.cleanup();
   }

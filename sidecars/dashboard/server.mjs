@@ -8,6 +8,7 @@ import { execSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { getEffectiveConfig } from "../../context/lib/config.js";
 import { buildHandoffBrief, inferWorkspaceFromStore } from "../../context/lib/handoff.js";
+import { WatchdogMonitor } from "../../context/lib/watchdog.js";
 import {
   analyzeTranscriptCache,
   computeCacheWarmth,
@@ -38,6 +39,7 @@ const SIDECAR_CSRF_TOKEN = crypto.randomBytes(24).toString("hex");
 let _runtimeStore = null;
 let _appStartTime = null;
 let _runtimeInitialized = false;
+let _watchdogMonitor = null;
 
 function getAppStartTime() {
   if (_appStartTime !== null) return _appStartTime;
@@ -56,7 +58,28 @@ function getAppStartTime() {
   return _appStartTime;
 }
 
+export function stopWatchdogMonitor() {
+  if (_watchdogMonitor) {
+    try {
+      _watchdogMonitor.stop();
+    } catch {}
+    _watchdogMonitor = null;
+  }
+}
+
+export function getWatchdogMonitor(options = {}) {
+  if (!_watchdogMonitor) {
+    _watchdogMonitor = new WatchdogMonitor({
+      getStore: () => getRuntimeStore(),
+      getAppStartTime: () => getAppStartTime(),
+      ...options
+    });
+  }
+  return _watchdogMonitor;
+}
+
 export function closeRuntimeStore() {
+  stopWatchdogMonitor();
   if (_runtimeStore) {
     try {
       _runtimeStore.close();
@@ -112,6 +135,19 @@ export function isAllowedOriginHeader(originHeader, hostHeader = null) {
     return false;
   }
   return true;
+}
+
+export function isAllowedRefererHeader(refererHeader, hostHeader = null) {
+  if (refererHeader === undefined || refererHeader === null || refererHeader === "") return true;
+  if (typeof refererHeader !== "string") return false;
+  const trimmed = refererHeader.trim();
+  if (!trimmed) return true;
+  try {
+    const refUrl = new URL(trimmed);
+    return isAllowedOriginHeader(refUrl.origin, hostHeader);
+  } catch {
+    return false;
+  }
 }
 
 export function isCrossSiteFetchHeader(secFetchSite, { allowSameSite = false } = {}) {
@@ -229,7 +265,7 @@ function getPackageVersion() {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../../package.json"), "utf8"));
     if (pkg.version) return pkg.version;
   } catch {}
-  return "1.3.0";
+  return "1.5.0";
 }
 
 function getRenderedHtml(csrfToken = SIDECAR_CSRF_TOKEN) {
@@ -379,6 +415,9 @@ function getStatsPayload(data, defaultConvId = "default") {
     targetSid,
     scope === "app" || scope === "session" ? { sinceTs: appStartTime } : {}
   );
+  try {
+    stats.starPrompt = store.evaluateStarPrompt({ markTriggered: true });
+  } catch {}
 
   stats.version = getPackageVersion();
 
@@ -444,9 +483,33 @@ function refreshWallClockTtl(diag, explicitTtlSec) {
   };
 }
 
+function formatCalibrationCacheStamp(historicalMap) {
+  if (!historicalMap || typeof historicalMap !== "object") return "";
+  const keys = Object.keys(historicalMap).sort();
+  if (keys.length === 0) return "";
+  return keys.map((k) => `${k}:${historicalMap[k]?.updatedTs || 0}`).join(",");
+}
+
+function inferConvIdFromTranscriptPath(transcriptPath, fallbackConvId = "") {
+  if (fallbackConvId && fallbackConvId !== "default" && fallbackConvId !== "all" && fallbackConvId !== "app") {
+    return fallbackConvId;
+  }
+  if (!transcriptPath || typeof transcriptPath !== "string") return "";
+  // .../brain/<convId>/.system_generated/logs/transcript.jsonl
+  const logDir = path.dirname(transcriptPath);
+  const sysDir = path.dirname(logDir);
+  if (path.basename(sysDir) === ".system_generated") {
+    const candidate = path.basename(path.dirname(sysDir));
+    if (candidate && isSafeConversationId(candidate)) return candidate;
+  }
+  return "";
+}
+
 function getCacheDiagPayload(data, defaultConvId = "default") {
   const { scope, convId } = resolveTargetSession(data, defaultConvId);
   const cfg = getEffectiveConfig();
+  const store = getRuntimeStore();
+  const ttlDesktopNotifyEnabled = store.isTtlDesktopNotifyEnabled();
   const rawTtl = data.ttl !== undefined && data.ttl !== "" ? data.ttl : cfg.cacheTtlSec;
   const explicitTtlSec = parseOptionalPositiveNumber(rawTtl);
   const envWindowTokens = parseOptionalPositiveNumber(cfg.windowTokens);
@@ -472,14 +535,26 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     const effectiveWindow = envWindowTokens ?? defProfile.windowTokens;
     const windowSource = envWindowTokens !== undefined ? "explicit" : "profile";
     const ttlSource = explicitTtlSec !== undefined ? "explicit" : "profile";
+    const effTtl = explicitTtlSec ?? defProfile.ttlSec;
     return {
       ok: true,
       transcriptFound: false,
       scope,
       conversationId: convId,
       serverNowMs: Date.now(),
-      cacheTtlSec: explicitTtlSec ?? defProfile.ttlSec,
+      ttlDesktopNotifyEnabled,
+      cacheTtlSec: effTtl,
       ttlSource,
+      ttlCalibration: {
+        origin: ttlSource,
+        profileId: defProfile.id,
+        warmSamples: 0,
+        coldSamples: 0,
+        maxWarmGapSec: null,
+        minColdMissGapSec: null,
+        estimatedTtlSec: effTtl,
+        confidence: ttlSource === "explicit" ? "high" : "low"
+      },
       maxWarmHitGapSec: null,
       ttlStatus: "cold",
       cacheTemperature: "cold",
@@ -539,7 +614,10 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
   }
   try {
     const st = fs.statSync(transcriptPath);
-    const cacheKey = `${transcriptPath}:${explicitTtlSec ?? "auto"}:${envWindowTokens ?? ""}:${envWarnTokens ?? ""}:${envCritTokens ?? ""}`;
+    const historicalTtlByProfile = store.getAllModelTtlCalibrations();
+    const calStamp = formatCalibrationCacheStamp(historicalTtlByProfile);
+    const baseKeyPrefix = `${transcriptPath}:${explicitTtlSec ?? "auto"}:${envWindowTokens ?? ""}:${envWarnTokens ?? ""}:${envCritTokens ?? ""}`;
+    const cacheKey = `${baseKeyPrefix}:${calStamp}`;
     const cached = parsedDiagCache.get(cacheKey);
     let diag;
     if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
@@ -550,14 +628,31 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
           ? parseTranscriptLines(fs.readFileSync(transcriptPath, "utf8"))
           : readTranscriptTail(transcriptPath, 524288);
       const nowMs = Date.now();
-      const diagOpts = { nowMs };
+      const obsConvId = inferConvIdFromTranscriptPath(transcriptPath, isSpecificConv ? convId : "");
+      const diagOpts = {
+        nowMs,
+        historicalTtlByProfile,
+        conversationId: obsConvId
+      };
       if (explicitTtlSec !== undefined) diagOpts.ttlSec = explicitTtlSec;
       if (envWindowTokens !== undefined) diagOpts.windowTokens = envWindowTokens;
       if (envWarnTokens !== undefined) diagOpts.warnTokens = envWarnTokens;
       if (envCritTokens !== undefined) diagOpts.criticalTokens = envCritTokens;
       diag = analyzeTranscriptCache(steps, diagOpts);
+      let finalCalStamp = calStamp;
+      if (diag.ttlObservations && Object.keys(diag.ttlObservations).length > 0) {
+        const recRes = store.recordModelTtlObservations(diag.ttlObservations, obsConvId, nowMs);
+        if (recRes && recRes.updatedProfiles > 0) {
+          finalCalStamp = formatCalibrationCacheStamp(store.getAllModelTtlCalibrations(nowMs));
+        }
+      }
       if (parsedDiagCache.size > 16) parsedDiagCache.clear();
-      parsedDiagCache.set(cacheKey, { mtimeMs: st.mtimeMs, size: st.size, ttlSec: explicitTtlSec, diag });
+      parsedDiagCache.set(`${baseKeyPrefix}:${finalCalStamp}`, {
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        ttlSec: explicitTtlSec,
+        diag
+      });
       diag = { ...diag, serverNowMs: nowMs };
     }
     return {
@@ -565,6 +660,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       transcriptFound: true,
       scope,
       conversationId: convId,
+      ttlDesktopNotifyEnabled,
       ...diag,
       contextComposition: diag.contextComposition ?? createEmptyContextComposition(),
       subagentBreakdown: diag.subagentBreakdown ?? createEmptySubagentBreakdown(),
@@ -788,23 +884,121 @@ function getHandoffPayload(data = {}, defaultConvId = "default") {
       cacheDiag = diag;
     }
   } catch {}
+  let stallContext = null;
+  if (data.includeStall !== false) {
+    try {
+      const monitor = getWatchdogMonitor();
+      const targetConv = convId && convId !== "default" ? convId : "";
+      if (targetConv) {
+        monitor.tick();
+        stallContext = monitor.getStallContextForConversation(targetConv);
+      } else if (scope !== "conversation") {
+        monitor.tick();
+        stallContext = monitor.getTopAlertingStallContext();
+      }
+    } catch {}
+  }
   const brief = buildHandoffBrief({
     store,
     sessionId: targetSid,
     cwd,
     cacheDiag,
     maxBytes,
-    sinceTs
+    sinceTs,
+    stallContext
   });
   return {
     ok: true,
     scope,
     conversationId: convId,
     sessionId: targetSid,
+    hasStallContext: Boolean(stallContext),
     markdown: brief.markdown,
     summary: brief.summary,
     bytes: brief.bytes,
     truncated: brief.truncated
+  };
+}
+
+function getWatchdogPayload(data = {}, defaultConvId = "default") {
+  const { scope, convId } = resolveTargetSession(data, defaultConvId);
+  const monitor = getWatchdogMonitor();
+  const targetConv = convId && convId !== "default" ? convId : "";
+  const status = monitor.getStatus({
+    conversationId: targetConv,
+    scope,
+    refresh: true
+  });
+  return {
+    ...status,
+    scope,
+    conversationId: convId
+  };
+}
+
+function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
+  const store = getRuntimeStore();
+  const monitor = getWatchdogMonitor();
+  const { scope, convId } = resolveTargetSession(data, defaultConvId);
+  const targetConv = convId && convId !== "default" ? convId : "";
+  const action = typeof data.action === "string" && data.action.trim() ? data.action.trim() : "";
+
+  if (action === "ack" || action === "snooze") {
+    const res = monitor.acknowledge(targetConv, data.snoozeSec);
+    if (!res.ok) return { ok: false, status: 400, error: res.error };
+    return { ...res, status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false }) };
+  }
+  if (action === "clear" || action === "markIdle") {
+    const res = monitor.markIdle(targetConv, "user_marked_idle");
+    if (!res.ok) return { ok: false, status: 400, error: res.error };
+    return { ...res, status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false }) };
+  }
+  if (action === "setEnabled") {
+    const cur = store.isWatchdogEnabled();
+    const next =
+      data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : !cur;
+    store.setWatchdogEnabled(next);
+    const effective = store.isWatchdogEnabled();
+    if (!effective) {
+      monitor.clearActiveLeasesOnDisable();
+    }
+    return {
+      ok: true,
+      enabled: effective,
+      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
+    };
+  }
+  if (action === "setDesktopNotify") {
+    const cur = store.isWatchdogDesktopNotifyEnabled();
+    const next =
+      data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : !cur;
+    store.setWatchdogDesktopNotifyEnabled(next);
+    const effective = store.isWatchdogDesktopNotifyEnabled();
+    return {
+      ok: true,
+      desktopNotifyEnabled: effective,
+      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
+    };
+  }
+  if (action === "setTtlDesktopNotify") {
+    const cur = store.isTtlDesktopNotifyEnabled();
+    const next =
+      data.enabled !== undefined ? (data.enabled === true || data.enabled === "true" || data.enabled === "1") : !cur;
+    store.setTtlDesktopNotifyEnabled(next);
+    const effective = store.isTtlDesktopNotifyEnabled();
+    return {
+      ok: true,
+      ttlDesktopNotifyEnabled: effective,
+      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
+    };
+  }
+  if (action === "tick") {
+    return monitor.getStatus({ conversationId: targetConv, scope, refresh: true });
+  }
+  return {
+    ok: false,
+    status: 400,
+    error: "Invalid watchdog action: expected 'ack', 'snooze', 'clear', 'markIdle', 'setEnabled', 'setDesktopNotify', 'setTtlDesktopNotify', or 'tick'"
   };
 }
 
@@ -1008,6 +1202,33 @@ function handleFeatureToggleMutation(isCli, data, defaultConvId = "default") {
   return { ok: true, [isCli ? "cliFilterEnabled" : "readDedupEnabled"]: saved, scope, sessionId: targetSid };
 }
 
+const STAR_PROMPT_ALLOWED_KEYS = new Set(["state"]);
+const STAR_PROMPT_ALLOWED_STATES = new Set(["clicked", "dismissed", "copied_cli"]);
+
+function handleStarPromptMutation(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return { ok: false, status: 400, error: "Request body must be a JSON object" };
+  }
+  for (const key of Object.keys(data)) {
+    if (!STAR_PROMPT_ALLOWED_KEYS.has(key)) {
+      return { ok: false, status: 400, error: `Unexpected field '${key}' in request body` };
+    }
+  }
+  if (typeof data.state !== "string" || !STAR_PROMPT_ALLOWED_STATES.has(data.state)) {
+    return {
+      ok: false,
+      status: 400,
+      error: "Invalid 'state' value: expected 'clicked', 'dismissed', or 'copied_cli'"
+    };
+  }
+  const store = getRuntimeStore();
+  const res = store.setStarPromptState(data.state);
+  if (!res.ok) {
+    return { ok: false, status: 400, error: res.error };
+  }
+  return { ok: true, starPrompt: store.evaluateStarPrompt({ markTriggered: false }) };
+}
+
 function sendJson(res, status, payload, extraHeaders = {}) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
@@ -1024,7 +1245,8 @@ const READ_ENDPOINTS = new Set([
   "/api/resume",
   "/api/source-chunks",
   "/api/cache-diag",
-  "/api/handoff"
+  "/api/handoff",
+  "/api/watchdog"
 ]);
 
 const MUTATING_ENDPOINTS = new Set([
@@ -1035,14 +1257,19 @@ const MUTATING_ENDPOINTS = new Set([
   "/api/purge",
   "/api/maintenance",
   "/api/cli-filter",
-  "/api/read-dedup"
+  "/api/read-dedup",
+  "/api/watchdog/action",
+  "/api/star-prompt"
 ]);
 
 export function createStandaloneServer({
   csrfToken = crypto.randomBytes(24).toString("hex"),
-  maxBodyBytes = MAX_REQUEST_BODY_BYTES
+  maxBodyBytes = MAX_REQUEST_BODY_BYTES,
+  watchdogOptions = null
 } = {}) {
   getRuntimeStore();
+  const monitor = getWatchdogMonitor(watchdogOptions || {});
+  monitor.start();
   const srv = http.createServer(async (req, res) => {
     try {
       // 1. Anti-DNS-rebinding Host validation & anti-CSRF Origin/Sec-Fetch-Site validation
@@ -1063,6 +1290,7 @@ export function createStandaloneServer({
       const isPreloadStub = req.method === "GET" && url.pathname === "/preload.js";
       if (
         !isAllowedOriginHeader(req.headers.origin, req.headers.host) ||
+        !isAllowedRefererHeader(req.headers.referer, req.headers.host) ||
         isCrossSiteFetchHeader(req.headers["sec-fetch-site"], { allowSameSite: isHtmlEntry || isPreloadStub })
       ) {
         sendJson(res, 403, { error: "Cross-origin request blocked" });
@@ -1167,6 +1395,10 @@ export function createStandaloneServer({
           sendJson(res, 200, getHandoffPayload(data));
           return;
         }
+        if (url.pathname === "/api/watchdog") {
+          sendJson(res, 200, getWatchdogPayload(data));
+          return;
+        }
       }
 
       // 5. POST-only /api/search (authenticated read-only FTS5 query, bounded JSON body)
@@ -1234,6 +1466,20 @@ export function createStandaloneServer({
           sendJson(res, 200, handleMaintenanceMutation(data));
         } else if (url.pathname === "/api/cli-filter" || url.pathname === "/api/read-dedup") {
           sendJson(res, 200, handleFeatureToggleMutation(url.pathname === "/api/cli-filter", data));
+        } else if (url.pathname === "/api/watchdog/action") {
+          const wdRes = handleWatchdogActionMutation(data);
+          if (wdRes.ok === false && wdRes.status) {
+            sendJson(res, wdRes.status, { error: wdRes.error });
+          } else {
+            sendJson(res, 200, wdRes);
+          }
+        } else if (url.pathname === "/api/star-prompt") {
+          const spRes = handleStarPromptMutation(data);
+          if (spRes.ok === false && spRes.status) {
+            sendJson(res, spRes.status, { error: spRes.error });
+          } else {
+            sendJson(res, 200, spRes);
+          }
         }
         return;
       }
@@ -1291,6 +1537,7 @@ if (isDirectRun) {
 
   if (isSidecarEnv) {
     getRuntimeStore();
+    getWatchdogMonitor().start();
     const app = new SidecarApp();
 
     const makeBadRequest = (error) =>
@@ -1447,5 +1694,28 @@ export function registerSidecarRoutes(app) {
     const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
     if (!check.ok) return makeBadRequest(check.error);
     return handleFeatureToggleMutation(false, data, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/watchdog", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    return getWatchdogPayload(data, app.config?.conversationId);
+  }, "POST");
+  app.api("/api/watchdog/action", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId", "action"]);
+    if (!check.ok) return makeBadRequest(check.error);
+    const res = handleWatchdogActionMutation(data, app.config?.conversationId);
+    if (res.ok === false) return makeBadRequest(res.error);
+    return res;
+  }, "POST");
+  app.api("/api/star-prompt", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const res = handleStarPromptMutation(data);
+    if (res.ok === false) return makeBadRequest(res.error);
+    return res;
   }, "POST");
 }

@@ -21,7 +21,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|.*apply_edits|.*run_checks|.*ctx_resume|call_mcp_tool",
+        "matcher": "run_command|edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|.*apply_edits|.*run_checks|.*ctx_resume|call_mcp_tool",
         "hooks": [
           {
             "type": "command",
@@ -35,6 +35,13 @@
       {
         "type": "command",
         "command": "node ./hooks/pre-invocation.mjs",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./hooks/stop.mjs",
         "timeout": 5
       }
     ]

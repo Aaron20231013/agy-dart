@@ -35,6 +35,8 @@ let resolveCdTargetCwdFn = null;
 let parseGitSubcommandFn = null;
 let securityModule = null;
 let textDiffModule = null;
+let cacheAnalyzerModule = null;
+let watchdogLeaseModule = null;
 
 async function ensureStoreClass() {
   if (!ContextModeStoreClass) {
@@ -69,6 +71,20 @@ async function ensureTextDiffModule() {
   return textDiffModule;
 }
 
+async function ensureCacheAnalyzer() {
+  if (!cacheAnalyzerModule) {
+    cacheAnalyzerModule = await import("../context/lib/cache-analyzer.js");
+  }
+  return cacheAnalyzerModule;
+}
+
+async function ensureWatchdogLease() {
+  if (!watchdogLeaseModule) {
+    watchdogLeaseModule = await import("../context/lib/watchdog-lease.js");
+  }
+  return watchdogLeaseModule;
+}
+
 if (!isDirectRun) {
   await Promise.all([ensureStoreClass(), ensureFilterRules(), ensureSecurityModule(), ensureTextDiffModule()]);
 }
@@ -84,7 +100,8 @@ export const LARGE_READ_CONFIRM_TTL_MS = 120 * 1000;
 export const LARGE_READ_CONFIRM_SHORT_TTL_MS = 30 * 1000;
 export const SENSITIVE_READ_CONFIRM_TTL_MS = 120 * 1000;
 export const SENSITIVE_READ_CONFIRM_SHORT_TTL_MS = 30 * 1000;
-export const MIN_DEDUP_FILE_BYTES = 1024;
+export const DEFAULT_READ_DEDUP_MIN_BYTES = 4096; // 4 KB (~1,000 tokens) — prevents 2-strike backfire on small files / narrow slices
+export const MIN_DEDUP_FILE_BYTES = DEFAULT_READ_DEDUP_MIN_BYTES;
 export const MAX_SNAPSHOT_FILE_BYTES = 256 * 1024;
 export const MIN_DIFF_READ_BYTES = 1536;
 export const MAX_DIFF_READ_BYTES = 6500;
@@ -1732,7 +1749,27 @@ async function main() {
     }
   }
 
+  const touchWatchdogPreTool = async (decision = "allow") => {
+    if (!effectiveCfg.stallWatchdog || !directConvId || directConvId === "default") return;
+    try {
+      const st = getSharedStore();
+      if (typeof st.isWatchdogEnabled === "function" && !st.isWatchdogEnabled()) return;
+      const wl = await ensureWatchdogLease();
+      wl.recordHookLeaseTransition(st, "PreToolUse", payload, {
+        directConvId,
+        rootSessionId: sessionId,
+        isSubagent: isSubagentCall,
+        cwd,
+        toolName,
+        toolArgs: args,
+        decision,
+        asyncBypassMs: effectiveCfg.cliFilterAsyncBypassMs ?? 2000
+      });
+    } catch {}
+  };
+
   if (isProtectionPaused(sessionId)) {
+    await touchWatchdogPreTool("allow");
     return finishAllow();
   }
 
@@ -1802,6 +1839,7 @@ async function main() {
                   reason,
                   key: "sensitive_file"
                 });
+                await touchWatchdogPreTool("deny");
                 closeSharedStore();
                 process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
                 process.exit(0);
@@ -1825,6 +1863,7 @@ async function main() {
                   reason,
                   key: "sensitive_file_warn"
                 });
+                await touchWatchdogPreTool("deny");
                 closeSharedStore();
                 process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
                 process.exit(0);
@@ -1852,23 +1891,38 @@ async function main() {
         }
 
         // Prepare Three-State Read Cache state upfront so cache hits run BEFORE Section 1a (eliminates 3-strike trap!)
-        const estBytes =
-          endLine !== null
-            ? Math.min(stat.size, Math.max(MIN_DEDUP_FILE_BYTES, Math.max(1, endLine - startLine + 1) * 45))
-            : stat.size;
+        const readDedupMinBytes = Number(effectiveCfg.readDedupMinBytes ?? DEFAULT_READ_DEDUP_MIN_BYTES);
+        const diffReadCandidate = effectiveCfg.diffRead === true && stat.size <= MAX_SNAPSHOT_FILE_BYTES;
+        let estBytes;
+        if (endLine !== null) {
+          const spanEst = Math.min(stat.size, Math.max(1, endLine - startLine + 1) * 45);
+          estBytes =
+            stat.size < readDedupMinBytes && !(diffReadCandidate && stat.size >= MIN_DIFF_READ_BYTES)
+              ? Math.min(stat.size, spanEst)
+              : measureLineRangeBytes(absPath, startLine, endLine, stat.size, spanEst);
+        } else if (startLine > 1) {
+          estBytes =
+            stat.size < readDedupMinBytes && !(diffReadCandidate && stat.size >= MIN_DIFF_READ_BYTES)
+              ? stat.size
+              : measureRemainingFromLineBytes(absPath, startLine, stat.size);
+        } else {
+          estBytes = stat.size;
+        }
+
         let dedupEnabled = true;
         try {
           dedupEnabled = getSharedStore().isReadDedupEnabled(sessionId);
         } catch {}
 
         const canUseReadCache = dedupEnabled && hasExplicitConvId && !subagentSharesParentContext;
-        const diffReadEnabled =
-          canUseReadCache &&
-          effectiveCfg.diffRead === true &&
-          stat.size <= MAX_SNAPSHOT_FILE_BYTES;
+        const meetsDedupMinBytes =
+          stat.size > 0 && (readDedupMinBytes <= 0 || estBytes >= readDedupMinBytes);
+        const diffReadEnabled = canUseReadCache && diffReadCandidate;
+        const meetsDiffMinBytes = diffReadEnabled && stat.size > 0 && estBytes >= MIN_DIFF_READ_BYTES;
         const diffReadMaxTurns = effectiveCfg.diffReadMaxTurns;
         const diffReadMaxAgeMs = effectiveCfg.diffReadMaxAgeMs;
         const readDedupMaxSteps = Number(effectiveCfg.readDedupMaxSteps ?? 40);
+        const readDedupMaxTurns = Number(effectiveCfg.readDedupMaxTurns ?? 12);
         const rawStepIdx = payload.stepIdx ?? payload.step_idx ?? payload.stepIndex ?? payload.step_index;
         const currentStepIdx =
           rawStepIdx !== undefined &&
@@ -1883,6 +1937,7 @@ async function main() {
         let readBounds = null;
         let effectiveEndLine = endLine;
         let convTurnSeq = 0;
+        let convTurnSeqLoaded = false;
         let currentRangeText = null;
         let currentSha256 = null;
         let currentRangeBytes = 0;
@@ -1901,26 +1956,227 @@ async function main() {
           return true;
         };
 
+        // Reset any stale `/compact` cmd stamp when a normal non-compact user prompt arrives (0 writes when absent)
+        const rawLastUserInput = payload.lastUserInput ?? payload.last_user_input ?? "";
+        const isSlashCompactInput =
+          typeof rawLastUserInput === "string" && /^\s*\/compact(?:\s|$)/i.test(rawLastUserInput);
+        if (canUseReadCache && typeof rawLastUserInput === "string" && rawLastUserInput.trim() && !isSlashCompactInput) {
+          try {
+            const st = getSharedStore();
+            const staleCmdKey = `compact_invalidated:cmd:${directConvId}`;
+            if (st.getMeta(staleCmdKey, null) !== null) {
+              st.deleteMeta(staleCmdKey);
+            }
+          } catch {}
+        }
+
+        // Zero-overhead-on-allow slow-path compaction guard: ONLY runs right before a State-2 or State-3 deny
+        let lazyCompactionChecked = false;
+        let lazyCompactionResult = null;
+        const checkLazyCompactionOnSlowPath = async ({ dupRow = null, snapshotRow = null } = {}) => {
+          if (lazyCompactionChecked) return lazyCompactionResult;
+          lazyCompactionChecked = true;
+          try {
+            const store = getSharedStore();
+
+            // 1. Defensive stepIdx rollback check (covers both file_reads and file_snapshots)
+            const trackedStep = dupRow ? dupRow.read_step : snapshotRow ? snapshotRow.read_step : null;
+            if (
+              currentStepIdx !== null &&
+              trackedStep !== null &&
+              trackedStep !== undefined &&
+              Number.isFinite(Number(trackedStep)) &&
+              currentStepIdx < Number(trackedStep)
+            ) {
+              store.invalidateFileReads(directConvId, null);
+              lazyCompactionResult = { invalidated: true, reason: "step_rollback" };
+              return lazyCompactionResult;
+            }
+
+            // 2. Unstamped `/compact` in payload.lastUserInput
+            if (isSlashCompactInput) {
+              const cmdText = rawLastUserInput.trim().slice(0, 128);
+              const cmdKey = `compact_invalidated:cmd:${directConvId}`;
+              let storedCmd = null;
+              try {
+                const rawStored = store.getTimedMeta(cmdKey, "");
+                if (rawStored) storedCmd = JSON.parse(rawStored);
+              } catch {}
+
+              let alreadyHandled = false;
+              if (storedCmd && storedCmd.text === cmdText) {
+                if (dupRow) {
+                  const rStep =
+                    dupRow.read_step !== null && dupRow.read_step !== undefined && Number.isFinite(Number(dupRow.read_step))
+                      ? Number(dupRow.read_step)
+                      : null;
+                  const rTurn =
+                    dupRow.read_turn_seq !== null &&
+                    dupRow.read_turn_seq !== undefined &&
+                    Number.isFinite(Number(dupRow.read_turn_seq))
+                      ? Number(dupRow.read_turn_seq)
+                      : null;
+                  if (
+                    (storedCmd.ts && Number(dupRow.read_ts) >= Number(storedCmd.ts)) ||
+                    (storedCmd.stepIdx !== null && storedCmd.stepIdx !== undefined && rStep !== null && rStep >= Number(storedCmd.stepIdx)) ||
+                    (storedCmd.initialNumSteps !== null &&
+                      storedCmd.initialNumSteps !== undefined &&
+                      rStep !== null &&
+                      rStep >= Number(storedCmd.initialNumSteps)) ||
+                    (storedCmd.turnSeq !== null &&
+                      storedCmd.turnSeq !== undefined &&
+                      Number(storedCmd.turnSeq) > 0 &&
+                      rTurn !== null &&
+                      rTurn >= Number(storedCmd.turnSeq))
+                  ) {
+                    alreadyHandled = true;
+                  }
+                } else if (snapshotRow) {
+                  const sStep =
+                    snapshotRow.read_step !== null &&
+                    snapshotRow.read_step !== undefined &&
+                    Number.isFinite(Number(snapshotRow.read_step))
+                      ? Number(snapshotRow.read_step)
+                      : null;
+                  if (
+                    (storedCmd.ts && Number(snapshotRow.updated_ts) >= Number(storedCmd.ts)) ||
+                    (storedCmd.stepIdx !== null && storedCmd.stepIdx !== undefined && sStep !== null && sStep >= Number(storedCmd.stepIdx)) ||
+                    (storedCmd.initialNumSteps !== null &&
+                      storedCmd.initialNumSteps !== undefined &&
+                      sStep !== null &&
+                      sStep >= Number(storedCmd.initialNumSteps)) ||
+                    (storedCmd.turnSeq !== null &&
+                      storedCmd.turnSeq !== undefined &&
+                      Number(storedCmd.turnSeq) > 0 &&
+                      Number(snapshotRow.full_read_seq) >= Number(storedCmd.turnSeq))
+                  ) {
+                    alreadyHandled = true;
+                  }
+                }
+              }
+
+              if (!alreadyHandled) {
+                store.invalidateFileReads(directConvId, null);
+                store.setTimedMeta(
+                  cmdKey,
+                  JSON.stringify({
+                    text: cmdText,
+                    initialNumSteps: null,
+                    stepIdx: currentStepIdx,
+                    turnSeq: convTurnSeq,
+                    ts: Date.now()
+                  })
+                );
+                lazyCompactionResult = { invalidated: true, reason: "slash_compact" };
+                return lazyCompactionResult;
+              }
+            }
+
+            // 3. Lazy transcript.jsonl tail scan (statSync size/mtime fast-skip)
+            let txPath =
+              typeof payload.transcriptPath === "string" && payload.transcriptPath.trim()
+                ? payload.transcriptPath.trim()
+                : typeof payload.transcript_path === "string" && payload.transcript_path.trim()
+                  ? payload.transcript_path.trim()
+                  : "";
+            let caMod = null;
+            if (!txPath || !fs.existsSync(txPath)) {
+              caMod = await ensureCacheAnalyzer();
+              txPath = caMod.findTranscriptForConversation(directConvId, { exactOnly: true }) || "";
+            }
+            if (txPath && fs.existsSync(txPath)) {
+              const txStat = fs.statSync(txPath);
+              if (txStat.isFile() && txStat.size > 0) {
+                const txStatKey = `compact_invalidated:tx_stat:${directConvId}`;
+                const statSig = `${txStat.size}:${Math.round(txStat.mtimeMs)}:${txPath}`;
+                if (store.getTimedMeta(txStatKey, "") !== statSig) {
+                  if (!caMod) caMod = await ensureCacheAnalyzer();
+                  const event = caMod.inspectTranscriptCompaction(txPath, { maxBytes: 131072 });
+                  store.setTimedMeta(txStatKey, statSig);
+                  if (event && event.stamp) {
+                    const lastCompactKey = `compact_invalidated:${directConvId}`;
+                    if (store.getTimedMeta(lastCompactKey, "") !== event.stamp) {
+                      if (event.hasExplicitStepIndex && Number.isFinite(event.stepIndex)) {
+                        store.invalidateFileReadsBefore(directConvId, { maxStep: event.stepIndex });
+                      } else {
+                        store.invalidateFileReads(directConvId, null);
+                      }
+                      store.setTimedMeta(lastCompactKey, event.stamp);
+
+                      if (dupRow) {
+                        const dupPreservedAfterCompact =
+                          event.hasExplicitStepIndex &&
+                          dupRow.read_step !== null &&
+                          dupRow.read_step !== undefined &&
+                          Number.isFinite(Number(dupRow.read_step)) &&
+                          Number(dupRow.read_step) > event.stepIndex;
+                        if (!dupPreservedAfterCompact) {
+                          lazyCompactionResult = { invalidated: true, reason: event.kind, event };
+                          return lazyCompactionResult;
+                        }
+                      } else if (snapshotRow) {
+                        const stillHasSnap = store.findFileSnapshot({
+                          sessionId: directConvId,
+                          filePath: absPath,
+                          startLine,
+                          endLine: effectiveEndLine,
+                          ino: null,
+                          maxAgeMs: diffReadMaxAgeMs
+                        });
+                        if (!stillHasSnap) {
+                          lazyCompactionResult = { invalidated: true, reason: event.kind, event };
+                          return lazyCompactionResult;
+                        }
+                      } else {
+                        lazyCompactionResult = { invalidated: true, reason: event.kind, event };
+                        return lazyCompactionResult;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } catch {
+            // Fail-open on any filesystem/DB error during lazy compaction inspection
+          }
+          lazyCompactionResult = { invalidated: false };
+          return lazyCompactionResult;
+        };
+
         // Pre-1a Read Cache Priority Check (State 2 unchanged dedup / State 3 diff-read / armed bypass)
-        if (canUseReadCache && stat.size >= MIN_DEDUP_FILE_BYTES && byteOffset <= 0) {
+        if (canUseReadCache && (meetsDedupMinBytes || meetsDiffMinBytes) && byteOffset <= 0) {
           readBounds = computeEffectiveReadBounds(absPath, startLine, endLine, stat.size);
           effectiveEndLine = readBounds.effectiveEndLine;
           if (!readBounds.skipCache) {
             try {
               const store = getSharedStore();
-              convTurnSeq = diffReadEnabled ? store.getConversationTurnSeq(directConvId) : 0;
-              const dup = store.findDuplicateRead({
-                sessionId: directConvId,
-                filePath: absPath,
-                startLine,
-                endLine: effectiveEndLine,
-                mtimeMs: stat.mtimeMs,
-                fileSize: stat.size,
-                ctimeMs: stat.ctimeMs,
-                ino: stat.ino,
-                currentStepIdx,
-                maxStepGap: readDedupMaxSteps
-              });
+              convTurnSeq = store.getConversationTurnSeq(directConvId);
+              convTurnSeqLoaded = true;
+              let dup = meetsDedupMinBytes
+                ? store.findDuplicateRead({
+                    sessionId: directConvId,
+                    filePath: absPath,
+                    startLine,
+                    endLine: effectiveEndLine,
+                    mtimeMs: stat.mtimeMs,
+                    fileSize: stat.size,
+                    ctimeMs: stat.ctimeMs,
+                    ino: stat.ino,
+                    currentStepIdx,
+                    maxStepGap: readDedupMaxSteps,
+                    currentTurnSeq: convTurnSeq,
+                    maxTurnGap: readDedupMaxTurns
+                  })
+                : null;
+
+              let compactionInvalidatedThisCall = false;
+              if (dup && Number(dup.bypass_armed) === 0) {
+                const compCheck = await checkLazyCompactionOnSlowPath({ dupRow: dup });
+                if (compCheck?.invalidated) {
+                  dup = null;
+                  compactionInvalidatedThisCall = true;
+                }
+              }
 
               if (dup && Number(dup.bypass_armed) === 0) {
                 store.armReadBypass({
@@ -1946,6 +2202,7 @@ async function main() {
                   key: "unchanged_reread"
                 });
 
+                await touchWatchdogPreTool("deny");
                 closeSharedStore();
                 process.stdout.write(JSON.stringify({ decision: "deny", reason: dedupReason }) + "\n");
                 process.exit(0);
@@ -1953,7 +2210,20 @@ async function main() {
 
               if (dup && Number(dup.bypass_armed) === 1) {
                 skipSizeGuardDueToCacheBypass = true;
-              } else if (!dup && diffReadEnabled) {
+                const rangeLabel = effectiveEndLine !== null ? `lines ${startLine}-${effectiveEndLine}` : "full file";
+                recordInterception({
+                  sessionId,
+                  agent: agentName,
+                  cwd,
+                  toolName,
+                  path: filePath,
+                  size: estBytes,
+                  returnedBytes: estBytes,
+                  reason: `[agy-dart read-dedup] 2-strike bypass allowed (${rangeLabel}, ~${formatBytes(estBytes)})`,
+                  kind: "dedup",
+                  key: "dedup_bypass"
+                });
+              } else if (!dup && !compactionInvalidatedThisCall && meetsDiffMinBytes) {
                 const snapshot = store.findFileSnapshot({
                   sessionId: directConvId,
                   filePath: absPath,
@@ -1965,77 +2235,98 @@ async function main() {
 
                 const baselineFullTs = snapshot ? Number(snapshot.full_read_ts || snapshot.updated_ts || 0) : 0;
                 const baselineFullSeq = snapshot ? Number(snapshot.full_read_seq || 0) : 0;
+                const baselineReadStep =
+                  snapshot &&
+                  snapshot.read_step !== null &&
+                  snapshot.read_step !== undefined &&
+                  Number.isFinite(Number(snapshot.read_step))
+                    ? Number(snapshot.read_step)
+                    : null;
                 const bypassArmed = Boolean(snapshot && Number(snapshot.bypass_armed) === 1);
                 const ageFresh = !snapshot || diffReadMaxAgeMs <= 0 || Date.now() - baselineFullTs <= diffReadMaxAgeMs;
                 const turnsFresh =
                   !snapshot ||
-                  diffReadMaxTurns <= 0 ||
-                  convTurnSeq - Math.max(0, baselineFullSeq) <= diffReadMaxTurns;
+                  (convTurnSeq >= Math.max(0, baselineFullSeq) &&
+                    (diffReadMaxTurns <= 0 || convTurnSeq - Math.max(0, baselineFullSeq) <= diffReadMaxTurns));
+                const stepRolledBack = Boolean(
+                  snapshot && currentStepIdx !== null && baselineReadStep !== null && currentStepIdx < baselineReadStep
+                );
 
-                if (snapshot && bypassArmed) {
+                if (stepRolledBack) {
+                  try {
+                    store.invalidateFileReads(directConvId, null);
+                  } catch {}
+                } else if (snapshot && bypassArmed) {
                   skipSizeGuardDueToCacheBypass = true;
-                } else if (snapshot && !bypassArmed && ageFresh && turnsFresh && (await loadCurrentRange())) {
-                  const { computeUnifiedDiff, extractLineSlice } = await ensureTextDiffModule();
-                  const baselineText = snapshot.isExactRange
-                    ? snapshot.content
-                    : extractLineSlice(snapshot.content, startLine, effectiveEndLine, snapshot.start_line);
-                  const baselineSha256 = snapshot.isExactRange ? snapshot.sha256 : sha256Text(baselineText);
+                } else if (snapshot && !bypassArmed && ageFresh && turnsFresh) {
+                  if (await loadCurrentRange()) {
+                    const { computeUnifiedDiff, extractLineSlice } = await ensureTextDiffModule();
+                    const baselineText = snapshot.isExactRange
+                      ? snapshot.content
+                      : extractLineSlice(snapshot.content, startLine, effectiveEndLine, snapshot.start_line);
+                    const baselineSha256 = snapshot.isExactRange ? snapshot.sha256 : sha256Text(baselineText);
 
-                  if (currentSha256 !== baselineSha256 && currentRangeBytes >= MIN_DIFF_READ_BYTES) {
-                    const diff = computeUnifiedDiff(baselineText, currentRangeText, {
-                      fileLabel: path.basename(filePath),
-                      startLine,
-                      maxDiffBytes: MAX_DIFF_READ_BYTES
-                    });
-
-                    if (
-                      diff.changed &&
-                      !diff.truncated &&
-                      diff.diffBytes > 0 &&
-                      diff.diffBytes <= MAX_DIFF_READ_BYTES &&
-                      diff.diffBytes < currentRangeBytes * MAX_DIFF_READ_RATIO
-                    ) {
-                      store.saveFileSnapshot({
-                        sessionId: directConvId,
-                        filePath: absPath,
+                    if (currentSha256 !== baselineSha256 && currentRangeBytes >= MIN_DIFF_READ_BYTES) {
+                      const diff = computeUnifiedDiff(baselineText, currentRangeText, {
+                        fileLabel: path.basename(filePath),
                         startLine,
-                        endLine: effectiveEndLine,
-                        sha256: currentSha256,
-                        mtimeMs: stat.mtimeMs,
-                        fileSize: stat.size,
-                        ino: null,
-                        content: currentRangeText,
-                        bypassArmed: 1,
-                        fullReadTs: baselineFullTs || Date.now(),
-                        fullReadSeq: baselineFullSeq || convTurnSeq
+                        maxDiffBytes: MAX_DIFF_READ_BYTES
                       });
 
-                      const rangeLabel = effectiveEndLine !== null ? `lines ${startLine}-${effectiveEndLine}` : "full file";
-                      const pctSaved = Math.max(1, Math.round((1 - diff.diffBytes / currentRangeBytes) * 100));
-                      const baseShort = String(baselineSha256 || "").slice(0, 8) || "unknown";
-                      const baseTimeIso = baselineFullTs ? `${new Date(baselineFullTs).toISOString().slice(11, 19)}Z` : "prior";
-                      const diffReason =
-                        `[agy-dart diff-read] '${filePath}' (${rangeLabel}) changed since baseline ${baseShort} @ ${baseTimeIso} ` +
-                        `(+${diff.addedLines}/-${diff.removedLines} lines, diff ${formatBytes(diff.diffBytes)} vs full ${formatBytes(currentRangeBytes)}, -${pctSaved}%):\n` +
-                        `\`\`\`diff\n${diff.diff}\n\`\`\`\n` +
-                        `Baseline: prior full copy in this conversation (${baseShort}). Reuse the prior copy + diff above; if you need the full file verbatim (如需全文请重读, e.g. after /compact), call ${toolName} once more to bypass.`;
+                      if (
+                        diff.changed &&
+                        !diff.truncated &&
+                        diff.diffBytes > 0 &&
+                        diff.diffBytes <= MAX_DIFF_READ_BYTES &&
+                        diff.diffBytes < currentRangeBytes * MAX_DIFF_READ_RATIO
+                      ) {
+                        const compCheck = await checkLazyCompactionOnSlowPath({ snapshotRow: snapshot });
+                        if (!compCheck?.invalidated) {
+                          store.saveFileSnapshot({
+                            sessionId: directConvId,
+                            filePath: absPath,
+                            startLine,
+                            endLine: effectiveEndLine,
+                            sha256: currentSha256,
+                            mtimeMs: stat.mtimeMs,
+                            fileSize: stat.size,
+                            ino: null,
+                            content: currentRangeText,
+                            bypassArmed: 1,
+                            fullReadTs: baselineFullTs || Date.now(),
+                            fullReadSeq: baselineFullSeq || convTurnSeq,
+                            readStep: baselineReadStep
+                          });
 
-                      recordInterception({
-                        sessionId,
-                        agent: agentName,
-                        cwd,
-                        toolName,
-                        path: filePath,
-                        size: currentRangeBytes,
-                        returnedBytes: diff.diffBytes,
-                        reason: diffReason,
-                        kind: "dedup",
-                        key: "modified_diff"
-                      });
+                          const rangeLabel = effectiveEndLine !== null ? `lines ${startLine}-${effectiveEndLine}` : "full file";
+                          const pctSaved = Math.max(1, Math.round((1 - diff.diffBytes / currentRangeBytes) * 100));
+                          const baseShort = String(baselineSha256 || "").slice(0, 8) || "unknown";
+                          const baseTimeIso = baselineFullTs ? `${new Date(baselineFullTs).toISOString().slice(11, 19)}Z` : "prior";
+                          const diffReason =
+                            `[agy-dart diff-read] '${filePath}' (${rangeLabel}) changed since baseline ${baseShort} @ ${baseTimeIso} ` +
+                            `(+${diff.addedLines}/-${diff.removedLines} lines, diff ${formatBytes(diff.diffBytes)} vs full ${formatBytes(currentRangeBytes)}, -${pctSaved}%):\n` +
+                            `\`\`\`diff\n${diff.diff}\n\`\`\`\n` +
+                            `Baseline: prior full copy in this conversation (${baseShort}). Reuse the prior copy + diff above; if you need the full file verbatim (如需全文请重读, e.g. after /compact), call ${toolName} once more to bypass.`;
 
-                      closeSharedStore();
-                      process.stdout.write(JSON.stringify({ decision: "deny", reason: diffReason }) + "\n");
-                      process.exit(0);
+                          recordInterception({
+                            sessionId,
+                            agent: agentName,
+                            cwd,
+                            toolName,
+                            path: filePath,
+                            size: currentRangeBytes,
+                            returnedBytes: diff.diffBytes,
+                            reason: diffReason,
+                            kind: "dedup",
+                            key: "modified_diff"
+                          });
+
+                          await touchWatchdogPreTool("deny");
+                          closeSharedStore();
+                          process.stdout.write(JSON.stringify({ decision: "deny", reason: diffReason }) + "\n");
+                          process.exit(0);
+                        }
+                      }
                     }
                   }
                 }
@@ -2289,6 +2580,7 @@ async function main() {
                     });
                   } catch {}
 
+                  await touchWatchdogPreTool("deny");
                   closeSharedStore();
                   process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
                   process.exit(0);
@@ -2310,7 +2602,7 @@ async function main() {
 
         // 1b. State 1 (First read) / Strike 2 bypass / stale baseline / large rewrite fallback:
         // Record this allowed read (resets bypass_armed = 0) and save compressed snapshot baseline anchored to this full read.
-        if (canUseReadCache && stat.size >= MIN_DEDUP_FILE_BYTES && byteOffset <= 0) {
+        if (canUseReadCache && (meetsDedupMinBytes || meetsDiffMinBytes) && byteOffset <= 0) {
           if (!readBounds) {
             readBounds = computeEffectiveReadBounds(absPath, startLine, endLine, stat.size);
             effectiveEndLine = readBounds.effectiveEndLine;
@@ -2318,20 +2610,27 @@ async function main() {
           if (!readBounds.skipCache) {
             try {
               const store = getSharedStore();
-              store.recordFileRead({
-                sessionId: directConvId,
-                filePath: absPath,
-                startLine,
-                endLine: effectiveEndLine,
-                mtimeMs: stat.mtimeMs,
-                fileSize: stat.size,
-                ctimeMs: stat.ctimeMs,
-                ino: stat.ino,
-                byteEst: readBounds.hostTruncated ? Math.max(estBytes, HOST_READ_MAX_BYTES) : estBytes,
-                stepIdx: currentStepIdx
-              });
+              if (!convTurnSeqLoaded) {
+                convTurnSeq = store.getConversationTurnSeq(directConvId);
+                convTurnSeqLoaded = true;
+              }
+              if (meetsDedupMinBytes) {
+                store.recordFileRead({
+                  sessionId: directConvId,
+                  filePath: absPath,
+                  startLine,
+                  endLine: effectiveEndLine,
+                  mtimeMs: stat.mtimeMs,
+                  fileSize: stat.size,
+                  ctimeMs: stat.ctimeMs,
+                  ino: stat.ino,
+                  byteEst: readBounds.hostTruncated ? Math.max(estBytes, HOST_READ_MAX_BYTES) : estBytes,
+                  stepIdx: currentStepIdx,
+                  turnSeq: convTurnSeq
+                });
+              }
 
-              if (diffReadEnabled && (await loadCurrentRange())) {
+              if (meetsDiffMinBytes && (await loadCurrentRange())) {
                 store.saveFileSnapshot({
                   sessionId: directConvId,
                   filePath: absPath,
@@ -2344,7 +2643,8 @@ async function main() {
                   content: currentRangeText,
                   bypassArmed: 0,
                   fullReadTs: Date.now(),
-                  fullReadSeq: convTurnSeq
+                  fullReadSeq: convTurnSeq,
+                  readStep: currentStepIdx
                 });
               }
             } catch {
@@ -2408,6 +2708,7 @@ async function main() {
     if (cliFilterEnabled && !bypassCliFilter && trimmedCmd) {
       const builtinRewrite = buildCliFilterRewrite(trimmedCmd, sessionId, cwd, { builtinOnly: true });
       if (builtinRewrite) {
+        await touchWatchdogPreTool("allow");
         closeSharedStore();
         process.stdout.write(
           JSON.stringify({
@@ -2453,6 +2754,7 @@ async function main() {
         reason: inspection.reason
       });
 
+      await touchWatchdogPreTool("deny");
       closeSharedStore();
       process.stdout.write(JSON.stringify({ decision: "deny", reason: inspection.reason }) + "\n");
       process.exit(0);
@@ -2462,6 +2764,7 @@ async function main() {
     if (cliFilterEnabled && !bypassCliFilter && trimmedCmd) {
       const customRewrite = buildCliFilterRewrite(trimmedCmd, sessionId, cwd, { customOnly: true });
       if (customRewrite) {
+        await touchWatchdogPreTool("allow");
         closeSharedStore();
         process.stdout.write(
           JSON.stringify({
@@ -2477,6 +2780,7 @@ async function main() {
     }
   }
 
+  await touchWatchdogPreTool("allow");
   return finishAllow();
 }
 

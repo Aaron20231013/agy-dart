@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
-import { getEffectiveConfig } from "../context/lib/config.js";
+import { getConfigSnapshot } from "../context/lib/config.js";
 
 const CONTEXT_WARN_TOKENS = 130000;
 const CONTEXT_CRITICAL_TOKENS = 160000;
@@ -259,11 +259,18 @@ export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = nu
 }
 
 async function main() {
-  const effectiveCfg = getEffectiveConfig();
+  const cfgSnapshot = getConfigSnapshot();
+  const effectiveCfg = cfgSnapshot.values;
   const resolvedDbPath = effectiveCfg.dbPath || path.join(os.homedir(), ".agy-dart", "context.db");
-  const needCompactionSweepOnly =
-    !effectiveCfg.cacheWatch && !effectiveCfg.diffRead && effectiveCfg.readDedup && fs.existsSync(resolvedDbPath);
-  if (!effectiveCfg.cacheWatch && !effectiveCfg.diffRead && !needCompactionSweepOnly) {
+  const watchdogExplicit = effectiveCfg.stallWatchdog && cfgSnapshot.sources.stallWatchdog !== "default";
+  const ttlNotifyExplicit = effectiveCfg.ttlDesktopNotify && cfgSnapshot.sources.ttlDesktopNotify !== "default";
+  const dbExists = fs.existsSync(resolvedDbPath);
+  const needExistingDbWork =
+    !effectiveCfg.cacheWatch &&
+    !effectiveCfg.diffRead &&
+    (effectiveCfg.readDedup || effectiveCfg.stallWatchdog || effectiveCfg.ttlDesktopNotify || dbExists) &&
+    dbExists;
+  if (!effectiveCfg.cacheWatch && !effectiveCfg.diffRead && !watchdogExplicit && !ttlNotifyExplicit && !needExistingDbWork) {
     process.stdout.write("{}\n");
     return;
   }
@@ -289,33 +296,118 @@ async function main() {
   let store = null;
 
   try {
-    const [storeMod, cacheAnalyzerMod] = await Promise.all([
+    const [storeMod, cacheAnalyzerMod, watchdogLeaseMod] = await Promise.all([
       import("../context/lib/store.js"),
-      import("../context/lib/cache-analyzer.js")
+      import("../context/lib/cache-analyzer.js"),
+      effectiveCfg.stallWatchdog || effectiveCfg.ttlDesktopNotify || dbExists
+        ? import("../context/lib/watchdog-lease.js")
+        : Promise.resolve(null)
     ]);
     const ContextModeStore = storeMod.ContextModeStore;
 
     // Hook mode: bounded SQLite busy timeout & deadline so external write locks fail-open in <1s
     store = new ContextModeStore({ hookMode: true, maxBusyRetries: 4, maxRetryDeadlineMs: 800 });
 
-    // Advance per-conversation turn sequence on every LLM turn when opt-in diff-read is active
-    // so non-read turns (edits/commands/chat) accurately age diff-read baselines — even if
-    // cacheWatch is disabled or alerts are paused (prevents stale diffs after unpause).
-    if (effectiveCfg.diffRead && directConvId && directConvId !== "default") {
-      try {
-        store.bumpConversationTurnSeq(directConvId);
-      } catch {}
-    }
-
-    const { analyzeTranscriptCache, findTranscriptForConversation, readTranscriptTail } = cacheAnalyzerMod;
+    const { analyzeTranscriptCache, findTranscriptForConversation, isSlashCompactText, readTranscriptTail } =
+      cacheAnalyzerMod;
 
     const targetConvId = directConvId && directConvId !== "default" ? directConvId : sessionId;
     const isSubagentConv = Boolean(directConvId && directConvId !== "default" && directConvId !== sessionId);
 
+    // Advance per-conversation turn sequence on every LLM turn when readDedup or diffRead is active
+    // so non-read turns (edits/commands/chat) accurately age read-dedup & diff-read baselines — even if
+    // cacheWatch is disabled or alerts are paused (PreInvocation is the sole turn clock; read_file never bumps it).
+    let currentTurnSeq = 0;
+    if ((effectiveCfg.diffRead || effectiveCfg.readDedup) && directConvId && directConvId !== "default") {
+      try {
+        currentTurnSeq = store.bumpConversationTurnSeq(directConvId);
+      } catch {}
+    }
+
+    // Parse initialNumSteps & invocationNum for rollback detection and idempotent `/compact` invalidation
+    const rawInitialSteps = payload.initialNumSteps ?? payload.initial_num_steps;
+    const initialNumSteps =
+      rawInitialSteps !== undefined &&
+      rawInitialSteps !== null &&
+      rawInitialSteps !== "" &&
+      typeof rawInitialSteps !== "boolean" &&
+      Number.isFinite(Number(rawInitialSteps)) &&
+      Number(rawInitialSteps) >= 0
+        ? Math.floor(Number(rawInitialSteps))
+        : null;
+    const rawInvNum = payload?.invocationNum ?? payload?.invocation_num ?? null;
+    const parsedInvNum =
+      rawInvNum !== undefined && rawInvNum !== null && rawInvNum !== "" && typeof rawInvNum !== "boolean"
+        ? Number(rawInvNum)
+        : NaN;
+    const isMidTurnContinuation = Number.isFinite(parsedInvNum) && parsedInvNum >= 1;
+    const isExplicitTurnEntry = Number.isFinite(parsedInvNum) && parsedInvNum === 0;
+
+    // 1. Detect initialNumSteps rollback (trajectory rewind/reset -> immediate invalidation)
+    if (initialNumSteps !== null && targetConvId && targetConvId !== "default") {
+      try {
+        const stepsKey = `compact_invalidated:steps:${targetConvId}`;
+        const rawPrevSteps = store.getTimedMeta(stepsKey, "");
+        const prevSteps = rawPrevSteps !== "" && Number.isFinite(Number(rawPrevSteps)) ? Math.floor(Number(rawPrevSteps)) : null;
+        if (prevSteps !== null && initialNumSteps < prevSteps) {
+          store.invalidateFileReads(targetConvId, null);
+          store.deleteMeta(`compact_invalidated:tx_stat:${targetConvId}`);
+          store.deleteMeta(`compact_invalidated:cmd:${targetConvId}`);
+        }
+        if (prevSteps !== initialNumSteps) {
+          store.setTimedMeta(stepsKey, String(initialNumSteps));
+        }
+      } catch {}
+    }
+
+    // 2. Immediate `/compact` command detection via lastUserInput (idempotent via initialNumSteps;
+    //    never re-invalidates during mid-turn tool loops where invocationNum >= 1).
+    const rawLastUserInput = payload.lastUserInput ?? payload.last_user_input ?? "";
+    if (typeof rawLastUserInput === "string" && rawLastUserInput.trim() && targetConvId && targetConvId !== "default") {
+      try {
+        const cmdKey = `compact_invalidated:cmd:${targetConvId}`;
+        if (isSlashCompactText(rawLastUserInput)) {
+          if (!isMidTurnContinuation) {
+            const cmdText = rawLastUserInput.trim().slice(0, 128);
+            let prevCmd = null;
+            const rawPrevCmd = store.getTimedMeta(cmdKey, "");
+            if (rawPrevCmd) {
+              try {
+                prevCmd = JSON.parse(rawPrevCmd);
+              } catch {}
+            }
+            const alreadyStamped = Boolean(
+              prevCmd &&
+                prevCmd.text === cmdText &&
+                (initialNumSteps !== null ? prevCmd.initialNumSteps === initialNumSteps : !isExplicitTurnEntry)
+            );
+            if (!alreadyStamped) {
+              store.invalidateFileReads(targetConvId, null);
+              store.setTimedMeta(
+                cmdKey,
+                JSON.stringify({
+                  text: cmdText,
+                  initialNumSteps,
+                  stepIdx: null,
+                  turnSeq: currentTurnSeq,
+                  ts: Date.now()
+                })
+              );
+            }
+          }
+        } else {
+          // Non-compact user turn resets cmd stamp so a subsequent `/compact` always triggers cleanly
+          if (store.getTimedMeta(cmdKey, "")) {
+            store.deleteMeta(cmdKey);
+          }
+        }
+      } catch {}
+    }
+
     let transcriptPath =
-      typeof payload.transcriptPath === "string" && payload.transcriptPath.trim()
-        ? payload.transcriptPath.trim()
-        : "";
+      (typeof payload.transcriptPath === "string" && payload.transcriptPath.trim()) ||
+      (typeof payload.transcript_path === "string" && payload.transcript_path.trim()) ||
+      "";
     if (!transcriptPath || !fs.existsSync(transcriptPath)) {
       if (targetConvId && targetConvId !== "default") {
         transcriptPath = findTranscriptForConversation(targetConvId, { exactOnly: true }) || "";
@@ -323,39 +415,143 @@ async function main() {
     }
 
     let diag = null;
+    let loadedSteps = [];
+    let txStatMtimeMs = 0;
+    let txStatSize = 0;
     if (transcriptPath && fs.existsSync(transcriptPath)) {
-      const steps = readTranscriptTail(transcriptPath, 131072);
+      let txStatSig = "";
+      try {
+        const txStat = fs.statSync(transcriptPath);
+        if (txStat.isFile() && txStat.size > 0) {
+          txStatMtimeMs = txStat.mtimeMs;
+          txStatSize = txStat.size;
+          txStatSig = `${txStat.size}:${Math.round(txStat.mtimeMs)}:${transcriptPath}`;
+        }
+      } catch {}
+
+      const steps = readTranscriptTail(transcriptPath, 131072, { minUsageSteps: 2 });
+      loadedSteps = steps;
       if (steps.length > 0) {
-        const diagOpts = {};
+        const diagOpts = {
+          conversationId: targetConvId && targetConvId !== "default" ? targetConvId : ""
+        };
         if (effectiveCfg.cacheTtlSec !== null) diagOpts.ttlSec = effectiveCfg.cacheTtlSec;
         if (effectiveCfg.windowTokens !== null) diagOpts.windowTokens = effectiveCfg.windowTokens;
         if (effectiveCfg.warnTokens !== null) diagOpts.warnTokens = effectiveCfg.warnTokens;
         if (effectiveCfg.criticalTokens !== null) diagOpts.criticalTokens = effectiveCfg.criticalTokens;
+        if (dbExists || store.db) {
+          try {
+            diagOpts.historicalTtlByProfile = store.getAllModelTtlCalibrations();
+          } catch {}
+        }
         diag = analyzeTranscriptCache(steps, diagOpts);
 
-        // Auto-invalidate file_reads & file_snapshots on compaction even when cacheWatch is off or paused.
-        // Reverse-scan so a later TTL bust never masks an earlier compaction bust, and bind to targetConvId
-        // so subagent compaction never wipes the parent conversation's file_reads.
-        let latestCompactBust = null;
-        for (let bi = diag.recentBusts.length - 1; bi >= 0; bi--) {
-          if (diag.recentBusts[bi]?.cause === "compaction_or_truncation") {
-            latestCompactBust = diag.recentBusts[bi];
-            break;
+        if (
+          diag.ttlObservations &&
+          Object.keys(diag.ttlObservations).length > 0 &&
+          targetConvId &&
+          targetConvId !== "default"
+        ) {
+          try {
+            const prevTxSig = store.getTimedMeta(`compact_invalidated:tx_stat:${targetConvId}`, "");
+            if (!txStatSig || prevTxSig !== txStatSig) {
+              store.recordModelTtlObservations(diag.ttlObservations, targetConvId);
+            }
+          } catch {}
+        }
+
+        // Auto-invalidate file_reads & file_snapshots on any compaction/pruning event even when cacheWatch is off or paused.
+        // Uses unified latestCompactionEvent (compaction bust, decoupled shrink / mild prune, explicit compact step, `/compact`)
+        // and preserves any post-compaction reads when explicit stepIndex is known.
+        const compactEvent = diag.latestCompactionEvent;
+        if (compactEvent && compactEvent.stamp) {
+          const lastCompactKey = `compact_invalidated:${targetConvId}`;
+          if (store.getTimedMeta(lastCompactKey, "") !== compactEvent.stamp) {
+            if (compactEvent.hasExplicitStepIndex && Number.isFinite(compactEvent.stepIndex)) {
+              store.invalidateFileReadsBefore(targetConvId, { maxStep: compactEvent.stepIndex });
+            } else {
+              store.invalidateFileReads(targetConvId, null);
+            }
+            store.setTimedMeta(lastCompactKey, compactEvent.stamp);
           }
         }
-        if (latestCompactBust) {
-          const lastCompactKey = `compact_invalidated:${targetConvId}`;
-          const stamp = latestCompactBust.at
-            ? `at:${latestCompactBust.at}:${latestCompactBust.prevCtxTokens}:${latestCompactBust.currCtxTokens}`
-            : latestCompactBust.hasExplicitStepIndex
-              ? `step:${latestCompactBust.stepIndex}:${latestCompactBust.prevCtxTokens}:${latestCompactBust.currCtxTokens}`
-              : `sig:${latestCompactBust.prevCtxTokens}:${latestCompactBust.currCtxTokens}:${latestCompactBust.wastedTokens ?? 0}`;
-          if (store.getTimedMeta(lastCompactKey, "") !== stamp) {
-            store.invalidateFileReads(targetConvId, null);
-            store.setTimedMeta(lastCompactKey, stamp);
-          }
+        if (txStatSig && targetConvId && targetConvId !== "default") {
+          try {
+            store.setTimedMeta(`compact_invalidated:tx_stat:${targetConvId}`, txStatSig);
+          } catch {}
         }
       }
+    }
+
+    // Record Sidecar Stall Watchdog / Idle TTL execution lease (isolated by direct conversationId)
+    const watchdogActive = Boolean(
+      effectiveCfg.stallWatchdog &&
+        (typeof store.isWatchdogEnabled !== "function" || store.isWatchdogEnabled())
+    );
+    const ttlNotifyActive = Boolean(
+      effectiveCfg.ttlDesktopNotify ||
+        ((dbExists || store.db) &&
+          typeof store.isTtlDesktopNotifyEnabled === "function" &&
+          store.isTtlDesktopNotifyEnabled())
+    );
+    if (
+      (watchdogActive || ttlNotifyActive) &&
+      targetConvId &&
+      targetConvId !== "default" &&
+      watchdogLeaseMod?.recordHookLeaseTransition
+    ) {
+      try {
+        let detectedSubagent = isSubagentConv;
+        if (!detectedSubagent) {
+          if (
+            watchdogLeaseMod.isSubagentLeasePayload?.(payload) ||
+            (typeof rawLastUserInput === "string" && watchdogLeaseMod.isHeadlessWorkerPrompt?.(rawLastUserInput))
+          ) {
+            detectedSubagent = true;
+          } else if (loadedSteps.length > 0) {
+            for (const s of loadedSteps) {
+              if (!s || typeof s !== "object") continue;
+              const stType = String(s.type || "").toUpperCase();
+              if (stType === "USER_INPUT" || String(s.role || "").toLowerCase() === "user") {
+                const uTxt =
+                  typeof s.user_input === "string"
+                    ? s.user_input
+                    : typeof s.content === "string"
+                      ? s.content
+                      : "";
+                if (uTxt && watchdogLeaseMod.isHeadlessWorkerPrompt?.(uTxt)) {
+                  detectedSubagent = true;
+                  break;
+                }
+              }
+              if (Array.isArray(s.tool_calls)) {
+                const hasFinish = s.tool_calls.some((c) => {
+                  const n = c && typeof c === "object" ? c.name || c.tool || c.function?.name || "" : "";
+                  return watchdogLeaseMod.extractBareToolName?.(n) === "finish";
+                });
+                if (hasFinish) {
+                  detectedSubagent = true;
+                  break;
+                }
+              }
+            }
+          }
+        }
+        watchdogLeaseMod.recordHookLeaseTransition(store, "PreInvocation", payload, {
+          directConvId: targetConvId,
+          rootSessionId: sessionId,
+          isSubagent: detectedSubagent,
+          cwd: payload.cwd || "",
+          transcriptPath,
+          transcriptMtimeMs: txStatMtimeMs,
+          transcriptSize: txStatSize,
+          contextTokens: diag?.currentContextTokens || 0,
+          mediaCount: diag?.totalMediaCount || 0,
+          model: diag?.currentModel || "",
+          cacheTtlSec: diag?.cacheTtlSec || 0,
+          ttlSource: diag?.ttlSource || ""
+        });
+      } catch {}
     }
 
     // Inherit parent pause state for subagents, while isolating alert suppression keys per direct conversation

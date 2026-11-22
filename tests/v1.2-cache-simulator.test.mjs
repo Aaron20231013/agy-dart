@@ -80,7 +80,7 @@ test("P2-10.1: Idle-heavy Claude session (8-15 min gaps at 120k context) -> ttl-
 
   assert.equal(report.sessions, 1);
   assert.equal(report.turnsWithUsage, 4);
-  assert.equal(report.policies.length, 7);
+  assert.equal(report.policies.length, 9);
 
   const obs = policyById(report, "observed");
   const ttl5m = policyById(report, "ttl-5m");
@@ -418,7 +418,7 @@ test("P2-10.5: Empty, zero-usage, and malformed sessions produce zero NaN/Infini
     assert.equal(rep.sessions, 0);
     assert.equal(rep.turnsWithUsage, 0);
     assert.equal(rep.recommendedPolicy, "observed");
-    assert.equal(rep.policies.length, 7);
+    assert.equal(rep.policies.length, 9);
     for (const p of rep.policies) {
       assert.equal(p.projectedHitRate, 0);
       assert.equal(p.projectedBusts, 0);
@@ -486,7 +486,7 @@ test("P2-10.6: Live CLI benchmark.mjs cache simulate (JSON & Markdown) + existin
     assertAllNumbersFinite(parsed);
     assert.equal(parsed.sessions, 1);
     assert.equal(parsed.turnsWithUsage, 3);
-    assert.equal(parsed.policies.length, 7);
+    assert.equal(parsed.policies.length, 9);
     assert.ok(
       policyById(parsed, "ttl-1h").projectedInputCostUsd < policyById(parsed, "ttl-5m").projectedInputCostUsd
     );
@@ -573,7 +573,7 @@ test("P2-10.7: Isolated install.mjs install --target copies cache-simulator.js a
     assertAllNumbersFinite(parsed);
     assert.equal(parsed.sessions, 1);
     assert.equal(parsed.turnsWithUsage, 2);
-    assert.equal(parsed.policies.length, 7);
+    assert.equal(parsed.policies.length, 9);
     assert.ok(
       policyById(parsed, "ttl-5m").projectedInputCostUsd < policyById(parsed, "ttl-1h").projectedInputCostUsd
     );

@@ -910,7 +910,7 @@ function probeMcpServerOnce({ command, args, cwd, env, timeoutMs }) {
       params: {
         protocolVersion: "2024-11-05",
         capabilities: {},
-        clientInfo: { name: "agy-dart-cache-audit", version: "1.3.0" }
+        clientInfo: { name: "agy-dart-cache-audit", version: "1.5.0" }
       }
     });
   });
@@ -2746,6 +2746,23 @@ async function main() {
     return;
   }
   const report = await auditEnvironmentCache(opts);
+  if (report?.scoreBreakdown?.criticalCount === 0) {
+    const hasCustomDbEnv = Boolean(process.env.AGY_DART_DB_PATH && process.env.AGY_DART_DB_PATH.trim());
+    const defaultCfgDir = path.resolve(path.join(getHomeDir(), ".gemini", "config"));
+    if (hasCustomDbEnv || path.resolve(opts.configDir) === defaultCfgDir) {
+      try {
+        const { suppressSqliteExperimentalWarning } = await import("../hooks/compile-cache.mjs");
+        suppressSqliteExperimentalWarning();
+        const { ContextModeStore } = await import("../context/lib/store.js");
+        const store = new ContextModeStore({ hookMode: true });
+        try {
+          store.recordCacheAuditPassed();
+        } finally {
+          store.close();
+        }
+      } catch {}
+    }
+  }
   if (opts.json) {
     process.stdout.write(JSON.stringify(report, null, 2) + "\n");
   } else {

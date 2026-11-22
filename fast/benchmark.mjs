@@ -1264,6 +1264,12 @@ function parsePositiveInt(raw) {
   if (!Number.isSafeInteger(n) || n < 1) return null;
   return n;
 }
+function parseNonNegativeInt(raw) {
+  if (!/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n < 0) return null;
+  return n;
+}
 function parseIsoTimestamp(raw, endOfDayIfDateOnly = false) {
   const trimmed = raw.trim();
   if (!trimmed || !/^\d{4}-\d{2}-\d{2}(?:[T\s].*)?$/.test(trimmed)) return null;
@@ -1278,7 +1284,7 @@ function printUsage() {
       "  node fast/benchmark.mjs analyze <path...> [--recent <N>] [--since <ISO>] [--until <ISO>] [--split-usage] [--json]",
       "  node fast/benchmark.mjs analyze --local [--recent <N>] [--since <ISO>] [--until <ISO>] [--split-usage] [--json]",
       "  node fast/benchmark.mjs cache [--local | <path...>] [--recent <N>] [--since <ISO>] [--until <ISO>] [--ttl <sec>] [--json]",
-      "  node fast/benchmark.mjs cache simulate [--local | <path...>] [--recent <N>] [--since <ISO>] [--until <ISO>] [--json]",
+      "  node fast/benchmark.mjs cache simulate [--local | <path...>] [--recent <N>] [--since <ISO>] [--until <ISO>] [--ttl <sec>] [--keepalive-tail <sec>] [--json]",
       "  node fast/benchmark.mjs compare --before <path> --after <path> [--json]",
       "",
       "Options:",
@@ -1287,6 +1293,7 @@ function printUsage() {
       "  --since <ISO>  Include only steps at or after an ISO-8601 timestamp (e.g. 2026-11-19T12:51:00+08:00)",
       "  --until <ISO>  Include only steps at or before an ISO-8601 timestamp",
       "  --ttl <sec>    Prompt-cache idle TTL override in seconds for 'cache' command (default: auto/profile)",
+      "  --keepalive-tail <sec>  End-of-session walk-away tail window in seconds for 'cache simulate' (default: 1800, 0 disables)",
       "  --split-usage  Split metrics into sessions with vs. without agy-fast tool calls",
       "  --json         Output raw JSON metrics"
     ].join("\n") + "\n"
@@ -1307,6 +1314,7 @@ async function main(argv) {
     let sinceMs;
     let untilMs;
     let ttlSec;
+    let keepaliveTailSec;
     let asJson = false;
     for (let i = isSimulate ? 2 : 1; i < args.length; i++) {
       const a = args[i];
@@ -1336,6 +1344,15 @@ async function main(argv) {
           return;
         }
         ttlSec = parsed;
+      } else if (isSimulate && (a === "--keepalive-tail" || a.startsWith("--keepalive-tail="))) {
+        const raw = a === "--keepalive-tail" ? args[++i] : a.slice("--keepalive-tail=".length);
+        const parsed = raw !== void 0 ? parseNonNegativeInt(raw) : null;
+        if (parsed === null) {
+          process.stderr.write("Error: --keepalive-tail must be a non-negative integer (seconds)\n");
+          process.exitCode = 1;
+          return;
+        }
+        keepaliveTailSec = parsed;
       } else if (a === "--since" || a.startsWith("--since=")) {
         const raw = a === "--since" ? args[++i] : a.slice("--since=".length);
         const parsed = raw !== void 0 ? parseIsoTimestamp(raw) : null;
@@ -1385,7 +1402,10 @@ async function main(argv) {
     if (untilMs !== void 0) opts.untilMs = untilMs;
     const sessions = await loadFilteredSessions(targets, opts);
     if (isSimulate) {
-      const sim = simulateCachePolicies(sessions, ttlSec !== void 0 ? { ttlSec } : {});
+      const simOpts = {};
+      if (ttlSec !== void 0) simOpts.ttlSec = ttlSec;
+      if (keepaliveTailSec !== void 0) simOpts.keepaliveTailSec = keepaliveTailSec;
+      const sim = simulateCachePolicies(sessions, simOpts);
       process.stdout.write(
         asJson ? `${JSON.stringify(sim, null, 2)}\n` : `${formatSimulationMarkdown(sim)}\n`
       );

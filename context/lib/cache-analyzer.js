@@ -63,6 +63,13 @@ const CRITICAL_WINDOW_RATIO = 0.80;
 const COLD_COMPACT_WINDOW_RATIO = 0.30;
 const DELAY_HOT_WINDOW_RATIO = 0.15;
 const EMPIRICAL_TTL_TRIGGER_RATIO = 1.1;
+export const TTL_CALIBRATION_MAX_AGE_MS = 14 * 24 * 3600 * 1000;
+const TTL_CALIBRATION_RECENT_MS = 7 * 24 * 3600 * 1000;
+const TTL_WARM_SAMPLE_MIN_SEC = 180;
+const TTL_COLD_SAMPLE_MIN_SEC = 120;
+const TTL_SAMPLE_MAX_SEC = 14400;
+const TTL_PURE_COLD_MAX_CACHE_RATIO = 0.25;
+const TTL_IMPLICIT_MAX_CAP_SEC = 3600;
 
 
 function toNonNegNum(val) {
@@ -252,27 +259,377 @@ export function extractStepTokenUsage(step) {
   };
 }
 
+function roundTo60(sec) {
+  return Math.max(60, Math.round(sec / 60) * 60);
+}
+
+function ceilTo60(sec) {
+  return Math.max(60, Math.ceil(sec / 60) * 60);
+}
+
+function clampNum(val, min, max) {
+  return Math.min(max, Math.max(min, val));
+}
+
+function isExtended1hTierProfile(profile) {
+  return (
+    Boolean(profile?.id && /^claude/i.test(profile.id)) ||
+    (profile?.cacheWrite1hMultiplier || 1) > (profile?.cacheWriteMultiplier || 1)
+  );
+}
+
+function normalizeTtlSamples(rawList, minSec, maxSec, { nowMs = null, maxAgeMs = null, defaultConv = "" } = {}) {
+  if (!Array.isArray(rawList) || rawList.length === 0) return [];
+  const out = [];
+  for (const item of rawList) {
+    if (!item || typeof item !== "object") continue;
+    const gapSec = Number(item.gapSec);
+    if (!Number.isFinite(gapSec) || gapSec < minSec || gapSec > maxSec) continue;
+    const rawAt = item.atMs;
+    const atMs = Number.isFinite(rawAt) && rawAt > 0 ? Math.floor(rawAt) : 0;
+    if (nowMs !== null && maxAgeMs !== null && atMs > 0 && nowMs - atMs > maxAgeMs) {
+      continue;
+    }
+    const conv = typeof item.conv === "string" && item.conv.trim() ? item.conv.trim() : defaultConv;
+    out.push({ gapSec: Math.round(gapSec), atMs, conv });
+  }
+  return out;
+}
+
+function mergeUniqueTtlSamples(sessionSamples, historySamples) {
+  const merged = [];
+  const seenExact = new Set();
+  const seenSessionStamp = new Set();
+  for (const s of sessionSamples) {
+    const exactKey = `${s.conv || "__session__"}:${s.atMs}:${s.gapSec}`;
+    if (seenExact.has(exactKey)) continue;
+    seenExact.add(exactKey);
+    if (s.atMs > 0) seenSessionStamp.add(`${s.atMs}:${s.gapSec}`);
+    merged.push(s);
+  }
+  for (const h of historySamples) {
+    const exactKey = `${h.conv || ""}:${h.atMs}:${h.gapSec}`;
+    if (seenExact.has(exactKey)) continue;
+    if (h.atMs > 0 && seenSessionStamp.has(`${h.atMs}:${h.gapSec}`)) continue;
+    seenExact.add(exactKey);
+    merged.push(h);
+  }
+  return merged;
+}
+
+function computeWarmLowerBound(warmList) {
+  if (!Array.isArray(warmList) || warmList.length === 0) return null;
+  const gaps = warmList.map((s) => s.gapSec).sort((a, b) => a - b);
+  const n = gaps.length;
+  if (n === 1) return gaps[0];
+  if (gaps[n - 2] >= gaps[n - 1] * 0.9) return gaps[n - 1];
+  if (n <= 4) return gaps[n - 1];
+  const p90Idx = Math.min(n - 1, Math.floor(0.9 * (n - 1)));
+  return gaps[p90Idx];
+}
+
+function computeColdUpperBound(coldList) {
+  if (!Array.isArray(coldList) || coldList.length === 0) return null;
+  const gaps = coldList.map((s) => s.gapSec).sort((a, b) => a - b);
+  const idx = gaps.length >= 5 ? Math.floor(0.2 * (gaps.length - 1)) : 0;
+  return gaps[idx];
+}
+
 function calibrateEmpiricalTtl(profile, maxWarmHitGapSec, hasExplicit1hWrite = false) {
   const profileTtl = profile?.ttlSec || DEFAULT_CACHE_TTL_SEC;
-  const isExtended1hTierModel =
-    Boolean(profile?.id && /^claude/i.test(profile.id)) ||
-    (profile?.cacheWrite1hMultiplier || 1) > (profile?.cacheWriteMultiplier || 1);
+  const isExtended1hTierModel = isExtended1hTierProfile(profile);
 
   if (hasExplicit1hWrite) {
     const floor =
       maxWarmHitGapSec !== null && maxWarmHitGapSec > 3600
-        ? Math.ceil(maxWarmHitGapSec / 60) * 60
+        ? ceilTo60(maxWarmHitGapSec)
         : 3600;
     return Math.max(profileTtl, floor);
   }
   if (maxWarmHitGapSec === null || !(maxWarmHitGapSec > profileTtl * EMPIRICAL_TTL_TRIGGER_RATIO)) {
     return null;
   }
-  const roundedFloor = Math.ceil(maxWarmHitGapSec / 60) * 60;
+  const roundedFloor = ceilTo60(maxWarmHitGapSec);
   if (isExtended1hTierModel) {
     return maxWarmHitGapSec <= 3600 ? 3600 : roundedFloor;
   }
-  return roundedFloor;
+  return Math.min(TTL_IMPLICIT_MAX_CAP_SEC, roundedFloor);
+}
+
+/**
+ * Cross-session & in-session interval-bounded empirical TTL estimator (pure function, zero DB I/O).
+ * Preserves backward-compatible `ttlSource` ("explicit" | "empirical" | "profile") while exposing
+ * rich provenance and sample bounds via `ttlCalibration`.
+ */
+export function estimateCalibratedTtl(
+  profile,
+  {
+    explicitTtlSec = null,
+    sessionMaxWarmGapSec = null,
+    sessionHas1hWrite = false,
+    sessionWarmSamples = [],
+    sessionColdSamples = [],
+    historyRecord = null,
+    nowMs = Date.now(),
+    convId = ""
+  } = {}
+) {
+  const profileId = profile?.id || "default";
+  const profileTtl = profile?.ttlSec || DEFAULT_CACHE_TTL_SEC;
+  const isExtended1h = isExtended1hTierProfile(profile);
+  const safeNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+
+  const sessWarm = normalizeTtlSamples(sessionWarmSamples, TTL_WARM_SAMPLE_MIN_SEC, TTL_SAMPLE_MAX_SEC, {
+    defaultConv: convId || "__session__"
+  });
+  if (
+    Number.isFinite(sessionMaxWarmGapSec) &&
+    sessionMaxWarmGapSec >= TTL_WARM_SAMPLE_MIN_SEC &&
+    sessionMaxWarmGapSec <= TTL_SAMPLE_MAX_SEC &&
+    !sessWarm.some((s) => s.gapSec === Math.round(sessionMaxWarmGapSec))
+  ) {
+    sessWarm.push({ gapSec: Math.round(sessionMaxWarmGapSec), atMs: safeNowMs, conv: convId || "__session__" });
+  }
+  const sessCold = normalizeTtlSamples(sessionColdSamples, TTL_COLD_SAMPLE_MIN_SEC, TTL_SAMPLE_MAX_SEC, {
+    defaultConv: convId || "__session__"
+  });
+
+  const histFresh =
+    historyRecord &&
+    typeof historyRecord === "object" &&
+    (!Number.isFinite(historyRecord.updatedTs) ||
+      historyRecord.updatedTs <= 0 ||
+      safeNowMs - historyRecord.updatedTs <= TTL_CALIBRATION_MAX_AGE_MS)
+      ? historyRecord
+      : null;
+
+  const histWarm = histFresh
+    ? normalizeTtlSamples(histFresh.warm, TTL_WARM_SAMPLE_MIN_SEC, TTL_SAMPLE_MAX_SEC, {
+        nowMs: safeNowMs,
+        maxAgeMs: TTL_CALIBRATION_MAX_AGE_MS
+      })
+    : [];
+  const histCold = histFresh
+    ? normalizeTtlSamples(histFresh.cold, TTL_COLD_SAMPLE_MIN_SEC, TTL_SAMPLE_MAX_SEC, {
+        nowMs: safeNowMs,
+        maxAgeMs: TTL_CALIBRATION_MAX_AGE_MS
+      })
+    : [];
+  const histHas1hWrite = Boolean(histFresh && histFresh.seen1hWrite);
+
+  const allWarm = mergeUniqueTtlSamples(sessWarm, histWarm);
+  const allCold = mergeUniqueTtlSamples(sessCold, histCold);
+
+  const maxWarmGapSec =
+    allWarm.length > 0
+      ? Math.max(...allWarm.map((s) => s.gapSec))
+      : Number.isFinite(sessionMaxWarmGapSec) && sessionMaxWarmGapSec > 0
+        ? Math.round(sessionMaxWarmGapSec)
+        : null;
+  const minColdMissGapSec = allCold.length > 0 ? Math.min(...allCold.map((s) => s.gapSec)) : null;
+
+  if (Number.isFinite(explicitTtlSec) && explicitTtlSec > 0) {
+    return {
+      ttlSec: explicitTtlSec,
+      ttlSource: "explicit",
+      ttlCalibration: {
+        origin: "explicit",
+        profileId,
+        warmSamples: allWarm.length,
+        coldSamples: allCold.length,
+        maxWarmGapSec,
+        minColdMissGapSec,
+        estimatedTtlSec: explicitTtlSec,
+        confidence: "high"
+      }
+    };
+  }
+
+  const has1hWrite = Boolean(sessionHas1hWrite || histHas1hWrite);
+  if (has1hWrite && isExtended1h) {
+    const floor = maxWarmGapSec !== null && maxWarmGapSec > 3600 ? ceilTo60(maxWarmGapSec) : 3600;
+    const est = Math.max(profileTtl, floor);
+    const origin = sessionHas1hWrite && histWarm.length === 0 && !histHas1hWrite ? "session" : histHas1hWrite ? "history" : "session";
+    return {
+      ttlSec: est,
+      ttlSource: "empirical",
+      ttlCalibration: {
+        origin,
+        profileId,
+        warmSamples: allWarm.length,
+        coldSamples: allCold.length,
+        maxWarmGapSec,
+        minColdMissGapSec,
+        estimatedTtlSec: est,
+        confidence: "high"
+      }
+    };
+  }
+
+  const hasHistoryData = histWarm.length > 0 || histCold.length > 0 || histHas1hWrite;
+  const resolveOrigin = (sessionTriggered) => {
+    if (hasHistoryData && !sessionTriggered) return "history";
+    if (hasHistoryData) return "history";
+    return "session";
+  };
+
+  const L = computeWarmLowerBound(allWarm);
+  const U = computeColdUpperBound(allCold);
+
+  // Extended 1h discrete-tier models (e.g. Claude 5m vs 1h) with observed >5.5m warm hit
+  // and no explicit history downward shift use the 1h tier floor unless multi-session cold hits prove otherwise.
+  if (isExtended1h && L !== null && L > profileTtl * EMPIRICAL_TTL_TRIGGER_RATIO) {
+    const distinctColdShort = new Set(
+      allCold.filter((c) => c.gapSec < 3600 && c.conv).map((c) => c.conv)
+    );
+    if (U === null || distinctColdShort.size < 2) {
+      const est = L <= 3600 ? 3600 : ceilTo60(L);
+      const sessL = computeWarmLowerBound(sessWarm);
+      const origin = hasHistoryData && !(sessL !== null && sessL > profileTtl * EMPIRICAL_TTL_TRIGGER_RATIO && histWarm.length === 0)
+        ? (histWarm.length > 0 ? "history" : "session")
+        : "session";
+      return {
+        ttlSec: est,
+        ttlSource: "empirical",
+        ttlCalibration: {
+          origin,
+          profileId,
+          warmSamples: allWarm.length,
+          coldSamples: allCold.length,
+          maxWarmGapSec,
+          minColdMissGapSec,
+          estimatedTtlSec: est,
+          confidence: allWarm.length >= 2 ? "high" : "medium"
+        }
+      };
+    }
+  }
+
+  let estimated = null;
+  let confidence = "low";
+
+  if (L !== null && U !== null) {
+    if (L < U) {
+      if (L > profileTtl * EMPIRICAL_TTL_TRIGGER_RATIO || U < profileTtl) {
+        const rawTarget = roundTo60(L + 0.35 * (U - L));
+        estimated = clampNum(rawTarget, L, Math.max(L, U - 60));
+        // Snap clean minute if L itself is a multiple of 60 or ceil slightly
+        estimated = roundTo60(estimated);
+        estimated = clampNum(estimated, roundTo60(L), Math.max(roundTo60(L), U - 60));
+        confidence = allWarm.length >= 2 && allCold.length >= 1 ? "high" : "medium";
+      }
+    } else {
+      // U <= L: Backend TTL likely shrank compared to older warm hits -> re-evaluate on recent subwindow
+      const recentCutoff = safeNowMs - TTL_CALIBRATION_RECENT_MS;
+      let recentWarm = allWarm.filter((s) => s.atMs <= 0 || s.atMs >= recentCutoff);
+      let recentCold = allCold.filter((s) => s.atMs <= 0 || s.atMs >= recentCutoff);
+      let lRec = computeWarmLowerBound(recentWarm);
+      let uRec = computeColdUpperBound(recentCold);
+
+      if (lRec !== null && uRec !== null && uRec <= lRec) {
+        // Still inverted inside 7d -> slice latest chronological half of combined observations
+        const tagged = [
+          ...allWarm.map((s, idx) => ({ ...s, kind: "warm", ord: idx })),
+          ...allCold.map((s, idx) => ({ ...s, kind: "cold", ord: allWarm.length + idx }))
+        ].sort((a, b) => (a.atMs !== b.atMs ? a.atMs - b.atMs : a.ord - b.ord));
+        const half = tagged.slice(Math.floor(tagged.length / 2));
+        const halfWarm = half.filter((x) => x.kind === "warm");
+        const halfCold = half.filter((x) => x.kind === "cold");
+        if (halfWarm.length > 0 || halfCold.length > 0) {
+          recentWarm = halfWarm;
+          recentCold = halfCold;
+          lRec = computeWarmLowerBound(recentWarm);
+          uRec = computeColdUpperBound(recentCold);
+        }
+      }
+
+      if (lRec !== null && uRec !== null && lRec < uRec) {
+        if (lRec > profileTtl * EMPIRICAL_TTL_TRIGGER_RATIO || uRec < profileTtl) {
+          const rawTarget = roundTo60(lRec + 0.35 * (uRec - lRec));
+          estimated = clampNum(rawTarget, roundTo60(lRec), Math.max(roundTo60(lRec), uRec - 60));
+          confidence = "medium";
+        }
+      } else {
+        const capU = uRec ?? U;
+        if (capU > profileTtl) {
+          estimated = clampNum(roundTo60(capU - 60), profileTtl, capU);
+          confidence = estimated > profileTtl ? "medium" : "low";
+          if (estimated === profileTtl) {
+            // Converged all the way back down to default profile TTL
+            return {
+              ttlSec: profileTtl,
+              ttlSource: "profile",
+              ttlCalibration: {
+                origin: hasHistoryData ? "history" : "profile",
+                profileId,
+                warmSamples: allWarm.length,
+                coldSamples: allCold.length,
+                maxWarmGapSec,
+                minColdMissGapSec,
+                estimatedTtlSec: profileTtl,
+                confidence: "medium"
+              }
+            };
+          }
+        } else {
+          const distinctColdConvs = new Set(
+            allCold.filter((c) => c.gapSec < profileTtl && c.conv).map((c) => c.conv)
+          );
+          if (distinctColdConvs.size >= 2) {
+            estimated = Math.max(60, Math.min(profileTtl, roundTo60(capU - 30)));
+            confidence = "medium";
+          }
+        }
+      }
+    }
+  } else if (L !== null) {
+    if (L > profileTtl * EMPIRICAL_TTL_TRIGGER_RATIO) {
+      const roundedFloor = ceilTo60(L);
+      estimated = isExtended1h ? (L <= 3600 ? 3600 : roundedFloor) : Math.min(TTL_IMPLICIT_MAX_CAP_SEC, roundedFloor);
+      confidence = allWarm.length >= 3 ? "high" : "medium";
+    }
+  } else if (U !== null && U < profileTtl) {
+    const distinctColdConvs = new Set(
+      allCold.filter((c) => c.gapSec < profileTtl && c.conv).map((c) => c.conv)
+    );
+    if (distinctColdConvs.size >= 2) {
+      estimated = Math.max(60, Math.min(profileTtl, roundTo60(U - 30)));
+      confidence = "medium";
+    }
+  }
+
+  if (estimated !== null && estimated !== profileTtl) {
+    const sessOnly = !hasHistoryData;
+    return {
+      ttlSec: estimated,
+      ttlSource: "empirical",
+      ttlCalibration: {
+        origin: sessOnly ? "session" : resolveOrigin(sessWarm.length > 0 || sessCold.length > 0),
+        profileId,
+        warmSamples: allWarm.length,
+        coldSamples: allCold.length,
+        maxWarmGapSec,
+        minColdMissGapSec,
+        estimatedTtlSec: estimated,
+        confidence
+      }
+    };
+  }
+
+  return {
+    ttlSec: profileTtl,
+    ttlSource: "profile",
+    ttlCalibration: {
+      origin: "profile",
+      profileId,
+      warmSamples: allWarm.length,
+      coldSamples: allCold.length,
+      maxWarmGapSec,
+      minColdMissGapSec,
+      estimatedTtlSec: profileTtl,
+      confidence: "low"
+    }
+  };
 }
 
 function parseTimeMs(iso) {
@@ -305,9 +662,13 @@ export function parseTranscriptLines(content) {
  * Reads maxBytes from the end of the file (automatically widening up to 2 MB if
  * the final JSONL step itself is larger than maxBytes, e.g. large tool dump or media).
  */
-export function readTranscriptTail(filePath, maxBytes = 131072) {
+export function readTranscriptTail(filePath, maxBytes = 131072, options = {}) {
   if (!filePath) return [];
   const HARD_CAP_BYTES = 2 * 1024 * 1024;
+  const minUsageSteps =
+    Number.isFinite(Number(options?.minUsageSteps)) && Number(options.minUsageSteps) >= 1
+      ? Math.floor(Number(options.minUsageSteps))
+      : 1;
   let fd = null;
   try {
     const stat = fs.statSync(filePath);
@@ -329,11 +690,22 @@ export function readTranscriptTail(filePath, maxBytes = 131072) {
         }
       }
       const steps = parseTranscriptLines(text);
-      const hasUsageStep = steps.some((s) => {
+      let primaryCtxSteps = 0;
+      let totalUsageSteps = 0;
+      for (const s of steps) {
         const u = extractStepTokenUsage(s);
-        return u.contextTokens > 0 || u.outputTokens > 0;
-      });
-      if (hasUsageStep || offset === 0 || windowBytes >= HARD_CAP_BYTES) {
+        if (u.contextTokens > 0 || u.outputTokens > 0) {
+          totalUsageSteps += 1;
+          if (u.contextTokens > 0 && !isSubagentStep(s)) {
+            primaryCtxSteps += 1;
+          }
+        }
+      }
+      const hasEnoughUsage =
+        minUsageSteps <= 1
+          ? totalUsageSteps >= 1
+          : primaryCtxSteps >= minUsageSteps || (primaryCtxSteps === 0 && totalUsageSteps >= minUsageSteps);
+      if (hasEnoughUsage || offset === 0 || windowBytes >= HARD_CAP_BYTES) {
         return steps;
       }
       windowBytes = Math.min(stat.size, Math.min(HARD_CAP_BYTES, windowBytes * 4));
@@ -826,6 +1198,204 @@ export function createEmptySubagentBreakdown() {
   return finalizeSubagentBreakdown(createRawSubagentCounters(), 0);
 }
 
+const MILD_PRUNE_MIN_PREV_TOKENS = 12000;
+const MILD_PRUNE_KEEP_RATIO = 0.85;
+const MILD_PRUNE_MIN_DROP_TOKENS = 8000;
+const SLASH_COMPACT_RE = /^\s*\/compact(?:\s|$)/i;
+const EXPLICIT_COMPACT_TYPE_RE = /(?:COMPACT|TRUNCAT|CONTEXT_SUMMARY|CONVERSATION_SUMMARY|CONTEXT_RESET)/i;
+const COMPACTION_SUMMARY_SYSTEM_RE =
+  /(?:(?:^|\n)\s*(?:conversation\s+(?:was\s+|has\s+been\s+)?compacted|context\s+(?:was\s+|has\s+been\s+)?(?:compacted|summarized|truncated)|summary\s+of\s+(?:the\s+)?(?:previous|earlier)\s+conversation|earlier\s+conversation\s+summary|<conversation_summary>|<context_summary>|\[(?:conversation\s+)?compacted\b|\[conversation\s+summary\b)|this\s+session\s+is\s+being\s+continued\s+from\s+a\s+previous\s+conversation|the\s+conversation\s+history\s+(?:was|has\s+been)\s+(?:compacted|truncated|summarized))/i;
+
+/** Check whether a user input string is an explicit `/compact` command */
+export function isSlashCompactText(text) {
+  return typeof text === "string" && SLASH_COMPACT_RE.test(text);
+}
+
+function parseExplicitStepIndex(step) {
+  if (!step || typeof step !== "object") return null;
+  const raw = step.step_index ?? step.stepIndex ?? step.step_idx ?? step.stepIdx;
+  if (raw === null || raw === undefined || raw === "" || typeof raw === "boolean") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+}
+
+function detectExplicitCompactionStep(step) {
+  if (!step || typeof step !== "object") return false;
+  const typeStr = String(step.type || "");
+  if (EXPLICIT_COMPACT_TYPE_RE.test(typeStr)) return true;
+  if (
+    step.compacted === true ||
+    step.isCompaction === true ||
+    step.is_compaction === true ||
+    step.metadata?.compacted === true ||
+    step.metadata?.isCompaction === true ||
+    step.metadata?.is_compaction === true
+  ) {
+    return true;
+  }
+  if (typeStr === "SYSTEM_MESSAGE") {
+    const text = extractStepText(step.content ?? step.text);
+    if (text && COMPACTION_SUMMARY_SYSTEM_RE.test(text)) return true;
+  }
+  return false;
+}
+
+function detectContextShrink(prevTokens, currTokens) {
+  if (!Number.isFinite(prevTokens) || !Number.isFinite(currTokens) || prevTokens <= 0 || currTokens <= 0) {
+    return { shrunk: false, severe: false };
+  }
+  const severe = prevTokens >= MIN_CACHEABLE_CONTEXT_TOKENS && currTokens < prevTokens * BUST_DROP_RATIO;
+  const mild =
+    prevTokens >= MILD_PRUNE_MIN_PREV_TOKENS &&
+    currTokens < prevTokens * MILD_PRUNE_KEEP_RATIO &&
+    prevTokens - currTokens >= MILD_PRUNE_MIN_DROP_TOKENS;
+  return { shrunk: severe || mild, severe };
+}
+
+function buildCompactionEvent({
+  kind,
+  step,
+  index,
+  prevCtxTokens = null,
+  currCtxTokens = null,
+  detailText = ""
+}) {
+  const explicitStep = parseExplicitStepIndex(step);
+  const hasExplicitStepIndex = explicitStep !== null;
+  const stepIndex = hasExplicitStepIndex ? explicitStep : index;
+  const at = typeof step?.created_at === "string" && step.created_at.trim() ? step.created_at.trim() : null;
+  const safePrev = Number.isFinite(prevCtxTokens) && prevCtxTokens > 0 ? Math.round(prevCtxTokens) : null;
+  const safeCurr = Number.isFinite(currCtxTokens) && currCtxTokens > 0 ? Math.round(currCtxTokens) : null;
+  const detailHash = sha256Hex(`${String(step?.type || "")}:${String(detailText || "").trim().slice(0, 160)}`).slice(0, 10);
+
+  let stamp;
+  if (kind === "compaction_bust" || kind === "context_shrink") {
+    stamp = at
+      ? `at:${at}:${safePrev ?? 0}:${safeCurr ?? 0}`
+      : hasExplicitStepIndex
+        ? `step:${stepIndex}:${safePrev ?? 0}:${safeCurr ?? 0}`
+        : `sig:shrink:${safePrev ?? 0}:${safeCurr ?? 0}`;
+  } else {
+    const tag = kind === "slash_compact" ? "cmd" : "exp";
+    stamp = at
+      ? `${tag}:at:${at}:${detailHash}`
+      : hasExplicitStepIndex
+        ? `${tag}:step:${stepIndex}:${detailHash}`
+        : `${tag}:sig:${safePrev ?? 0}:${detailHash}`;
+  }
+
+  return {
+    stamp,
+    kind,
+    stepIndex,
+    hasExplicitStepIndex,
+    at,
+    prevCtxTokens: safePrev,
+    currCtxTokens: safeCurr
+  };
+}
+
+/**
+ * Lightweight linear scan over transcript steps extracting the latest compaction/pruning event
+ * across all 4 signals (compaction bust, decoupled context shrink / mild prune, explicit
+ * compaction/summary step, and `/compact` user input). Matches `analyzeTranscriptCache().latestCompactionEvent`.
+ */
+export function extractLatestCompactionEvent(steps) {
+  if (!Array.isArray(steps) || steps.length === 0) return null;
+  let latest = null;
+  let prevPrimaryCtx = 0;
+  let prevSubCtx = 0;
+  let seenPrimaryTurn = false;
+  let prevModel = "";
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (!step || typeof step !== "object") continue;
+
+    const stepIsSubagent = isSubagentStep(step);
+    const refPrevCtx = stepIsSubagent
+      ? (!seenPrimaryTurn ? prevSubCtx : 0)
+      : prevPrimaryCtx;
+
+    if (step.type === "USER_INPUT") {
+      const userText = extractStepText(step.content ?? step.text);
+      if ((!stepIsSubagent || !seenPrimaryTurn) && isSlashCompactText(userText)) {
+        latest = buildCompactionEvent({
+          kind: "slash_compact",
+          step,
+          index: i,
+          prevCtxTokens: refPrevCtx,
+          detailText: userText
+        });
+      }
+      continue;
+    }
+
+    const isExplicitCompact = detectExplicitCompactionStep(step);
+    if (isExplicitCompact && (!stepIsSubagent || !seenPrimaryTurn)) {
+      const explicitUsage = step.type === "PLANNER_RESPONSE" ? extractStepTokenUsage(step) : null;
+      latest = buildCompactionEvent({
+        kind: "explicit_compaction_step",
+        step,
+        index: i,
+        prevCtxTokens: refPrevCtx,
+        currCtxTokens: explicitUsage && explicitUsage.contextTokens > 0 ? explicitUsage.contextTokens : null,
+        detailText: extractStepText(step.content ?? step.text)
+      });
+    }
+
+    if (step.type !== "PLANNER_RESPONSE") continue;
+
+    const usage = extractStepTokenUsage(step);
+    const ctxTok = usage.contextTokens;
+    const model = typeof step.model === "string" ? step.model : "";
+    if (ctxTok > 0) {
+      if (!stepIsSubagent || !seenPrimaryTurn) {
+        if (refPrevCtx > 0) {
+          const shrink = detectContextShrink(refPrevCtx, ctxTok);
+          if (shrink.shrunk) {
+            const isModelSwitch = Boolean(prevModel && model && model !== prevModel);
+            const retainedRatio = refPrevCtx > 0 ? usage.cacheReadTokens / refPrevCtx : 1;
+            const isBust = retainedRatio < BUST_DROP_RATIO || (refPrevCtx >= 10000 && usage.cacheReadTokens === 0);
+            const kind = shrink.severe && isBust && !isModelSwitch ? "compaction_bust" : "context_shrink";
+            latest = buildCompactionEvent({
+              kind,
+              step,
+              index: i,
+              prevCtxTokens: refPrevCtx,
+              currCtxTokens: ctxTok
+            });
+          }
+        }
+        if (!stepIsSubagent) {
+          prevPrimaryCtx = ctxTok;
+          seenPrimaryTurn = true;
+        } else {
+          prevSubCtx = ctxTok;
+        }
+      }
+      if (model && (!stepIsSubagent || !seenPrimaryTurn)) prevModel = model;
+    }
+  }
+
+  return latest;
+}
+
+/**
+ * Fast tail-only compaction scanner for transcript.jsonl (shared by PreInvocation & PreToolUse).
+ */
+export function inspectTranscriptCompaction(transcriptPath, options = {}) {
+  const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : 131072;
+  const minUsageSteps =
+    Number.isFinite(Number(options.minUsageSteps)) && Number(options.minUsageSteps) >= 1
+      ? Math.floor(Number(options.minUsageSteps))
+      : 2;
+  if (!transcriptPath || typeof transcriptPath !== "string") return null;
+  const steps = readTranscriptTail(transcriptPath, maxBytes, { minUsageSteps });
+  if (steps.length === 0) return null;
+  return extractLatestCompactionEvent(steps);
+}
+
 /**
  * Analyze a single transcript session's steps for server-side KV-cache / Prompt Cache
  * hit rates, model-aware dynamic watermarks & TTL, cache-bust attribution, wasted re-prefill
@@ -859,6 +1429,11 @@ export function analyzeTranscriptCache(steps, options = {}) {
     Number.isFinite(options.inputPricePer1M) && options.inputPricePer1M > 0
       ? options.inputPricePer1M
       : null;
+  const historicalTtlByProfile =
+    options.historicalTtlByProfile && typeof options.historicalTtlByProfile === "object"
+      ? options.historicalTtlByProfile
+      : null;
+  const optionConvId = typeof options.conversationId === "string" ? options.conversationId.trim() : "";
 
   const bustsByCause = {
     ttl_idle_expiry: 0,
@@ -896,6 +1471,17 @@ export function analyzeTranscriptCache(steps, options = {}) {
   let maxWarmHitGapSec = null;
   const maxWarmGapByProfile = new Map();
   const seen1hWriteByProfile = new Map();
+  const warmObsByProfile = new Map();
+  const coldObsByProfile = new Map();
+
+  const pushProfileObservation = (map, profileId, entry) => {
+    let arr = map.get(profileId);
+    if (!arr) {
+      arr = [];
+      map.set(profileId, arr);
+    }
+    arr.push(entry);
+  };
 
   let prevCtxTokens = 0;
   let prevModel = "";
@@ -905,6 +1491,11 @@ export function analyzeTranscriptCache(steps, options = {}) {
   let hasSeenPlanner = false;
   let inToolLoop = false;
   let prevTurnTools = [];
+  let latestCompactionEvent = null;
+  let prevCompactPrimaryCtx = 0;
+  let prevCompactSubCtx = 0;
+  let prevCompactModel = "";
+  let seenPrimaryCompactTurn = false;
 
   const seenReadSignatures = new Set();
 
@@ -970,7 +1561,8 @@ export function analyzeTranscriptCache(steps, options = {}) {
     }
 
     if (step.type === "USER_INPUT") {
-      const userMeasure = estimateTextTokens(extractStepText(step.content ?? step.text));
+      const userText = extractStepText(step.content ?? step.text);
+      const userMeasure = estimateTextTokens(userText);
       compRaw.user.bytes += userMeasure.bytes;
       compRaw.user.estTokens += userMeasure.estTokens;
       if (stepIsSubagent) {
@@ -982,11 +1574,37 @@ export function analyzeTranscriptCache(steps, options = {}) {
       if (!stepIsSubagent) {
         inToolLoop = false;
       }
+      if ((!stepIsSubagent || !seenPrimaryCompactTurn) && isSlashCompactText(userText)) {
+        const refPrevUserCompact = stepIsSubagent ? prevCompactSubCtx : prevCompactPrimaryCtx;
+        seenReadSignatures.clear();
+        latestCompactionEvent = buildCompactionEvent({
+          kind: "slash_compact",
+          step,
+          index: i,
+          prevCtxTokens: refPrevUserCompact,
+          detailText: userText
+        });
+      }
       prevTurnTools = [];
       pendingToolCalls = [];
       pendingCallCursor = 0;
       pendingCallsById.clear();
       continue;
+    }
+
+    const isExplicitCompactStep = detectExplicitCompactionStep(step);
+    if (isExplicitCompactStep && (!stepIsSubagent || !seenPrimaryCompactTurn)) {
+      const refPrevCompactCtx = stepIsSubagent ? prevCompactSubCtx : prevCompactPrimaryCtx;
+      const explicitUsage = step.type === "PLANNER_RESPONSE" ? extractStepTokenUsage(step) : null;
+      seenReadSignatures.clear();
+      latestCompactionEvent = buildCompactionEvent({
+        kind: "explicit_compaction_step",
+        step,
+        index: i,
+        prevCtxTokens: refPrevCompactCtx,
+        currCtxTokens: explicitUsage && explicitUsage.contextTokens > 0 ? explicitUsage.contextTokens : null,
+        detailText: extractStepText(step.content ?? step.text)
+      });
     }
 
     if (step.type === "SYSTEM_MESSAGE") {
@@ -1104,6 +1722,17 @@ export function analyzeTranscriptCache(steps, options = {}) {
       subRaw.subagentTurns += 1;
     } else {
       subRaw.primaryTurns += 1;
+    }
+    const turnUsage = extractStepTokenUsage(step);
+    const refPrevCompactCtx = stepIsSubagent
+      ? (!seenPrimaryCompactTurn ? prevCompactSubCtx : 0)
+      : prevCompactPrimaryCtx;
+    const turnShrink =
+      (!stepIsSubagent || !seenPrimaryCompactTurn) && refPrevCompactCtx > 0 && turnUsage.contextTokens > 0
+        ? detectContextShrink(refPrevCompactCtx, turnUsage.contextTokens)
+        : { shrunk: false, severe: false };
+    if (turnShrink.shrunk) {
+      seenReadSignatures.clear();
     }
     pendingToolCalls = [];
     pendingCallCursor = 0;
@@ -1333,7 +1962,6 @@ export function analyzeTranscriptCache(steps, options = {}) {
       }
     }
 
-    const turnUsage = extractStepTokenUsage(step);
     const safeIn = turnUsage.inputTokens;
     const safeCache = turnUsage.cacheReadTokens;
     const safeCacheCreate = turnUsage.cacheCreationTokens;
@@ -1438,18 +2066,44 @@ export function analyzeTranscriptCache(steps, options = {}) {
             if (prevProfileMax === undefined || gapSec > prevProfileMax) {
               maxWarmGapByProfile.set(activeTurnProfile.id, gapSec);
             }
+            if (gapSec >= TTL_WARM_SAMPLE_MIN_SEC && gapSec <= TTL_SAMPLE_MAX_SEC) {
+              pushProfileObservation(warmObsByProfile, activeTurnProfile.id, {
+                gapSec,
+                atMs: tMs ?? nowMs
+              });
+            }
           }
         } else {
           turnWasBust = true;
-          const calibratedTurnTtl =
-            explicitTtlSec === null
-              ? calibrateEmpiricalTtl(
-                  activeTurnProfile,
-                  maxWarmGapByProfile.get(activeTurnProfile.id) ?? null,
-                  Boolean(seen1hWriteByProfile.get(activeTurnProfile.id))
-                )
-              : null;
-          const turnTtlSec = explicitTtlSec ?? calibratedTurnTtl ?? activeTurnProfile.ttlSec;
+          const turnCal = estimateCalibratedTtl(activeTurnProfile, {
+            explicitTtlSec,
+            sessionMaxWarmGapSec: maxWarmGapByProfile.get(activeTurnProfile.id) ?? null,
+            sessionHas1hWrite: Boolean(seen1hWriteByProfile.get(activeTurnProfile.id)),
+            sessionWarmSamples: warmObsByProfile.get(activeTurnProfile.id) || [],
+            sessionColdSamples: coldObsByProfile.get(activeTurnProfile.id) || [],
+            historyRecord: historicalTtlByProfile ? historicalTtlByProfile[activeTurnProfile.id] : null,
+            nowMs: tMs ?? nowMs,
+            convId: optionConvId
+          });
+          const turnTtlSec = turnCal.ttlSec;
+
+          // Record pure-idle cold miss candidate INDEPENDENT of `turnTtlSec` / `cause === "ttl_idle_expiry"`
+          // to prevent upward-only calibration lock-in when server TTL shrinks.
+          if (
+            sameModel &&
+            ctxTok >= prevCtxTokens * BUST_DROP_RATIO &&
+            !mediaLoadedSincePrev &&
+            !systemMsgSincePrev &&
+            safeCache / prevCtxTokens < TTL_PURE_COLD_MAX_CACHE_RATIO &&
+            gapSec !== null &&
+            gapSec >= TTL_COLD_SAMPLE_MIN_SEC &&
+            gapSec <= TTL_SAMPLE_MAX_SEC
+          ) {
+            pushProfileObservation(coldObsByProfile, activeTurnProfile.id, {
+              gapSec,
+              atMs: tMs ?? nowMs
+            });
+          }
 
           let cause = "prefix_drift";
           if (prevModel && model && model !== prevModel) {
@@ -1516,6 +2170,32 @@ export function analyzeTranscriptCache(steps, options = {}) {
         triggerTool: dominantTrigger ? dominantTrigger.label : null
       });
 
+      if (turnShrink.shrunk) {
+        seenReadSignatures.clear();
+        const isCompactModelSwitch = Boolean(prevCompactModel && model && model !== prevCompactModel);
+        const compactRetainedRatio = refPrevCompactCtx > 0 ? safeCache / refPrevCompactCtx : 1;
+        const isCompactBust = compactRetainedRatio < BUST_DROP_RATIO || (refPrevCompactCtx >= 10000 && safeCache === 0);
+        const compactKind =
+          turnShrink.severe && isCompactBust && !isCompactModelSwitch ? "compaction_bust" : "context_shrink";
+        latestCompactionEvent = buildCompactionEvent({
+          kind: compactKind,
+          step,
+          index: i,
+          prevCtxTokens: refPrevCompactCtx,
+          currCtxTokens: ctxTok
+        });
+      }
+
+      if (!stepIsSubagent) {
+        prevCompactPrimaryCtx = ctxTok;
+        seenPrimaryCompactTurn = true;
+      } else if (!seenPrimaryCompactTurn) {
+        prevCompactSubCtx = ctxTok;
+      }
+      if (model && (!stepIsSubagent || !seenPrimaryCompactTurn)) {
+        prevCompactModel = model;
+      }
+
       prevCtxTokens = ctxTok;
       if (model) prevModel = model;
       if (tMs !== null) prevPlannerMs = tMs;
@@ -1548,21 +2228,39 @@ export function analyzeTranscriptCache(steps, options = {}) {
     windowSource = "profile";
   }
 
-  let ttlSec;
-  let ttlSource;
   const activeProfileMaxWarmGap = maxWarmGapByProfile.get(matchedProfile.id) ?? null;
   const activeHas1hWrite = Boolean(seen1hWriteByProfile.get(matchedProfile.id));
-  if (explicitTtlSec !== null) {
-    ttlSec = explicitTtlSec;
-    ttlSource = "explicit";
-  } else {
-    const calibratedTtl = calibrateEmpiricalTtl(matchedProfile, activeProfileMaxWarmGap, activeHas1hWrite);
-    if (calibratedTtl !== null) {
-      ttlSec = calibratedTtl;
-      ttlSource = "empirical";
-    } else {
-      ttlSec = matchedProfile.ttlSec;
-      ttlSource = "profile";
+  const ttlEstResult = estimateCalibratedTtl(matchedProfile, {
+    explicitTtlSec,
+    sessionMaxWarmGapSec: activeProfileMaxWarmGap,
+    sessionHas1hWrite: activeHas1hWrite,
+    sessionWarmSamples: warmObsByProfile.get(matchedProfile.id) || [],
+    sessionColdSamples: coldObsByProfile.get(matchedProfile.id) || [],
+    historyRecord: historicalTtlByProfile ? historicalTtlByProfile[matchedProfile.id] : null,
+    nowMs,
+    convId: optionConvId
+  });
+  const ttlSec = ttlEstResult.ttlSec;
+  const ttlSource = ttlEstResult.ttlSource;
+  const ttlCalibration = ttlEstResult.ttlCalibration;
+
+  const ttlObservations = {};
+  const observedProfileIds = new Set([
+    ...warmObsByProfile.keys(),
+    ...coldObsByProfile.keys(),
+    ...seen1hWriteByProfile.keys()
+  ]);
+  for (const pid of observedProfileIds) {
+    const w = warmObsByProfile.get(pid) || [];
+    const c = coldObsByProfile.get(pid) || [];
+    const s1h = Boolean(seen1hWriteByProfile.get(pid));
+    if (w.length > 0 || c.length > 0 || s1h) {
+      ttlObservations[pid] = {
+        profileId: pid,
+        warm: w.slice(-20),
+        cold: c.slice(-20),
+        seen1hWrite: s1h
+      };
     }
   }
 
@@ -1643,8 +2341,17 @@ export function analyzeTranscriptCache(steps, options = {}) {
     const tLongWrite = p.cacheWrite1hMultiplier ?? tBaseWrite;
     const pMaxGap = maxWarmGapByProfile.get(p.id) ?? null;
     const pHas1h = Boolean(seen1hWriteByProfile.get(p.id));
-    const pCalTtl = explicitTtlSec === null ? calibrateEmpiricalTtl(p, pMaxGap, pHas1h) : null;
-    const pTtlSec = explicitTtlSec ?? pCalTtl ?? p.ttlSec;
+    const pCal = estimateCalibratedTtl(p, {
+      explicitTtlSec,
+      sessionMaxWarmGapSec: pMaxGap,
+      sessionHas1hWrite: pHas1h,
+      sessionWarmSamples: warmObsByProfile.get(p.id) || [],
+      sessionColdSamples: coldObsByProfile.get(p.id) || [],
+      historyRecord: historicalTtlByProfile ? historicalTtlByProfile[p.id] : null,
+      nowMs,
+      convId: optionConvId
+    });
+    const pTtlSec = pCal.ttlSec;
     let tWriteMult;
     if (explicitWriteMultiplier !== null) {
       tWriteMult = explicitWriteMultiplier;
@@ -1769,6 +2476,8 @@ export function analyzeTranscriptCache(steps, options = {}) {
     idleSeconds,
     cacheTtlSec: ttlSec,
     ttlSource,
+    ttlCalibration,
+    ttlObservations,
     maxWarmHitGapSec,
     ttlRemainingSec,
     ttlStatus,
@@ -1789,7 +2498,8 @@ export function analyzeTranscriptCache(steps, options = {}) {
     subagentBreakdown,
     recentTurns,
     topContextDeltas,
-    recentBusts: recentBusts.slice(-10)
+    recentBusts: recentBusts.slice(-10),
+    latestCompactionEvent
   };
 }
 

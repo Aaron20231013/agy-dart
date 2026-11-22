@@ -535,14 +535,16 @@ test("Guardrails: large rewrite (>=40%), >6.5KB diff, tiny file (<1.5KB), compac
     assert.ok(Buffer.byteLength(tinyV1, "utf8") >= 1024 && Buffer.byteLength(tinyV1, "utf8") < 1536);
     writeAndBumpMtime(tinyFile, tinyV1, 0);
 
+    const tinyMinEnv = { AGY_DART_READ_DEDUP_MIN_BYTES: "1024" };
     assert.equal(
-      runHook("hooks/pre-tool-use.mjs", { conversationId: "s-tiny", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: tinyFile } } }, tmpDb).decision,
+      runHook("hooks/pre-tool-use.mjs", { conversationId: "s-tiny", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: tinyFile } } }, tmpDb, tinyMinEnv).decision,
       "allow"
     );
     const tinyUnchanged = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "s-tiny", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: tinyFile } } },
-      tmpDb
+      tmpDb,
+      tinyMinEnv
     );
     assert.equal(tinyUnchanged.decision, "deny");
     assert.ok(tinyUnchanged.reason.includes("[agy-dart read-dedup]"));
@@ -552,7 +554,8 @@ test("Guardrails: large rewrite (>=40%), >6.5KB diff, tiny file (<1.5KB), compac
     const tinyMod = runHook(
       "hooks/pre-tool-use.mjs",
       { conversationId: "s-tiny", cwd: tmpDir, toolCall: { name: "read_file", args: { Path: tinyFile } } },
-      tmpDb
+      tmpDb,
+      tinyMinEnv
     );
     assert.equal(tinyMod.decision, "allow", "Tiny file (<1.5 KB) must skip diff-read and allow directly");
 

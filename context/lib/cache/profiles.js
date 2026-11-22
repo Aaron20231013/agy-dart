@@ -57,10 +57,21 @@ export const MODEL_CACHE_PROFILES = Object.freeze([
     cacheWrite1hMultiplier: 1.0
   },
   // Gemini 4 & Antigravity next-gen codenames (Neon / Carbon / Argon / Hydrogen)
+  // Antigravity host enforces auto-compaction at 512k by default; honor explicit 1m/1000k tags first.
   {
     id: "gemini-4-1m",
-    pattern: /(?:gemini[-_/\s]?4(?:\.\d+)?\b|(?:^|[-_/\s.])(?:neon|carbon|argon|hydrogen)(?:$|[-_/\s.\d]))/i,
+    pattern: /(?:gemini[-_/\s]?4(?:\.\d+)?\b|(?:^|[-_/\s.])(?:neon|carbon|argon|hydrogen)(?=$|[-_/\s.\d])).*(?:[-_/\s[(])(?:1m|1000k)\b/i,
     windowTokens: 1000000,
+    ttlSec: 300,
+    cacheDiscountRate: 0.90,
+    inputPer1M: 2.00,
+    cacheWriteMultiplier: 1.0,
+    cacheWrite1hMultiplier: 1.0
+  },
+  {
+    id: "gemini-4-512k",
+    pattern: /(?:gemini[-_/\s]?4(?:\.\d+)?\b|(?:^|[-_/\s.])(?:neon|carbon|argon|hydrogen)(?:$|[-_/\s.\d]))/i,
+    windowTokens: 512000,
     ttlSec: 300,
     cacheDiscountRate: 0.90,
     inputPer1M: 2.00,

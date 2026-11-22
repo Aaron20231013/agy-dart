@@ -11,6 +11,54 @@ const __dirname = path.dirname(__selfPath);
 const REPO_ROOT = path.resolve(__dirname, "..");
 const PLUGIN_NAME = "agy-dart";
 
+export const GITHUB_REPO_URL = "https://github.com/zou172866/agy-dart";
+export const GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/agy-dart";
+export const GH_AUTH_CHECK_TIMEOUT_MS = 1500;
+
+export function isGhCliAuthenticated({
+  bin = "gh",
+  args = ["auth", "status"],
+  timeoutMs = GH_AUTH_CHECK_TIMEOUT_MS,
+  env = process.env
+} = {}) {
+  const rawTimeout = Number(timeoutMs);
+  const effectiveTimeout =
+    Number.isFinite(rawTimeout) && rawTimeout > 0
+      ? Math.min(GH_AUTH_CHECK_TIMEOUT_MS, Math.max(50, Math.floor(rawTimeout)))
+      : GH_AUTH_CHECK_TIMEOUT_MS;
+  try {
+    const res = spawnSync(bin, args, {
+      stdio: "ignore",
+      timeout: effectiveTimeout,
+      killSignal: "SIGKILL",
+      windowsHide: true,
+      env: { ...env, GH_PROMPT_DISABLED: "1", NO_COLOR: "1" }
+    });
+    return Boolean(res && !res.error && !res.signal && res.status === 0);
+  } catch {
+    return false;
+  }
+}
+
+export function printStarFollowupHint({
+  mode = "install",
+  ghAuthenticated = isGhCliAuthenticated()
+} = {}) {
+  if (mode === "doctor") {
+    console.log(`[agy-dart] All checks passed. Track compatibility fixes & releases: ${GITHUB_REPO_URL}`);
+    if (ghAuthenticated) {
+      console.log(`[agy-dart] GitHub CLI logged in (optional manual star): ${GH_STAR_COMMAND}`);
+    }
+    return;
+  }
+  console.log("[agy-dart] Antigravity updates fast -- Star / Watch Releases on GitHub for compatibility fixes:");
+  console.log(`           ${GITHUB_REPO_URL}`);
+  if (ghAuthenticated) {
+    console.log("[agy-dart] GitHub CLI detected (logged in). You can also star manually anytime:");
+    console.log(`           ${GH_STAR_COMMAND}`);
+  }
+}
+
 const MODES = {
   "strict-8k": { cutoffBytes: 8192, readHook: true, label: "Strict (8 KB / 205 lines)" },
   "balanced-16k": { cutoffBytes: 16384, readHook: true, label: "Classic Balanced (16 KB / 410 lines)" },
@@ -51,11 +99,14 @@ export const RUNTIME_FILES = Object.freeze([
   "context/lib/text-diff.js",
   "context/lib/json-crusher.js",
   "context/lib/handoff.js",
+  "context/lib/watchdog-lease.js",
+  "context/lib/watchdog.js",
   "hooks/compile-cache.mjs",
   "hooks/session-start.mjs",
   "hooks/pre-tool-use.mjs",
   "hooks/post-tool-use.mjs",
   "hooks/pre-invocation.mjs",
+  "hooks/stop.mjs",
   "hooks/cli-filter.mjs",
   "hooks/filter-rules.mjs",
   "sidecars/dashboard/sidecar.json",
@@ -118,6 +169,7 @@ function parseArgs(argv) {
   let explicitMode = false;
   let installRg = false;
   let withDevtools = false;
+  let json = false;
   let showHelp = false;
   const positional = [];
 
@@ -125,6 +177,8 @@ function parseArgs(argv) {
     const a = args[i];
     if (a === "-h" || a === "--help") {
       showHelp = true;
+    } else if (a === "--json") {
+      json = true;
     } else if (a === "--install-rg") {
       installRg = true;
     } else if (a === "--with-devtools") {
@@ -182,6 +236,7 @@ function parseArgs(argv) {
     explicitMode,
     installRg,
     withDevtools,
+    json,
     showHelp
   };
 }
@@ -202,6 +257,7 @@ Options:
   --with-devtools        Also copy offline CLI devtools (benchmark, cache-simulator, cache-audit, prefix-budget, verify-package-graph, gen-review-brief)
   --runtime-only         Install runtime files only (default)
   --install-rg           On Windows x64, download official ripgrep (rg.exe) to ~/.local/bin and add to PATH
+  --json                 Output machine-readable JSON (for 'doctor')
   -h, --help             Show this help
 `);
 }
@@ -232,7 +288,7 @@ async function applyMode(targetDir, modeKey, skipDb = false, { explicitMode = tr
       ],
       PostToolUse: [
         {
-          matcher: "edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|.*apply_edits|.*run_checks|.*ctx_resume|call_mcp_tool",
+          matcher: "run_command|edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|.*apply_edits|.*run_checks|.*ctx_resume|call_mcp_tool",
           hooks: [
             {
               type: "command",
@@ -246,6 +302,13 @@ async function applyMode(targetDir, modeKey, skipDb = false, { explicitMode = tr
         {
           type: "command",
           command: "node ./hooks/pre-invocation.mjs",
+          timeout: 5
+        }
+      ],
+      Stop: [
+        {
+          type: "command",
+          command: "node ./hooks/stop.mjs",
           timeout: 5
         }
       ]
@@ -420,12 +483,16 @@ async function verifySessionStart(hookScript, sampleDir, dbPath) {
   return { durationMs: Date.now() - t0, bytes: Buffer.byteLength(msg, "utf8") };
 }
 
-async function runDoctor(targetDir) {
+async function runDoctor(targetDir, { json = false, showStarHint = true } = {}) {
   const nodeVer = checkNodeAndSqlite();
   await import("node:sqlite");
   const exists = await pathExists(targetDir);
   if (!exists) {
-    console.log(`agy-dart is not installed at: ${targetDir}`);
+    if (json) {
+      console.log(JSON.stringify({ ok: false, installed: false, targetDir }, null, 2));
+    } else {
+      console.log(`agy-dart is not installed at: ${targetDir}`);
+    }
     return false;
   }
 
@@ -446,6 +513,10 @@ async function runDoctor(targetDir) {
     const hasCliFilter = await pathExists(path.join(targetDir, "hooks", "cli-filter.mjs"));
     const hasPostHook = await pathExists(path.join(targetDir, "hooks", "post-tool-use.mjs"));
     const hasPreInvHook = await pathExists(path.join(targetDir, "hooks", "pre-invocation.mjs"));
+    const hasStopHook = await pathExists(path.join(targetDir, "hooks", "stop.mjs"));
+    const hasWatchdog =
+      (await pathExists(path.join(targetDir, "context", "lib", "watchdog.js"))) &&
+      (await pathExists(path.join(targetDir, "context", "lib", "watchdog-lease.js")));
     const hasCompileCacheHelper = await pathExists(path.join(targetDir, "hooks", "compile-cache.mjs"));
     const hasDevtools = await pathExists(path.join(targetDir, "fast", "benchmark.mjs"));
     const hasRg = hasCommand("rg", ["--version"]);
@@ -453,6 +524,7 @@ async function runDoctor(targetDir) {
     const hasCompileCache = typeof nodeModule?.enableCompileCache === "function";
 
     let configLines = [];
+    let configSnapshotSummary = null;
     try {
       const cfgModPath = path.join(targetDir, "context", "lib", "config.js");
       const cfgMod = await import(pathToFileURL((await pathExists(cfgModPath)) ? cfgModPath : path.join(REPO_ROOT, "context", "lib", "config.js")).href);
@@ -470,7 +542,14 @@ async function runDoctor(targetDir) {
           liveStore.close();
         }
       } catch {}
-      configLines = cfgMod.formatEffectiveConfigLines(cfgMod.getConfigSnapshot(), extraReadGuard);
+      const snapshot = cfgMod.getConfigSnapshot();
+      configLines = cfgMod.formatEffectiveConfigLines(snapshot, extraReadGuard);
+      configSnapshotSummary = {
+        configPath: snapshot.configPath,
+        fileExists: snapshot.fileExists,
+        configError: snapshot.configError || null,
+        values: snapshot.values
+      };
     } catch {}
 
     let filterDiag = null;
@@ -492,6 +571,68 @@ async function runDoctor(targetDir) {
     const matcher = hooksRaw?.["agy-dart-lifecycle"]?.PreToolUse?.[0]?.matcher || "";
     const hasPostCfg = Array.isArray(hooksRaw?.["agy-dart-lifecycle"]?.PostToolUse);
     const hasPreInvCfg = Array.isArray(hooksRaw?.["agy-dart-lifecycle"]?.PreInvocation);
+    const hasStopCfg = Array.isArray(hooksRaw?.["agy-dart-lifecycle"]?.Stop);
+
+    const legacy = [];
+    const globalRoot = getGlobalPluginsRoot();
+    if (path.resolve(targetDir) === path.resolve(globalRoot, PLUGIN_NAME)) {
+      if (await pathExists(path.join(globalRoot, "agy-fast"))) legacy.push("agy-fast");
+      if (await pathExists(path.join(globalRoot, "antigravity-plugin-context-mode"))) legacy.push("antigravity-plugin-context-mode");
+    }
+
+    const allOk =
+      fastCheck.tools.length === 4 &&
+      ctxCheck.tools.length === 8 &&
+      hookCheck.bytes > 0 &&
+      hasPluginJson &&
+      hasMcpConfig &&
+      hasSidecar &&
+      hasPreHook &&
+      hasCliFilter &&
+      hasPostHook &&
+      hasPostCfg &&
+      hasPreInvHook &&
+      hasPreInvCfg &&
+      hasStopHook &&
+      hasStopCfg &&
+      hasWatchdog &&
+      hasCompileCacheHelper;
+
+    if (json) {
+      console.log(
+        JSON.stringify(
+          {
+            ok: allOk,
+            installed: true,
+            targetDir,
+            profile: hasDevtools ? "runtime+devtools" : "runtime-only",
+            nodeVersion: nodeVer,
+            compileCache: hasCompileCache,
+            compileCacheHelper: hasCompileCacheHelper,
+            ripgrep: hasRg,
+            mcpFast: { ok: fastCheck.tools.length === 4, tools: fastCheck.tools },
+            mcpContext: { ok: ctxCheck.tools.length === 8, tools: ctxCheck.tools },
+            sessionStart: { ok: hookCheck.bytes > 0, ...hookCheck },
+            hooks: {
+              preToolUse: hasPreHook,
+              preToolUseMatcher: matcher,
+              cliFilter: hasCliFilter,
+              postToolUse: hasPostHook && hasPostCfg,
+              preInvocation: hasPreInvHook && hasPreInvCfg,
+              stop: hasStopHook && hasStopCfg && hasWatchdog
+            },
+            sidecar: hasSidecar,
+            manifests: hasPluginJson && hasMcpConfig,
+            config: configSnapshotSummary,
+            projectFilters: filterDiag,
+            legacyPlugins: legacy
+          },
+          null,
+          2
+        )
+      );
+      return allOk;
+    }
 
     console.log("agy-dart health check:");
     console.log(`  - Plugin path   : ${targetDir}`);
@@ -503,8 +644,9 @@ async function runDoctor(targetDir) {
     console.log(`  - MCP [context] : OK (${ctxCheck.tools.length} tools: ${ctxCheck.tools.join(", ")})`);
     console.log(`  - SessionStart  : OK (${hookCheck.durationMs}ms, ${hookCheck.bytes} bytes)`);
     console.log(`  - PreToolUse    : ${hasPreHook ? "OK" : "MISSING"} (matcher: ${matcher}; cli-filter: ${hasCliFilter ? "OK" : "MISSING"})`);
-    console.log(`  - PostToolUse   : ${hasPostHook && hasPostCfg ? "OK (edit/compaction read-dedup invalidation)" : "MISSING"}`);
-    console.log(`  - PreInvocation : ${hasPreInvHook && hasPreInvCfg ? "OK (UI-only KV-cache watermark/TTL watch)" : "MISSING"}`);
+    console.log(`  - PostToolUse   : ${hasPostHook && hasPostCfg ? "OK (edit/compaction read-dedup & watchdog lease update)" : "MISSING"}`);
+    console.log(`  - PreInvocation : ${hasPreInvHook && hasPreInvCfg ? "OK (UI-only KV-cache watermark/TTL & watchdog lease)" : "MISSING"}`);
+    console.log(`  - Stop          : ${hasStopHook && hasStopCfg && hasWatchdog ? "OK (Sidecar Stall Watchdog IDLE lease transition)" : "MISSING"}`);
     console.log(`  - Sidecar UI    : ${hasSidecar ? "OK (sidecars/dashboard present)" : "MISSING"}`);
     console.log(`  - Manifests     : ${hasPluginJson && hasMcpConfig ? "OK (plugin.json + mcp_config.json)" : "MISSING"}`);
     for (const line of configLines) {
@@ -535,31 +677,15 @@ async function runDoctor(targetDir) {
     }
 
     // Friendly warning if standalone legacy plugins coexist globally
-    const globalRoot = getGlobalPluginsRoot();
-    if (path.resolve(targetDir) === path.resolve(globalRoot, PLUGIN_NAME)) {
-      const legacy = [];
-      if (await pathExists(path.join(globalRoot, "agy-fast"))) legacy.push("agy-fast");
-      if (await pathExists(path.join(globalRoot, "antigravity-plugin-context-mode"))) legacy.push("antigravity-plugin-context-mode");
-      if (legacy.length > 0) {
-        console.log(`  - Notice        : Found standalone plugin(s): ${legacy.join(", ")}. Disable or remove them in Customizations -> Installed to avoid duplicate MCP/hooks.`);
-      }
+    if (legacy.length > 0) {
+      console.log(`  - Notice        : Found standalone plugin(s): ${legacy.join(", ")}. Disable or remove them in Customizations -> Installed to avoid duplicate MCP/hooks.`);
     }
 
-    return (
-      fastCheck.tools.length === 4 &&
-      ctxCheck.tools.length === 8 &&
-      hookCheck.bytes > 0 &&
-      hasPluginJson &&
-      hasMcpConfig &&
-      hasSidecar &&
-      hasPreHook &&
-      hasCliFilter &&
-      hasPostHook &&
-      hasPostCfg &&
-      hasPreInvHook &&
-      hasPreInvCfg &&
-      hasCompileCacheHelper
-    );
+    if (allOk && showStarHint) {
+      printStarFollowupHint({ mode: "doctor" });
+    }
+
+    return allOk;
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -901,10 +1027,11 @@ async function runInstall(opts) {
     installRipgrepWindows();
   }
 
-  const ok = await runDoctor(dstRoot);
+  const ok = await runDoctor(dstRoot, { json: false, showStarHint: false });
   if (!ok) throw new Error("Post-install health check failed.");
 
   console.log("\nDone! Restart Antigravity (or reload window) and open a new conversation to activate agy-dart.");
+  printStarFollowupHint({ mode: "install" });
 }
 
 async function main() {
@@ -936,7 +1063,7 @@ async function main() {
     }
     case "doctor":
     case "status": {
-      const ok = await runDoctor(opts.targetDir);
+      const ok = await runDoctor(opts.targetDir, { json: opts.json, showStarHint: !opts.json });
       if (!ok) process.exitCode = 1;
       break;
     }
