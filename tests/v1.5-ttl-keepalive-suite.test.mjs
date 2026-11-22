@@ -859,7 +859,8 @@ test("v1.5-5: Decoupled stallWatchdog=false + ttlDesktopNotify=true, env precede
       ctx
     );
     assert.ok(getEl("kv-ttl-notify-btn").textContent.includes("临期提醒：开"));
-    assert.ok(getEl("kv-ttl-badge").title.includes("history"), `Expected history calibration in tooltip: ${getEl("kv-ttl-badge").title}`);
+    assert.ok(getEl("kv-ttl-badge").title.includes("历史校准"), `Expected localized history calibration in tooltip: ${getEl("kv-ttl-badge").title}`);
+    assert.equal(getEl("kv-ttl-badge").title.includes("(history)"), false);
     assert.ok(getEl("kv-ttl-badge").title.includes("4 热 / 2 冷"));
 
     await vm.runInContext("toggleTtlNotify();", ctx);

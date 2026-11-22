@@ -60,7 +60,7 @@ function readPluginVersion() {
       return cachedPluginVersion;
     }
   } catch {}
-  cachedPluginVersion = "1.5.0";
+  cachedPluginVersion = "1.5.1";
   return cachedPluginVersion;
 }
 

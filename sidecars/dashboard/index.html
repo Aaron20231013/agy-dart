@@ -1456,7 +1456,7 @@
             <option value="8192">8 KB</option>
             <option value="16384">16 KB</option>
             <option value="32768">32 KB</option>
-            <option value="46080">45 KB (host cap)</option>
+            <option id="cutoff-host-opt" value="46080" data-i18n="cutoffHostCap">45 KB (host cap)</option>
             <option value="65536">64 KB</option>
             <option id="cutoff-none-opt" value="0" data-i18n="cutoffNone">none</option>
           </select>
@@ -1840,7 +1840,10 @@
         cutoffConvLabel: 'Cutoff:',
         cutoffAppLabel: 'Session Cutoff:',
         cutoffLifetimeLabel: 'Global Cutoff:',
+        cutoffHostCap: '45 KB (host cap)',
+        cutoffCustomFmt: '{size} (custom)',
         cutoffNone: 'none',
+        tierOff: 'off',
         versionTip: 'Current agy-dart Version',
         refreshTip: 'Refresh Telemetry',
         showingStatsFor: 'Scope:',
@@ -1926,6 +1929,7 @@
         noCustomExt: 'No custom extensions added.',
         removeCustomTip: 'Remove custom exemption',
         customExtPlaceholder: 'Add extension (e.g. .csv, .parquet, .log)...',
+        invalidExtFmt: 'Invalid extension format (e.g. .log or .csv)',
         addBtn: '+ Add',
         scopeExplainHtml: 'Exemptions and cutoffs save to <strong id="exempt-scope-note" class="scope-emphasis">{scope}</strong> scope (Conversation: this chat; Session: until restart; Lifetime: persistent).',
         searchTitle: 'Search Indexed Files & Outputs',
@@ -1987,6 +1991,8 @@
         healthCliDedupTip: 'Breakdown of CLI filters and unchanged read-dedup saves in current scope',
         guardEfficiency: 'Guard efficiency: {pct}%',
         guardRecalls: 'recalls: {rec}/{tot}',
+        ghostRecRaise45k: 'Cutoff may be too tight for this repo; consider switching to 45 KB (host-45k).',
+        ghostRecAtHostCap: 'Already at 45 KB host cap; multi-slice reads on >45 KB files are normal (use read_slices outlines or exemptPaths if needed).',
         ttlBarLabel: 'Prompt Cache TTL',
         ttlExpiredBar: '0s / {total} · Expired ({idle} idle)',
         ttlExpiredBadge: 'TTL EXPIRED ({idle} idle)',
@@ -2027,6 +2033,8 @@
         oscillationPart: '{n}x edit↔fail oscillation{files}',
         repeatPart: '{pct}% repeat ({tool} ×{n})',
         convergenceWatch: 'Convergence watch ({status}): {parts}',
+        loopStatusWarn: 'WARN',
+        loopStatusCritical: 'CRITICAL',
         topGrowth: 'Top growth:',
         turnBarTip: 'Turn #{turn}: {pct}% hit | {ctx}k tok ({delta}){tool}{bust}',
         turnBustTag: ' | BUST: {cause}',
@@ -2053,6 +2061,12 @@
         ttlTip: 'Effective TTL: {ttl} (source: {src}){gap}{cal}',
         ttlGapPart: ' | Max warm gap: {gap}',
         ttlCalPart: ' | Calibrated ({origin}): {w} warm / {c} cold{bounds}',
+        srcEmpirical: 'empirical',
+        srcExplicit: 'explicit',
+        srcProfile: 'profile',
+        srcTranscript: 'transcript',
+        srcHistory: 'history',
+        srcSession: 'session',
         kvTtlNotifyLabel: 'TTL Alert',
         kvTtlNotifyTip: 'Opt-in OS desktop alert when high-context (>=60k) idle cache is about to expire (never auto-sends messages or burns quota)',
         confirmResetExempt: 'Reset file categories to defaults and clear custom extensions?',
@@ -2129,7 +2143,10 @@
         cutoffConvLabel: '截断阈值：',
         cutoffAppLabel: '会话阈值：',
         cutoffLifetimeLabel: '全局阈值：',
+        cutoffHostCap: '45 KB（宿主上限）',
+        cutoffCustomFmt: '{size}（自定义）',
         cutoffNone: '不限制',
+        tierOff: '关闭',
         versionTip: '当前 agy-dart 版本',
         refreshTip: '刷新遥测数据',
         showingStatsFor: '统计范围：',
@@ -2215,6 +2232,7 @@
         noCustomExt: '暂无自定义扩展名。',
         removeCustomTip: '移除该自定义豁免',
         customExtPlaceholder: '添加扩展名（如 .csv, .parquet, .log）...',
+        invalidExtFmt: '扩展名格式无效（例如 .log 或 .csv）',
         addBtn: '+ 添加',
         scopeExplainHtml: '当前写入 <strong id="exempt-scope-note" class="scope-emphasis">{scope}</strong> 范围（当前对话仅本窗口；本次会话重启前有效；历史累计持久化）。',
         searchTitle: '本地索引检索',
@@ -2276,6 +2294,8 @@
         healthCliDedupTip: '当前范围内 CLI 过滤与未变读去重的生效次数',
         guardEfficiency: '护栏有效率：{pct}%',
         guardRecalls: '分页召回：{rec}/{tot}',
+        ghostRecRaise45k: '当前仓库的截断阈值可能偏紧，建议切换至 45 KB（宿主上限）。',
+        ghostRecAtHostCap: '已对齐 45 KB 宿主单次读取上限；超 45 KB 大文件分段读取属正常现象（可配合 read_slices 大纲或添加豁免路径）。',
         ttlBarLabel: '提示词缓存 TTL',
         ttlExpiredBar: '0s / {total} · 已过期（空闲 {idle}）',
         ttlExpiredBadge: 'TTL 已过期（空闲 {idle}）',
@@ -2316,6 +2336,8 @@
         oscillationPart: '{n} 次改错↔失败震荡{files}',
         repeatPart: '{pct}% 重复调用（{tool} ×{n}）',
         convergenceWatch: '收敛监控（{status}）：{parts}',
+        loopStatusWarn: '预警',
+        loopStatusCritical: '严重',
         topGrowth: '增长 Top：',
         turnBarTip: '第 {turn} 轮：命中 {pct}% | 上下文 {ctx}k tok（{delta}）{tool}{bust}',
         turnBustTag: ' | 失效：{cause}',
@@ -2342,6 +2364,12 @@
         ttlTip: '生效 TTL：{ttl}（来源：{src}）{gap}{cal}',
         ttlGapPart: ' | 最大热命中间隔：{gap}',
         ttlCalPart: ' | 实证校准（{origin}）：{w} 热 / {c} 冷样本{bounds}',
+        srcEmpirical: '实证校准',
+        srcExplicit: '自定义',
+        srcProfile: '默认',
+        srcTranscript: '会话轨迹',
+        srcHistory: '历史校准',
+        srcSession: '本会话',
         kvTtlNotifyLabel: '临期提醒',
         kvTtlNotifyTip: '默认关闭：仅在高上下文（≥60k）空闲即将过期时弹一次系统提醒，绝不自动发消息烧额度',
         confirmResetExempt: '确认恢复默认文件分组并清空所有自定义扩展名？',
@@ -2424,6 +2452,24 @@
       media: 'segMedia'
     };
 
+    const SOURCE_I18N_KEYS = {
+      empirical: 'srcEmpirical',
+      explicit: 'srcExplicit',
+      profile: 'srcProfile',
+      transcript: 'srcTranscript',
+      history: 'srcHistory',
+      session: 'srcSession'
+    };
+
+    const BUST_CAUSE_I18N_KEYS = {
+      ttl_idle_expiry: 'bustTtl',
+      compaction_or_truncation: 'bustCompact',
+      model_switch: 'bustModel',
+      system_injection: 'bustSysMsg',
+      multimodal_media: 'bustMedia',
+      prefix_drift: 'bustDrift'
+    };
+
     function detectInitialLang() {
       try {
         const params = new URLSearchParams(window.location?.search || '');
@@ -2446,6 +2492,8 @@
     let currentLang = detectInitialLang();
     let currentScope = 'conversation';
     let cachedStats = null;
+    let cachedCutoffMeta = null;
+    let cachedGhost = null;
     let cachedKv = null;
     let cachedResume = null;
     let cachedDoctor = null;
@@ -2494,6 +2542,21 @@
     function tSeg(segKey, fallback) {
       const k = SEG_I18N_KEYS[segKey];
       return k ? t(k) : (fallback || segKey);
+    }
+
+    function fmtSourceLabel(src) {
+      const raw = String(src || '').trim();
+      if (!raw) return '';
+      const k = SOURCE_I18N_KEYS[raw];
+      return k ? t(k) : raw;
+    }
+
+    function fmtBustCause(cause) {
+      const raw = String(cause || '').trim();
+      if (!raw) return '';
+      if (currentLang !== 'zh') return raw;
+      const k = BUST_CAUSE_I18N_KEYS[raw];
+      return k ? t(k) : raw;
     }
 
     function updateLangButtons() {
@@ -2663,6 +2726,23 @@
         const badgeEl = document.getElementById('comparison-badge');
         if (badgeEl) badgeEl.innerText = t('pctSaved', { rate: totalRaw > 0 || rawRate > 0 ? rateStr : '0.0%' });
       } else {
+        const cutoffSelect = document.getElementById('cutoff-select');
+        if (cutoffSelect && Array.isArray(cutoffSelect.options)) {
+          for (const opt of cutoffSelect.options) {
+            if (opt.value === '46080') opt.textContent = t('cutoffHostCap');
+            else if (opt.value === '0') opt.textContent = t('cutoffNone');
+            else if (opt.dataset && opt.dataset.customCutoff === '1') {
+              opt.textContent = t('cutoffCustomFmt', { size: formatBytes(Number(opt.value)) });
+            }
+          }
+        }
+        const rawCutoffVal = cutoffSelect && cutoffSelect.value !== undefined && cutoffSelect.value !== ''
+          ? Number(cutoffSelect.value)
+          : 46080;
+        renderGateReadCutoff(Number.isFinite(rawCutoffVal) ? rawCutoffVal : 46080, cachedCutoffMeta);
+        if (cachedGhost) {
+          renderGhostEfficiency(cachedGhost);
+        }
         const cliBtn = document.getElementById('toggle-cli-filter-btn');
         const dedupBtn = document.getElementById('toggle-read-dedup-btn');
         updateFeaturePill('toggle-cli-filter-btn', t('cliFilterLabel'), cliBtn?.dataset?.enabled !== '0');
@@ -2991,7 +3071,7 @@
       } else {
         const fmtTier = (b) => {
           const n = Number(b || 0);
-          if (n <= 0) return 'off';
+          if (n <= 0) return t('tierOff');
           return n % 1024 === 0 ? `${n / 1024} KB` : formatBytes(n);
         };
         const maxLines = calculateMaxLineRange(activeCutoff);
@@ -3003,6 +3083,7 @@
     }
 
     function updateCutoffDropdown(s) {
+      if (s && typeof s === 'object') cachedCutoffMeta = s;
       const cutoffSelect = document.getElementById('cutoff-select');
       const DEFAULT_CUTOFF_VAL = 46080;
       let activeCutoff = DEFAULT_CUTOFF_VAL;
@@ -3020,6 +3101,10 @@
         ? cutoffSelect.querySelector('option[data-custom-cutoff="1"]')
         : null;
       for (const opt of cutoffSelect.options) {
+        if (opt.value === '46080') opt.textContent = t('cutoffHostCap');
+        else if (opt.value === '0') opt.textContent = t('cutoffNone');
+      }
+      for (const opt of cutoffSelect.options) {
         if (opt.value === targetVal && !(opt.dataset && opt.dataset.customCutoff === '1')) {
           cutoffSelect.value = targetVal;
           matched = true;
@@ -3035,7 +3120,7 @@
       } else if (typeof document.createElement === 'function' && typeof cutoffSelect.appendChild === 'function') {
         const customOpt = existingCustom || document.createElement('option');
         customOpt.value = targetVal;
-        customOpt.textContent = `${formatBytes(activeCutoff)} (custom)`;
+        customOpt.textContent = t('cutoffCustomFmt', { size: formatBytes(activeCutoff) });
         if (typeof customOpt.setAttribute === 'function') customOpt.setAttribute('data-custom-cutoff', '1');
         if (customOpt.dataset) customOpt.dataset.customCutoff = '1';
         if (!existingCustom) {
@@ -3263,7 +3348,7 @@
       if (!val) return;
       const cleanExt = val.startsWith('*.') ? val.slice(1) : val;
       if (!/^\.?[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$/.test(cleanExt)) {
-        alert(t('alertAddExemptFail', { msg: 'Invalid extension format (e.g. .log or .csv)' }));
+        alert(t('alertAddExemptFail', { msg: t('invalidExtFmt') }));
         return;
       }
 
@@ -3720,7 +3805,22 @@
       return `${sign}$${abs.toFixed(2)}`;
     }
 
+    function resolveGhostRecommendationText(ghost) {
+      if (!ghost) return '';
+      if (ghost.recommendationCode === 'raise_to_host_45k') return t('ghostRecRaise45k');
+      if (ghost.recommendationCode === 'use_outlines_or_exempt') return t('ghostRecAtHostCap');
+      if (typeof ghost.recommendation === 'string' && ghost.recommendation) {
+        if (ghost.recommendation.includes('switching to 45 KB')) return t('ghostRecRaise45k');
+        if (ghost.recommendation.includes('45 KB host cap') || ghost.recommendation.includes('switching to 64 KB')) {
+          return t('ghostRecAtHostCap');
+        }
+        return ghost.recommendation;
+      }
+      return '';
+    }
+
     function renderGhostEfficiency(ghost) {
+      cachedGhost = ghost || null;
       const rowEl = document.getElementById('kv-ghost-row');
       const effEl = document.getElementById('kv-ghost-efficiency');
       const recEl = document.getElementById('kv-ghost-recalls');
@@ -3732,20 +3832,28 @@
       }
       rowEl.classList.remove('hidden');
       const effPct = Math.round(Number(ghost.evictionEfficiency ?? 1) * 100);
+      const isHostCapNote = ghost.recommendationCode === 'use_outlines_or_exempt';
       if (effEl) {
         effEl.innerText = t('guardEfficiency', { pct: effPct });
-        effEl.className = effPct < 65 ? 'val-warn' : 'val-ok';
+        effEl.className = effPct < 65 && !isHostCapNote ? 'val-warn' : 'val-ok';
       }
       if (recEl) {
         recEl.innerText = t('guardRecalls', { rec: ghost.ghostRecalls || 0, tot: ghost.totalBlocked });
       }
       if (tipEl) {
-        if (ghost.recommendation) {
-          tipEl.innerText = ghost.recommendation;
-          tipEl.classList.remove('hidden');
+        const recText = resolveGhostRecommendationText(ghost);
+        if (recText) {
+          tipEl.innerText = recText;
+          tipEl.className = isHostCapNote ? 'muted-note' : 'muted-note val-warn';
+          if (tipEl.classList) {
+            tipEl.classList.remove('hidden');
+            if (isHostCapNote && typeof tipEl.classList.remove === 'function') tipEl.classList.remove('val-warn');
+            else if (!isHostCapNote && typeof tipEl.classList.add === 'function') tipEl.classList.add('val-warn');
+          }
         } else {
           tipEl.innerText = '';
-          tipEl.classList.add('hidden');
+          tipEl.className = 'hidden muted-note val-warn';
+          if (tipEl.classList && typeof tipEl.classList.add === 'function') tipEl.classList.add('hidden');
         }
       }
     }
@@ -3833,7 +3941,9 @@
       }
 
       if (rowEl) rowEl.classList.remove('hidden');
-      const ttlSrcTag = kvTtlState.ttlSource && kvTtlState.ttlSource !== 'profile' ? ` (${kvTtlState.ttlSource})` : '';
+      const hasCustomTtlSrc = Boolean(kvTtlState.ttlSource && kvTtlState.ttlSource !== 'profile');
+      const ttlSrcLabel = hasCustomTtlSrc ? fmtSourceLabel(kvTtlState.ttlSource) : '';
+      const ttlSrcTag = ttlSrcLabel ? (currentLang === 'zh' ? `（${ttlSrcLabel}）` : ` (${ttlSrcLabel})`) : '';
       if (labelEl) {
         labelEl.textContent = `${t('ttlBarLabel')}${ttlSrcTag}`;
       }
@@ -4173,6 +4283,7 @@
 
     function renderKvCacheCard(kv) {
       if (!kv) return;
+      cachedKv = kv;
       const hitEl = document.getElementById('kv-hit-rate');
       const ctxEl = document.getElementById('kv-ctx-tokens');
       const bustEl = document.getElementById('kv-bust-count');
@@ -4234,6 +4345,8 @@
       const winK = kv.modelProfile?.windowTokens ? Math.round(kv.modelProfile.windowTokens / 1000) : 200;
       const winSrc = kv.windowSource || kv.modelProfile?.windowSource || 'profile';
       const ttlSrc = kv.ttlSource || 'profile';
+      const winSrcLabel = fmtSourceLabel(winSrc);
+      const ttlSrcLabel = fmtSourceLabel(ttlSrc);
       const writeMult = Number(kv.cacheWriteMultiplier || kv.modelProfile?.cacheWriteMultiplier || 1);
 
       if (hitEl) hitEl.innerText = `${(Number(kv.weightedHitRate || 0) * 100).toFixed(1)}%`;
@@ -4243,7 +4356,7 @@
         ctxEl.title = t('ctxTip', {
           cur: (kv.currentContextTokens || 0).toLocaleString(),
           win: (kv.modelProfile?.windowTokens || 200000).toLocaleString(),
-          src: winSrc
+          src: winSrcLabel
         });
       }
       if (bustEl) bustEl.innerText = String(kv.bustCount || 0);
@@ -4266,7 +4379,7 @@
           wmEl.className = 'meta-tag is-ok';
           wmEl.innerText = t('wmOk');
         }
-        wmEl.title = t('wmTip', { win: winK, src: winSrc, warn: warnK, crit: critK });
+        wmEl.title = t('wmTip', { win: winK, src: winSrcLabel, warn: warnK, crit: critK });
       }
 
       if (tempEl) {
@@ -4289,7 +4402,7 @@
           modelEl.title = t('modelTip', {
             model: kv.currentModel || 'default',
             win: winK,
-            src: winSrc,
+            src: winSrcLabel,
             disc: Math.round((kv.cacheDiscountRate ?? 0.9) * 100),
             mult: writeMult.toFixed(2)
           });
@@ -4344,13 +4457,13 @@
           if (cal.minColdMissGapSec) boundParts.push(`<${fmtSec(cal.minColdMissGapSec)}`);
           const boundsTxt = boundParts.length > 0 ? ` [${boundParts.join(', ')}]` : '';
           calTip = t('ttlCalPart', {
-            origin: cal.origin || ttlSrc,
+            origin: fmtSourceLabel(cal.origin || ttlSrc),
             w: cal.warmSamples || 0,
             c: cal.coldSamples || 0,
             bounds: boundsTxt
           });
         }
-        ttlEl.title = t('ttlTip', { ttl: fmtSec(kv.cacheTtlSec), src: ttlSrc, gap: gapTip, cal: calTip });
+        ttlEl.title = t('ttlTip', { ttl: fmtSec(kv.cacheTtlSec), src: ttlSrcLabel, gap: gapTip, cal: calTip });
       }
 
       updateHandoffButtonStyle(kv.compactAdvice);
@@ -4377,8 +4490,9 @@
           if (showRepeat && lw.maxRepeatCount >= 3) {
             parts.push(t('repeatPart', { pct: Math.round((lw.repeatRate || 0) * 100), tool: lw.topRepeatedCall || 'tool', n: lw.maxRepeatCount }));
           }
+          const statusLabel = isCrit ? t('loopStatusCritical') : t('loopStatusWarn');
           loopRowEl.className = isCrit ? 'alert-strip is-danger' : 'alert-strip is-warn';
-          loopRowEl.innerText = t('convergenceWatch', { status: lw.status.toUpperCase(), parts: parts.join(' + ') });
+          loopRowEl.innerText = t('convergenceWatch', { status: statusLabel, parts: parts.join(' + ') });
           loopRowEl.classList.remove('hidden');
         }
       } else {
@@ -4409,7 +4523,7 @@
                 ctx: Math.round((turnItem.ctxTokens || 0) / 1000),
                 delta: deltaStr,
                 tool: turnItem.triggerTool ? ` | ${turnItem.triggerTool}` : '',
-                bust: turnItem.isBust ? t('turnBustTag', { cause: turnItem.bustCause }) : ''
+                bust: turnItem.isBust ? t('turnBustTag', { cause: fmtBustCause(turnItem.bustCause) }) : ''
               })
             );
             return `<div class="turn-bar-col" title="${tip}"><div class="turn-bar ${cls}" style="height:${hPct}%"></div></div>`;

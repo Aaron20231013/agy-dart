@@ -910,7 +910,7 @@ function probeMcpServerOnce({ command, args, cwd, env, timeoutMs }) {
       params: {
         protocolVersion: "2024-11-05",
         capabilities: {},
-        clientInfo: { name: "agy-dart-cache-audit", version: "1.5.0" }
+        clientInfo: { name: "agy-dart-cache-audit", version: "1.5.1" }
       }
     });
   });

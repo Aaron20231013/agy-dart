@@ -380,8 +380,14 @@ async function main() {
         if (effectivePaths.length > 0) {
           for (const absPath of effectivePaths) {
             store.invalidateFileReads(sessionId, absPath);
+            if (typeof store.clearGhostInterception === "function") {
+              store.clearGhostInterception(sessionId, absPath);
+            }
             if (directConvId && directConvId !== sessionId) {
               store.invalidateFileReads(directConvId, absPath);
+              if (typeof store.clearGhostInterception === "function") {
+                store.clearGhostInterception(directConvId, absPath);
+              }
             }
             if (typeof store.invalidateFileReadsByPath === "function") {
               store.invalidateFileReadsByPath(absPath);

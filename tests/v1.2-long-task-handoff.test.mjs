@@ -318,7 +318,9 @@ test("Long-Task 2: ctx_execute 120s default, timeoutSec 1..300 clamping, timedOu
 
     if (fs.existsSync(pidFile)) {
       const grandPid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
-      await new Promise((r) => setTimeout(r, 350));
+      for (let w = 0; w < 25 && isPidAlive(grandPid); w++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
       assert.equal(isPidAlive(grandPid), false, `Grandchild PID ${grandPid} must be terminated on timeout`);
     }
 

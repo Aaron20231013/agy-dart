@@ -8,6 +8,9 @@ import {
   MAX_SNAPSHOT_BYTES
 } from "./schema.js";
 
+/** Only immediate paged slices within 10 minutes of an un-paged block count toward ghost recalls */
+export const GHOST_RECALL_WINDOW_MS = 10 * 60 * 1000;
+
 export class ReadMethods {
   /** Normalize absolute file paths consistently across OSes for dedup/invalidation */
   _normalizeTrackPath(filePath) {
@@ -334,6 +337,9 @@ export class ReadMethods {
         if (!norm) return 0;
         const res = this.db
           .prepare("DELETE FROM file_reads WHERE session_id = ? AND file_path = ?")
+          .run(sid, norm);
+        this.db
+          .prepare("UPDATE ghost_interceptions SET recall_closed = 1 WHERE session_id = ? AND file_path = ? AND recall_closed = 0")
           .run(sid, norm);
         return res.changes || 0;
       }
@@ -663,21 +669,24 @@ export class ReadMethods {
   }
 
   /** Record a large-file interception in the Ghost Registry to track subsequent paged recalls */
-  recordGhostInterception({ sessionId, filePath, fileSize = 0, cutoffBytes = DEFAULT_CUTOFF_BYTES }) {
+  recordGhostInterception({ sessionId, filePath, fileSize = 0, cutoffBytes = DEFAULT_CUTOFF_BYTES, nowMs }) {
     this.open();
     const sid = sessionId || "default";
     const norm = this._normalizeTrackPath(filePath);
     if (!norm) return;
-    const now = Date.now();
+    const now = Number.isFinite(nowMs) ? Math.round(nowMs) : Date.now();
     this._withBusyRetry(() => {
       this.db
         .prepare(`
-          INSERT INTO ghost_interceptions (session_id, file_path, file_size, cutoff_bytes, blocked_ts, recall_reads, recall_bytes)
-          VALUES (?, ?, ?, ?, ?, 0, 0)
+          INSERT INTO ghost_interceptions (session_id, file_path, file_size, cutoff_bytes, blocked_ts, recall_reads, recall_bytes, recall_closed)
+          VALUES (?, ?, ?, ?, ?, 0, 0, 0)
           ON CONFLICT(session_id, file_path) DO UPDATE SET
             file_size = excluded.file_size,
             cutoff_bytes = excluded.cutoff_bytes,
-            blocked_ts = excluded.blocked_ts
+            blocked_ts = excluded.blocked_ts,
+            recall_reads = 0,
+            recall_bytes = 0,
+            recall_closed = 0
         `)
         .run(
           sid,
@@ -689,34 +698,57 @@ export class ReadMethods {
     });
   }
 
-  /** Check if a file has an active Ghost Registry interception row for this session */
-  hasGhostInterception(sessionId, filePath) {
+  /** Check if a file has an open Ghost Registry recall window for this session */
+  hasGhostInterception(sessionId, filePath, options = {}) {
     this.open();
     const sid = sessionId || "default";
     const norm = this._normalizeTrackPath(filePath);
     if (!norm) return false;
+    const now = Number.isFinite(options?.nowMs) ? Math.round(options.nowMs) : Date.now();
     const row = this.db
-      .prepare("SELECT 1 FROM ghost_interceptions WHERE session_id = ? AND file_path = ? LIMIT 1")
-      .get(sid, norm);
+      .prepare(
+        "SELECT 1 FROM ghost_interceptions WHERE session_id = ? AND file_path = ? AND recall_closed = 0 AND (? - blocked_ts) <= ? LIMIT 1"
+      )
+      .get(sid, norm, now, GHOST_RECALL_WINDOW_MS);
     return Boolean(row);
   }
 
-  /** Record a subsequent paged read against a previously intercepted file (no-op if never blocked) */
-  recordGhostRecall({ sessionId, filePath, bytesRead = 0 }) {
+  /** Close the pending Ghost Registry recall window for an edited file while keeping total_blocked intact */
+  clearGhostInterception(sessionId, filePath) {
+    this.open();
+    const sid = sessionId || "default";
+    const norm = this._normalizeTrackPath(filePath);
+    if (!norm) return 0;
+    const res = this._withBusyRetry(() =>
+      this.db
+        .prepare(
+          "UPDATE ghost_interceptions SET recall_closed = 1 WHERE session_id = ? AND file_path = ? AND recall_closed = 0"
+        )
+        .run(sid, norm)
+    );
+    return res.changes || 0;
+  }
+
+  /** Record an immediate paged read (within 10m & pre-edit) against a previously intercepted file */
+  recordGhostRecall({ sessionId, filePath, bytesRead = 0, nowMs }) {
     this.open();
     const sid = sessionId || "default";
     const norm = this._normalizeTrackPath(filePath);
     if (!norm) return 0;
     const addBytes = Math.max(0, Math.round(Number(bytesRead) || 0));
+    const now = Number.isFinite(nowMs) ? Math.round(nowMs) : Date.now();
     const res = this._withBusyRetry(() =>
       this.db
         .prepare(`
           UPDATE ghost_interceptions
           SET recall_reads = recall_reads + 1,
               recall_bytes = recall_bytes + ?
-          WHERE session_id = ? AND file_path = ?
+          WHERE session_id = ?
+            AND file_path = ?
+            AND recall_closed = 0
+            AND (? - blocked_ts) <= ?
         `)
-        .run(addBytes, sid, norm)
+        .run(addBytes, sid, norm, now, GHOST_RECALL_WINDOW_MS)
     );
     return res.changes || 0;
   }
@@ -763,20 +795,25 @@ export class ReadMethods {
     const ghostRecalls = Number(row?.ghost_recalls || 0);
     const evictionEfficiency = totalBlocked > 0 ? Number((1 - ghostRecalls / totalBlocked).toFixed(4)) : 1;
     const currentCutoff = this.getCutoff(sid === "all" || sid === "lifetime" ? null : sid);
-    const recommendation =
-      totalBlocked >= 3 && evictionEfficiency < 0.65 && currentCutoff > 0
-        ? currentCutoff < 46080
-          ? "Cutoff may be too tight for this repo; consider switching to 45 KB (host-45k)."
-          : currentCutoff < 65536
-            ? "Cutoff may be too tight for this repo; consider switching to 64 KB or adding exemptPaths."
-            : null
-        : null;
+    let recommendationCode = null;
+    let recommendation = null;
+    if (totalBlocked >= 3 && evictionEfficiency < 0.65 && currentCutoff > 0) {
+      if (currentCutoff < 46080) {
+        recommendationCode = "raise_to_host_45k";
+        recommendation = "Cutoff may be too tight for this repo; consider switching to 45 KB (host-45k).";
+      } else {
+        recommendationCode = "use_outlines_or_exempt";
+        recommendation =
+          "Already at 45 KB host cap; multi-slice reads on >45 KB files are normal (use read_slices outlines or exemptPaths if needed).";
+      }
+    }
 
     return {
       totalBlocked,
       ghostRecalls,
       evictionEfficiency,
       currentCutoff,
+      recommendationCode,
       recommendation
     };
   }

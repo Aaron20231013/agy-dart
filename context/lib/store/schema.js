@@ -218,6 +218,7 @@ export class SchemaMethods {
         blocked_ts INTEGER NOT NULL,
         recall_reads INTEGER NOT NULL DEFAULT 0,
         recall_bytes INTEGER NOT NULL DEFAULT 0,
+        recall_closed INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (session_id, file_path)
       );
 
@@ -289,6 +290,16 @@ export class SchemaMethods {
           } catch (err) {
             if (!/duplicate column name/i.test(String(err?.message || ""))) throw err;
           }
+        }
+      }
+
+      // Idempotent schema upgrade: ensure ghost_interceptions tracks recall_closed for edit-window reset
+      const ghostCols = this.db.prepare("PRAGMA table_info(ghost_interceptions)").all();
+      if (!ghostCols.some((c) => c.name === "recall_closed")) {
+        try {
+          this.db.exec("ALTER TABLE ghost_interceptions ADD COLUMN recall_closed INTEGER NOT NULL DEFAULT 0;");
+        } catch (err) {
+          if (!/duplicate column name/i.test(String(err?.message || ""))) throw err;
         }
       }
     });

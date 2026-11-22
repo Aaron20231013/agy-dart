@@ -961,7 +961,7 @@ test("v1.3-6: Installer bidirectional upgrade migration, Sidecar /api/purge 'con
 
     // 4. Sidecar index.html: 45 KB option, <= 800-line clamp, and dynamic custom cutoff option echo
     const htmlSource = fs.readFileSync(path.join(ROOT, "sidecars", "dashboard", "index.html"), "utf8");
-    assert.ok(htmlSource.includes('<option value="46080">45 KB (host cap)</option>'));
+    assert.match(htmlSource, /<option\b[^>]*value="46080"[^>]*data-i18n="cutoffHostCap"[^>]*>45 KB \(host cap\)<\/option>/);
     const scriptBlocks = [...htmlSource.matchAll(/<script>([\s\S]*?)<\/script>/gi)];
     const mainScript = scriptBlocks[scriptBlocks.length - 1][1];
 

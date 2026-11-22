@@ -265,7 +265,7 @@ function getPackageVersion() {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../../package.json"), "utf8"));
     if (pkg.version) return pkg.version;
   } catch {}
-  return "1.5.0";
+  return "1.5.1";
 }
 
 function getRenderedHtml(csrfToken = SIDECAR_CSRF_TOKEN) {
