@@ -110,6 +110,69 @@ function estimateColdReprefillHint(diag, isZh = false) {
   return isZh ? `（冷重算预计约 ${coldUsdStr}）` : ` (~${coldUsdStr} cold re-prefill)`;
 }
 
+function collectSessionSubprojectPaths(store, targetConvId, rootSessionId) {
+  if (!store) return { worktree: "", paths: [] };
+  let worktree = "";
+  const modifiedPaths = [];
+  const candidateSids = [targetConvId];
+  if (rootSessionId && rootSessionId !== "default" && rootSessionId !== targetConvId) {
+    candidateSids.push(rootSessionId);
+  }
+  try {
+    if (typeof store.getSessionCheckpoint === "function") {
+      for (const sid of candidateSids) {
+        if (!sid || sid === "default") continue;
+        const cp = store.getSessionCheckpoint(sid);
+        if (cp) {
+          if (!worktree && typeof cp.worktree === "string" && cp.worktree.trim()) {
+            worktree = cp.worktree.trim();
+          }
+          if (Array.isArray(cp.modifiedFiles) && cp.modifiedFiles.length > 0) {
+            for (const f of cp.modifiedFiles) {
+              const p = typeof f === "string" ? f : f?.path;
+              if (typeof p === "string" && p.trim()) modifiedPaths.push(p.trim());
+            }
+            if (modifiedPaths.length > 0) break;
+          }
+        }
+      }
+    }
+  } catch {}
+  if (modifiedPaths.length > 0) {
+    return { worktree, paths: modifiedPaths };
+  }
+
+  const readPaths = [];
+  try {
+    if (store.db && targetConvId && targetConvId !== "default") {
+      const rows = store.db
+        .prepare("SELECT DISTINCT file_path FROM file_reads WHERE session_id = ? ORDER BY read_ts DESC LIMIT 12")
+        .all(targetConvId);
+      for (const r of rows || []) {
+        if (r && typeof r.file_path === "string" && r.file_path.trim()) {
+          readPaths.push(r.file_path.trim());
+        }
+      }
+    }
+  } catch {}
+  return { worktree, paths: readPaths };
+}
+
+function formatChatWindowBadge(workspaceLabel = "", convTitle = "", isZh = false) {
+  const safeWs = typeof workspaceLabel === "string" ? workspaceLabel.replace(/[`\r\n]/g, "").trim() : "";
+  const safeTitle = typeof convTitle === "string" ? convTitle.replace(/[\r\n]/g, "").trim() : "";
+  if (safeWs && safeTitle) {
+    return isZh ? ` · **窗口 \`${safeWs}\`（${safeTitle}）**` : ` · **Window \`${safeWs}\` (${safeTitle})**`;
+  }
+  if (safeWs) {
+    return isZh ? ` · **窗口 \`${safeWs}\`**` : ` · **Window \`${safeWs}\`**`;
+  }
+  if (safeTitle) {
+    return isZh ? ` · **（${safeTitle}）**` : ` · **(${safeTitle})**`;
+  }
+  return "";
+}
+
 export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = null, lang = null }) {
   const alerts = [];
   if (!diag || diag.turnsWithUsage === 0) return alerts;
@@ -208,9 +271,15 @@ export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = nu
         );
       }
     }
-  } else if (diag.watermark === "ok" && prevWm) {
-    // Reset watermark state after compaction
-    store.deleteMeta(wmKey);
+  } else if (diag.watermark === "ok") {
+    if (prevWm) {
+      // Reset watermark state after compaction
+      store.deleteMeta(wmKey);
+    }
+    const wmDesktopKey = `cache_alert:${sessionId}:wm_desktop`;
+    if (getAlertMeta(wmDesktopKey, "")) {
+      store.deleteMeta(wmDesktopKey);
+    }
   }
 
   // 2. Idle Prompt-Cache TTL expiry & proactive expiring alerts (once per idle episode, turn entry only)
@@ -327,13 +396,26 @@ async function main() {
   const resolvedDbPath = effectiveCfg.dbPath || path.join(os.homedir(), ".agy-dart", "context.db");
   const watchdogExplicit = effectiveCfg.stallWatchdog && cfgSnapshot.sources.stallWatchdog !== "default";
   const ttlNotifyExplicit = effectiveCfg.ttlDesktopNotify && cfgSnapshot.sources.ttlDesktopNotify !== "default";
+  const watermarkNotifyExplicit =
+    effectiveCfg.watermarkDesktopNotify === true && cfgSnapshot.sources.watermarkDesktopNotify !== "default";
   const dbExists = fs.existsSync(resolvedDbPath);
   const needExistingDbWork =
     !effectiveCfg.cacheWatch &&
     !effectiveCfg.diffRead &&
-    (effectiveCfg.readDedup || effectiveCfg.stallWatchdog || effectiveCfg.ttlDesktopNotify || dbExists) &&
+    (effectiveCfg.readDedup ||
+      effectiveCfg.stallWatchdog ||
+      effectiveCfg.ttlDesktopNotify ||
+      effectiveCfg.watermarkDesktopNotify === true ||
+      dbExists) &&
     dbExists;
-  if (!effectiveCfg.cacheWatch && !effectiveCfg.diffRead && !watchdogExplicit && !ttlNotifyExplicit && !needExistingDbWork) {
+  if (
+    !effectiveCfg.cacheWatch &&
+    !effectiveCfg.diffRead &&
+    !watchdogExplicit &&
+    !ttlNotifyExplicit &&
+    !watermarkNotifyExplicit &&
+    !needExistingDbWork
+  ) {
     process.stdout.write("{}\n");
     return;
   }
@@ -362,7 +444,11 @@ async function main() {
     const [storeMod, cacheAnalyzerMod, watchdogLeaseMod] = await Promise.all([
       import("../context/lib/store.js"),
       import("../context/lib/cache-analyzer.js"),
-      effectiveCfg.stallWatchdog || effectiveCfg.ttlDesktopNotify || dbExists
+      effectiveCfg.cacheWatch ||
+      effectiveCfg.stallWatchdog ||
+      effectiveCfg.ttlDesktopNotify ||
+      effectiveCfg.watermarkDesktopNotify === true ||
+      dbExists
         ? import("../context/lib/watchdog-lease.js")
         : Promise.resolve(null)
     ]);
@@ -546,10 +632,68 @@ async function main() {
       }
     }
 
-    // Record Sidecar Stall Watchdog / Idle TTL execution lease (isolated by direct conversationId)
+    // Resolve window/subproject identity & official short conversation title once per PreInvocation
+    let resolvedWorkspaceLabel = "";
+    let resolvedConvTitle = "";
+    let resolvedCwd = "";
+    let subprojectPaths = [];
+    if (targetConvId && targetConvId !== "default" && watchdogLeaseMod) {
+      try {
+        const existingLease =
+          (dbExists || store.db) && typeof watchdogLeaseMod.readWatchdogLease === "function"
+            ? watchdogLeaseMod.readWatchdogLease(store, targetConvId)
+            : null;
+        const allowDefaultSummaryDb =
+          Boolean(process.env.AGY_DART_SUMMARY_DB_PATH) || cfgSnapshot.sources.dbPath === "default";
+        const summary = watchdogLeaseMod.lookupConversationSummary
+          ? watchdogLeaseMod.lookupConversationSummary(targetConvId, {
+              payload,
+              transcriptPath,
+              allowDefaultDb: allowDefaultSummaryDb
+            })
+          : { title: "", cwd: "" };
+        resolvedConvTitle = summary.title || existingLease?.convTitle || "";
+        const payloadCwd = watchdogLeaseMod.extractPayloadWorkspaceRoot
+          ? watchdogLeaseMod.extractPayloadWorkspaceRoot(payload)
+          : payload.cwd || "";
+        resolvedCwd = payloadCwd || summary.cwd || existingLease?.cwd || "";
+
+        if (dbExists || store.db) {
+          const activity = collectSessionSubprojectPaths(store, targetConvId, sessionId);
+          subprojectPaths = activity.paths;
+          if (!resolvedCwd && activity.worktree) {
+            resolvedCwd = activity.worktree;
+          }
+        }
+        if (resolvedCwd && watchdogLeaseMod.formatWorkspaceWindowLabel) {
+          const computedWs = watchdogLeaseMod.formatWorkspaceWindowLabel(resolvedCwd, subprojectPaths);
+          if (
+            existingLease?.workspaceLabel &&
+            existingLease.cwd === resolvedCwd &&
+            computedWs &&
+            existingLease.workspaceLabel.startsWith(`${computedWs}/`)
+          ) {
+            resolvedWorkspaceLabel = existingLease.workspaceLabel;
+          } else {
+            resolvedWorkspaceLabel = computedWs || existingLease?.workspaceLabel || "";
+          }
+        } else if (existingLease?.workspaceLabel) {
+          resolvedWorkspaceLabel = existingLease.workspaceLabel;
+        }
+      } catch {}
+    }
+
+    // Record Sidecar Stall Watchdog / Idle TTL / Watermark execution lease (isolated by direct conversationId)
     const watchdogActive = Boolean(
       effectiveCfg.stallWatchdog &&
         (typeof store.isWatchdogEnabled !== "function" || store.isWatchdogEnabled())
+    );
+    const desktopStallNotifyActive = Boolean(
+      watchdogActive &&
+        (effectiveCfg.watchdogDesktopNotify ||
+          ((dbExists || store.db) &&
+            typeof store.isWatchdogDesktopNotifyEnabled === "function" &&
+            store.isWatchdogDesktopNotifyEnabled()))
     );
     const ttlNotifyActive = Boolean(
       effectiveCfg.ttlDesktopNotify ||
@@ -557,8 +701,11 @@ async function main() {
           typeof store.isTtlDesktopNotifyEnabled === "function" &&
           store.isTtlDesktopNotifyEnabled())
     );
+    const watermarkNotifyActive =
+      effectiveCfg.watermarkDesktopNotify === true ||
+      (effectiveCfg.watermarkDesktopNotify === null && (ttlNotifyActive || desktopStallNotifyActive));
     if (
-      (watchdogActive || ttlNotifyActive) &&
+      (watchdogActive || ttlNotifyActive || watermarkNotifyActive) &&
       targetConvId &&
       targetConvId !== "default" &&
       watchdogLeaseMod?.recordHookLeaseTransition
@@ -604,11 +751,18 @@ async function main() {
           directConvId: targetConvId,
           rootSessionId: sessionId,
           isSubagent: detectedSubagent,
-          cwd: payload.cwd || "",
+          cwd: resolvedCwd || payload.cwd || "",
+          workspaceLabel: resolvedWorkspaceLabel,
+          convTitle: resolvedConvTitle,
+          modifiedOrReadPaths: subprojectPaths,
           transcriptPath,
           transcriptMtimeMs: txStatMtimeMs,
           transcriptSize: txStatSize,
           contextTokens: diag?.currentContextTokens || 0,
+          windowTokens: diag?.modelProfile?.windowTokens || 0,
+          warnTokens: diag?.warnTokens || 0,
+          criticalTokens: diag?.criticalTokens || 0,
+          watermark: diag?.watermark || "",
           mediaCount: diag?.totalMediaCount || 0,
           model: diag?.currentModel || "",
           cacheTtlSec: diag?.cacheTtlSec || 0,
@@ -641,8 +795,10 @@ async function main() {
       return;
     }
 
-    const prefixBadge = uiLang === "zh" ? "[agy-dart 缓存守卫]" : "[agy-dart KV-Cache Watch]";
-    const markdown = alerts.map((a) => `> **${prefixBadge}** ${a}`).join("\n");
+    const isZhUi = uiLang === "zh";
+    const prefixBadge = isZhUi ? "[agy-dart 缓存守卫]" : "[agy-dart KV-Cache Watch]";
+    const windowBadge = formatChatWindowBadge(resolvedWorkspaceLabel, resolvedConvTitle, isZhUi);
+    const markdown = alerts.map((a) => `> **${prefixBadge}**${windowBadge} ${a}`).join("\n");
     // Zero-prefix-pollution UI-only step: systemMessage is "" so the model receives 0 tokens!
     process.stdout.write(
       JSON.stringify({

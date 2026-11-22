@@ -37,17 +37,21 @@ import {
   classifyToolExecutionKind,
   deriveLlmSubphase,
   extractBareToolName,
+  formatWorkspaceWindowLabel,
   getToolTimeoutTier,
   getWatchdogLeaseKey,
   isHeadlessWorkerPrompt,
   isSubagentLeasePayload,
   listWatchdogLeases,
+  lookupConversationSummary,
+  lookupConversationTitle,
   normalizeWatchdogLease,
   parseMaybeJsonObj,
   readWatchdogLease,
   recordHookLeaseTransition,
   sanitizeConversationId,
   sanitizeWatchdogText,
+  truncateUtf8Safe,
   writeWatchdogLease,
   writeWatchdogLeaseIfUnchanged
 } from "./watchdog-lease.js";
@@ -57,16 +61,20 @@ export {
   WATCHDOG_LEASE_PREFIX,
   WATCHDOG_PHASES,
   classifyToolExecutionKind,
+  formatWorkspaceWindowLabel,
   getToolTimeoutTier,
   getWatchdogLeaseKey,
   isHeadlessWorkerPrompt,
   isSubagentLeasePayload,
   listWatchdogLeases,
+  lookupConversationSummary,
+  lookupConversationTitle,
   normalizeWatchdogLease,
   readWatchdogLease,
   recordHookLeaseTransition,
   sanitizeConversationId,
   sanitizeWatchdogText,
+  truncateUtf8Safe,
   writeWatchdogLease,
   writeWatchdogLeaseIfUnchanged
 };
@@ -645,6 +653,57 @@ export function diagnoseStallCause(lease = {}, options = {}) {
   };
 }
 
+function formatShortTitleWorkspace(ws, maxBytes = 16) {
+  if (!ws) return "";
+  if (Buffer.byteLength(ws, "utf8") <= maxBytes) return ws;
+  const slashIdx = ws.lastIndexOf("/");
+  if (slashIdx > 0 && slashIdx < ws.length - 1) {
+    const leaf = ws.slice(slashIdx + 1);
+    if (!/^\d+$/.test(leaf)) {
+      const prefixed = `…/${leaf}`;
+      if (Buffer.byteLength(prefixed, "utf8") <= maxBytes) return prefixed;
+      if (Buffer.byteLength(leaf, "utf8") <= maxBytes) return leaf;
+    }
+  }
+  const cut = truncateUtf8Safe(ws, Math.max(4, maxBytes - 2));
+  return `${cut}..`;
+}
+
+/**
+ * Format compact window/subproject tag for desktop notification titles (`<= 19B` so total
+ * Windows BalloonTipTitle stays strictly `<= 60B`) and conversation title prefix for bodies.
+ * Falls back to empty strings when both `workspaceLabel` and `convTitle` are absent.
+ */
+export function buildWindowNotificationPrefix(lease, { isZh = false } = {}) {
+  if (!lease || typeof lease !== "object") {
+    return { titleTag: "", bodyPrefix: "" };
+  }
+  const rawWs =
+    (typeof lease.workspaceLabel === "string" && lease.workspaceLabel.trim()) ||
+    (typeof lease.cwd === "string" && lease.cwd.trim() ? formatWorkspaceWindowLabel(lease.cwd) : "");
+  const cleanWs = rawWs ? sanitizeWatchdogText(rawWs, 48) : "";
+  const shortWs = cleanWs ? formatShortTitleWorkspace(cleanWs, 16) : "";
+  const titleTag = shortWs ? ` [${shortWs}]` : "";
+
+  const wsBody = cleanWs ? truncateUtf8Safe(cleanWs, 24) : "";
+  const titleBody =
+    typeof lease.convTitle === "string" && lease.convTitle.trim()
+      ? sanitizeWatchdogText(lease.convTitle, 36)
+      : "";
+  const shortId = String(lease.conversationId || "").slice(0, 4) || "0000";
+
+  let bodyPrefix = "";
+  if (wsBody && titleBody) {
+    bodyPrefix = isZh ? `【${wsBody} · ${titleBody}】` : `[${wsBody} · ${titleBody}] `;
+  } else if (wsBody) {
+    bodyPrefix = isZh ? `【窗口: ${wsBody} #${shortId}】` : `[${wsBody} #${shortId}] `;
+  } else if (titleBody) {
+    bodyPrefix = isZh ? `【${titleBody}】` : `[${titleBody}] `;
+  }
+
+  return { titleTag, bodyPrefix };
+}
+
 /**
  * Pure OS desktop notification command builder (env-var indirection on Windows,
  * strict argv-only dispatch on macOS/Linux — zero dynamic shell interpolation).
@@ -757,6 +816,10 @@ export class WatchdogMonitor {
     this.readTailFn = options.readTailFn || ((p, bytes) => readTranscriptTail(p, bytes, { minUsageSteps: 1 }));
     this.findTranscriptFn =
       options.findTranscriptFn || ((convId) => findTranscriptForConversation(convId, { exactOnly: true }));
+    this.lookupTitleFn =
+      options.lookupTitleFn ||
+      ((convId, { transcriptPath } = {}) =>
+        transcriptPath ? lookupConversationTitle(convId, { transcriptPath, allowDefaultDb: false }) : "");
     this.notifyFn = options.notifyFn || sendDesktopNotification;
     this.buildHandoffFn = options.buildHandoffFn || buildHandoffBrief;
     this.staleLeaseMs =
@@ -785,6 +848,7 @@ export class WatchdogMonitor {
     this.tailReadCount = 0;
     this.notificationCount = 0;
     this.ttlNotificationCount = 0;
+    this.watermarkNotificationCount = 0;
   }
 
   start() {
@@ -1009,6 +1073,41 @@ export class WatchdogMonitor {
     return Boolean(cfg.ttlDesktopNotify);
   }
 
+  _resolveWatermarkDesktopNotifyEnabled(store, cfg, { desktopNotifyEnabled = false, ttlDesktopNotifyEnabled = false } = {}) {
+    const envRaw = process.env.AGY_DART_WATERMARK_DESKTOP_NOTIFY;
+    if (typeof envRaw === "string" && envRaw.trim() !== "") {
+      const s = envRaw.trim().toLowerCase();
+      if (s === "1" || s === "true" || s === "yes" || s === "on") return true;
+      if (s === "0" || s === "false" || s === "no" || s === "off") return false;
+    }
+    if (store && typeof store.getMeta === "function") {
+      try {
+        const raw = store.getMeta("cache:watermark_desktop_notify", null);
+        if (raw !== null) {
+          if (raw === "true" || raw === "1") return true;
+          if (raw === "false" || raw === "0") return false;
+        }
+      } catch {}
+    }
+    if (typeof cfg?.watermarkDesktopNotify === "boolean") {
+      return cfg.watermarkDesktopNotify;
+    }
+    return Boolean(ttlDesktopNotifyEnabled || desktopNotifyEnabled);
+  }
+
+  _enrichNotificationLeaseIdentity(lease) {
+    if (!lease || lease.convTitle) return lease;
+    try {
+      const fallbackTitle = this.lookupTitleFn?.(lease.conversationId, {
+        transcriptPath: lease.transcriptPath || ""
+      });
+      if (typeof fallbackTitle === "string" && fallbackTitle.trim()) {
+        return { ...lease, convTitle: sanitizeWatchdogText(fallbackTitle, 36) };
+      }
+    } catch {}
+    return lease;
+  }
+
   _resolveUiLangInfo(store, cfg) {
     const envParsed = parseUiLang(process.env.AGY_DART_LANG);
     if (envParsed) {
@@ -1099,11 +1198,13 @@ export class WatchdogMonitor {
       if (this._lastTtlNotifyGlobalTs > 0 && nowWallMs - this._lastTtlNotifyGlobalTs < 60_000) continue;
 
       const isZh = uiLang === "zh";
-      const title = isZh ? "agy-dart：缓存即将过期" : "agy-dart: KV-Cache Expiring";
+      const notifyLease = this._enrichNotificationLeaseIdentity(lease);
+      const { titleTag, bodyPrefix } = buildWindowNotificationPrefix(notifyLease, { isZh });
+      const title = isZh ? `agy-dart${titleTag}：缓存即将过期` : `agy-dart${titleTag}: KV-Cache Expiring`;
       const body = sanitizeWatchdogText(
         isZh
-          ? `${Math.round(ctxTokens / 1000)}k 上下文热缓存约 ${remSec} 秒后过期（TTL ${fmtDur(effectiveTtlSec)}）。继续发消息可保热，或等过期后执行 /compact。`
-          : `${Math.round(ctxTokens / 1000)}k context warm cache expires in ~${remSec}s (TTL ${fmtDur(effectiveTtlSec)}). Reply to keep warm or /compact after expiry.`,
+          ? `${bodyPrefix}${Math.round(ctxTokens / 1000)}k 上下文热缓存约 ${remSec} 秒后过期（TTL ${fmtDur(effectiveTtlSec)}）。继续发消息可保热，或等过期后执行 /compact。`
+          : `${bodyPrefix}${Math.round(ctxTokens / 1000)}k context warm cache expires in ~${remSec}s (TTL ${fmtDur(effectiveTtlSec)}). Reply to keep warm or /compact after expiry.`,
         220
       );
       this._ttlNotifiedKeys.set(lease.conversationId, dedupKey);
@@ -1118,6 +1219,94 @@ export class WatchdogMonitor {
         });
         if (!res || res.dispatched !== false) {
           this.ttlNotificationCount += 1;
+        }
+      } catch {}
+    }
+  }
+
+  _evaluateWatermarkNotifications(
+    store,
+    leases,
+    { nowWallMs, watermarkDesktopNotifyEnabled, uiLang = "en", sleepJumpMs }
+  ) {
+    if (!store || !Array.isArray(leases) || leases.length === 0) return;
+
+    const getWmMeta = (k) => {
+      try {
+        if (typeof store.getTimedMeta === "function") return store.getTimedMeta(k, "") || "";
+        if (typeof store.getMeta === "function") return store.getMeta(k, "") || "";
+      } catch {}
+      return "";
+    };
+    const setWmMeta = (k, v) => {
+      try {
+        if (typeof store.setTimedMeta === "function") store.setTimedMeta(k, v);
+        else if (typeof store.setMeta === "function") store.setMeta(k, v);
+      } catch {}
+    };
+    const deleteWmMeta = (k) => {
+      try {
+        if (typeof store.deleteMeta === "function") store.deleteMeta(k);
+      } catch {}
+    };
+
+    for (const lease of leases) {
+      if (!lease || lease.isSubagent) continue;
+      const wmKey = `cache_alert:${lease.conversationId}:wm_desktop`;
+      if (lease.watermark === "ok") {
+        if (getWmMeta(wmKey)) {
+          deleteWmMeta(wmKey);
+        }
+        continue;
+      }
+
+      if (!watermarkDesktopNotifyEnabled || sleepJumpMs !== 0) continue;
+      if (lease.watermark !== "critical") continue;
+      if (lease.subphase === "stale_cleanup" || lease.subphase === "disabled") continue;
+      if (lease.updatedTs <= 0 || nowWallMs < lease.updatedTs) continue;
+      if (this.staleLeaseMs > 0 && nowWallMs - lease.updatedTs > this.staleLeaseMs) continue;
+      const stopReason = String(lease.stopReason || "").trim();
+      if (
+        lease.phase === WATCHDOG_PHASES.IDLE &&
+        /^(?:EXECUTOR_TERMINATION_REASON_)?(?:USER_CANCELED|USER_CANCELLED|CANCELED|CANCELLED|ABORTED|ERROR)\b/i.test(
+          stopReason
+        )
+      ) {
+        continue;
+      }
+
+      if (getWmMeta(wmKey) === "critical") continue;
+      setWmMeta(wmKey, "critical");
+
+      const isZh = uiLang === "zh";
+      const notifyLease = this._enrichNotificationLeaseIdentity(lease);
+      const { titleTag, bodyPrefix } = buildWindowNotificationPrefix(notifyLease, { isZh });
+      const ctxTokens = Math.max(0, Number(notifyLease.contextTokens || 0));
+      const ctxK = Math.round(ctxTokens / 1000);
+      const winTokens = Number(notifyLease.windowTokens || 0);
+      const winPart =
+        winTokens > 0 && ctxTokens > 0
+          ? `/${Math.round(winTokens / 1000)}k (${Math.min(100, Math.round((ctxTokens / winTokens) * 100))}%)`
+          : "";
+
+      const title = isZh ? `agy-dart${titleTag}：上下文快满了` : `agy-dart${titleTag}: Context Almost Full`;
+      const body = sanitizeWatchdogText(
+        isZh
+          ? `${bodyPrefix}上下文已达 ${ctxK}k${winPart}，建议阶段收尾后复制面板「交接简报」并执行 /compact。`
+          : `${bodyPrefix}Context at ${ctxK}k${winPart}. Copy Sidecar Handoff Brief and /compact at next milestone.`,
+        220
+      );
+
+      try {
+        const res = this.notifyFn({
+          title,
+          body,
+          platform: this.platform,
+          kind: "watermark_critical",
+          conversationId: lease.conversationId
+        });
+        if (!res || res.dispatched !== false) {
+          this.watermarkNotificationCount += 1;
         }
       } catch {}
     }
@@ -1139,17 +1328,22 @@ export class WatchdogMonitor {
     const enabled = this._resolveWatchdogEnabled(store, cfg);
     const desktopNotifyEnabled = this._resolveDesktopNotifyEnabled(store, cfg);
     const ttlDesktopNotifyEnabled = this._resolveTtlDesktopNotifyEnabled(store, cfg);
+    const watermarkDesktopNotifyEnabled = this._resolveWatermarkDesktopNotifyEnabled(store, cfg, {
+      desktopNotifyEnabled: enabled && desktopNotifyEnabled,
+      ttlDesktopNotifyEnabled
+    });
     const langInfo = this._resolveUiLangInfo(store, cfg);
     const uiLang = langInfo.lang;
     const sleepJumpMs = this._checkSleepDrift(nowWallMs, nowMonoNs, pollMs);
 
-    if (!store || (!enabled && !ttlDesktopNotifyEnabled)) {
+    if (!store || (!enabled && !ttlDesktopNotifyEnabled && !watermarkDesktopNotifyEnabled)) {
       this._convState.clear();
       this._lastEvaluated.clear();
       return {
         enabled,
         desktopNotifyEnabled,
         ttlDesktopNotifyEnabled,
+        watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
         serverNowMs: nowWallMs,
@@ -1172,10 +1366,17 @@ export class WatchdogMonitor {
         uiLang,
         sleepJumpMs
       });
+      this._evaluateWatermarkNotifications(store, leases, {
+        nowWallMs,
+        watermarkDesktopNotifyEnabled,
+        uiLang,
+        sleepJumpMs
+      });
       return {
         enabled,
         desktopNotifyEnabled,
         ttlDesktopNotifyEnabled,
+        watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
         serverNowMs: nowWallMs,
@@ -1211,10 +1412,17 @@ export class WatchdogMonitor {
         uiLang,
         sleepJumpMs
       });
+      this._evaluateWatermarkNotifications(store, leases, {
+        nowWallMs,
+        watermarkDesktopNotifyEnabled,
+        uiLang,
+        sleepJumpMs
+      });
       return {
         enabled,
         desktopNotifyEnabled,
         ttlDesktopNotifyEnabled,
+        watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
         serverNowMs: nowWallMs,
@@ -1268,6 +1476,12 @@ export class WatchdogMonitor {
         sleepJumpMs
       }
     );
+    this._evaluateWatermarkNotifications(store, leases, {
+      nowWallMs,
+      watermarkDesktopNotifyEnabled,
+      uiLang,
+      sleepJumpMs
+    });
 
     this._lastEvaluated.clear();
     for (const item of evaluated) {
@@ -1278,6 +1492,7 @@ export class WatchdogMonitor {
       enabled,
       desktopNotifyEnabled,
       ttlDesktopNotifyEnabled,
+      watermarkDesktopNotifyEnabled,
       uiLang,
       uiLangSource: langInfo.source,
       serverNowMs: nowWallMs,
@@ -1308,7 +1523,12 @@ export class WatchdogMonitor {
       activeToolSummary: "",
       lastCompletedTool: lease.lastCompletedTool || "",
       lastUserInput: lease.lastUserInput || "",
+      cwd: lease.cwd || "",
+      workspaceLabel: lease.workspaceLabel || "",
+      convTitle: lease.convTitle || "",
       contextTokens: lease.contextTokens || 0,
+      windowTokens: lease.windowTokens || 0,
+      watermark: lease.watermark || "",
       mediaCount: lease.mediaCount || 0,
       model: lease.model || "",
       stopReason: lease.stopReason || "",
@@ -1708,11 +1928,18 @@ export class WatchdogMonitor {
           this.notificationCount += 1;
           try {
             const isZh = uiLang === "zh";
+            const notifyLease = this._enrichNotificationLeaseIdentity(lease);
+            const { titleTag, bodyPrefix } = buildWindowNotificationPrefix(notifyLease, { isZh });
+            const title = isZh ? `agy-dart${titleTag}：对话疑似卡住` : `agy-dart${titleTag}: Session Stalled`;
+            const body = sanitizeWatchdogText(
+              isZh
+                ? `${bodyPrefix}${diagnosis?.labelZh || diagnosis?.label || lease.phase}（已无响应 ${silentSec} 秒）。请打开右侧 agy-dart 面板复制抢救简报。`
+                : `${bodyPrefix}${diagnosis?.label || lease.phase} (silent ${silentSec}s). Open Sidecar to copy Rescue Handoff Brief.`,
+              220
+            );
             this.notifyFn({
-              title: isZh ? "agy-dart：对话疑似卡住" : "agy-dart: Session Stalled",
-              body: isZh
-                ? `${diagnosis?.labelZh || diagnosis?.label || lease.phase}（已无响应 ${silentSec} 秒）。请打开右侧 agy-dart 面板复制抢救简报。`
-                : `${diagnosis?.label || lease.phase} (silent ${silentSec}s). Open Sidecar to copy Rescue Handoff Brief.`,
+              title,
+              body,
               conversationId: lease.conversationId,
               causeId: diagnosis?.causeId || "",
               silentSec,
@@ -1745,7 +1972,12 @@ export class WatchdogMonitor {
       activeToolSummary: lease.activeToolSummary || "",
       lastCompletedTool: lease.lastCompletedTool || "",
       lastUserInput: lease.lastUserInput || "",
+      cwd: lease.cwd || "",
+      workspaceLabel: lease.workspaceLabel || "",
+      convTitle: lease.convTitle || "",
       contextTokens: lease.contextTokens || 0,
+      windowTokens: lease.windowTokens || 0,
+      watermark: lease.watermark || "",
       mediaCount: lease.mediaCount || 0,
       model: lease.model || "",
       stopReason: lease.stopReason || "",
@@ -1769,6 +2001,12 @@ export class WatchdogMonitor {
     const ttlDesktopNotifyEnabled = tickRes
       ? tickRes.ttlDesktopNotifyEnabled
       : this._resolveTtlDesktopNotifyEnabled(store, cfg);
+    const watermarkDesktopNotifyEnabled = tickRes
+      ? tickRes.watermarkDesktopNotifyEnabled
+      : this._resolveWatermarkDesktopNotifyEnabled(store, cfg, {
+          desktopNotifyEnabled: enabled && desktopNotifyEnabled,
+          ttlDesktopNotifyEnabled
+        });
     const langInfo = tickRes
       ? { lang: tickRes.uiLang || "en", source: tickRes.uiLangSource || "default" }
       : this._resolveUiLangInfo(store, cfg);
@@ -1801,6 +2039,7 @@ export class WatchdogMonitor {
       enabled,
       desktopNotifyEnabled,
       ttlDesktopNotifyEnabled,
+      watermarkDesktopNotifyEnabled,
       uiLang: langInfo.lang,
       uiLangSource: langInfo.source,
       ttlNotifyLeadSec,
@@ -1832,7 +2071,8 @@ export class WatchdogMonitor {
         statSyncCount: this.statSyncCount,
         tailReadCount: this.tailReadCount,
         notificationCount: this.notificationCount,
-        ttlNotificationCount: this.ttlNotificationCount
+        ttlNotificationCount: this.ttlNotificationCount,
+        watermarkNotificationCount: this.watermarkNotificationCount
       }
     };
   }

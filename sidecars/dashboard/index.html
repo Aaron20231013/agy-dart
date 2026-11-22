@@ -4752,6 +4752,7 @@
           const subPart = cur.isSubagent ? ` · ${t('wdSubagentTag')}` : '';
           const bucketText = formatWdBucketLabel(cur.bucket, cur.subphase || cur.phase);
           bucketBadge.textContent = `${bucketText}${ctxPart}${subPart}`;
+          bucketBadge.title = [cur.workspaceLabel, cur.convTitle, cur.conversationId].filter(Boolean).join(' · ');
           bucketBadge.classList.remove('hidden');
         }
         if (toolBadge) {
@@ -4827,11 +4828,17 @@
             `<span>${escapeHtml(t('wdOtherAlertPrefix'))}</span>` +
             others
               .map((s) => {
-                const shortId = escapeHtml(String(s.conversationId).slice(0, 10));
+                const rawId = String(s.conversationId || '');
+                const labelText = [s.workspaceLabel, s.convTitle]
+                  .map((v) => (typeof v === 'string' ? v.trim() : ''))
+                  .filter(Boolean)
+                  .join(' · ') || rawId.slice(0, 8);
+                const displayLabel = escapeHtml(labelText);
+                const fullIdTitle = escapeHtml(rawId);
                 const sevTag = escapeHtml(s.severity === 'stalled' ? t('wdSevStalled') : t('wdSevSuspect'));
                 const cls = s.severity === 'stalled' ? 'meta-tag is-danger' : 'meta-tag is-warn';
                 const subMark = s.isSubagent ? ` (${escapeHtml(t('wdSubagentTag'))})` : '';
-                return `<span class="${cls}">${shortId}${subMark}: ${sevTag} ${escapeHtml(fmtSec(s.silentSec))}</span>`;
+                return `<span class="${cls}" title="${fullIdTitle}">${displayLabel}${subMark}: ${sevTag} ${escapeHtml(fmtSec(s.silentSec))}</span>`;
               })
               .join('');
         } else {

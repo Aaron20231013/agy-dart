@@ -60,6 +60,7 @@ export const CONFIG_DEFAULTS = Object.freeze({
   ttlDesktopNotify: false,
   ttlNotifyLeadSec: 60,
   ttlNotifyMinTokens: 60000,
+  watermarkDesktopNotify: null,
   uiLang: "en"
 });
 
@@ -496,6 +497,11 @@ export function getConfigSnapshot(options = {}) {
     clampInt(parsePositiveInt(env?.AGY_DART_TTL_NOTIFY_MIN_TOKENS), 4000, 500000),
     clampInt(parsePositiveInt(cfg.ttlNotifyMinTokens), 4000, 500000)
   );
+  pick(
+    "watermarkDesktopNotify",
+    parseEnvBool(env?.AGY_DART_WATERMARK_DESKTOP_NOTIFY),
+    cfgBool("watermarkDesktopNotify")
+  );
   pick("uiLang", parseUiLang(env?.AGY_DART_LANG), parseUiLang(cfg.uiLang));
 
   return {
@@ -575,8 +581,11 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra
       `tool=${values.watchdogToolFastSec}s/${values.watchdogToolCmdSec}s, bg=${values.watchdogSubagentSec}s, ` +
       `desktopNotify=${values.watchdogDesktopNotify} (${sources.watchdogDesktopNotify})`
   );
+  const wmNotifyDisplay =
+    values.watermarkDesktopNotify === null ? "auto" : String(values.watermarkDesktopNotify);
   lines.push(
     `  - TTL alert     : desktopNotify=${values.ttlDesktopNotify} (${sources.ttlDesktopNotify}), ` +
+      `watermarkNotify=${wmNotifyDisplay} (${sources.watermarkDesktopNotify}), ` +
       `lead=${values.ttlNotifyLeadSec}s, minTokens=${values.ttlNotifyMinTokens}, lang=${values.uiLang} (${sources.uiLang})`
   );
 

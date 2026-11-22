@@ -264,7 +264,7 @@ export function computeBriefMetrics(rootDir = REPO_ROOT) {
   const totalTrackedLines = Object.values(fileLineCounts).reduce((a, b) => a + b, 0);
 
   return {
-    version: pkg.version || "1.5.2",
+    version: pkg.version || "1.5.3",
     gitHeadShort: getGitHeadSha(rootDir),
     testFiles: tests.files,
     testCases: tests.cases,

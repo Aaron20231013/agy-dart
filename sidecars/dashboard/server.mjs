@@ -272,7 +272,7 @@ function getPackageVersion() {
       return cachedPkgVersion;
     }
   } catch {}
-  return "1.5.2";
+  return "1.5.3";
 }
 
 function getRenderedHtml(csrfToken = SIDECAR_CSRF_TOKEN) {

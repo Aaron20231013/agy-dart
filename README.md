@@ -28,6 +28,14 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 
 ---
 
+## What's New in v1.5.3 (Multi-Window Workspace/Subproject + Conversation Title Attribution & Critical-Context Desktop Alert)
+
+1. **Multi-Window Workspace / Subproject & Official Conversation Title Attribution**:
+   - Added `formatWorkspaceWindowLabel` and read-only `lookupConversationSummary` / `lookupConversationTitle` in `context/lib/watchdog-lease.js`: automatically disambiguates numeric/generic leaf directories (`e:\故事\1` → `故事/1`, `d:\proj\v2` → `proj/v2`), refines umbrella workspaces (`e:\work` + single active subproject → `work/agy-dart`), and reads Antigravity's official short conversation title + fallback `workspace_uris` from `conversation_summaries.db` with **zero raw user-prompt leakage**.
+   - Upgraded desktop OS notifications (TTL Expiring + Session Stalled), `PreInvocation` UI-only `metadata.user_markdown` banners (`systemMessage: ""`), and Sidecar `wd-other-alerts` cross-session pills to display `workspaceLabel` + `convTitle` within Windows `NotifyIcon` byte caps (`title <= 60B`, `body <= 220B`, zero UTF-8 splitting).
+2. **"Context Almost Full" (`critical` Watermark) Desktop Notification (Zero `statSync`)**:
+   - Added `_evaluateWatermarkNotifications` (`watermarkDesktopNotify`, `AGY_DART_WATERMARK_DESKTOP_NOTIFY`, default `null` auto-following `ttlDesktopNotify || watchdogDesktopNotify`) so background/multi-window primary sessions crossing into `critical` context watermark emit a single deduplicated OS desktop reminder (`agy-dart [work/agy-dart]: Context Almost Full` / `：上下文快满了`) with automatic reset after `/compact` drops back to `ok`, strictly maintaining **0 `fs.statSync` calls** on idle ticks.
+
 ## What's New in v1.5.2 (Hot-Path Hook & SQLite Fast-Skip, HTML/Dart Outlines, UTF-8 Pipes & Concurrent Sidecar Polling)
 
 1. **Hook & SQLite Cold-Start Acceleration**:

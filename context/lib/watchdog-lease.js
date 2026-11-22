@@ -3,10 +3,15 @@
  * lifecycle hooks (PreInvocation / PreToolUse / PostToolUse / Stop) and
  * the Sidecar Watchdog engine (`context/lib/watchdog.js`).
  *
- * Deliberately imports ONLY `node:path` and `./security.js` so hooks never
- * pay the parse cost of `cache-analyzer.js` or `handoff.js` on hot paths.
+ * Deliberately keeps top-level imports restricted to tiny Node built-ins and
+ * `./security.js` (`node:sqlite` is loaded lazily only when `lookupConversationSummary`
+ * opens an existing `conversation_summaries.db`) so hooks never pay heavy parse costs.
  */
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { redactSecrets } from "./security.js";
 
 export const WATCHDOG_LEASE_PREFIX = "watchdog_lease:";
@@ -97,7 +102,7 @@ export function getToolTimeoutTier(toolKind = "", phase = "") {
   return 0;
 }
 
-function truncateUtf8SafeLocal(text, maxBytes) {
+export function truncateUtf8Safe(text, maxBytes) {
   if (!text) return "";
   const limit = Number.isFinite(maxBytes) ? Math.max(0, Math.floor(maxBytes)) : 0;
   if (limit === 0) return "";
@@ -139,7 +144,9 @@ export function sanitizeWatchdogText(raw, maxBytes = 200) {
     .trim();
   if (!flat) return "";
   if (Buffer.byteLength(flat, "utf8") <= maxBytes) return flat;
-  return `${truncateUtf8SafeLocal(flat, Math.max(8, maxBytes - 3))}...`;
+  const budget = Math.max(1, maxBytes - 3);
+  if (maxBytes <= 3) return truncateUtf8Safe(flat, maxBytes);
+  return `${truncateUtf8Safe(flat, budget)}...`;
 }
 
 function sanitizeCwd(raw) {
@@ -147,6 +154,357 @@ function sanitizeCwd(raw) {
   const trimmed = raw.trim();
   if (!trimmed || trimmed.includes("\0") || /^[\\/]{2}/.test(trimmed)) return "";
   return trimmed.slice(0, 512);
+}
+
+const AMBIGUOUS_LEAF_DIR_RE =
+  /^(?:\d+|v\d+(?:[._-]\d+)*|src|app|apps|lib|pkg|packages|package|client|server|web|api|core|main|trunk|dev|prod|test|tests|docs|scripts|build|dist)$/i;
+const INTERNAL_REPO_DIRS_RE =
+  /^(?:src|lib|test|tests|__tests__|spec|specs|docs|doc|scripts|bin|config|configs|public|assets|static|styles|components|views|pages|routes|controllers|models|utils|helpers|hooks|context|fast|sidecars|rules|skills|dist|build|out|target|coverage|node_modules|vendor|tmp|temp)$/i;
+const MONOREPO_CONTAINER_DIRS_RE = /^(?:packages|apps|services|modules|crates|plugins|projects)$/i;
+const SYSTEM_HOME_PARENT_RE = /^(?:users|home|root|mnt|volumes|var|tmp|opt)$/i;
+
+let lazyDatabaseSync = null;
+let localSqliteWarnGuardInstalled = false;
+
+function getLazyDatabaseSync() {
+  if (lazyDatabaseSync) return lazyDatabaseSync;
+  if (!localSqliteWarnGuardInstalled) {
+    localSqliteWarnGuardInstalled = true;
+    try {
+      const origEmit = process.emitWarning.bind(process);
+      process.emitWarning = (warning, ...args) => {
+        const msg = typeof warning === "string" ? warning : String(warning?.message || "");
+        const type = typeof args[0] === "string" ? args[0] : args[0]?.type || warning?.name || "";
+        if (/ExperimentalWarning/i.test(String(type)) && /sqlite/i.test(msg)) return;
+        return origEmit(warning, ...args);
+      };
+    } catch {}
+  }
+  const req = createRequire(import.meta.url);
+  lazyDatabaseSync = req("node:sqlite").DatabaseSync;
+  return lazyDatabaseSync;
+}
+
+export function decodeFileUriOrPath(raw) {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.includes("\0")) return "";
+  if (/^file:\/\//i.test(trimmed)) {
+    const winDriveMatch = trimmed.match(/^file:\/\/\/([a-zA-Z])(?::|%3[aA])(\/.*)?$/);
+    if (winDriveMatch) {
+      const drive = winDriveMatch[1];
+      let rest = winDriveMatch[2] || "/";
+      try {
+        rest = decodeURIComponent(rest);
+      } catch {}
+      const sep = process.platform === "win32" ? "\\" : "/";
+      const normalizedRest = rest.replace(/\//g, sep);
+      return sanitizeCwd(`${drive}:${normalizedRest}`);
+    }
+    try {
+      return sanitizeCwd(fileURLToPath(trimmed));
+    } catch {
+      try {
+        return sanitizeCwd(fileURLToPath(decodeURIComponent(trimmed)));
+      } catch {
+        return "";
+      }
+    }
+  }
+  return sanitizeCwd(trimmed);
+}
+
+export function parseWorkspaceUriToPath(rawWorkspaceUris) {
+  if (typeof rawWorkspaceUris !== "string") return "";
+  const trimmed = rawWorkspaceUris.trim();
+  if (!trimmed) return "";
+  const candidates = [];
+  if (trimmed.startsWith("[") || trimmed.startsWith("{") || trimmed.startsWith('"')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (typeof item === "string") candidates.push(item);
+          else if (item && typeof item === "object") candidates.push(item.uri || item.path || "");
+        }
+      } else if (typeof parsed === "string") {
+        candidates.push(parsed);
+      } else if (parsed && typeof parsed === "object") {
+        candidates.push(parsed.uri || parsed.path || "");
+      }
+    } catch {}
+  }
+  if (candidates.length === 0) {
+    const uriMatches = trimmed.match(/file:\/\/[^\s"',;\]]+/gi);
+    if (uriMatches && uriMatches.length > 0) {
+      candidates.push(...uriMatches);
+    } else {
+      candidates.push(...trimmed.split(/[\r\n,;]+/));
+    }
+  }
+  for (const cand of candidates) {
+    const decoded = decodeFileUriOrPath(cand);
+    if (decoded) return decoded;
+  }
+  return "";
+}
+
+export function extractPayloadWorkspaceRoot(payload = {}) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "";
+  const meta = payload.metadata && typeof payload.metadata === "object" ? payload.metadata : null;
+  const direct = decodeFileUriOrPath(payload.cwd || payload.workspacePath || payload.workspace_path || meta?.cwd || "");
+  if (direct) return direct;
+
+  const listSources = [
+    payload.workspacePaths,
+    payload.workspace_paths,
+    payload.workspaceRoots,
+    payload.workspace_roots,
+    payload.workspaces,
+    meta?.workspacePaths,
+    meta?.workspace_paths,
+    meta?.workspaceRoots,
+    meta?.workspace_roots
+  ];
+  for (const src of listSources) {
+    if (typeof src === "string" && src.trim()) {
+      const p = parseWorkspaceUriToPath(src) || decodeFileUriOrPath(src);
+      if (p) return p;
+    } else if (Array.isArray(src)) {
+      for (const item of src) {
+        const raw = typeof item === "string" ? item : item?.uri || item?.path || "";
+        const p = decodeFileUriOrPath(raw);
+        if (p) return p;
+      }
+    }
+  }
+  return "";
+}
+
+/**
+ * Pure, 0-fs-I/O smart window/subproject label formatter:
+ *   - Disambiguates numeric/version/generic leaf dirs (`e:\故事\1` -> `故事/1`, `d:\proj\v2` -> `proj/v2`)
+ *   - Refines umbrella workspaces (`e:\work` + edits/reads inside `e:\work\agy-dart\...` -> `work/agy-dart`)
+ */
+export function formatWorkspaceWindowLabel(cwd, modifiedOrReadPaths = []) {
+  const cleanCwd = decodeFileUriOrPath(cwd);
+  if (!cleanCwd) return "";
+  const posixCwd = cleanCwd.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!posixCwd) return "";
+
+  const hasWinDrive = /^[a-zA-Z]:(?:\/|$)/.test(posixCwd);
+  const bodyAfterRoot = hasWinDrive ? posixCwd.slice(2).replace(/^\/+/, "") : posixCwd.replace(/^\/+/, "");
+  const segments = bodyAfterRoot.split("/").filter(Boolean);
+  if (segments.length === 0) return "";
+
+  const leaf = segments[segments.length - 1];
+  const parent = segments.length >= 2 ? segments[segments.length - 2] : "";
+  const isShortAmbiguous =
+    leaf.length === 1 || (Buffer.byteLength(leaf, "utf8") <= 2 && /^[a-z0-9._-]+$/i.test(leaf));
+  const needsParent =
+    Boolean(parent) &&
+    !SYSTEM_HOME_PARENT_RE.test(parent) &&
+    (AMBIGUOUS_LEAF_DIR_RE.test(leaf) || isShortAmbiguous);
+  const baseLabel = needsParent ? `${parent}/${leaf}` : leaf;
+
+  if (Array.isArray(modifiedOrReadPaths) && modifiedOrReadPaths.length > 0) {
+    const cwdPrefix = `${posixCwd}/`;
+    const cwdPrefixLower = cwdPrefix.toLowerCase();
+    const caseInsensitive = hasWinDrive || process.platform === "win32";
+    const subprojects = new Set();
+    const subprojectDisplay = new Map();
+    let sawRootFile = false;
+    let sawInternalRepoDir = false;
+
+    for (const entry of modifiedOrReadPaths) {
+      const rawPath =
+        typeof entry === "string"
+          ? entry.trim()
+          : entry && typeof entry.path === "string"
+            ? entry.path.trim()
+            : "";
+      if (!rawPath || rawPath.includes("\0")) continue;
+      let posixPath = rawPath.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
+      if (!posixPath) continue;
+
+      let rel = "";
+      const isAbs = posixPath.startsWith("/") || /^[a-zA-Z]:(?:\/|$)/.test(posixPath);
+      if (isAbs) {
+        const matchesCwd = caseInsensitive
+          ? posixPath.toLowerCase().startsWith(cwdPrefixLower)
+          : posixPath.startsWith(cwdPrefix);
+        if (!matchesCwd) continue;
+        rel = posixPath.slice(cwdPrefix.length);
+      } else {
+        if (posixPath === ".." || posixPath.startsWith("../")) continue;
+        rel = posixPath;
+      }
+
+      const relParts = rel.split("/").filter(Boolean);
+      if (relParts.length === 0) continue;
+      if (relParts.length === 1) {
+        if (!relParts[0].startsWith(".")) sawRootFile = true;
+        continue;
+      }
+
+      const dir1 = relParts[0];
+      if (MONOREPO_CONTAINER_DIRS_RE.test(dir1) && relParts.length >= 3 && !relParts[1].startsWith(".")) {
+        const sub = relParts[1];
+        const key = caseInsensitive ? sub.toLowerCase() : sub;
+        subprojects.add(key);
+        if (!subprojectDisplay.has(key)) subprojectDisplay.set(key, sub);
+      } else if (dir1.startsWith(".") || INTERNAL_REPO_DIRS_RE.test(dir1)) {
+        if (!/^\.(?:gemini|agy-dart|vscode|idea)$/i.test(dir1)) {
+          sawInternalRepoDir = true;
+        }
+      } else {
+        const key = caseInsensitive ? dir1.toLowerCase() : dir1;
+        subprojects.add(key);
+        if (!subprojectDisplay.has(key)) subprojectDisplay.set(key, dir1);
+      }
+    }
+
+    if (!sawRootFile && !sawInternalRepoDir && subprojects.size === 1) {
+      const [onlyKey] = subprojects;
+      const subName = subprojectDisplay.get(onlyKey) || onlyKey;
+      if (subName && subName.toLowerCase() !== leaf.toLowerCase()) {
+        return sanitizeWatchdogText(`${baseLabel}/${subName}`, 48);
+      }
+    }
+  }
+
+  return sanitizeWatchdogText(baseLabel, 48);
+}
+
+function extractInlinePayloadTitle(payload = {}) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "";
+  const meta = payload.metadata && typeof payload.metadata === "object" ? payload.metadata : null;
+  const candidates = [
+    payload.conversationTitle,
+    payload.conversation_title,
+    payload.title,
+    meta?.conversationTitle,
+    meta?.conversation_title
+  ];
+  for (const cand of candidates) {
+    if (typeof cand !== "string") continue;
+    const trimmed = cand.trim();
+    if (!trimmed || trimmed.includes("\n") || trimmed.includes("\r")) continue;
+    if (Buffer.byteLength(trimmed, "utf8") > 160) continue;
+    if (HEADLESS_FINISH_PROMPT_RE.test(trimmed)) continue;
+    const clean = sanitizeWatchdogText(trimmed, 36);
+    if (clean) return clean;
+  }
+  return "";
+}
+
+function resolveCandidateSummaryDbPaths({ transcriptPath = "", summaryDbPath = "", allowDefaultDb = true } = {}) {
+  const out = [];
+  const seen = new Set();
+  const pushUnique = (p) => {
+    if (typeof p !== "string" || !p.trim()) return;
+    const resolved = path.resolve(p.trim());
+    const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(resolved);
+    }
+  };
+
+  if (summaryDbPath) pushUnique(summaryDbPath);
+  if (typeof process.env.AGY_DART_SUMMARY_DB_PATH === "string" && process.env.AGY_DART_SUMMARY_DB_PATH.trim()) {
+    pushUnique(process.env.AGY_DART_SUMMARY_DB_PATH);
+  }
+
+  if (typeof transcriptPath === "string" && transcriptPath.trim()) {
+    let cur = path.dirname(path.resolve(transcriptPath.trim()));
+    for (let depth = 0; depth < 7 && cur; depth += 1) {
+      if (path.basename(cur).toLowerCase() === "brain") {
+        const agRoot = path.dirname(cur);
+        if (agRoot && agRoot !== cur) {
+          pushUnique(path.join(agRoot, "conversation_summaries.db"));
+        }
+        break;
+      }
+      const next = path.dirname(cur);
+      if (!next || next === cur) break;
+      cur = next;
+    }
+  }
+
+  if (allowDefaultDb) {
+    const home = os.homedir();
+    if (home) {
+      pushUnique(path.join(home, ".gemini", "antigravity", "conversation_summaries.db"));
+      pushUnique(path.join(home, ".gemini", "antigravity-ide", "conversation_summaries.db"));
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Read-only, fail-open lookup of Antigravity's official short conversation title
+ * and fallback workspace root from `conversation_summaries.db` (zero user-prompt leakage).
+ */
+export function lookupConversationSummary(conversationId, options = {}) {
+  const safeId = sanitizeConversationId(conversationId);
+  const safeOpts = options && typeof options !== "string" ? options : {};
+  const inlineTitle = extractInlinePayloadTitle(safeOpts.payload);
+  const inlineCwd = extractPayloadWorkspaceRoot(safeOpts.payload) || decodeFileUriOrPath(safeOpts.cwd || "");
+  if (!safeId) {
+    return { title: inlineTitle, cwd: inlineCwd };
+  }
+  if (inlineTitle && inlineCwd) {
+    return { title: inlineTitle, cwd: inlineCwd };
+  }
+
+  const dbCandidates = resolveCandidateSummaryDbPaths({
+    transcriptPath: safeOpts.transcriptPath || "",
+    summaryDbPath: safeOpts.summaryDbPath || "",
+    allowDefaultDb: safeOpts.allowDefaultDb !== false
+  });
+
+  for (const dbPath of dbCandidates) {
+    let db = null;
+    try {
+      if (!fs.existsSync(dbPath)) continue;
+      const DatabaseSync = getLazyDatabaseSync();
+      try {
+        db = new DatabaseSync(dbPath, { readOnly: true, timeout: 250 });
+      } catch {
+        db = new DatabaseSync(dbPath, { readOnly: true });
+        try {
+          db.exec("PRAGMA busy_timeout = 250;");
+        } catch {}
+      }
+      const row = db
+        .prepare("SELECT title, workspace_uris FROM conversation_summaries WHERE conversation_id = ? LIMIT 1")
+        .get(safeId);
+      if (row) {
+        const dbTitle = typeof row.title === "string" ? sanitizeWatchdogText(row.title, 36) : "";
+        const dbCwd = typeof row.workspace_uris === "string" ? parseWorkspaceUriToPath(row.workspace_uris) : "";
+        return {
+          title: inlineTitle || dbTitle,
+          cwd: inlineCwd || dbCwd
+        };
+      }
+    } catch {
+      // Fail-open on locked/corrupt/unreadable summary DB
+    } finally {
+      if (db) {
+        try {
+          db.close();
+        } catch {}
+      }
+    }
+  }
+
+  return { title: inlineTitle, cwd: inlineCwd };
+}
+
+export function lookupConversationTitle(conversationId, options = {}) {
+  return lookupConversationSummary(conversationId, options).title;
 }
 
 function firstNonEmptyString(...values) {
@@ -427,6 +785,8 @@ export function normalizeWatchdogLease(raw, fallbackConvId = "") {
     lastCompletedTool: typeof raw.lastCompletedTool === "string" ? raw.lastCompletedTool.slice(0, 80) : "",
     lastCompletedToolTs: toFiniteTs(raw.lastCompletedToolTs, 0),
     cwd: sanitizeCwd(raw.cwd || ""),
+    workspaceLabel: sanitizeWatchdogText(raw.workspaceLabel || "", 48),
+    convTitle: sanitizeWatchdogText(raw.convTitle || "", 36),
     transcriptPath:
       typeof raw.transcriptPath === "string" &&
       !raw.transcriptPath.includes("\0") &&
@@ -445,6 +805,23 @@ export function normalizeWatchdogLease(raw, fallbackConvId = "") {
       Number.isFinite(Number(raw.contextTokens)) && Number(raw.contextTokens) >= 0
         ? Math.floor(Number(raw.contextTokens))
         : 0,
+    windowTokens:
+      Number.isFinite(Number(raw.windowTokens)) && Number(raw.windowTokens) >= 0
+        ? Math.floor(Number(raw.windowTokens))
+        : 0,
+    warnTokens:
+      Number.isFinite(Number(raw.warnTokens)) && Number(raw.warnTokens) >= 0
+        ? Math.floor(Number(raw.warnTokens))
+        : 0,
+    criticalTokens:
+      Number.isFinite(Number(raw.criticalTokens)) && Number(raw.criticalTokens) >= 0
+        ? Math.floor(Number(raw.criticalTokens))
+        : 0,
+    watermark:
+      typeof raw.watermark === "string" &&
+      (raw.watermark === "ok" || raw.watermark === "warn" || raw.watermark === "critical")
+        ? raw.watermark
+        : "",
     mediaCount:
       Number.isFinite(Number(raw.mediaCount)) && Number(raw.mediaCount) >= 0
         ? Math.floor(Number(raw.mediaCount))
@@ -617,10 +994,16 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
     lastCompletedTool: "",
     lastCompletedToolTs: 0,
     cwd: "",
+    workspaceLabel: "",
+    convTitle: "",
     transcriptPath: "",
     transcriptMtimeMs: 0,
     transcriptSize: 0,
     contextTokens: 0,
+    windowTokens: 0,
+    warnTokens: 0,
+    criticalTokens: 0,
+    watermark: "",
     mediaCount: 0,
     model: "",
     cacheTtlSec: 0,
@@ -629,6 +1012,54 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
     stopReason: "",
     ackedUntilTs: 0
   };
+
+  const resolvedTranscriptPath =
+    (typeof safeOptions.transcriptPath === "string" && safeOptions.transcriptPath.trim()) ||
+    (typeof safePayload.transcriptPath === "string" && safePayload.transcriptPath.trim()) ||
+    (typeof safePayload.transcript_path === "string" && safePayload.transcript_path.trim()) ||
+    base.transcriptPath;
+
+  let resolvedCwd =
+    sanitizeCwd(safeOptions.cwd || extractPayloadWorkspaceRoot(safePayload) || "") || base.cwd;
+
+  let resolvedTitle = "";
+  if (typeof safeOptions.convTitle === "string" && safeOptions.convTitle.trim()) {
+    resolvedTitle = sanitizeWatchdogText(safeOptions.convTitle, 36);
+  } else {
+    resolvedTitle = extractInlinePayloadTitle(safePayload);
+  }
+  if (
+    (!resolvedTitle || !resolvedCwd) &&
+    (safeOptions.summaryDbPath || safeOptions.lookupSummary === true)
+  ) {
+    const summary = lookupConversationSummary(directConvId, {
+      payload: safePayload,
+      cwd: resolvedCwd,
+      transcriptPath: resolvedTranscriptPath,
+      summaryDbPath: safeOptions.summaryDbPath || "",
+      allowDefaultDb: safeOptions.allowDefaultDb !== false
+    });
+    if (!resolvedTitle && summary.title) resolvedTitle = summary.title;
+    if (!resolvedCwd && summary.cwd) resolvedCwd = summary.cwd;
+  }
+
+  let resolvedWorkspaceLabel = base.workspaceLabel || "";
+  if (typeof safeOptions.workspaceLabel === "string" && safeOptions.workspaceLabel.trim()) {
+    resolvedWorkspaceLabel = sanitizeWatchdogText(safeOptions.workspaceLabel, 48);
+  } else if (resolvedCwd) {
+    const computedWs = formatWorkspaceWindowLabel(resolvedCwd, safeOptions.modifiedOrReadPaths || []);
+    if (
+      base.workspaceLabel &&
+      base.cwd &&
+      base.cwd === resolvedCwd &&
+      computedWs &&
+      base.workspaceLabel.startsWith(`${computedWs}/`)
+    ) {
+      resolvedWorkspaceLabel = base.workspaceLabel;
+    } else if (computedWs) {
+      resolvedWorkspaceLabel = computedWs;
+    }
+  }
 
   const next = {
     ...base,
@@ -639,12 +1070,10 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
         ? parentConversationId
         : base.parentConversationId || "",
     isSubagent: isSubagent || base.isSubagent,
-    cwd: sanitizeCwd(safeOptions.cwd || safePayload.cwd || "") || base.cwd,
-    transcriptPath:
-      (typeof safeOptions.transcriptPath === "string" && safeOptions.transcriptPath.trim()) ||
-      (typeof safePayload.transcriptPath === "string" && safePayload.transcriptPath.trim()) ||
-      (typeof safePayload.transcript_path === "string" && safePayload.transcript_path.trim()) ||
-      base.transcriptPath,
+    cwd: resolvedCwd,
+    workspaceLabel: resolvedWorkspaceLabel,
+    convTitle: resolvedTitle || base.convTitle || "",
+    transcriptPath: resolvedTranscriptPath,
     updatedTs: now,
     lastHeartbeatTs: Math.max(base.lastHeartbeatTs || 0, now),
     hookEvent: eventName,
@@ -662,6 +1091,21 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
   }
   if (Number.isFinite(safeOptions.contextTokens) && safeOptions.contextTokens >= 0) {
     next.contextTokens = Math.floor(safeOptions.contextTokens);
+  }
+  if (Number.isFinite(safeOptions.windowTokens) && safeOptions.windowTokens > 0) {
+    next.windowTokens = Math.floor(safeOptions.windowTokens);
+  }
+  if (Number.isFinite(safeOptions.warnTokens) && safeOptions.warnTokens > 0) {
+    next.warnTokens = Math.floor(safeOptions.warnTokens);
+  }
+  if (Number.isFinite(safeOptions.criticalTokens) && safeOptions.criticalTokens > 0) {
+    next.criticalTokens = Math.floor(safeOptions.criticalTokens);
+  }
+  if (
+    typeof safeOptions.watermark === "string" &&
+    (safeOptions.watermark === "ok" || safeOptions.watermark === "warn" || safeOptions.watermark === "critical")
+  ) {
+    next.watermark = safeOptions.watermark;
   }
   if (Number.isFinite(safeOptions.mediaCount) && safeOptions.mediaCount >= 0) {
     next.mediaCount = Math.floor(safeOptions.mediaCount);

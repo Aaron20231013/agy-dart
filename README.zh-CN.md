@@ -28,6 +28,14 @@
 
 ---
 
+## v1.5.3 核心升级（多窗口工作区/子项目 + 官方对话短标题定位与「上下文快满了」桌面提醒）
+
+1. **多窗口工作区/子项目智能细化与官方会话短标题定位（零 Prompt 泄露）**：
+   - `context/lib/watchdog-lease.js` 新增 `formatWorkspaceWindowLabel` 与只读 `lookupConversationSummary` / `lookupConversationTitle`：自动对纯数字/通用末级目录补齐父级（如 `e:\故事\1` → `故事/1`、`d:\proj\v2` → `proj/v2`），对聚合目录结合会话已改/已读文件自动细化子项目（如 `e:\work` → `work/agy-dart`），并从 Antigravity 官方 `conversation_summaries.db` 只读提取左侧会话短标题与兜底工作区路径（**100% 杜绝泄露原始用户 Prompt**）。
+   - 全面升级右下角桌面弹窗（TTL 临期 + 卡死看门狗）、`PreInvocation` 聊天内零前缀污染横幅（`systemMessage: ""`）以及 Sidecar 跨会话告警条（`wd-other-alerts`），在死守 Windows `NotifyIcon` `title <= 60B` / `body <= 220B` 字节预算与 UTF-8 零截断乱码的前提下精准标出所属窗口与对话短标题。
+2. **新增「上下文快满了」（`critical` 告急水位）右下角桌面提醒（空闲 0 `statSync`）**：
+   - 新增 `_evaluateWatermarkNotifications` 与 `watermarkDesktopNotify`（`AGY_DART_WATERMARK_DESKTOP_NOTIFY`，默认 `null` 自动跟随桌面提醒开关，已开桌面通知的用户零配置即刻生效）：主会话进入告急水位时自动弹出 1 次右下角提醒（如 `agy-dart [work/agy-dart]：上下文快满了`），执行 `/compact` 回落 `ok` 水位后自动重置，且全空闲巡检严格保持 **`0` 次 `fs.statSync`**。
+
 ## v1.5.2 核心升级（钩子与 SQLite 热路径提速、HTML/Dart 符号大纲、Windows UTF-8 管道与面板并发轮询）
 
 1. **生命周期钩子与 SQLite 冷启动极速快跳**：

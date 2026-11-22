@@ -112,17 +112,36 @@ export async function handleStopPayload(payload = {}, options = {}) {
         ? store.isTtlDesktopNotifyEnabled()
         : effectiveCfg.ttlDesktopNotify
     );
-    if (!watchdogActive && !ttlNotifyActive) {
-      const existing = readWatchdogLease(store, directConvId);
+    const watermarkNotifyActive =
+      effectiveCfg.watermarkDesktopNotify === true ||
+      (effectiveCfg.watermarkDesktopNotify === null && ttlNotifyActive);
+    const existing = readWatchdogLease(store, directConvId);
+    if (!watchdogActive && !ttlNotifyActive && !watermarkNotifyActive) {
       if (!existing || existing.phase === WATCHDOG_PHASES.IDLE) {
         return { updated: false, reason: "disabled" };
       }
     }
     const sessionId = resolveSessionId(safePayload);
+    let stopModifiedPaths = [];
+    if (
+      existing?.cwd &&
+      (!existing.workspaceLabel || !existing.workspaceLabel.includes("/")) &&
+      typeof store.getSessionCheckpoint === "function"
+    ) {
+      try {
+        const cp = store.getSessionCheckpoint(directConvId) || store.getSessionCheckpoint(sessionId);
+        if (Array.isArray(cp?.modifiedFiles)) {
+          stopModifiedPaths = cp.modifiedFiles
+            .map((f) => (typeof f === "string" ? f : f?.path || ""))
+            .filter(Boolean);
+        }
+      } catch {}
+    }
     const lease = recordHookLeaseTransition(store, "Stop", safePayload, {
       directConvId,
       rootSessionId: sessionId,
       cwd: safePayload.cwd || "",
+      ...(stopModifiedPaths.length > 0 ? { modifiedOrReadPaths: stopModifiedPaths } : {}),
       ...(safeOptions.stopReason !== undefined ? { stopReason: safeOptions.stopReason } : {}),
       ...(safeOptions.fullyIdle !== undefined ? { fullyIdle: safeOptions.fullyIdle } : {}),
       ...(safeOptions.error !== undefined ? { error: safeOptions.error } : {})
