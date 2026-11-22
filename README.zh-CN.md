@@ -8,7 +8,7 @@
 
 零运行期依赖 · 双引擎零冲突协作 · 死守 ≤ 8.8 KB 零溢盘 · 内置实时 Sidecar 面板 · 支持一键补装 `rg`
 
-简体中文 · [English](README.md) · [第三方开源致谢与许可](THIRD_PARTY_NOTICES.md)
+简体中文 · [English](README.md) · [社区反馈与改进](#社区反馈与改进community-feedback--improvements) · [第三方开源致谢与许可](THIRD_PARTY_NOTICES.md)
 
 </div>
 
@@ -79,6 +79,47 @@
 4. **安全补强与数据库 TTL/Vacuum 维护**：
    - `ctx_index(url)` 补齐 SSRF 防护（仅 `http:`/`https:`、最多 5 跳相对重定向、逐跳 DNS 私网/回环/链路本地 IP 拦截与 DNS pinning），落库/回传前默认执行轻量密钥正则脱敏（可用 `AGY_DART_DISABLE_SECRET_REDACTION=1` 关闭），并支持可选敏感文件读取提醒（`AGY_DART_SENSITIVE_FILE_GUARD=warn|deny`）。
    - Markdown 标题感知分块、SHA-256 内容去重、每日轻量 TTL 清理、`ctx_purge({ scope: "stale", vacuum: true })` 与 Sidecar 一键 **Prune & Vacuum**。
+
+---
+
+## 社区反馈与改进（Community Feedback & Improvements）
+
+本区域专门记录来自社区真实工作流的吐槽、痛点原文，以及对应的工程改造方案与底层设计原理。欢迎继续通过 GitHub Issue 或评论区反馈真实踩坑场景。
+
+### `[v1.3.0]` 16 KB 默认读拦截误伤代码评审（`.patch`）与无 MCP 子代理
+
+#### 1. 社区反馈原文
+
+> 「Claude 没有这个限制。大文件它会分段读完，不会因此停下来。这个 16 KB 的限制也不是 Antigravity 自带的，而是你那台机器上 Antigravity 配置里加的一道读前检查（agy-dart protection），放宽它或者给评审目录开个例外就能解决，16kb 单文件读写居然是默认配置吗」
+
+> 「@xcq: 我是让他做我工作流的 reviewer，会碰到这种情况，git 的 patch 文件直接拒绝读写，因为单个 patch 文件随便就超过 16kb 了碰到现在的默认设置就会失败，我走了 `AGY_DART_DISABLE_READ_HOOK=1`」
+
+*(注：`agy-dart` 从不拦截写操作，仅在读文件前做保护；但对 code reviewer 来说，读 `.patch` 失败就足以直接中断整个评审流程。)*
+
+顺着这两条反馈做全链路代码复核后，共定位出 `v1.2.2` 的 **5 处深层工程根因**：
+1. **在宿主能力的 35% 处永久硬拒**：Antigravity 原生 `read_file` 自带 `46,080 B`（45 KiB）/ 800 行硬封顶与分页续读，但 `v1.2.2` 沿袭上游 `context-mode` 在 16 KB 就抢先硬 `deny`，且唯独大文件守卫没有 2-strike 重试旁路。
+2. **合法翻页续读被自己误杀**：`ByteOffset` 原本在大文件拦截**之后**才解析，省略 `EndLine` 的 `StartLine` 续读会被 `isWideRange` 挡住；宽行多行文本（如中文长段）超 36 KB 还会被误报为“压缩单行文件”。
+3. **代码评审链路断层**：`agy-dart_fast` `read_slices({ outlines })` 缺少 `.patch`/`.diff` 解析器；退回 `git diff` / `gh pr diff` 时，`filterGitDiff` 会剥光所有 `' '` 上下文行（且 `gh pr view` 正文含 diff 代码块会误抹 PR 元数据）。
+4. **无 MCP 子代理死锁（上游 `context-mode#1311` 同款）**：未挂载 `agy-dart_context` 的 reviewer / research 子代理撞上硬 `deny` 后无路可走。
+5. **三通道强耦合**：原逻辑中勾选 `exemptExtensions` 会短路跳过整个 `readDedup`，且 `run_command` 的 `cat`/`curl` 共用 `maxReadBytes` 与 `exemptExtensions`，设 `0` 或勾选豁免会连带放穿终端大文件/二进制直吐。
+
+#### 2. 改进方案（`v1.2.2` → `v1.3.0`）
+
+| 维度 | 旧版 `v1.2.2` | 新版 `v1.3.0` 改造 |
+| :--- | :--- | :--- |
+| **读文件阈值模型** | 一刀切 `16 KB / 410 行` 永久硬 `deny` | **四层风险分级 + 2-strike 软护栏（默认 `host-45k`）**：<br>• Tier 0（附件 / 指令文档 / 二进制）：0-SQLite 直放<br>• Tier 1（高噪日志 / 锁文件 / 压缩单行）：死守 **`16 KB`**（`noiseMaxReadBytes`）<br>• Tier 2（常规源码 / 文档）：精确对齐宿主 **`45 KiB`（`46,080 B`）/ 800 行** + 2-strike<br>• Tier 3（`.patch` / `.diff` 评审）：**`128 KB`**（`reviewMaxReadBytes`）直放，超限 2-strike |
+| **分页续读与防死锁** | 拦截 `ByteOffset` / 开放尾行；无 MCP 子代理卡死 | 前置 `ByteOffset` 余量计算与合法续读放行；区分压缩单行与宽行多行文本（动态给出 `suggestedLines`）；5 分支会话/子代理/匿名 TTL 隔离 + 读缓存优先防三连拒；子代理支持 2-strike 原生降级 |
+| **通道解耦与安全** | 豁免跳过 `readDedup` 且放穿 `cat`/`curl` | `read_file` 体积豁免仅跳过大小拦截，**完整保留 `readDedup`/`diffRead`**；`run_command` 拆出独立 `shellDumpMaxBytes = 16 KB` 并彻底移除 `exemptExtensions` 依赖；补齐 `realpathSync` 防软链穿透与严格整型参数校验 |
+| **代码评审一等公民** | `.patch` 无大纲；`git diff` 剥上下文 | `read_slices({ outlines })` 新增原生 `.patch`/`.diff` 文件与 `@@` hunk 大纲解析；`filterGitDiff` 升级为 `<= 7.9 KB` 内**三阶段保真**（预算内 100% 留上下文 → `-U`/`-W` 保上下文截断 → 1 行上下文再压缩）+ 修复 `gh pr view` 误伤 |
+| **可信配置与平滑升级** | 只能用 `AGY_DART_DISABLE_READ_HOOK=1` 一锅端 | `~/.agy-dart/config.json` 新增 `readGuardMode`（`soft`/`strict`/`off`）、分档阈值、`exemptExtensions` 与线性无 ReDoS `exemptPaths`；`cutoff:source` 升级自动将旧默认 `16384` 迁至 `46080` 且保留用户自定义值 |
+
+#### 3. 底层设计原理（为什么这样改，而不是直接取消拦截）
+
+1. **对齐宿主物理天花板，消灭「负 ROI 拦截区间」**：Antigravity 原生 `read_file` 已将单次读取封顶在 `46,080 B`（~11.5K tokens）/ 800 行。在 `16 KB ~ 45 KiB` 间硬拦省下的 token 很少，却会多烧 1 轮 TTFT + 整段前缀 Cache Read 费用（负收益）；对齐 `45 KiB` 后，凡放行必一轮无损读完，只在真正需要多轮分页（`> 45 KiB`）时再引导大纲切片。
+2. **按「信噪比与阅读模式」分层，而非按字节一刀切**：日志/锁文件/压缩包几乎无需逐行通读，走 `ctx_execute` 沙箱聚合压缩率 >90%，继续死守 `16 KB`；源码需要上下文对齐 `45 KiB`；`.patch`/`.diff` 评审需要按变更顺序通读找未知逻辑 Bug，因此给到 `128 KB` 直放 + 超限给原生 Diff Outline。
+3. **2-Strike 软护栏防死锁，配合 5 分支 TTL 隔离防抖动**：Hook 无法预知所有子代理的 MCP 权限，也不应成为流程单点死锁；重试一次放行（由宿主 45 KiB 兜底）兼顾首轮引导与零卡死，同时按独立对话 / 带 ID 子代理 / 匿名子代理 / 仅父 ID / 匿名工作区 5 分支隔离确认窗、续读刷新 TTL、读缓存优先于大文件拦截（彻底消除三连拒）。
+4. **严格解耦「有宿主封顶通道」与「无封顶通道」**：`read_file` 有宿主 45 KiB 兜底，但 `cat` / `curl` / `git diff` 没有任何原生上限——放宽 `read_file` 绝不能放宽 `cat`/`curl`（独立 `shellDumpMaxBytes`），也不能靠 `skipFlags` 绕过 `cli-filter.mjs`（否则 5 MB diff 会无封顶、无脱敏直吐）；跳过大文件首次拦截也绝不等于跳过 `readDedup` 去重。
+5. **安全与威胁模型守恒**：`exemptPaths` / `exemptExtensions` 仅从可信用户级 `~/.agy-dart/config.json` 与环境变量加载（不默认信任仓库内配置防上下文 DoS），严格执行于 `sensitiveFileGuard` 之后，且全部经 `fs.realpathSync` 校验与线性段匹配防 ReDoS。
 
 ---
 

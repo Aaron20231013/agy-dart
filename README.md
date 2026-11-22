@@ -8,7 +8,7 @@
 
 Zero Runtime Dependencies · Dual-Engine Co-op · Hard `<= 8.8 KB` No-Spill Budget · Built-in Live Sidecar Dashboard · Optional Auto `rg` Setup
 
-[简体中文](README.zh-CN.md) · English · [Third-Party Notices](THIRD_PARTY_NOTICES.md)
+[简体中文](README.zh-CN.md) · English · [Community Feedback & Improvements](#community-feedback--improvements) · [Third-Party Notices](THIRD_PARTY_NOTICES.md)
 
 </div>
 
@@ -79,6 +79,51 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 4. **Security Hardening & DB Maintenance**:
    - SSRF-hardened `ctx_index(url)` (`http:`/`https:` whitelist, max 5 redirects with relative `Location` resolution, per-hop DNS & IPv4/IPv6 private/loopback/link-local blocking with DNS pinning), configurable secret redaction before indexing/return (`AGY_DART_DISABLE_SECRET_REDACTION=1` to opt out), and optional sensitive-file read guard (`AGY_DART_SENSITIVE_FILE_GUARD=warn|deny`).
    - Heading-aware Markdown chunking, SHA-256 content dedup, daily TTL pruning, `ctx_purge({ scope: "stale", vacuum: true })`, and one-click **Prune & Vacuum** in the Sidecar Dashboard.
+
+---
+
+## Community Feedback & Improvements
+
+This dedicated section tracks real-world friction reported by the community (preserving the original feedback), along with the exact engineering fixes and underlying design principles shipped in response.
+
+### `[v1.3.0]` 16 KB Default Read Guard Blocking Code Review (`.patch`) & MCP-less Subagents
+
+#### 1. Original Community Feedback
+
+> *"Claude doesn't have this limit — it reads large files in chunks without stopping. This 16 KB limit isn't built into Antigravity either; it's a pre-read check (`agy-dart protection`) from your local config. Relaxing it or exempting the review directory fixes it — is a 16 KB single-file read/write limit seriously the default config?"*
+>
+> *(Original Chinese: 「Claude 没有这个限制。大文件它会分段读完，不会因此停下来。这个 16 KB 的限制也不是 Antigravity 自带的，而是你那台机器上 Antigravity 配置里加的一道读前检查（agy-dart protection），放宽它或者给评审目录开个例外就能解决，16kb 单文件读写居然是默认配置吗」)*
+
+> *"`@xcq`: I use it as a reviewer in my workflow and hit this exact issue — git `.patch` files get rejected directly because a single patch easily exceeds 16 KB and fails under the default config, so I fell back to `AGY_DART_DISABLE_READ_HOOK=1`."*
+>
+> *(Original Chinese: 「@xcq: 我是让他做我工作流的 reviewer，会碰到这种情况，git 的 patch 文件直接拒绝读写，因为单个 patch 文件随便就超过 16kb 了碰到现在的默认设置就会失败，我走了 `AGY_DART_DISABLE_READ_HOOK=1`」)*
+
+*(Note: `agy-dart` never restricts writes—only pre-read guards—but blocking `.patch` reads is enough to stall a review workflow.)*
+
+End-to-end codebase auditing against these reports exposed **5 deeper root causes in `v1.2.2`**:
+1. **Permanent hard-deny at 35% of the host's native cap**: Antigravity's native `read_file` already caps each call at `46,080 B` (45 KiB) / 800 lines with native pagination, yet `v1.2.2` inherited a 16 KB hard-deny with no 2-strike bypass (unlike `read-dedup` and `diff-read` in the same file).
+2. **Valid host pagination blocked by the hook itself**: `ByteOffset` was parsed *after* the size guard, open-ended `StartLine` continuations hit `isWideRange`, and wide multi-line prose/logs exceeding 36 KB were mislabeled as `"giant single-line/minified content"`.
+3. **Broken code-review fallback chain**: `agy-dart_fast` `read_slices({ outlines })` had no `.patch`/`.diff` parser, while `filterGitDiff` stripped all `' '` context lines from `git diff` and `gh pr diff` (and `filterGhCli` wiped `gh pr view` metadata whenever a PR body contained a Markdown diff fence).
+4. **MCP-less subagent deadlock (same class as upstream `context-mode#1311`)**: Reviewer/research subagents without `agy-dart_context` tools stalled when hard-denied with MCP-only instructions.
+5. **Cross-channel coupling**: Text extension exemptions short-circuited before `readDedup`, and `run_command` (`cat`/`curl`) shared `maxReadBytes` and `exemptExtensions`, meaning disabling the read cutoff or adding exemptions could inadvertently punch holes through shell dump protection.
+
+#### 2. Solution Shipped (`v1.2.2` → `v1.3.0`)
+
+| Area | Before (`v1.2.2`) | After (`v1.3.0`) |
+| :--- | :--- | :--- |
+| **Read Threshold Model** | Flat `16 KB / 410 lines` permanent hard `deny` | **4-Tier Risk Model + 2-Strike Soft Guard (default `host-45k`)**:<br>• Tier 0 (attachments / instructions / binaries): 0-SQLite allow<br>• Tier 1 (high-noise logs / lockfiles / minified): **`16 KB`** (`noiseMaxReadBytes`)<br>• Tier 2 (source code / docs): **`45 KiB` (`46,080 B`) / 800 lines** + 2-strike<br>• Tier 3 (`.patch` / `.diff` review): **`128 KB`** (`reviewMaxReadBytes`) direct allow, 2-strike above |
+| **Pagination & Anti-Deadlock** | Blocked `ByteOffset` & open-ended `StartLine`; stalled MCP-less subagents | Pre-guard `ByteOffset` remaining-bytes check & valid continuation allow; split minified vs wide multi-line slices (computing `suggestedLines`); 5-branch session/subagent/anonymous TTL isolation + pre-1a read-cache priority (eliminates 3-strike trap); subagent 2-strike native fallback |
+| **Channel Decoupling & Security** | Exemptions skipped `readDedup` & leaked into `cat`/`curl` | `read_file` size exemptions skip Section 1a only (**preserving `readDedup`/`diffRead`**); `run_command` uses independent `shellDumpMaxBytes = 16 KB` with `exemptExtensions` removed; `realpathSync` symlink checks & strict integer `parseLineArg` |
+| **First-Class Code Review** | No `.patch` outliner; `git diff` stripped context | Native zero-dep `.patch`/`.diff` parser (`extractDiffSymbols`) in `read_slices({ outlines })`; **3-stage context-preserving `filterGitDiff`** inside `<= 7.9 KB` (lossless within budget → `-U`/`-W` preserved cap → 1-line context before compact `+/-`) + fixed `gh pr view` detection |
+| **Trusted Config & Upgrade** | Required `AGY_DART_DISABLE_READ_HOOK=1` | `~/.agy-dart/config.json` adds `readGuardMode` (`soft`/`strict`/`off`), per-tier cutoffs, `exemptExtensions`, and linear ReDoS-proof `exemptPaths`; `cutoff:source` migrates legacy `16384` default to `46080` while preserving user-chosen cutoffs |
+
+#### 3. Underlying Design Principles
+
+1. **Align with the host's physical ceiling to eliminate negative-ROI blocks**: Because Antigravity's host `read_file` already caps single responses at `46,080 B` (~11.5K tokens) / 800 lines, hard-blocking `16 KB–45 KiB` files saves minimal tokens while paying an extra full-prefix LLM round trip (negative ROI). Aligning source defaults to `45 KiB` guarantees 1-turn lossless reads below the cap and intervenes only when multi-turn paging is actually unavoidable.
+2. **Tier by signal-to-noise ratio and reading mode, not flat file size**: Logs, lockfiles, and minified bundles rarely benefit from sequential reading (`ctx_execute` cuts >90%, keeping `16 KB`); source code aligns to `45 KiB`; sequential code-review `.patch`/`.diff` files need linear inspection to catch logic bugs (`128 KB` direct allow + native Diff Outline above).
+3. **Soft 2-strike guardrails over permanent deadlocks**: Hooks cannot assume every subagent has MCP tools. A 2-strike retry path (bounded by the host's 45 KiB ceiling) preserves Turn-1 guidance while guaranteeing zero deadlocks—backed by 5-branch TTL key isolation, TTL refresh across continuation pages, and read-cache priority so retries never loop into 3-strike chains.
+4. **Strictly decouple host-capped channels from uncapped channels**: `read_file` has a 45 KiB host cap, whereas `cat`, `curl`, and `git diff` do not. Relaxing `read_file` must never relax shell dump guards (`shellDumpMaxBytes`) or bypass `cli-filter.mjs` via `skipFlags` (which would expose unbounded 5 MB diffs without secret redaction), and skipping first-read size checks must never disable `readDedup`.
+5. **Preserve the security threat model**: `exemptPaths` and `exemptExtensions` are loaded exclusively from trusted user-level `~/.agy-dart/config.json` and env vars (never from untrusted repo configs), run strictly after `sensitiveFileGuard`, validate symlink targets via `fs.realpathSync`, and use linear segment matching to eliminate ReDoS.
 
 ---
 
