@@ -28,6 +28,19 @@
 
 ---
 
+## v1.5.4 核心升级（双端点击跳转到对应会话 + 按对话独立计次的 KV-Cache 自动续温）
+
+1. **右下角系统通知弹窗点击直达目标会话（跨窗口唤醒 + `pendingJump` 状态桥）**：
+   - `context/lib/watchdog.js` 升级 Windows `NotifyIcon` 脚本为非阻塞 WinForms 消息循环（绑定 `BalloonTipClicked` / `BalloonTipClosed`），点击后立即输出快路径信令并通过零注入环境变量驱动 Win32 `AgyDartWinFocus`（剔除 `DWMWA_CLOAKED` 隐藏窗、启动器与浏览器进程，按「对话短标题 > 工作区目录 > 子项目标签」评分置顶目标 Antigravity 窗口，不缩放已最大化窗口），随后以退出码 `42` 收尾。
+   - 三类桌面弹窗（TTL 临期、告急水位、卡死看门狗）统一在点击时写入 `20s` TTL 的 `watchdog:pending_jump` 票据，全空闲巡检继续保持 **`0` 次 `fs.statSync`**，严守 `title <= 60B` / `body <= 220B` 与零用户 Prompt 泄露边界。
+2. **Sidecar 面板跨会话告警胶囊点击跳转 + 多窗口会话快切栏**：
+   - `sidecars/dashboard/server.mjs`（`POST /api/watchdog/action`）新增 `focusConversation`（支持只读 `conversation_summaries.db` 兜底补齐历史会话路径/标题并唤醒目标窗口）与幂等 `ackJump`。
+   - `sidecars/dashboard/index.html` 为 `#wd-other-alerts` 增加鼠标点击与 `Enter/Space` 键盘跳转，新增 `#wd-session-switcher` 多窗口主会话快切胶囊栏，并在窗口 `focus` / `visibilitychange` 时结合 `window.sidecar.getWorkspaceUris()` 实现本工作区 **0ms 优先认领**（无目录归属时 `1.2s` 兜底认领）调用 `window.sidecar.ui.toggleConversation(conversationId)` 精准切回目标对话。
+3. **KV-Cache TTL 自动续温保活（默认每对话 `3` 次额度）与第一栏「当前上下文」高亮总览**：
+   - `context/lib/watchdog.js`、`sidecars/dashboard/server.mjs` 与 `sidecars/dashboard/index.html` 新增后台空闲自动续温（`#kv-keepalive-group` 支持开关、`1–20` 次调节与手动重置）：主会话在 TTL 到期前约 `30` 秒自动发送极轻量 OK 保活指令续期（按会话解析并缓存 `projectId`、发送失败自动回滚额度、自动跳过子智能体与后台工作流挂起态，并在保活额度用尽前抑制重复桌面临期弹窗）；同时为实证 TTL 校准增加模型基线保底（`>= profile.ttlSec`），防止隐式缓存偶发副本/漂移未命中将 TTL 误压低至 `<5m` 导致保活过早触发。
+   - `hooks/pre-invocation.mjs` 与 `context/lib/watchdog-lease.js` 完整兼容 `agentapi send-message` 注入 `SYSTEM_MESSAGE` 且残留上一轮 `lastUserInput` 的真实通道：精准识别 `[agy-dart TTL保活]` 轮次（不误重置 `1/3 → 2/3 → 3/3` 计次、不覆盖 `lastUserInput`、不误清 `/compact` 后读缓存、不消耗 `readDedup`/`diffRead` 轮次），并在你本人发送下一条真实消息时自动归零为 `0/N`。
+   - 面板收口为聚焦本次对话统计（隐藏顶部范围切换与 `统计范围：当前对话` 状态条），并将「本次对话上下文总览」（`#ctx-overview-box` / `#ctx-spotlight-box`）置顶到第一栏独立异色卡片中，综合呈现大号「当前上下文」容量条、缓存温度/TTL 倒计时、缓存命中率与护栏已挡冗余 Token。
+
 ## v1.5.3 核心升级（多窗口工作区/子项目 + 官方对话短标题定位与「上下文快满了」桌面提醒）
 
 1. **多窗口工作区/子项目智能细化与官方会话短标题定位（零 Prompt 泄露）**：

@@ -60,6 +60,10 @@ export const CONFIG_DEFAULTS = Object.freeze({
   ttlDesktopNotify: false,
   ttlNotifyLeadSec: 60,
   ttlNotifyMinTokens: 60000,
+  ttlKeepalive: true,
+  ttlKeepaliveMaxCount: 3,
+  ttlKeepaliveLeadSec: 30,
+  ttlKeepaliveMinTokens: 0,
   watermarkDesktopNotify: null,
   uiLang: "en"
 });
@@ -497,6 +501,30 @@ export function getConfigSnapshot(options = {}) {
     clampInt(parsePositiveInt(env?.AGY_DART_TTL_NOTIFY_MIN_TOKENS), 4000, 500000),
     clampInt(parsePositiveInt(cfg.ttlNotifyMinTokens), 4000, 500000)
   );
+  let ttlKeepaliveEnv;
+  if (parseEnvBool(env?.AGY_DART_DISABLE_TTL_KEEPALIVE) === true) {
+    ttlKeepaliveEnv = false;
+  } else {
+    ttlKeepaliveEnv =
+      parseEnvBool(env?.AGY_DART_TTL_KEEPALIVE) ??
+      parseDisableEnvFlag(env?.AGY_DART_DISABLE_TTL_KEEPALIVE);
+  }
+  pick("ttlKeepalive", ttlKeepaliveEnv, cfgBool("ttlKeepalive"));
+  pick(
+    "ttlKeepaliveMaxCount",
+    clampInt(parsePositiveInt(env?.AGY_DART_TTL_KEEPALIVE_MAX_COUNT), 1, 20),
+    clampInt(parsePositiveInt(cfg.ttlKeepaliveMaxCount), 1, 20)
+  );
+  pick(
+    "ttlKeepaliveLeadSec",
+    clampInt(parsePositiveInt(env?.AGY_DART_TTL_KEEPALIVE_LEAD_SEC), 10, 180),
+    clampInt(parsePositiveInt(cfg.ttlKeepaliveLeadSec), 10, 180)
+  );
+  pick(
+    "ttlKeepaliveMinTokens",
+    clampInt(parseNonNegativeInt(env?.AGY_DART_TTL_KEEPALIVE_MIN_TOKENS), 0, 500000),
+    clampInt(parseNonNegativeInt(cfg.ttlKeepaliveMinTokens), 0, 500000)
+  );
   pick(
     "watermarkDesktopNotify",
     parseEnvBool(env?.AGY_DART_WATERMARK_DESKTOP_NOTIFY),
@@ -586,6 +614,7 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra
   lines.push(
     `  - TTL alert     : desktopNotify=${values.ttlDesktopNotify} (${sources.ttlDesktopNotify}), ` +
       `watermarkNotify=${wmNotifyDisplay} (${sources.watermarkDesktopNotify}), ` +
+      `keepalive=${values.ttlKeepalive} (${sources.ttlKeepalive}, max=${values.ttlKeepaliveMaxCount}, lead=${values.ttlKeepaliveLeadSec}s), ` +
       `lead=${values.ttlNotifyLeadSec}s, minTokens=${values.ttlNotifyMinTokens}, lang=${values.uiLang} (${sources.uiLang})`
   );
 

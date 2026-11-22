@@ -7,6 +7,16 @@ import {
   FILE_CATEGORIES
 } from "./schema.js";
 
+const DEFAULT_PROFILE_COLD_FLOOR_SEC = 300;
+
+function resolveProfileColdFloorSec(profileId) {
+  return profileId === "deepseek-128k" ? 600 : DEFAULT_PROFILE_COLD_FLOOR_SEC;
+}
+
+function resolveModelColdFloorSec(modelStr) {
+  return typeof modelStr === "string" && /deepseek/i.test(modelStr) ? 600 : DEFAULT_PROFILE_COLD_FLOOR_SEC;
+}
+
 export const STAR_PROMPT_META_KEY = "star_prompt";
 export const CACHE_AUDIT_PASSED_META_KEY = "cache_audit:passed_at";
 export const STAR_PROMPT_STATES = Object.freeze(["pending", "clicked", "dismissed", "copied_cli"]);
@@ -1093,6 +1103,138 @@ export class SettingsMaintenanceMethods {
     return boolVal;
   }
 
+  /** Check if KV-cache TTL auto-keepalive is enabled (default ON; env > sqlite > config) */
+  isTtlKeepaliveEnabled() {
+    const snap = getConfigSnapshot();
+    if (snap.sources.ttlKeepalive === "env") {
+      return Boolean(snap.values.ttlKeepalive);
+    }
+    this.open();
+    const raw = this.getMeta("cache:ttl_keepalive_enabled", null);
+    if (raw !== null) {
+      return raw !== "false" && raw !== "0";
+    }
+    return Boolean(snap.values.ttlKeepalive);
+  }
+
+  /** Enable or disable KV-cache TTL auto-keepalive in SQLite meta */
+  setTtlKeepaliveEnabled(enabled) {
+    this.open();
+    const boolVal = Boolean(enabled && enabled !== "false" && enabled !== "0");
+    this.setMeta("cache:ttl_keepalive_enabled", boolVal ? "true" : "false");
+    return boolVal;
+  }
+
+  /** Resolve max auto-keepalive activations per conversation before a fresh user message (1..20, default 3) */
+  getTtlKeepaliveMaxCount() {
+    const snap = getConfigSnapshot();
+    const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 3)));
+    if (snap.sources.ttlKeepaliveMaxCount === "env") {
+      return clampMax(snap.values.ttlKeepaliveMaxCount);
+    }
+    this.open();
+    const raw = this.getMeta("cache:ttl_keepalive_max_count", null);
+    if (raw !== null && raw !== "") {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n >= 1) return clampMax(n);
+    }
+    return clampMax(snap.values.ttlKeepaliveMaxCount ?? 3);
+  }
+
+  /** Persist max auto-keepalive count (1..20) in SQLite meta */
+  setTtlKeepaliveMaxCount(maxCount) {
+    const clamped = Math.min(20, Math.max(1, Math.floor(Number(maxCount) || 3)));
+    this.open();
+    this.setMeta("cache:ttl_keepalive_max_count", String(clamped));
+    return clamped;
+  }
+
+  _sanitizeKeepaliveConvId(conversationId) {
+    if (typeof conversationId !== "string") return "";
+    const trimmed = conversationId.trim();
+    if (!trimmed || trimmed.length > 128) return "";
+    if (trimmed === "." || trimmed === ".." || trimmed.includes("..")) return "";
+    if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) return "";
+    const lower = trimmed.toLowerCase();
+    if (lower === "default" || lower === "all" || lower === "lifetime" || lower === "app") return "";
+    return trimmed;
+  }
+
+  /** Read per-conversation TTL auto-keepalive activation state */
+  getTtlKeepaliveState(conversationId) {
+    const empty = {
+      usedCount: 0,
+      lastIdleAnchorTs: 0,
+      lastSentTs: 0,
+      pendingAck: false,
+      lastError: "",
+      updatedTs: 0
+    };
+    const cleanId = this._sanitizeKeepaliveConvId(conversationId);
+    if (!cleanId) return empty;
+    this.open();
+    const raw = this.getMeta(`cache:ttl_keepalive_state:${cleanId}`, null);
+    if (!raw || typeof raw !== "string") return empty;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return empty;
+      return {
+        usedCount: Number.isFinite(Number(parsed.usedCount)) && Number(parsed.usedCount) >= 0 ? Math.floor(Number(parsed.usedCount)) : 0,
+        lastIdleAnchorTs: Number.isFinite(Number(parsed.lastIdleAnchorTs)) && Number(parsed.lastIdleAnchorTs) > 0 ? Math.floor(Number(parsed.lastIdleAnchorTs)) : 0,
+        lastSentTs: Number.isFinite(Number(parsed.lastSentTs)) && Number(parsed.lastSentTs) > 0 ? Math.floor(Number(parsed.lastSentTs)) : 0,
+        pendingAck: Boolean(parsed.pendingAck),
+        lastError: typeof parsed.lastError === "string" ? parsed.lastError.slice(0, 180) : "",
+        updatedTs: Number.isFinite(Number(parsed.updatedTs)) && Number(parsed.updatedTs) > 0 ? Math.floor(Number(parsed.updatedTs)) : 0
+      };
+    } catch {
+      return empty;
+    }
+  }
+
+  /** Merge & persist per-conversation TTL auto-keepalive state */
+  setTtlKeepaliveState(conversationId, patch = {}) {
+    const cleanId = this._sanitizeKeepaliveConvId(conversationId);
+    if (!cleanId) return null;
+    this.open();
+    const cur = this.getTtlKeepaliveState(cleanId);
+    const safePatch = patch && typeof patch === "object" ? patch : {};
+    const next = {
+      usedCount:
+        safePatch.usedCount !== undefined
+          ? Math.max(0, Math.floor(Number(safePatch.usedCount) || 0))
+          : cur.usedCount,
+      lastIdleAnchorTs:
+        safePatch.lastIdleAnchorTs !== undefined
+          ? Math.max(0, Math.floor(Number(safePatch.lastIdleAnchorTs) || 0))
+          : cur.lastIdleAnchorTs,
+      lastSentTs:
+        safePatch.lastSentTs !== undefined
+          ? Math.max(0, Math.floor(Number(safePatch.lastSentTs) || 0))
+          : cur.lastSentTs,
+      pendingAck: safePatch.pendingAck !== undefined ? Boolean(safePatch.pendingAck) : cur.pendingAck,
+      lastError:
+        safePatch.lastError !== undefined ? String(safePatch.lastError || "").slice(0, 180) : cur.lastError,
+      updatedTs:
+        safePatch.updatedTs !== undefined && Number.isFinite(Number(safePatch.updatedTs))
+          ? Math.floor(Number(safePatch.updatedTs))
+          : Date.now()
+    };
+    this.setMeta(`cache:ttl_keepalive_state:${cleanId}`, JSON.stringify(next));
+    return next;
+  }
+
+  /** Reset per-conversation TTL auto-keepalive counter back to 0 */
+  resetTtlKeepaliveState(conversationId, nowMs = Date.now()) {
+    return this.setTtlKeepaliveState(conversationId, {
+      usedCount: 0,
+      lastIdleAnchorTs: 0,
+      lastSentTs: 0,
+      pendingAck: false,
+      lastError: "",
+      updatedTs: nowMs
+    });
+  }
+
   /** Resolve UI/alert language ('zh' | 'en') and provenance ('env' | 'sqlite' | 'config' | 'default') */
   getUiLangInfo() {
     const snap = getConfigSnapshot();
@@ -1156,11 +1298,12 @@ export class SettingsMaintenanceMethods {
         }
         return out.slice(-20);
       };
+      const coldFloorSec = resolveProfileColdFloorSec(cleanId);
       return {
         v: 1,
         profileId: cleanId,
         warm: filterSamples(parsed.warm, 180),
-        cold: filterSamples(parsed.cold, 120),
+        cold: filterSamples(parsed.cold, coldFloorSec),
         seen1hWrite: Boolean(parsed.seen1hWrite),
         updatedTs
       };
@@ -1205,8 +1348,9 @@ export class SettingsMaintenanceMethods {
             }
             return list.slice(-20);
           };
+          const coldFloorSec = resolveProfileColdFloorSec(pid);
           const warm = filterSamples(parsed.warm, 180);
-          const cold = filterSamples(parsed.cold, 120);
+          const cold = filterSamples(parsed.cold, coldFloorSec);
           const seen1hWrite = Boolean(parsed.seen1hWrite);
           if (warm.length > 0 || cold.length > 0 || seen1hWrite) {
             out[pid] = {
@@ -1280,10 +1424,25 @@ export class SettingsMaintenanceMethods {
         return { list: merged.slice(-20), addedNew };
       };
 
+      const coldFloorSec = resolveProfileColdFloorSec(pid);
+      let hadLegacySubFloorCold = false;
+      try {
+        const rawStored = this.getMeta(`ttl_calibration:v1:${pid}`, null);
+        if (rawStored) {
+          const parsedRaw = JSON.parse(rawStored);
+          if (Array.isArray(parsedRaw?.cold)) {
+            hadLegacySubFloorCold = parsedRaw.cold.some(
+              (c) => c && Number.isFinite(Number(c.gapSec)) && Number(c.gapSec) < coldFloorSec
+            );
+          }
+        }
+      } catch {}
+
       const warmRes = mergeRing(existing.warm, obs.warm, 180);
-      const coldRes = mergeRing(existing.cold, obs.cold, 120);
+      const coldRes = mergeRing(existing.cold, obs.cold, coldFloorSec);
       const next1h = Boolean(existing.seen1hWrite || obs.seen1hWrite);
-      const changed = warmRes.addedNew || coldRes.addedNew || next1h !== existing.seen1hWrite;
+      const changed =
+        warmRes.addedNew || coldRes.addedNew || next1h !== existing.seen1hWrite || hadLegacySubFloorCold;
       if (!changed) continue;
 
       const record = {
@@ -1299,6 +1458,60 @@ export class SettingsMaintenanceMethods {
     }
 
     return { updatedProfiles };
+  }
+
+  /** Scrub legacy sub-baseline (< profile.ttlSec) cold noise & empirical leases in SQLite meta */
+  sanitizeModelTtlState() {
+    this.open();
+    let scrubbedCalibrations = 0;
+    let clampedLeases = 0;
+    try {
+      this._withWriteTx(() => {
+        const calRows = this.db
+          .prepare("SELECT key, value FROM meta WHERE key LIKE 'ttl_calibration:v1:%'")
+          .all();
+        const upsertStmt = this.db.prepare(
+          "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        );
+        for (const row of calRows || []) {
+          if (!row || typeof row.key !== "string" || typeof row.value !== "string") continue;
+          const pid = row.key.slice("ttl_calibration:v1:".length).trim();
+          const floorSec = resolveProfileColdFloorSec(pid);
+          try {
+            const parsed = JSON.parse(row.value);
+            if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.cold)) continue;
+            const filteredCold = parsed.cold.filter(
+              (c) => c && Number.isFinite(Number(c.gapSec)) && Number(c.gapSec) >= floorSec
+            );
+            if (filteredCold.length !== parsed.cold.length) {
+              parsed.cold = filteredCold;
+              upsertStmt.run(row.key, JSON.stringify(parsed));
+              scrubbedCalibrations += 1;
+            }
+          } catch {}
+        }
+
+        const leaseRows = this.db
+          .prepare("SELECT key, value FROM meta WHERE key LIKE 'watchdog_lease:%'")
+          .all();
+        for (const row of leaseRows || []) {
+          if (!row || typeof row.key !== "string" || typeof row.value !== "string") continue;
+          try {
+            const lease = JSON.parse(row.value);
+            if (!lease || typeof lease !== "object") continue;
+            if (lease.ttlSource !== "empirical") continue;
+            const modelStr = typeof lease.model === "string" ? lease.model : "";
+            const floorSec = resolveModelColdFloorSec(modelStr);
+            if (Number.isFinite(Number(lease.cacheTtlSec)) && Number(lease.cacheTtlSec) > 0 && Number(lease.cacheTtlSec) < floorSec) {
+              lease.cacheTtlSec = floorSec;
+              upsertStmt.run(row.key, JSON.stringify(lease));
+              clampedLeases += 1;
+            }
+          } catch {}
+        }
+      });
+    } catch {}
+    return { scrubbedCalibrations, clampedLeases };
   }
 
   /** Read normalized one-time GitHub Star milestone prompt state from SQLite meta */
@@ -1458,6 +1671,7 @@ export class SettingsMaintenanceMethods {
       return total;
     };
 
+    this.sanitizeModelTtlState();
     const bytesBefore = getDiskSize();
     const txStats = this._withWriteTx(() => {
       const staleSources = this.db
@@ -1488,7 +1702,7 @@ export class SettingsMaintenanceMethods {
         const leaseCutoffTs = Math.min(cutoffTs, now - 24 * 3600 * 1000);
         const metaRows = this.db
           .prepare(
-            "SELECT key, value FROM meta WHERE key LIKE 'cache_alert:%' OR key LIKE 'compact_invalidated:%' OR key LIKE 'sensitive_read_confirm:%' OR key LIKE 'large_read_confirm:%' OR key LIKE 'conv_turn_seq:%' OR key LIKE 'watchdog_lease:%' OR key LIKE 'ttl_calibration:%'"
+            "SELECT key, value FROM meta WHERE key LIKE 'cache_alert:%' OR key LIKE 'compact_invalidated:%' OR key LIKE 'sensitive_read_confirm:%' OR key LIKE 'large_read_confirm:%' OR key LIKE 'conv_turn_seq:%' OR key LIKE 'watchdog_lease:%' OR key LIKE 'ttl_calibration:%' OR key LIKE 'cache:ttl_keepalive_state:%'"
           )
           .all();
         const delMetaStmt = this.db.prepare("DELETE FROM meta WHERE key = ?");
@@ -1503,7 +1717,8 @@ export class SettingsMaintenanceMethods {
           }
           const isShortConfirm =
             row.key.startsWith("large_read_confirm:") || row.key.startsWith("sensitive_read_confirm:");
-          const isWatchdogLease = row.key.startsWith("watchdog_lease:");
+          const isWatchdogLease =
+            row.key.startsWith("watchdog_lease:") || row.key.startsWith("cache:ttl_keepalive_state:");
           if (isShortConfirm) {
             if (entryTs <= 0 || entryTs < confirmCutoffTs) {
               delMetaStmt.run(row.key);

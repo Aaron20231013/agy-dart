@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import os from "node:os";
-import { execSync } from "node:child_process";
+import { execFile, execSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { getEffectiveConfig } from "../../context/lib/config.js";
 import { buildHandoffBrief, inferWorkspaceFromStore } from "../../context/lib/handoff.js";
@@ -40,6 +40,73 @@ let _runtimeStore = null;
 let _appStartTime = null;
 let _runtimeInitialized = false;
 let _watchdogMonitor = null;
+const _convProjectIdCache = new Map();
+
+function runAgentApiAsync(args, { projectId = "", timeoutMs = 12000 } = {}) {
+  const exe = process.env.ANTIGRAVITY_AGENTAPI_EXE;
+  const file = exe || "agentapi";
+  const execArgs = exe ? ["agentapi", ...args] : args;
+  const env = projectId ? { ...process.env, ANTIGRAVITY_PROJECT_ID: projectId } : process.env;
+  return new Promise((resolve, reject) => {
+    execFile(
+      file,
+      execArgs,
+      { encoding: "utf8", timeout: timeoutMs, windowsHide: true, env },
+      (err, stdout) => {
+        if (err) return reject(err);
+        const trimmed = String(stdout || "").trim();
+        if (!trimmed) return resolve({});
+        try {
+          resolve(JSON.parse(trimmed));
+        } catch {
+          resolve({ raw: trimmed });
+        }
+      }
+    );
+  });
+}
+
+export async function sendSidecarKeepaliveMessage(conversationId, message, { execFn = runAgentApiAsync } = {}) {
+  if (!isSafeConversationId(conversationId) || /^-/.test(conversationId)) {
+    return { ok: false, error: "invalid_conversation_id" };
+  }
+  const cleanMsg = String(message || "").trim();
+  if (!cleanMsg) {
+    return { ok: false, error: "empty_message" };
+  }
+
+  let projectId = _convProjectIdCache.get(conversationId) || "";
+  if (!projectId) {
+    try {
+      const metaRes = await execFn(["get-conversation-metadata", conversationId], { timeoutMs: 8000 });
+      const metaEvent = metaRes?.response?.conversationMetadata || metaRes?.response?.conversation_metadata;
+      const resolvedId = metaEvent?.metadata?.projectId || metaEvent?.metadata?.project_id || "";
+      if (typeof resolvedId === "string" && resolvedId.trim()) {
+        projectId = resolvedId.trim();
+        if (_convProjectIdCache.size >= 100) {
+          const oldest = _convProjectIdCache.keys().next().value;
+          if (oldest !== undefined) _convProjectIdCache.delete(oldest);
+        }
+        _convProjectIdCache.set(conversationId, projectId);
+      }
+    } catch {
+      // Fall back to ambient ANTIGRAVITY_PROJECT_ID if metadata lookup is unavailable
+    }
+  }
+  if (!projectId) {
+    projectId = process.env.ANTIGRAVITY_PROJECT_ID || "";
+  }
+
+  try {
+    const res = await execFn(["send-message", conversationId, cleanMsg], { projectId, timeoutMs: 12000 });
+    if (res && res.error) {
+      return { ok: false, error: String(res.error) };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err || "send_message_failed") };
+  }
+}
 
 function getAppStartTime() {
   if (_appStartTime !== null) return _appStartTime;
@@ -80,6 +147,7 @@ export function getWatchdogMonitor(options = {}) {
 
 export function closeRuntimeStore() {
   stopWatchdogMonitor();
+  _convProjectIdCache.clear();
   if (_runtimeStore) {
     try {
       _runtimeStore.close();
@@ -272,7 +340,7 @@ function getPackageVersion() {
       return cachedPkgVersion;
     }
   } catch {}
-  return "1.5.3";
+  return "1.5.4";
 }
 
 function getRenderedHtml(csrfToken = SIDECAR_CSRF_TOKEN) {
@@ -523,6 +591,18 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
   const cfg = getEffectiveConfig();
   const store = getRuntimeStore();
   const ttlDesktopNotifyEnabled = store.isTtlDesktopNotifyEnabled();
+  const isSpecificConvForKa = Boolean(
+    convId && convId !== "default" && convId !== "all" && convId !== "app"
+  );
+  const kaState = isSpecificConvForKa ? store.getTtlKeepaliveState(convId) : { usedCount: 0, lastSentTs: 0, lastError: "" };
+  const ttlKeepalive = {
+    enabled: store.isTtlKeepaliveEnabled(),
+    maxCount: store.getTtlKeepaliveMaxCount(),
+    usedCount: kaState.usedCount,
+    leadSec: Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30))),
+    lastSentTs: kaState.lastSentTs || 0,
+    lastError: kaState.lastError || ""
+  };
   const rawTtl = data.ttl !== undefined && data.ttl !== "" ? data.ttl : cfg.cacheTtlSec;
   const explicitTtlSec = parseOptionalPositiveNumber(rawTtl);
   const envWindowTokens = parseOptionalPositiveNumber(cfg.windowTokens);
@@ -556,6 +636,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       conversationId: convId,
       serverNowMs: Date.now(),
       ttlDesktopNotifyEnabled,
+      ttlKeepalive,
       cacheTtlSec: effTtl,
       ttlSource,
       ttlCalibration: {
@@ -627,6 +708,17 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
   }
   try {
     const st = fs.statSync(transcriptPath);
+    const resolvedObsConvId = inferConvIdFromTranscriptPath(transcriptPath, isSpecificConv ? convId : "");
+    let effectiveTtlKeepalive = ttlKeepalive;
+    if (!isSpecificConvForKa && resolvedObsConvId) {
+      const resolvedKa = store.getTtlKeepaliveState(resolvedObsConvId);
+      effectiveTtlKeepalive = {
+        ...ttlKeepalive,
+        usedCount: resolvedKa.usedCount,
+        lastSentTs: resolvedKa.lastSentTs || 0,
+        lastError: resolvedKa.lastError || ""
+      };
+    }
     const historicalTtlByProfile = store.getAllModelTtlCalibrations();
     const calStamp = formatCalibrationCacheStamp(historicalTtlByProfile);
     const baseKeyPrefix = `${transcriptPath}:${explicitTtlSec ?? "auto"}:${envWindowTokens ?? ""}:${envWarnTokens ?? ""}:${envCritTokens ?? ""}`;
@@ -641,7 +733,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
           ? parseTranscriptLines(fs.readFileSync(transcriptPath, "utf8"))
           : readTranscriptTail(transcriptPath, 524288);
       const nowMs = Date.now();
-      const obsConvId = inferConvIdFromTranscriptPath(transcriptPath, isSpecificConv ? convId : "");
+      const obsConvId = resolvedObsConvId;
       const diagOpts = {
         nowMs,
         historicalTtlByProfile,
@@ -673,7 +765,9 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       transcriptFound: true,
       scope,
       conversationId: convId,
+      resolvedConversationId: resolvedObsConvId || convId,
       ttlDesktopNotifyEnabled,
+      ttlKeepalive: effectiveTtlKeepalive,
       ...diag,
       contextComposition: diag.contextComposition ?? createEmptyContextComposition(),
       subagentBreakdown: diag.subagentBreakdown ?? createEmptySubagentBreakdown(),
@@ -1005,6 +1099,46 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
     };
   }
+  if (action === "setTtlKeepalive") {
+    if (data.maxCount !== undefined) {
+      const rawMax = data.maxCount;
+      const invalidType =
+        rawMax === null ||
+        typeof rawMax === "boolean" ||
+        typeof rawMax === "object" ||
+        (typeof rawMax === "string" && rawMax.trim() === "");
+      const parsedMax = invalidType ? NaN : Number(rawMax);
+      if (!Number.isFinite(parsedMax) || !Number.isInteger(parsedMax) || parsedMax < 1 || parsedMax > 20) {
+        return { ok: false, status: 400, error: "Invalid 'maxCount' value: expected integer between 1 and 20" };
+      }
+      store.setTtlKeepaliveMaxCount(parsedMax);
+    }
+    if (data.enabled !== undefined) {
+      const next = data.enabled === true || data.enabled === "true" || data.enabled === "1";
+      store.setTtlKeepaliveEnabled(next);
+    } else if (data.maxCount === undefined) {
+      const cur = store.isTtlKeepaliveEnabled();
+      store.setTtlKeepaliveEnabled(!cur);
+    }
+    if (data.resetCount === true && targetConv) {
+      store.resetTtlKeepaliveState(targetConv);
+    }
+    return {
+      ok: true,
+      ttlKeepaliveEnabled: store.isTtlKeepaliveEnabled(),
+      ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(),
+      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
+    };
+  }
+  if (action === "resetTtlKeepalive") {
+    if (targetConv) {
+      store.resetTtlKeepaliveState(targetConv);
+    }
+    return {
+      ok: true,
+      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
+    };
+  }
   if (action === "setUiLang") {
     const requested = typeof data.lang === "string" ? data.lang.trim().toLowerCase() : "";
     if (requested !== "zh" && requested !== "en") {
@@ -1019,13 +1153,38 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false })
     };
   }
+  if (action === "focusConversation") {
+    if (data.skipOsFocus !== undefined && typeof data.skipOsFocus !== "boolean") {
+      return { ok: false, status: 400, error: "Field 'skipOsFocus' must be a boolean" };
+    }
+    const hasExplicitConv = data.conversationId !== undefined && data.conversationId !== null;
+    const explicitConv = typeof data.conversationId === "string" ? data.conversationId.trim() : "";
+    const res = monitor.focusConversation(hasExplicitConv ? explicitConv : targetConv, {
+      source: "sidecar_ui",
+      skipOsFocus: data.skipOsFocus === true
+    });
+    if (!res.ok) return { ok: false, status: 400, error: res.error };
+    return {
+      ...res,
+      status: monitor.getStatus({ conversationId: res.conversationId, scope, refresh: false })
+    };
+  }
+  if (action === "ackJump") {
+    const res = monitor.acknowledgePendingJump(data.jumpId);
+    if (!res.ok) return { ok: false, status: 400, error: res.error };
+    return {
+      ...res,
+      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false })
+    };
+  }
   if (action === "tick") {
     return monitor.getStatus({ conversationId: targetConv, scope, refresh: true });
   }
   return {
     ok: false,
     status: 400,
-    error: "Invalid watchdog action: expected 'ack', 'snooze', 'clear', 'markIdle', 'setEnabled', 'setDesktopNotify', 'setTtlDesktopNotify', 'setUiLang', or 'tick'"
+    error:
+      "Invalid watchdog action: expected 'ack', 'snooze', 'clear', 'markIdle', 'setEnabled', 'setDesktopNotify', 'setTtlDesktopNotify', 'setTtlKeepalive', 'resetTtlKeepalive', 'setUiLang', 'focusConversation', 'ackJump', or 'tick'"
   };
 }
 
@@ -1477,7 +1636,15 @@ export function createStandaloneServer({
           return;
         }
         const data = parsed.data;
-        const mutFieldCheck = validateStringFields(data, ["scope", "conversationId", "sessionId", "action", "category", "ext"]);
+        const mutFieldCheck = validateStringFields(data, [
+          "scope",
+          "conversationId",
+          "sessionId",
+          "action",
+          "category",
+          "ext",
+          "jumpId"
+        ]);
         if (!mutFieldCheck.ok) {
           sendJson(res, 400, { error: mutFieldCheck.error });
           return;
@@ -1570,8 +1737,10 @@ if (isDirectRun) {
 
   if (isSidecarEnv) {
     getRuntimeStore();
-    getWatchdogMonitor().start();
     const app = new SidecarApp();
+    getWatchdogMonitor({
+      keepaliveSendFn: ({ conversationId, message }) => sendSidecarKeepaliveMessage(conversationId, message)
+    }).start();
 
     const makeBadRequest = (error) =>
       SidecarResponse
@@ -1599,7 +1768,11 @@ if (isDirectRun) {
     console.log(`[agy-dart sidecar] registered and running`);
   } else {
     const port = resolveStandalonePort(process.env);
-    const server = createStandaloneServer();
+    const server = createStandaloneServer({
+      watchdogOptions: {
+        keepaliveSendFn: ({ conversationId, message }) => sendSidecarKeepaliveMessage(conversationId, message)
+      }
+    });
     server.listen(port, "127.0.0.1", () => {
       const addr = server.address();
       const boundPort = typeof addr === "object" && addr ? addr.port : port;
@@ -1738,7 +1911,7 @@ export function registerSidecarRoutes(app) {
   app.api("/api/watchdog/action", (rawData) => {
     const data = normalizeSidecarBody(rawData);
     if (!data) return makeBadRequest("Request body must be a JSON object");
-    const check = validateStringFields(data, ["scope", "conversationId", "sessionId", "action"]);
+    const check = validateStringFields(data, ["scope", "conversationId", "sessionId", "action", "jumpId"]);
     if (!check.ok) return makeBadRequest(check.error);
     const res = handleWatchdogActionMutation(data, app.config?.conversationId);
     if (res.ok === false) return makeBadRequest(res.error);

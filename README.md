@@ -28,6 +28,19 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 
 ---
 
+## What's New in v1.5.4 (Click-to-Jump Across Desktop Alerts & Sidecar + Per-Conversation KV-Cache Auto-Keepalive)
+
+1. **Clickable Desktop Notifications + Cross-Window Foreground Activation (`pendingJump` Bridge)**:
+   - Upgraded `buildDesktopNotificationCommand` & `sendDesktopNotification` in `context/lib/watchdog.js` with a non-blocking WinForms message pump (`BalloonTipClicked` / `BalloonTipClosed`), stdout fast-path click signaling, exit-code `42` protocol, and strict env-only Win32 `AgyDartWinFocus` scoring (`convTitle > cwd leaf > workspaceLabel > Antigravity main window`, filtering out `DWMWA_CLOAKED` ghost windows, launchers, and browsers without shrinking maximized windows).
+   - Wired all 3 desktop alerts (TTL Expiring, Critical Watermark, Session Stalled) to record a `20s`-TTL `watchdog:pending_jump` ticket on click while preserving `title <= 60B`, `body <= 220B`, zero `lastUserInput` exposure, and **0 `fs.statSync` calls** on idle ticks.
+2. **Clickable Sidecar Alert Pills & Multi-Window Session Switcher**:
+   - Extended `POST /api/watchdog/action` in `sidecars/dashboard/server.mjs` with `focusConversation` (including read-only `conversation_summaries.db` fallback + cross-window OS focus) and idempotent `ackJump`.
+   - Upgraded `#wd-other-alerts` in `sidecars/dashboard/index.html` with click + `Enter/Space` keyboard jump, added `#wd-session-switcher` for multi-window primary sessions, and implemented `window.sidecar.getWorkspaceUris()` **0ms workspace-matched `pendingJump` claiming** (`1.2s` fallback when unmatched) invoking `window.sidecar.ui.toggleConversation(conversationId)`.
+3. **Per-Conversation KV-Cache TTL Auto-Keepalive (`0/3` Default Cap) & Band-1 Current Context Spotlight**:
+   - Added background idle TTL keepalive (`_evaluateIdleTtlKeepalive` in `context/lib/watchdog.js`, `sendSidecarKeepaliveMessage` in `sidecars/dashboard/server.mjs`, and `#kv-keepalive-group` controls in `sidecars/dashboard/index.html`): sends a minimal OK-only keepalive ~`30s` before prompt-cache expiry (`1..20` configurable cap, default `3` per primary conversation, rollback on RPC failure, suppressed during `stopped_bg_pending` / subagents, and coordinated with desktop TTL alerts), while clamping empirical TTL calibration to `>= profile.ttlSec` so sub-5m replica/routing misses never shrink TTL or trigger premature keepalives.
+   - `hooks/pre-invocation.mjs` & `context/lib/watchdog-lease.js` recognize `[agy-dart TTL Keepalive]` / `[agy-dart TTL保活]` turns across both `SYSTEM_MESSAGE` (`agentapi send-message` with carried-over `lastUserInput`) and `USER_INPUT` without overwriting `lastUserInput`, wiping post-`/compact` reads, or aging `conv_turn_seq`, and automatically reset `usedCount` to `0` on your next genuine message.
+   - Promoted `#kv-cache-card` (`#ctx-overview-box` / `#ctx-spotlight-box`) to **Band 1** with a distinct tinted card surface, prominent `CURRENT CONTEXT` hero readout + live window bar, synthesized guard-savings KPI, and streamlined conversation-focused telemetry (`currentScope = 'conversation'`).
+
 ## What's New in v1.5.3 (Multi-Window Workspace/Subproject + Conversation Title Attribution & Critical-Context Desktop Alert)
 
 1. **Multi-Window Workspace / Subproject & Official Conversation Title Attribution**:

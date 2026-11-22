@@ -70,6 +70,7 @@ const TTL_COLD_SAMPLE_MIN_SEC = 120;
 const TTL_SAMPLE_MAX_SEC = 14400;
 const TTL_PURE_COLD_MAX_CACHE_RATIO = 0.25;
 const TTL_IMPLICIT_MAX_CAP_SEC = 3600;
+const TTL_KEEPALIVE_STEP_RE = /\[agy-dart TTL(?:保活| Keepalive)(?:\s|\])/i;
 
 
 function toNonNegNum(val) {
@@ -419,6 +420,9 @@ export function estimateCalibratedTtl(
 
   const allWarm = mergeUniqueTtlSamples(sessWarm, histWarm);
   const allCold = mergeUniqueTtlSamples(sessCold, histCold);
+  const sessColdAboveFloor = sessCold.filter((c) => c.gapSec >= profileTtl);
+  const histColdAboveFloor = histCold.filter((c) => c.gapSec >= profileTtl);
+  const coldAboveFloor = mergeUniqueTtlSamples(sessColdAboveFloor, histColdAboveFloor);
 
   const maxWarmGapSec =
     allWarm.length > 0
@@ -427,6 +431,8 @@ export function estimateCalibratedTtl(
         ? Math.round(sessionMaxWarmGapSec)
         : null;
   const minColdMissGapSec = allCold.length > 0 ? Math.min(...allCold.map((s) => s.gapSec)) : null;
+  const effectiveMinColdGapSec =
+    coldAboveFloor.length > 0 ? Math.min(...coldAboveFloor.map((s) => s.gapSec)) : null;
 
   if (Number.isFinite(explicitTtlSec) && explicitTtlSec > 0) {
     return {
@@ -457,16 +463,16 @@ export function estimateCalibratedTtl(
         origin,
         profileId,
         warmSamples: allWarm.length,
-        coldSamples: allCold.length,
+        coldSamples: coldAboveFloor.length,
         maxWarmGapSec,
-        minColdMissGapSec,
+        minColdMissGapSec: effectiveMinColdGapSec,
         estimatedTtlSec: est,
         confidence: "high"
       }
     };
   }
 
-  const hasHistoryData = histWarm.length > 0 || histCold.length > 0 || histHas1hWrite;
+  const hasHistoryData = histWarm.length > 0 || histColdAboveFloor.length > 0 || histHas1hWrite;
   const resolveOrigin = (sessionTriggered) => {
     if (hasHistoryData && !sessionTriggered) return "history";
     if (hasHistoryData) return "history";
@@ -474,13 +480,13 @@ export function estimateCalibratedTtl(
   };
 
   const L = computeWarmLowerBound(allWarm);
-  const U = computeColdUpperBound(allCold);
+  const U = computeColdUpperBound(coldAboveFloor);
 
   // Extended 1h discrete-tier models (e.g. Claude 5m vs 1h) with observed >5.5m warm hit
   // and no explicit history downward shift use the 1h tier floor unless multi-session cold hits prove otherwise.
   if (isExtended1h && L !== null && L > profileTtl * EMPIRICAL_TTL_TRIGGER_RATIO) {
     const distinctColdShort = new Set(
-      allCold.filter((c) => c.gapSec < 3600 && c.conv).map((c) => c.conv)
+      coldAboveFloor.filter((c) => c.gapSec < 3600 && c.conv).map((c) => c.conv)
     );
     if (U === null || distinctColdShort.size < 2) {
       const est = L <= 3600 ? 3600 : ceilTo60(L);
@@ -495,9 +501,9 @@ export function estimateCalibratedTtl(
           origin,
           profileId,
           warmSamples: allWarm.length,
-          coldSamples: allCold.length,
+          coldSamples: coldAboveFloor.length,
           maxWarmGapSec,
-          minColdMissGapSec,
+          minColdMissGapSec: effectiveMinColdGapSec,
           estimatedTtlSec: est,
           confidence: allWarm.length >= 2 ? "high" : "medium"
         }
@@ -510,19 +516,20 @@ export function estimateCalibratedTtl(
 
   if (L !== null && U !== null) {
     if (L < U) {
-      if (L > profileTtl * EMPIRICAL_TTL_TRIGGER_RATIO || U < profileTtl) {
+      if (L > profileTtl * EMPIRICAL_TTL_TRIGGER_RATIO) {
+        const floorL = Math.max(profileTtl, roundTo60(L));
         const rawTarget = roundTo60(L + 0.35 * (U - L));
         estimated = clampNum(rawTarget, L, Math.max(L, U - 60));
-        // Snap clean minute if L itself is a multiple of 60 or ceil slightly
+        // Snap clean minute if L itself is a multiple of 60 or ceil slightly, never below profileTtl
         estimated = roundTo60(estimated);
-        estimated = clampNum(estimated, roundTo60(L), Math.max(roundTo60(L), U - 60));
-        confidence = allWarm.length >= 2 && allCold.length >= 1 ? "high" : "medium";
+        estimated = clampNum(estimated, floorL, Math.max(floorL, U - 60));
+        confidence = allWarm.length >= 2 && coldAboveFloor.length >= 1 ? "high" : "medium";
       }
     } else {
-      // U <= L: Backend TTL likely shrank compared to older warm hits -> re-evaluate on recent subwindow
+      // U <= L: Backend TTL likely shrank compared to older warm hits (or implicit cache has interleaved misses >= profileTtl)
       const recentCutoff = safeNowMs - TTL_CALIBRATION_RECENT_MS;
       let recentWarm = allWarm.filter((s) => s.atMs <= 0 || s.atMs >= recentCutoff);
-      let recentCold = allCold.filter((s) => s.atMs <= 0 || s.atMs >= recentCutoff);
+      let recentCold = coldAboveFloor.filter((s) => s.atMs <= 0 || s.atMs >= recentCutoff);
       let lRec = computeWarmLowerBound(recentWarm);
       let uRec = computeColdUpperBound(recentCold);
 
@@ -530,7 +537,7 @@ export function estimateCalibratedTtl(
         // Still inverted inside 7d -> slice latest chronological half of combined observations
         const tagged = [
           ...allWarm.map((s, idx) => ({ ...s, kind: "warm", ord: idx })),
-          ...allCold.map((s, idx) => ({ ...s, kind: "cold", ord: allWarm.length + idx }))
+          ...coldAboveFloor.map((s, idx) => ({ ...s, kind: "cold", ord: allWarm.length + idx }))
         ].sort((a, b) => (a.atMs !== b.atMs ? a.atMs - b.atMs : a.ord - b.ord));
         const half = tagged.slice(Math.floor(tagged.length / 2));
         const halfWarm = half.filter((x) => x.kind === "warm");
@@ -544,9 +551,10 @@ export function estimateCalibratedTtl(
       }
 
       if (lRec !== null && uRec !== null && lRec < uRec) {
-        if (lRec > profileTtl * EMPIRICAL_TTL_TRIGGER_RATIO || uRec < profileTtl) {
+        if (lRec > profileTtl * EMPIRICAL_TTL_TRIGGER_RATIO) {
+          const floorRec = Math.max(profileTtl, roundTo60(lRec));
           const rawTarget = roundTo60(lRec + 0.35 * (uRec - lRec));
-          estimated = clampNum(rawTarget, roundTo60(lRec), Math.max(roundTo60(lRec), uRec - 60));
+          estimated = clampNum(rawTarget, floorRec, Math.max(floorRec, uRec - 60));
           confidence = "medium";
         }
       } else {
@@ -555,7 +563,7 @@ export function estimateCalibratedTtl(
           estimated = clampNum(roundTo60(capU - 60), profileTtl, capU);
           confidence = estimated > profileTtl ? "medium" : "low";
           if (estimated === profileTtl) {
-            // Converged all the way back down to default profile TTL
+            // Converged all the way back down to default profile TTL (never shrink below profileTtl)
             return {
               ttlSec: profileTtl,
               ttlSource: "profile",
@@ -563,21 +571,13 @@ export function estimateCalibratedTtl(
                 origin: hasHistoryData ? "history" : "profile",
                 profileId,
                 warmSamples: allWarm.length,
-                coldSamples: allCold.length,
+                coldSamples: coldAboveFloor.length,
                 maxWarmGapSec,
-                minColdMissGapSec,
+                minColdMissGapSec: effectiveMinColdGapSec,
                 estimatedTtlSec: profileTtl,
                 confidence: "medium"
               }
             };
-          }
-        } else {
-          const distinctColdConvs = new Set(
-            allCold.filter((c) => c.gapSec < profileTtl && c.conv).map((c) => c.conv)
-          );
-          if (distinctColdConvs.size >= 2) {
-            estimated = Math.max(60, Math.min(profileTtl, roundTo60(capU - 30)));
-            confidence = "medium";
           }
         }
       }
@@ -588,14 +588,6 @@ export function estimateCalibratedTtl(
       estimated = isExtended1h ? (L <= 3600 ? 3600 : roundedFloor) : Math.min(TTL_IMPLICIT_MAX_CAP_SEC, roundedFloor);
       confidence = allWarm.length >= 3 ? "high" : "medium";
     }
-  } else if (U !== null && U < profileTtl) {
-    const distinctColdConvs = new Set(
-      allCold.filter((c) => c.gapSec < profileTtl && c.conv).map((c) => c.conv)
-    );
-    if (distinctColdConvs.size >= 2) {
-      estimated = Math.max(60, Math.min(profileTtl, roundTo60(U - 30)));
-      confidence = "medium";
-    }
   }
 
   if (estimated !== null && estimated !== profileTtl) {
@@ -604,12 +596,12 @@ export function estimateCalibratedTtl(
       ttlSec: estimated,
       ttlSource: "empirical",
       ttlCalibration: {
-        origin: sessOnly ? "session" : resolveOrigin(sessWarm.length > 0 || sessCold.length > 0),
+        origin: sessOnly ? "session" : resolveOrigin(sessWarm.length > 0 || sessColdAboveFloor.length > 0),
         profileId,
         warmSamples: allWarm.length,
-        coldSamples: allCold.length,
+        coldSamples: coldAboveFloor.length,
         maxWarmGapSec,
-        minColdMissGapSec,
+        minColdMissGapSec: effectiveMinColdGapSec,
         estimatedTtlSec: estimated,
         confidence
       }
@@ -623,9 +615,9 @@ export function estimateCalibratedTtl(
       origin: "profile",
       profileId,
       warmSamples: allWarm.length,
-      coldSamples: allCold.length,
+      coldSamples: coldAboveFloor.length,
       maxWarmGapSec,
-      minColdMissGapSec,
+      minColdMissGapSec: effectiveMinColdGapSec,
       estimatedTtlSec: profileTtl,
       confidence: "low"
     }
@@ -1000,7 +992,7 @@ export function estimateTextTokens(text) {
   return { bytes, estTokens };
 }
 
-function extractStepText(val) {
+export function extractStepText(val) {
   if (typeof val === "string") return val;
   if (val === null || val === undefined) return "";
   if (Array.isArray(val)) {
@@ -1609,8 +1601,8 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
     if (step.type === "SYSTEM_MESSAGE") {
       if (hasSeenPlanner) {
-        const msgText = typeof step.content === "string" ? step.content.trim() : "";
-        if (msgText.length > 0) {
+        const msgText = extractStepText(step.content ?? step.text).trim();
+        if (msgText.length > 0 && !TTL_KEEPALIVE_STEP_RE.test(msgText)) {
           systemMsgSincePrev = true;
         }
       }
@@ -2088,7 +2080,12 @@ export function analyzeTranscriptCache(steps, options = {}) {
           const turnTtlSec = turnCal.ttlSec;
 
           // Record pure-idle cold miss candidate INDEPENDENT of `turnTtlSec` / `cause === "ttl_idle_expiry"`
-          // to prevent upward-only calibration lock-in when server TTL shrinks.
+          // to prevent upward-only calibration lock-in when server TTL shrinks, while filtering out sub-baseline
+          // (< profile.ttlSec) replica-routing/prefix-drift misses so they never evict genuine >= profile.ttlSec cold samples.
+          const minColdSampleSec =
+            explicitTtlSec !== null && explicitTtlSec > 0
+              ? Math.max(60, Math.min(TTL_COLD_SAMPLE_MIN_SEC, explicitTtlSec))
+              : Math.max(TTL_COLD_SAMPLE_MIN_SEC, activeTurnProfile.ttlSec || DEFAULT_CACHE_TTL_SEC);
           if (
             sameModel &&
             ctxTok >= prevCtxTokens * BUST_DROP_RATIO &&
@@ -2096,7 +2093,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
             !systemMsgSincePrev &&
             safeCache / prevCtxTokens < TTL_PURE_COLD_MAX_CACHE_RATIO &&
             gapSec !== null &&
-            gapSec >= TTL_COLD_SAMPLE_MIN_SEC &&
+            gapSec >= minColdSampleSec &&
             gapSec <= TTL_SAMPLE_MAX_SEC
           ) {
             pushProfileObservation(coldObsByProfile, activeTurnProfile.id, {

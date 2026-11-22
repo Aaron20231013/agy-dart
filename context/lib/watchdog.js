@@ -14,6 +14,7 @@
  *   - Pre-generates redacted Rescue Handoff Brief + 1-2 targeted troubleshooting tips on red `stalled`.
  *   - Desktop OS notifications are opt-in (default OFF) and debounced per incident/cooldown.
  */
+import crypto from "node:crypto";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { getEffectiveConfig, parseUiLang } from "./config.js";
@@ -35,12 +36,14 @@ import {
   KNOWN_MCP_TOOL_RE,
   LONG_MCP_TOOL_RE,
   classifyToolExecutionKind,
+  decodeFileUriOrPath,
   deriveLlmSubphase,
   extractBareToolName,
   formatWorkspaceWindowLabel,
   getToolTimeoutTier,
   getWatchdogLeaseKey,
   isHeadlessWorkerPrompt,
+  isSameWorkspacePath,
   isSubagentLeasePayload,
   listWatchdogLeases,
   lookupConversationSummary,
@@ -61,10 +64,12 @@ export {
   WATCHDOG_LEASE_PREFIX,
   WATCHDOG_PHASES,
   classifyToolExecutionKind,
+  decodeFileUriOrPath,
   formatWorkspaceWindowLabel,
   getToolTimeoutTier,
   getWatchdogLeaseKey,
   isHeadlessWorkerPrompt,
+  isSameWorkspacePath,
   isSubagentLeasePayload,
   listWatchdogLeases,
   lookupConversationSummary,
@@ -78,6 +83,11 @@ export {
   writeWatchdogLease,
   writeWatchdogLeaseIfUnchanged
 };
+
+export const NOTIFY_CLICK_EXIT_CODE = 42;
+export const NOTIFY_CLICK_STDOUT_TOKEN = "AGY_CLICKED";
+export const PENDING_JUMP_META_KEY = "watchdog:pending_jump";
+export const DEFAULT_PENDING_JUMP_TTL_MS = 20_000;
 
 export const DEFAULT_STALE_LEASE_MS = 2 * 60 * 60 * 1000; // 2 hours
 export const DEFAULT_ORPHAN_TURN0_MS = 15 * 60 * 1000; // 15 minutes
@@ -705,12 +715,282 @@ export function buildWindowNotificationPrefix(lease, { isZh = false } = {}) {
 }
 
 /**
+ * C# 5.0 compatible Win32 P/Invoke helper (zero single quotes so it embeds inside a
+ * single-quoted PowerShell literal with zero interpolation risk).
+ * Filters out cloaked UWP windows, launchers, and browsers; scores Antigravity windows by
+ * conversation title > cwd leaf > workspace/subproject label > fallback Antigravity window;
+ * restores minimized windows without shrinking maximized ones and unlocks ForegroundLockTimeout.
+ */
+export const WIN32_WINDOW_FOCUS_CSHARP = [
+  "using System;",
+  "using System.Diagnostics;",
+  "using System.Runtime.InteropServices;",
+  "using System.Text;",
+  "public static class AgyDartWinFocus {",
+  "  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);",
+  '  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc lpEnumFunc, IntPtr lParam);',
+  '  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);',
+  '  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);',
+  '  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);',
+  '  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);',
+  '  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLengthW(IntPtr hWnd);',
+  '  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);',
+  '  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+  '  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();',
+  '  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);',
+  '  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);',
+  '  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);',
+  '  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);',
+  '  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);',
+  '  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);',
+  '  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);',
+  "  private static bool ContainsCjk(string s) {",
+  "    if (string.IsNullOrEmpty(s)) return false;",
+  "    for (int i = 0; i < s.Length; i++) { if ((int)s[i] >= 0x2E80) return true; }",
+  "    return false;",
+  "  }",
+  "  private static bool HasBoundaryToken(string title, string token) {",
+  "    if (string.IsNullOrEmpty(title) || string.IsNullOrEmpty(token)) return false;",
+  "    if (ContainsCjk(token)) return title.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;",
+  "    int idx = 0;",
+  "    while (idx <= title.Length - token.Length) {",
+  "      int pos = title.IndexOf(token, idx, StringComparison.OrdinalIgnoreCase);",
+  "      if (pos < 0) return false;",
+  "      bool leftOk = pos == 0 || !char.IsLetterOrDigit(title[pos - 1]);",
+  "      int end = pos + token.Length;",
+  "      bool rightOk = end >= title.Length || !char.IsLetterOrDigit(title[end]);",
+  "      if (leftOk && rightOk) return true;",
+  "      idx = pos + 1;",
+  "    }",
+  "    return false;",
+  "  }",
+  "  private static bool HasSegmentToken(string title, string token) {",
+  "    if (string.IsNullOrEmpty(title) || string.IsNullOrEmpty(token)) return false;",
+  "    if (title.Equals(token, StringComparison.OrdinalIgnoreCase)) return true;",
+  '    if (title.StartsWith(token + " - ", StringComparison.OrdinalIgnoreCase)) return true;',
+  '    if (title.IndexOf(" - " + token + " - ", StringComparison.OrdinalIgnoreCase) >= 0) return true;',
+  '    if (title.EndsWith(" - " + token, StringComparison.OrdinalIgnoreCase)) return true;',
+  "    return false;",
+  "  }",
+  "  public static int ScoreWindow(string wt, string pn, string convTitle, string wsLabel, string cwd) {",
+  "    if (string.IsNullOrEmpty(wt)) return -1;",
+  '    string proc = pn ?? "";',
+  '    if (proc.IndexOf("launcher", StringComparison.OrdinalIgnoreCase) >= 0) return -1;',
+  '    if (wt.StartsWith("Antigravity Launcher", StringComparison.OrdinalIgnoreCase) || wt.StartsWith("Developer Tools -", StringComparison.OrdinalIgnoreCase)) return -1;',
+  '    bool isAgProc = proc.IndexOf("antigravity", StringComparison.OrdinalIgnoreCase) >= 0;',
+  '    bool isAgTitle = proc.Length == 0 && (wt.EndsWith(" - Antigravity", StringComparison.OrdinalIgnoreCase) || wt.Equals("Antigravity", StringComparison.OrdinalIgnoreCase));',
+  "    if (!isAgProc && !isAgTitle) return -1;",
+  '    string tNeedle = (convTitle ?? "").Trim().TrimEnd(".\\u2026".ToCharArray()).Trim();',
+  '    int dashIdx = wt.IndexOf(" - ", StringComparison.Ordinal);',
+  "    string wtLead = (dashIdx > 0 ? wt.Substring(0, dashIdx) : wt).Trim();",
+  '    bool wtTrunc = wt.EndsWith("...", StringComparison.Ordinal) || wt.EndsWith("\\u2026", StringComparison.Ordinal) || wtLead.EndsWith("...", StringComparison.Ordinal) || wtLead.EndsWith("\\u2026", StringComparison.Ordinal);',
+  '    string wtStem = (wtLead.EndsWith("...", StringComparison.Ordinal) || wtLead.EndsWith("\\u2026", StringComparison.Ordinal) ? wtLead : wt).Trim().TrimEnd(".\\u2026".ToCharArray()).Trim();',
+  '    string cwdNorm = (cwd ?? "").Trim().Replace("/", "\\\\").TrimEnd("\\\\".ToCharArray());',
+  '    string cwdLeaf = "";',
+  "    if (cwdNorm.Length > 0) {",
+  '      int idx = cwdNorm.LastIndexOf("\\\\");',
+  "      cwdLeaf = idx >= 0 ? cwdNorm.Substring(idx + 1) : cwdNorm;",
+  '      if (cwdLeaf.EndsWith(":")) cwdLeaf = "";',
+  "    }",
+  '    string wsNorm = (wsLabel ?? "").Trim().Replace("\\\\", "/").Trim("/".ToCharArray());',
+  '    string[] wsParts = wsNorm.Split("/".ToCharArray(), StringSplitOptions.RemoveEmptyEntries);',
+  '    string wsLeaf = wsParts.Length > 0 ? wsParts[wsParts.Length - 1].Trim() : "";',
+  '    string wsParent = wsParts.Length > 1 ? wsParts[0].Trim() : "";',
+  "    int score = isAgProc ? 20 : 10;",
+  "    if (tNeedle.Length >= 2 && wt.IndexOf(tNeedle, StringComparison.OrdinalIgnoreCase) >= 0) score += 1000;",
+  "    else if (wtTrunc && wtStem.Length >= 4 && tNeedle.Length >= wtStem.Length && tNeedle.StartsWith(wtStem, StringComparison.OrdinalIgnoreCase)) score += 950;",
+  '    if (wsNorm.IndexOf("/") > 0 && (HasBoundaryToken(wt, wsNorm) || HasBoundaryToken(wt, wsNorm.Replace("/", "\\\\")))) score += 560;',
+  "    bool matchedLeaf = false;",
+  "    bool matchedParent = false;",
+  "    if (cwdLeaf.Length > 0) {",
+  "      if (HasSegmentToken(wt, cwdLeaf)) { score += (wsParent.Length > 0 ? 220 : 420); matchedLeaf = true; }",
+  "      else if (cwdLeaf.Length >= 2 && HasBoundaryToken(wt, cwdLeaf)) { score += (wsParent.Length > 0 ? 110 : 180); matchedLeaf = true; }",
+  "    }",
+  "    if (wsLeaf.Length > 0 && !wsLeaf.Equals(cwdLeaf, StringComparison.OrdinalIgnoreCase)) {",
+  "      if (HasSegmentToken(wt, wsLeaf)) { score += 400; matchedLeaf = true; }",
+  "      else if (wsLeaf.Length >= 2 && HasBoundaryToken(wt, wsLeaf)) { score += 200; matchedLeaf = true; }",
+  "    }",
+  "    if (wsParent.Length > 0 && !wsParent.Equals(cwdLeaf, StringComparison.OrdinalIgnoreCase) && !wsParent.Equals(wsLeaf, StringComparison.OrdinalIgnoreCase)) {",
+  "      if (HasSegmentToken(wt, wsParent)) { score += 280; matchedParent = true; }",
+  "      else if (wsParent.Length >= 2 && HasBoundaryToken(wt, wsParent)) { score += 140; matchedParent = true; }",
+  "    }",
+  "    if (matchedParent && matchedLeaf) score += 160;",
+  "    return score;",
+  "  }",
+  "  public static bool FocusBest(string convTitle, string wsLabel, string cwd) {",
+  "    IntPtr best = IntPtr.Zero;",
+  "    int bestScore = -1;",
+  "    EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {",
+  "      if (!IsWindowVisible(hWnd)) return true;",
+  "      int cloaked = 0;",
+  "      if (DwmGetWindowAttribute(hWnd, 14, out cloaked, 4) == 0 && cloaked != 0) return true;",
+  "      int len = GetWindowTextLengthW(hWnd);",
+  "      if (len <= 0) return true;",
+  "      StringBuilder sb = new StringBuilder(Math.Min(len + 2, 512));",
+  "      GetWindowTextW(hWnd, sb, sb.Capacity);",
+  "      string wt = sb.ToString();",
+  "      uint pid = 0;",
+  "      GetWindowThreadProcessId(hWnd, out pid);",
+  '      string pn = "";',
+  "      if (pid != 0) {",
+  '        try { pn = Process.GetProcessById((int)pid).ProcessName ?? ""; } catch {}',
+  "      }",
+  "      int sc = ScoreWindow(wt, pn, convTitle, wsLabel, cwd);",
+  "      if (sc >= 0 && GetWindow(hWnd, 4) == IntPtr.Zero) sc += 5;",
+  "      if (sc > bestScore) { bestScore = sc; best = hWnd; }",
+  "      return true;",
+  "    }, IntPtr.Zero);",
+  "    if (best == IntPtr.Zero) return false;",
+  "    if (IsIconic(best)) ShowWindow(best, 9); else ShowWindow(best, 5);",
+  "    IntPtr fg = GetForegroundWindow();",
+  "    uint curTid = GetCurrentThreadId();",
+  "    uint dummy = 0;",
+  "    uint fgTid = fg != IntPtr.Zero ? GetWindowThreadProcessId(fg, out dummy) : 0;",
+  "    uint targetTid = GetWindowThreadProcessId(best, out dummy);",
+  "    bool attFg = false;",
+  "    bool attTarget = false;",
+  "    try {",
+  "      if (fgTid != 0 && fgTid != curTid) attFg = AttachThreadInput(curTid, fgTid, true);",
+  "      if (targetTid != 0 && targetTid != curTid && targetTid != fgTid) attTarget = AttachThreadInput(curTid, targetTid, true);",
+  "      SetWindowPos(best, new IntPtr(-1), 0, 0, 0, 0, 0x0043);",
+  "      SetWindowPos(best, new IntPtr(-2), 0, 0, 0, 0, 0x0043);",
+  "      BringWindowToTop(best);",
+  "      SetForegroundWindow(best);",
+  "      if (GetForegroundWindow() != best) {",
+  "        keybd_event(0xFF, 0, 0, UIntPtr.Zero);",
+  "        keybd_event(0xFF, 0, 2, UIntPtr.Zero);",
+  "        SetForegroundWindow(best);",
+  "      }",
+  "    } finally {",
+  "      if (attTarget) AttachThreadInput(curTid, targetTid, false);",
+  "      if (attFg) AttachThreadInput(curTid, fgTid, false);",
+  "    }",
+  "    return true;",
+  "  }",
+  "}"
+].join(" ");
+
+function buildWin32FocusCompilePowerShell() {
+  return `if (-not ('AgyDartWinFocus' -as [type])) { Add-Type -TypeDefinition '${WIN32_WINDOW_FOCUS_CSHARP}' -ErrorAction Stop; }`;
+}
+
+function buildWin32FocusInvokePowerShell() {
+  return [
+    "$ct = [Environment]::GetEnvironmentVariable('AGY_DART_NOTIFY_CONV_TITLE');",
+    "$ws = [Environment]::GetEnvironmentVariable('AGY_DART_NOTIFY_WS_LABEL');",
+    "$cw = [Environment]::GetEnvironmentVariable('AGY_DART_NOTIFY_CWD');",
+    "if ('AgyDartWinFocus' -as [type]) { [void][AgyDartWinFocus]::FocusBest($ct, $ws, $cw); }"
+  ].join(" ");
+}
+
+function buildWin32FocusPowerShellCall() {
+  return `${buildWin32FocusCompilePowerShell()} ${buildWin32FocusInvokePowerShell()}`;
+}
+
+function sanitizeNotificationIdentity({ conversationId = "", cwd = "", workspaceLabel = "", convTitle = "" } = {}) {
+  const safeConvId = sanitizeConversationId(conversationId);
+  const decodedCwd = decodeFileUriOrPath(cwd);
+  const safeCwd = decodedCwd ? sanitizeWatchdogText(decodedCwd, 260) : "";
+  const rawWs =
+    (typeof workspaceLabel === "string" && workspaceLabel.trim()) ||
+    (decodedCwd ? formatWorkspaceWindowLabel(decodedCwd) : "");
+  const safeWsLabel = rawWs ? sanitizeWatchdogText(rawWs, 64) : "";
+  const safeConvTitle =
+    typeof convTitle === "string" && convTitle.trim() ? sanitizeWatchdogText(convTitle, 64) : "";
+  return { safeConvId, safeCwd, safeWsLabel, safeConvTitle };
+}
+
+/**
+ * Pure OS window focus command builder (env-var indirection on Windows,
+ * static AppleScript on macOS — zero dynamic shell interpolation).
+ */
+export function buildWindowFocusCommand({
+  conversationId = "",
+  cwd = "",
+  workspaceLabel = "",
+  convTitle = "",
+  platform = process.platform,
+  baseEnv = process.env
+} = {}) {
+  const { safeConvId, safeCwd, safeWsLabel, safeConvTitle } = sanitizeNotificationIdentity({
+    conversationId,
+    cwd,
+    workspaceLabel,
+    convTitle
+  });
+  const env = { ...baseEnv };
+  let cmd = "";
+  let args = [];
+
+  if (platform === "win32") {
+    env.AGY_DART_NOTIFY_CONV_ID = safeConvId;
+    env.AGY_DART_NOTIFY_CWD = safeCwd;
+    env.AGY_DART_NOTIFY_WS_LABEL = safeWsLabel;
+    env.AGY_DART_NOTIFY_CONV_TITLE = safeConvTitle;
+    const psScript = `try { ${buildWin32FocusPowerShellCall()} } catch {}`;
+    cmd = "powershell.exe";
+    args = ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", psScript];
+  } else if (platform === "darwin") {
+    cmd = "osascript";
+    args = ["-e", 'tell application "Antigravity" to activate'];
+  }
+
+  return { cmd, args, env, safeConvId, safeCwd, safeWsLabel, safeConvTitle, platform };
+}
+
+/**
+ * Safe, zero-dependency, fail-open OS window foreground activator for cross-window jumps.
+ */
+export function focusDesktopConversationWindow({
+  conversationId = "",
+  cwd = "",
+  workspaceLabel = "",
+  convTitle = "",
+  platform = process.platform,
+  spawnFn = spawn
+} = {}) {
+  try {
+    const spec = buildWindowFocusCommand({
+      conversationId,
+      cwd,
+      workspaceLabel,
+      convTitle,
+      platform
+    });
+    if (!spec.cmd) {
+      return { dispatched: false, platform };
+    }
+    const child = spawnFn(spec.cmd, spec.args, {
+      stdio: "ignore",
+      windowsHide: true,
+      env: spec.env
+    });
+    child.on?.("error", () => {});
+    const killTimer = setTimeout(() => {
+      try {
+        child.kill?.();
+      } catch {}
+    }, 8000);
+    killTimer.unref?.();
+    child.on?.("exit", () => clearTimeout(killTimer));
+    child.unref?.();
+    return { dispatched: true, platform };
+  } catch {
+    return { dispatched: false, platform };
+  }
+}
+
+/**
  * Pure OS desktop notification command builder (env-var indirection on Windows,
  * strict argv-only dispatch on macOS/Linux — zero dynamic shell interpolation).
  */
 export function buildDesktopNotificationCommand({
   title = "agy-dart Stall Watchdog",
   body = "",
+  conversationId = "",
+  cwd = "",
+  workspaceLabel = "",
+  convTitle = "",
   platform = process.platform,
   baseEnv = process.env
 } = {}) {
@@ -718,6 +998,12 @@ export function buildDesktopNotificationCommand({
   const safeTitle = sanitizeWatchdogText(title, 60) || "agy-dart Stall Watchdog";
   const safeBody =
     sanitizeWatchdogText(body, 220) || "Session appears stalled. Open agy-dart Sidecar for Rescue Brief.";
+  const { safeConvId, safeCwd, safeWsLabel, safeConvTitle } = sanitizeNotificationIdentity({
+    conversationId,
+    cwd,
+    workspaceLabel,
+    convTitle
+  });
 
   let cmd = "";
   let args = [];
@@ -726,9 +1012,15 @@ export function buildDesktopNotificationCommand({
   if (platform === "win32") {
     env.AGY_DART_NOTIFY_TITLE = safeTitle;
     env.AGY_DART_NOTIFY_BODY = safeBody;
+    env.AGY_DART_NOTIFY_CONV_ID = safeConvId;
+    env.AGY_DART_NOTIFY_CWD = safeCwd;
+    env.AGY_DART_NOTIFY_WS_LABEL = safeWsLabel;
+    env.AGY_DART_NOTIFY_CONV_TITLE = safeConvTitle;
     const psScript = [
       "$t = [Environment]::GetEnvironmentVariable('AGY_DART_NOTIFY_TITLE');",
       "$b = [Environment]::GetEnvironmentVariable('AGY_DART_NOTIFY_BODY');",
+      "$script:clicked = $false;",
+      "$script:closed = $false;",
       "try {",
       "  Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop;",
       "  Add-Type -AssemblyName System.Drawing -ErrorAction Stop;",
@@ -737,11 +1029,25 @@ export function buildDesktopNotificationCommand({
       "  $ni.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning;",
       "  $ni.BalloonTipTitle = $t;",
       "  $ni.BalloonTipText = $b;",
+      "  $ni.add_BalloonTipClicked({ $script:clicked = $true });",
+      "  $ni.add_BalloonTipClosed({ $script:closed = $true });",
       "  $ni.Visible = $true;",
       "  $ni.ShowBalloonTip(5000);",
-      "  Start-Sleep -Milliseconds 4000;",
+      "  $sw = [System.Diagnostics.Stopwatch]::StartNew();",
+      "  while (-not $script:clicked -and -not $script:closed -and $sw.ElapsedMilliseconds -lt 6500) {",
+      "    [System.Windows.Forms.Application]::DoEvents();",
+      "    Start-Sleep -Milliseconds 60;",
+      "  }",
+      "  [System.Windows.Forms.Application]::DoEvents();",
+      "  $ni.Visible = $false;",
       "  $ni.Dispose();",
-      "} catch {}"
+      "} catch {}",
+      "if ($script:clicked) {",
+      `  try { ${buildWin32FocusCompilePowerShell()} } catch {}`,
+      `  try { [Console]::Out.WriteLine('${NOTIFY_CLICK_STDOUT_TOKEN}'); [Console]::Out.Flush(); Start-Sleep -Milliseconds 25; } catch {}`,
+      `  try { ${buildWin32FocusInvokePowerShell()} } catch {}`,
+      `  [Environment]::Exit(${NOTIFY_CLICK_EXIT_CODE});`,
+      "}"
     ].join(" ");
     cmd = "powershell.exe";
     args = ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", psScript];
@@ -759,32 +1065,95 @@ export function buildDesktopNotificationCommand({
     args = ["--app-name=agy-dart", "--urgency=normal", "--", safeTitle, safeBody];
   }
 
-  return { cmd, args, env, safeTitle, safeBody, platform };
+  return {
+    cmd,
+    args,
+    env,
+    safeTitle,
+    safeBody,
+    safeConvId,
+    safeCwd,
+    safeWsLabel,
+    safeConvTitle,
+    platform
+  };
 }
 
 /**
  * Safe, zero-dependency, fail-open OS desktop notification helper (opt-in only).
+ * Supports click-to-jump callback via stdout fast-path token and exit code 42.
  */
 export function sendDesktopNotification({
   title = "agy-dart Stall Watchdog",
   body = "",
-  platform = process.platform
+  conversationId = "",
+  cwd = "",
+  workspaceLabel = "",
+  convTitle = "",
+  onClick = null,
+  platform = process.platform,
+  spawnFn = spawn
 } = {}) {
   try {
-    const spec = buildDesktopNotificationCommand({ title, body, platform });
-    const child = spawn(spec.cmd, spec.args, {
-      stdio: "ignore",
+    const spec = buildDesktopNotificationCommand({
+      title,
+      body,
+      conversationId,
+      cwd,
+      workspaceLabel,
+      convTitle,
+      platform
+    });
+    const hasClickCallback = typeof onClick === "function";
+    const child = spawnFn(spec.cmd, spec.args, {
+      stdio: hasClickCallback ? ["ignore", "pipe", "ignore"] : "ignore",
       windowsHide: true,
       env: spec.env
     });
-    child.on("error", () => {});
+    let clickHandled = false;
+    const fireClickOnce = () => {
+      if (clickHandled || !hasClickCallback) return;
+      clickHandled = true;
+      try {
+        onClick({
+          conversationId: spec.safeConvId,
+          cwd: spec.safeCwd,
+          workspaceLabel: spec.safeWsLabel,
+          convTitle: spec.safeConvTitle
+        });
+      } catch {}
+    };
+    if (hasClickCallback && child?.stdout) {
+      let stdoutBuf = "";
+      child.stdout.on?.("data", (chunk) => {
+        stdoutBuf += String(chunk || "");
+        if (stdoutBuf.includes(NOTIFY_CLICK_STDOUT_TOKEN)) {
+          fireClickOnce();
+        } else if (stdoutBuf.length > 256) {
+          stdoutBuf = stdoutBuf.slice(-128);
+        }
+      });
+      child.stdout.on?.("error", () => {});
+      child.stdout.unref?.();
+    }
+    child.on?.("error", () => {});
     const killTimer = setTimeout(() => {
       try {
-        child.kill();
+        child.kill?.();
       } catch {}
-    }, 12000);
+    }, 15000);
     killTimer.unref?.();
-    child.on("exit", () => clearTimeout(killTimer));
+    let finalized = false;
+    const onTerminate = (code) => {
+      if (finalized) return;
+      finalized = true;
+      clearTimeout(killTimer);
+      if (code === NOTIFY_CLICK_EXIT_CODE) {
+        fireClickOnce();
+      }
+    };
+    child.on?.("close", onTerminate);
+    child.on?.("exit", onTerminate);
     child.unref?.();
     return { dispatched: true, platform };
   } catch {
@@ -820,8 +1189,16 @@ export class WatchdogMonitor {
       options.lookupTitleFn ||
       ((convId, { transcriptPath } = {}) =>
         transcriptPath ? lookupConversationTitle(convId, { transcriptPath, allowDefaultDb: false }) : "");
+    this.lookupSummaryFn =
+      options.lookupSummaryFn || ((convId, opts = {}) => lookupConversationSummary(convId, opts));
     this.notifyFn = options.notifyFn || sendDesktopNotification;
+    this.keepaliveSendFn = typeof options.keepaliveSendFn === "function" ? options.keepaliveSendFn : null;
+    this.focusWindowFn = options.focusWindowFn || focusDesktopConversationWindow;
     this.buildHandoffFn = options.buildHandoffFn || buildHandoffBrief;
+    this.pendingJumpTtlMs =
+      Number.isFinite(options.pendingJumpTtlMs) && options.pendingJumpTtlMs > 0
+        ? Math.floor(options.pendingJumpTtlMs)
+        : DEFAULT_PENDING_JUMP_TTL_MS;
     this.staleLeaseMs =
       Number.isFinite(options.staleLeaseMs) && options.staleLeaseMs > 0
         ? options.staleLeaseMs
@@ -843,11 +1220,14 @@ export class WatchdogMonitor {
     this._convState = new Map();
     this._lastEvaluated = new Map();
     this._ttlNotifiedKeys = new Map();
+    this._keepaliveInFlight = new Set();
     this._lastTtlNotifyGlobalTs = 0;
+    this._fallbackPendingJump = null;
     this.statSyncCount = 0;
     this.tailReadCount = 0;
     this.notificationCount = 0;
     this.ttlNotificationCount = 0;
+    this.ttlKeepaliveCount = 0;
     this.watermarkNotificationCount = 0;
   }
 
@@ -1073,6 +1453,55 @@ export class WatchdogMonitor {
     return Boolean(cfg.ttlDesktopNotify);
   }
 
+  _resolveTtlKeepaliveEnabled(store, cfg) {
+    const disableRaw = process.env.AGY_DART_DISABLE_TTL_KEEPALIVE;
+    if (typeof disableRaw === "string" && disableRaw.trim() !== "") {
+      const d = disableRaw.trim().toLowerCase();
+      if (d === "1" || d === "true" || d === "yes" || d === "on") return false;
+      if (d === "0" || d === "false" || d === "no" || d === "off") return true;
+    }
+    const envRaw = process.env.AGY_DART_TTL_KEEPALIVE;
+    if (typeof envRaw === "string" && envRaw.trim() !== "") {
+      const s = envRaw.trim().toLowerCase();
+      if (s === "1" || s === "true" || s === "yes" || s === "on") return true;
+      if (s === "0" || s === "false" || s === "no" || s === "off") return false;
+    }
+    if (this._hasCustomConfig) {
+      if (store && typeof store.getMeta === "function") {
+        const raw = store.getMeta("cache:ttl_keepalive_enabled", null);
+        if (raw !== null) return raw !== "false" && raw !== "0";
+      }
+      return cfg.ttlKeepalive !== undefined ? Boolean(cfg.ttlKeepalive) : true;
+    }
+    if (store && typeof store.isTtlKeepaliveEnabled === "function") {
+      return store.isTtlKeepaliveEnabled();
+    }
+    return cfg.ttlKeepalive !== undefined ? Boolean(cfg.ttlKeepalive) : true;
+  }
+
+  _resolveTtlKeepaliveMaxCount(store, cfg) {
+    const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 3)));
+    const envRaw = process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT;
+    if (typeof envRaw === "string" && envRaw.trim() !== "") {
+      const n = Number(envRaw.trim());
+      if (Number.isFinite(n) && n >= 1) return clampMax(n);
+    }
+    if (this._hasCustomConfig) {
+      if (store && typeof store.getMeta === "function") {
+        const raw = store.getMeta("cache:ttl_keepalive_max_count", null);
+        if (raw !== null && raw !== "") {
+          const n = Number(raw);
+          if (Number.isFinite(n) && n >= 1) return clampMax(n);
+        }
+      }
+      return clampMax(cfg.ttlKeepaliveMaxCount ?? 3);
+    }
+    if (store && typeof store.getTtlKeepaliveMaxCount === "function") {
+      return store.getTtlKeepaliveMaxCount();
+    }
+    return clampMax(cfg.ttlKeepaliveMaxCount ?? 3);
+  }
+
   _resolveWatermarkDesktopNotifyEnabled(store, cfg, { desktopNotifyEnabled = false, ttlDesktopNotifyEnabled = false } = {}) {
     const envRaw = process.env.AGY_DART_WATERMARK_DESKTOP_NOTIFY;
     if (typeof envRaw === "string" && envRaw.trim() !== "") {
@@ -1134,25 +1563,185 @@ export class WatchdogMonitor {
       return Math.floor(cfg.cacheTtlSec);
     }
     const profile = resolveModelProfile(lease?.model || null);
+    const profileFloor = profile?.ttlSec || DEFAULT_CACHE_TTL_SEC;
     if (store && typeof store.getModelTtlCalibration === "function") {
       try {
         const hist = store.getModelTtlCalibration(profile.id, nowWallMs);
         if (hist && ((hist.warm && hist.warm.length > 0) || (hist.cold && hist.cold.length > 0) || hist.seen1hWrite)) {
           const cal = estimateCalibratedTtl(profile, { historyRecord: hist, nowMs: nowWallMs });
-          if (cal && cal.ttlSource === "empirical" && cal.ttlSec > 0) {
-            return Math.floor(cal.ttlSec);
+          if (cal && cal.ttlSec > 0 && (cal.ttlSource === "empirical" || lease?.ttlSource === "empirical")) {
+            return Math.max(profileFloor, Math.floor(cal.ttlSec));
           }
         }
       } catch {}
     }
     if (Number.isFinite(lease?.cacheTtlSec) && lease.cacheTtlSec > 0) {
-      return Math.floor(lease.cacheTtlSec);
+      return lease.ttlSource === "empirical"
+        ? Math.max(profileFloor, Math.floor(lease.cacheTtlSec))
+        : Math.floor(lease.cacheTtlSec);
     }
-    return profile?.ttlSec || DEFAULT_CACHE_TTL_SEC;
+    return profileFloor;
   }
 
-  _evaluateIdleTtlNotifications(store, leases, { nowWallMs, cfg, ttlDesktopNotifyEnabled, uiLang = "en", sleepJumpMs }) {
-    if (!ttlDesktopNotifyEnabled || !Array.isArray(leases) || leases.length === 0) return;
+  _evaluateIdleTtlKeepalive(
+    store,
+    leases,
+    { nowWallMs, cfg, ttlKeepaliveEnabled, ttlKeepaliveMaxCount = 3, uiLang = "en", sleepJumpMs }
+  ) {
+    const coveredConvIds = new Set();
+    const exhaustedConvMap = new Map();
+    if (
+      !ttlKeepaliveEnabled ||
+      typeof this.keepaliveSendFn !== "function" ||
+      !store ||
+      !Array.isArray(leases) ||
+      leases.length === 0
+    ) {
+      return { coveredConvIds, exhaustedConvMap };
+    }
+
+    const rawMinTok = cfg.ttlKeepaliveMinTokens;
+    const minTokens =
+      rawMinTok !== undefined && rawMinTok !== null && Number.isFinite(Number(rawMinTok))
+        ? Math.min(500000, Math.max(0, Math.floor(Number(rawMinTok))))
+        : 0;
+    const leadSec = Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30)));
+    const maxCount = Math.min(20, Math.max(1, Math.floor(Number(ttlKeepaliveMaxCount) || 3)));
+
+    if (sleepJumpMs !== 0) {
+      return { coveredConvIds, exhaustedConvMap };
+    }
+
+    for (const lease of leases) {
+      if (!lease || lease.phase !== WATCHDOG_PHASES.IDLE || lease.isSubagent) continue;
+      if (lease.subphase !== "stopped") continue;
+      const stopReason = String(lease.stopReason || "").trim();
+      if (
+        /^(?:EXECUTOR_TERMINATION_REASON_)?(?:USER_CANCELED|USER_CANCELLED|CANCELED|CANCELLED|ABORTED|ERROR|watchdog_disabled|stale_|orphan_)/i.test(
+          stopReason
+        )
+      ) {
+        continue;
+      }
+      if (minTokens > 0 && Number(lease.contextTokens || 0) < minTokens) continue;
+
+      const effectiveTtlSec = this._resolveLeaseEffectiveTtlSec(store, lease, cfg, nowWallMs);
+      const effectiveLeadSec = Math.min(leadSec, Math.max(5, Math.floor(effectiveTtlSec * 0.5)));
+      if (!(effectiveTtlSec > effectiveLeadSec)) continue;
+
+      const idleAnchorTs = lease.idleAnchorTs || lease.phaseChangedTs || lease.updatedTs || 0;
+      if (idleAnchorTs <= 0 || nowWallMs < idleAnchorTs) continue;
+      const idleSec = Math.floor((nowWallMs - idleAnchorTs) / 1000);
+      const remSec = effectiveTtlSec - idleSec;
+      if (remSec <= 0) continue;
+
+      const kaState =
+        typeof store.getTtlKeepaliveState === "function"
+          ? store.getTtlKeepaliveState(lease.conversationId)
+          : { usedCount: 0, lastIdleAnchorTs: 0, lastSentTs: 0, pendingAck: false };
+
+      const sentOnCurrentIdleCycle =
+        kaState.lastIdleAnchorTs === idleAnchorTs ||
+        this._keepaliveInFlight.has(lease.conversationId) ||
+        Boolean(kaState.pendingAck && kaState.lastSentTs > 0 && nowWallMs - kaState.lastSentTs < 60_000);
+
+      if (kaState.usedCount < maxCount || sentOnCurrentIdleCycle) {
+        // Suppress all TTL popups during auto-warming cycles 1..maxCount (including while #maxCount is in transit)
+        coveredConvIds.add(lease.conversationId);
+      } else if (kaState.lastIdleAnchorTs > 0 && kaState.lastIdleAnchorTs !== idleAnchorTs) {
+        // Auto-warming #maxCount has finished and its renewed cycle is now running -> eligible to alert once expiring
+        exhaustedConvMap.set(lease.conversationId, {
+          usedCount: kaState.usedCount,
+          maxCount
+        });
+      }
+
+      if (kaState.usedCount >= maxCount) continue;
+      if (remSec > effectiveLeadSec) continue;
+
+      if (this._keepaliveInFlight.has(lease.conversationId)) continue;
+      if (kaState.lastIdleAnchorTs === idleAnchorTs) continue;
+      if (kaState.lastSentTs > 0 && nowWallMs - kaState.lastSentTs < 25_000) continue;
+
+      const nextUsed = kaState.usedCount + 1;
+      const isZh = uiLang === "zh";
+      const message = isZh
+        ? `[agy-dart TTL保活 ${nextUsed}/${maxCount}] 仅回复 OK 以保持上下文缓存热度，请勿调用任何工具或修改任何内容。`
+        : `[agy-dart TTL Keepalive ${nextUsed}/${maxCount}] Reply OK only to keep the prompt cache warm. Do not call any tools or modify any files.`;
+
+      const convId = lease.conversationId;
+      const prevUsed = kaState.usedCount;
+      const prevAnchor = kaState.lastIdleAnchorTs;
+      this._keepaliveInFlight.add(convId);
+      try {
+        store.setTtlKeepaliveState?.(convId, {
+          usedCount: nextUsed,
+          lastIdleAnchorTs: idleAnchorTs,
+          lastSentTs: nowWallMs,
+          pendingAck: true,
+          lastError: "",
+          updatedTs: nowWallMs
+        });
+      } catch {}
+
+      Promise.resolve()
+        .then(() =>
+          this.keepaliveSendFn({
+            conversationId: convId,
+            message,
+            usedCount: nextUsed,
+            maxCount,
+            cwd: lease.cwd || ""
+          })
+        )
+        .then((res) => {
+          if (res && res.ok === false) {
+            throw new Error(res.error || "keepalive_send_failed");
+          }
+          this.ttlKeepaliveCount += 1;
+        })
+        .catch((err) => {
+          try {
+            store.setTtlKeepaliveState?.(convId, {
+              usedCount: prevUsed,
+              lastIdleAnchorTs: prevAnchor,
+              lastSentTs: nowWallMs,
+              pendingAck: false,
+              lastError: String(err?.message || err || "keepalive_send_failed").slice(0, 180),
+              updatedTs: this.nowFn()
+            });
+          } catch {}
+        })
+        .finally(() => {
+          this._keepaliveInFlight.delete(convId);
+        });
+    }
+
+    return { coveredConvIds, exhaustedConvMap };
+  }
+
+  _evaluateIdleTtlNotifications(
+    store,
+    leases,
+    {
+      nowWallMs,
+      cfg,
+      ttlDesktopNotifyEnabled,
+      uiLang = "en",
+      sleepJumpMs,
+      coveredConvIds = null,
+      exhaustedConvMap = null
+    }
+  ) {
+    const envNotifyRaw = process.env.AGY_DART_TTL_DESKTOP_NOTIFY;
+    const explicitlyMutedByEnv =
+      typeof envNotifyRaw === "string" && /^(?:0|false|no|off)$/i.test(envNotifyRaw.trim());
+    const hasExhaustedKeepalive = Boolean(
+      exhaustedConvMap && exhaustedConvMap.size > 0 && !explicitlyMutedByEnv
+    );
+    if ((!ttlDesktopNotifyEnabled && !hasExhaustedKeepalive) || !Array.isArray(leases) || leases.length === 0) {
+      return;
+    }
     const minTokens = Math.min(500000, Math.max(4000, Math.floor(Number(cfg.ttlNotifyMinTokens) || 60000)));
     const leadSec = Math.min(300, Math.max(15, Math.floor(Number(cfg.ttlNotifyLeadSec) || 60)));
 
@@ -1176,13 +1765,18 @@ export class WatchdogMonitor {
 
     for (const lease of leases) {
       if (!lease || lease.phase !== WATCHDOG_PHASES.IDLE || lease.isSubagent) continue;
+      if (coveredConvIds && coveredConvIds.has(lease.conversationId)) continue;
       if (lease.subphase !== "stopped" && lease.subphase !== "stopped_bg_pending") continue;
       const stopReason = String(lease.stopReason || "").trim();
       if (/^(?:EXECUTOR_TERMINATION_REASON_)?(?:USER_CANCELED|USER_CANCELLED|CANCELED|CANCELLED|ABORTED|ERROR)\b/i.test(stopReason)) {
         continue;
       }
+      const exhaustedInfo =
+        !explicitlyMutedByEnv && exhaustedConvMap ? exhaustedConvMap.get(lease.conversationId) || null : null;
+      if (!exhaustedInfo && !ttlDesktopNotifyEnabled) continue;
+
       const ctxTokens = Number(lease.contextTokens || 0);
-      if (ctxTokens < minTokens) continue;
+      if (!exhaustedInfo && ctxTokens < minTokens) continue;
 
       const effectiveTtlSec = this._resolveLeaseEffectiveTtlSec(store, lease, cfg, nowWallMs);
       if (!(effectiveTtlSec > leadSec)) continue;
@@ -1200,22 +1794,48 @@ export class WatchdogMonitor {
       const isZh = uiLang === "zh";
       const notifyLease = this._enrichNotificationLeaseIdentity(lease);
       const { titleTag, bodyPrefix } = buildWindowNotificationPrefix(notifyLease, { isZh });
-      const title = isZh ? `agy-dart${titleTag}：缓存即将过期` : `agy-dart${titleTag}: KV-Cache Expiring`;
+      const ctxLabel = ctxTokens >= 1000 ? `${Math.round(ctxTokens / 1000)}k ` : "";
+      const title = exhaustedInfo
+        ? isZh
+          ? `agy-dart${titleTag}：自动续温已满 (${exhaustedInfo.usedCount}/${exhaustedInfo.maxCount})`
+          : `agy-dart${titleTag}: Auto-Keepalive Limit (${exhaustedInfo.usedCount}/${exhaustedInfo.maxCount})`
+        : isZh
+          ? `agy-dart${titleTag}：缓存即将过期`
+          : `agy-dart${titleTag}: KV-Cache Expiring`;
       const body = sanitizeWatchdogText(
-        isZh
-          ? `${bodyPrefix}${Math.round(ctxTokens / 1000)}k 上下文热缓存约 ${remSec} 秒后过期（TTL ${fmtDur(effectiveTtlSec)}）。继续发消息可保热，或等过期后执行 /compact。`
-          : `${bodyPrefix}${Math.round(ctxTokens / 1000)}k context warm cache expires in ~${remSec}s (TTL ${fmtDur(effectiveTtlSec)}). Reply to keep warm or /compact after expiry.`,
+        exhaustedInfo
+          ? isZh
+            ? `${bodyPrefix}已完成 ${exhaustedInfo.usedCount}/${exhaustedInfo.maxCount} 次自动续温，${ctxLabel}热缓存约 ${remSec} 秒后过期（TTL ${fmtDur(effectiveTtlSec)}）。继续发消息可保热，或等过期后执行 /compact。`
+            : `${bodyPrefix}Used ${exhaustedInfo.usedCount}/${exhaustedInfo.maxCount} auto-keepalives; ${ctxLabel}warm cache expires in ~${remSec}s (TTL ${fmtDur(effectiveTtlSec)}). Reply to keep warm or /compact after expiry.`
+          : isZh
+            ? `${bodyPrefix}${Math.round(ctxTokens / 1000)}k 上下文热缓存约 ${remSec} 秒后过期（TTL ${fmtDur(effectiveTtlSec)}）。继续发消息可保热，或等过期后执行 /compact。`
+            : `${bodyPrefix}${Math.round(ctxTokens / 1000)}k context warm cache expires in ~${remSec}s (TTL ${fmtDur(effectiveTtlSec)}). Reply to keep warm or /compact after expiry.`,
         220
       );
       this._ttlNotifiedKeys.set(lease.conversationId, dedupKey);
       this._lastTtlNotifyGlobalTs = nowWallMs;
       try {
+        const notifyWsLabel =
+          notifyLease.workspaceLabel ||
+          (notifyLease.cwd ? formatWorkspaceWindowLabel(notifyLease.cwd) : "");
         const res = this.notifyFn({
           title,
           body,
           platform: this.platform,
           kind: "ttl_expiring",
-          conversationId: lease.conversationId
+          conversationId: lease.conversationId,
+          cwd: notifyLease.cwd || "",
+          workspaceLabel: notifyWsLabel,
+          convTitle: notifyLease.convTitle || "",
+          onClick: () => {
+            this.recordPendingConversationJump({
+              conversationId: lease.conversationId,
+              cwd: notifyLease.cwd || "",
+              workspaceLabel: notifyWsLabel,
+              convTitle: notifyLease.convTitle || "",
+              source: "ttl_desktop_notify"
+            });
+          }
         });
         if (!res || res.dispatched !== false) {
           this.ttlNotificationCount += 1;
@@ -1298,12 +1918,27 @@ export class WatchdogMonitor {
       );
 
       try {
+        const notifyWsLabel =
+          notifyLease.workspaceLabel ||
+          (notifyLease.cwd ? formatWorkspaceWindowLabel(notifyLease.cwd) : "");
         const res = this.notifyFn({
           title,
           body,
           platform: this.platform,
           kind: "watermark_critical",
-          conversationId: lease.conversationId
+          conversationId: lease.conversationId,
+          cwd: notifyLease.cwd || "",
+          workspaceLabel: notifyWsLabel,
+          convTitle: notifyLease.convTitle || "",
+          onClick: () => {
+            this.recordPendingConversationJump({
+              conversationId: lease.conversationId,
+              cwd: notifyLease.cwd || "",
+              workspaceLabel: notifyWsLabel,
+              convTitle: notifyLease.convTitle || "",
+              source: "watermark_desktop_notify"
+            });
+          }
         });
         if (!res || res.dispatched !== false) {
           this.watermarkNotificationCount += 1;
@@ -1328,6 +1963,9 @@ export class WatchdogMonitor {
     const enabled = this._resolveWatchdogEnabled(store, cfg);
     const desktopNotifyEnabled = this._resolveDesktopNotifyEnabled(store, cfg);
     const ttlDesktopNotifyEnabled = this._resolveTtlDesktopNotifyEnabled(store, cfg);
+    const ttlKeepaliveEnabled = this._resolveTtlKeepaliveEnabled(store, cfg);
+    const ttlKeepaliveMaxCount = this._resolveTtlKeepaliveMaxCount(store, cfg);
+    const ttlKeepaliveActive = Boolean(ttlKeepaliveEnabled && typeof this.keepaliveSendFn === "function");
     const watermarkDesktopNotifyEnabled = this._resolveWatermarkDesktopNotifyEnabled(store, cfg, {
       desktopNotifyEnabled: enabled && desktopNotifyEnabled,
       ttlDesktopNotifyEnabled
@@ -1336,13 +1974,15 @@ export class WatchdogMonitor {
     const uiLang = langInfo.lang;
     const sleepJumpMs = this._checkSleepDrift(nowWallMs, nowMonoNs, pollMs);
 
-    if (!store || (!enabled && !ttlDesktopNotifyEnabled && !watermarkDesktopNotifyEnabled)) {
+    if (!store || (!enabled && !ttlDesktopNotifyEnabled && !ttlKeepaliveActive && !watermarkDesktopNotifyEnabled)) {
       this._convState.clear();
       this._lastEvaluated.clear();
       return {
         enabled,
         desktopNotifyEnabled,
         ttlDesktopNotifyEnabled,
+        ttlKeepaliveEnabled,
+        ttlKeepaliveMaxCount,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -1359,12 +1999,22 @@ export class WatchdogMonitor {
       for (const id of this._ttlNotifiedKeys.keys()) {
         if (!liveIds.has(id)) this._ttlNotifiedKeys.delete(id);
       }
+      const { coveredConvIds, exhaustedConvMap } = this._evaluateIdleTtlKeepalive(store, leases, {
+        nowWallMs,
+        cfg,
+        ttlKeepaliveEnabled,
+        ttlKeepaliveMaxCount,
+        uiLang,
+        sleepJumpMs
+      });
       this._evaluateIdleTtlNotifications(store, leases, {
         nowWallMs,
         cfg,
         ttlDesktopNotifyEnabled,
         uiLang,
-        sleepJumpMs
+        sleepJumpMs,
+        coveredConvIds,
+        exhaustedConvMap
       });
       this._evaluateWatermarkNotifications(store, leases, {
         nowWallMs,
@@ -1376,6 +2026,8 @@ export class WatchdogMonitor {
         enabled,
         desktopNotifyEnabled,
         ttlDesktopNotifyEnabled,
+        ttlKeepaliveEnabled,
+        ttlKeepaliveMaxCount,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -1405,12 +2057,22 @@ export class WatchdogMonitor {
       for (const id of this._ttlNotifiedKeys.keys()) {
         if (!liveIds.has(id)) this._ttlNotifiedKeys.delete(id);
       }
+      const { coveredConvIds, exhaustedConvMap } = this._evaluateIdleTtlKeepalive(store, leases, {
+        nowWallMs,
+        cfg,
+        ttlKeepaliveEnabled,
+        ttlKeepaliveMaxCount,
+        uiLang,
+        sleepJumpMs
+      });
       this._evaluateIdleTtlNotifications(store, leases, {
         nowWallMs,
         cfg,
         ttlDesktopNotifyEnabled,
         uiLang,
-        sleepJumpMs
+        sleepJumpMs,
+        coveredConvIds,
+        exhaustedConvMap
       });
       this._evaluateWatermarkNotifications(store, leases, {
         nowWallMs,
@@ -1422,6 +2084,8 @@ export class WatchdogMonitor {
         enabled,
         desktopNotifyEnabled,
         ttlDesktopNotifyEnabled,
+        ttlKeepaliveEnabled,
+        ttlKeepaliveMaxCount,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -1465,17 +2129,24 @@ export class WatchdogMonitor {
       if (!seenIds.has(id)) this._ttlNotifiedKeys.delete(id);
     }
 
-    this._evaluateIdleTtlNotifications(
-      store,
-      leases.filter((l) => l.phase === WATCHDOG_PHASES.IDLE),
-      {
-        nowWallMs,
-        cfg,
-        ttlDesktopNotifyEnabled,
-        uiLang,
-        sleepJumpMs
-      }
-    );
+    const idleLeases = leases.filter((l) => l.phase === WATCHDOG_PHASES.IDLE);
+    const { coveredConvIds, exhaustedConvMap } = this._evaluateIdleTtlKeepalive(store, idleLeases, {
+      nowWallMs,
+      cfg,
+      ttlKeepaliveEnabled,
+      ttlKeepaliveMaxCount,
+      uiLang,
+      sleepJumpMs
+    });
+    this._evaluateIdleTtlNotifications(store, idleLeases, {
+      nowWallMs,
+      cfg,
+      ttlDesktopNotifyEnabled,
+      uiLang,
+      sleepJumpMs,
+      coveredConvIds,
+      exhaustedConvMap
+    });
     this._evaluateWatermarkNotifications(store, leases, {
       nowWallMs,
       watermarkDesktopNotifyEnabled,
@@ -1492,6 +2163,8 @@ export class WatchdogMonitor {
       enabled,
       desktopNotifyEnabled,
       ttlDesktopNotifyEnabled,
+      ttlKeepaliveEnabled,
+      ttlKeepaliveMaxCount,
       watermarkDesktopNotifyEnabled,
       uiLang,
       uiLangSource: langInfo.source,
@@ -1937,13 +2610,28 @@ export class WatchdogMonitor {
                 : `${bodyPrefix}${diagnosis?.label || lease.phase} (silent ${silentSec}s). Open Sidecar to copy Rescue Handoff Brief.`,
               220
             );
+            const notifyWsLabel =
+              notifyLease.workspaceLabel ||
+              (notifyLease.cwd ? formatWorkspaceWindowLabel(notifyLease.cwd) : "");
             this.notifyFn({
               title,
               body,
               conversationId: lease.conversationId,
+              cwd: notifyLease.cwd || "",
+              workspaceLabel: notifyWsLabel,
+              convTitle: notifyLease.convTitle || "",
               causeId: diagnosis?.causeId || "",
               silentSec,
-              platform: this.platform
+              platform: this.platform,
+              onClick: () => {
+                this.recordPendingConversationJump({
+                  conversationId: lease.conversationId,
+                  cwd: notifyLease.cwd || "",
+                  workspaceLabel: notifyWsLabel,
+                  convTitle: notifyLease.convTitle || "",
+                  source: "watchdog_desktop_notify"
+                });
+              }
             });
           } catch {}
         }
@@ -2001,6 +2689,12 @@ export class WatchdogMonitor {
     const ttlDesktopNotifyEnabled = tickRes
       ? tickRes.ttlDesktopNotifyEnabled
       : this._resolveTtlDesktopNotifyEnabled(store, cfg);
+    const ttlKeepaliveEnabled = tickRes
+      ? tickRes.ttlKeepaliveEnabled
+      : this._resolveTtlKeepaliveEnabled(store, cfg);
+    const ttlKeepaliveMaxCount = tickRes
+      ? tickRes.ttlKeepaliveMaxCount
+      : this._resolveTtlKeepaliveMaxCount(store, cfg);
     const watermarkDesktopNotifyEnabled = tickRes
       ? tickRes.watermarkDesktopNotifyEnabled
       : this._resolveWatermarkDesktopNotifyEnabled(store, cfg, {
@@ -2012,6 +2706,7 @@ export class WatchdogMonitor {
       : this._resolveUiLangInfo(store, cfg);
     const ttlNotifyLeadSec = Math.min(300, Math.max(15, Math.floor(Number(cfg.ttlNotifyLeadSec) || 60)));
     const ttlNotifyMinTokens = Math.min(500000, Math.max(4000, Math.floor(Number(cfg.ttlNotifyMinTokens) || 60000)));
+    const ttlKeepaliveLeadSec = Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30)));
 
     const sessions = Array.from(this._lastEvaluated.values()).sort((a, b) => {
       const rankDiff = severityRank(b.severity) - severityRank(a.severity);
@@ -2029,16 +2724,32 @@ export class WatchdogMonitor {
       current = sessions.find((s) => s.phase !== WATCHDOG_PHASES.IDLE) || sessions[0] || null;
     }
 
+    const kaTargetConvId = safeConvId || current?.conversationId || "";
+    const kaState =
+      kaTargetConvId && store && typeof store.getTtlKeepaliveState === "function"
+        ? store.getTtlKeepaliveState(kaTargetConvId)
+        : { usedCount: 0, lastSentTs: 0, lastError: "" };
+
     const alertingSessions = sessions.filter((s) => s.severity === "stalled" || s.severity === "suspect");
     const activeCount = sessions.filter((s) => s.phase !== WATCHDOG_PHASES.IDLE).length;
     const suspectCount = sessions.filter((s) => s.severity === "suspect").length;
     const stalledCount = sessions.filter((s) => s.severity === "stalled").length;
+    const pendingJump = this.getPendingConversationJump(nowWallMs);
 
     return {
       ok: true,
       enabled,
       desktopNotifyEnabled,
       ttlDesktopNotifyEnabled,
+      ttlKeepalive: {
+        enabled: ttlKeepaliveEnabled,
+        supported: typeof this.keepaliveSendFn === "function",
+        maxCount: ttlKeepaliveMaxCount,
+        usedCount: kaState.usedCount,
+        leadSec: ttlKeepaliveLeadSec,
+        lastSentTs: kaState.lastSentTs || 0,
+        lastError: kaState.lastError || ""
+      },
       watermarkDesktopNotifyEnabled,
       uiLang: langInfo.lang,
       uiLangSource: langInfo.source,
@@ -2060,6 +2771,7 @@ export class WatchdogMonitor {
         lastDriftAt: this._lastSleepDriftAt,
         lastJumpMs: this._lastSleepJumpMs
       },
+      pendingJump,
       current,
       sessions: sessions.slice(0, 20),
       alertingSessions: alertingSessions.slice(0, 10),
@@ -2072,8 +2784,205 @@ export class WatchdogMonitor {
         tailReadCount: this.tailReadCount,
         notificationCount: this.notificationCount,
         ttlNotificationCount: this.ttlNotificationCount,
+        ttlKeepaliveCount: this.ttlKeepaliveCount,
         watermarkNotificationCount: this.watermarkNotificationCount
       }
+    };
+  }
+
+  recordPendingConversationJump({
+    conversationId = "",
+    cwd = "",
+    workspaceLabel = "",
+    convTitle = "",
+    source = "desktop_notify",
+    ttlMs = this.pendingJumpTtlMs
+  } = {}) {
+    const safeId = sanitizeConversationId(conversationId);
+    if (!safeId) {
+      return { ok: false, error: "Valid conversationId is required" };
+    }
+    const now = this.nowFn();
+    const effectiveTtlMs = Math.min(
+      120_000,
+      Math.max(1000, Math.floor(Number(ttlMs) || this.pendingJumpTtlMs || DEFAULT_PENDING_JUMP_TTL_MS))
+    );
+    const decodedCwd = decodeFileUriOrPath(cwd);
+    const cleanCwd = decodedCwd ? sanitizeWatchdogText(decodedCwd, 260) : "";
+    const rawWs =
+      (typeof workspaceLabel === "string" && workspaceLabel.trim()) ||
+      (decodedCwd ? formatWorkspaceWindowLabel(decodedCwd) : "");
+    const cleanWs = rawWs ? sanitizeWatchdogText(rawWs, 48) : "";
+    const cleanTitle =
+      typeof convTitle === "string" && convTitle.trim() ? sanitizeWatchdogText(convTitle, 36) : "";
+    const cleanSource = sanitizeWatchdogText(source, 32) || "desktop_notify";
+    const jumpId = `jmp_${now.toString(36)}_${crypto.randomBytes(4).toString("hex")}`;
+    const ticket = {
+      jumpId,
+      conversationId: safeId,
+      cwd: cleanCwd,
+      workspaceLabel: cleanWs,
+      convTitle: cleanTitle,
+      source: cleanSource,
+      createdTs: now,
+      expiresTs: now + effectiveTtlMs
+    };
+
+    const store = this.getStore?.();
+    let persisted = false;
+    if (store && typeof store.setMeta === "function") {
+      try {
+        store.setMeta(PENDING_JUMP_META_KEY, JSON.stringify(ticket));
+        persisted = true;
+      } catch {}
+    }
+    this._fallbackPendingJump = persisted ? null : ticket;
+    return { ok: true, pendingJump: ticket };
+  }
+
+  getPendingConversationJump(nowMs = this.nowFn()) {
+    const store = this.getStore?.();
+    let raw = null;
+    const hasStoreMeta = Boolean(store && typeof store.getMeta === "function");
+    if (hasStoreMeta) {
+      try {
+        raw = store.getMeta(PENDING_JUMP_META_KEY, null);
+      } catch {}
+    } else if (this._fallbackPendingJump) {
+      raw = this._fallbackPendingJump;
+    }
+    if (!raw) return null;
+
+    const clearStored = () => {
+      this._fallbackPendingJump = null;
+      if (store && typeof store.deleteMeta === "function") {
+        try {
+          store.deleteMeta(PENDING_JUMP_META_KEY);
+        } catch {}
+      }
+    };
+
+    const parsed = parseMaybeJsonObj(raw);
+    const jumpId = typeof parsed.jumpId === "string" ? parsed.jumpId.trim() : "";
+    const safeId = sanitizeConversationId(parsed.conversationId);
+    const createdTs = Number(parsed.createdTs);
+    const expiresTs = Number(parsed.expiresTs);
+    if (
+      !jumpId ||
+      jumpId.length > 96 ||
+      !/^[A-Za-z0-9._:-]+$/.test(jumpId) ||
+      !safeId ||
+      !Number.isFinite(expiresTs) ||
+      nowMs >= expiresTs ||
+      (Number.isFinite(createdTs) && createdTs > nowMs + 60_000)
+    ) {
+      clearStored();
+      return null;
+    }
+
+    const decodedCwd = decodeFileUriOrPath(parsed.cwd || "");
+    const cleanCwd = decodedCwd ? sanitizeWatchdogText(decodedCwd, 260) : "";
+    const cleanWs =
+      typeof parsed.workspaceLabel === "string" && parsed.workspaceLabel.trim()
+        ? sanitizeWatchdogText(parsed.workspaceLabel, 48)
+        : cleanCwd
+          ? formatWorkspaceWindowLabel(cleanCwd)
+          : "";
+    const cleanTitle =
+      typeof parsed.convTitle === "string" && parsed.convTitle.trim()
+        ? sanitizeWatchdogText(parsed.convTitle, 36)
+        : "";
+    const cleanSource = sanitizeWatchdogText(parsed.source || "desktop_notify", 32) || "desktop_notify";
+
+    return {
+      jumpId,
+      conversationId: safeId,
+      cwd: cleanCwd,
+      workspaceLabel: cleanWs,
+      convTitle: cleanTitle,
+      source: cleanSource,
+      createdTs: Number.isFinite(createdTs) && createdTs > 0 ? Math.floor(createdTs) : nowMs,
+      expiresTs: Math.floor(expiresTs)
+    };
+  }
+
+  acknowledgePendingJump(jumpId = "") {
+    const cleanJumpId = typeof jumpId === "string" ? jumpId.trim() : "";
+    if (!cleanJumpId || cleanJumpId.length > 96 || !/^[A-Za-z0-9._:-]+$/.test(cleanJumpId)) {
+      return { ok: false, error: "Valid jumpId is required" };
+    }
+    const cur = this.getPendingConversationJump(this.nowFn());
+    if (!cur || cur.jumpId !== cleanJumpId) {
+      return { ok: true, acknowledged: false, jumpId: cleanJumpId };
+    }
+    this._fallbackPendingJump = null;
+    const store = this.getStore?.();
+    if (store && typeof store.deleteMeta === "function") {
+      try {
+        store.deleteMeta(PENDING_JUMP_META_KEY);
+      } catch {}
+    }
+    return {
+      ok: true,
+      acknowledged: true,
+      jumpId: cleanJumpId,
+      conversationId: cur.conversationId
+    };
+  }
+
+  focusConversation(conversationId = "", { source = "sidecar_ui", skipOsFocus = false } = {}) {
+    const safeId = sanitizeConversationId(conversationId);
+    if (!safeId) {
+      return { ok: false, error: "Valid conversationId is required" };
+    }
+    const store = this.getStore?.();
+    const lease = store ? readWatchdogLease(store, safeId) : null;
+    const evaluated = this._lastEvaluated.get(safeId) || null;
+    let cwd = lease?.cwd || evaluated?.cwd || "";
+    let workspaceLabel = lease?.workspaceLabel || evaluated?.workspaceLabel || "";
+    let convTitle = lease?.convTitle || evaluated?.convTitle || "";
+    const transcriptPath = lease?.transcriptPath || "";
+
+    if (!cwd || !convTitle) {
+      try {
+        const summary = this.lookupSummaryFn?.(safeId, { transcriptPath }) || null;
+        if (summary) {
+          if (!convTitle && summary.title) convTitle = summary.title;
+          if (!cwd && summary.cwd) cwd = summary.cwd;
+        }
+      } catch {}
+    }
+    if (!workspaceLabel && cwd) {
+      workspaceLabel = formatWorkspaceWindowLabel(cwd);
+    }
+
+    const rec = this.recordPendingConversationJump({
+      conversationId: safeId,
+      cwd,
+      workspaceLabel,
+      convTitle,
+      source
+    });
+
+    let focused = false;
+    if (!skipOsFocus) {
+      try {
+        const focusRes = this.focusWindowFn?.({
+          conversationId: safeId,
+          cwd: rec.pendingJump?.cwd || cwd,
+          workspaceLabel: rec.pendingJump?.workspaceLabel || workspaceLabel,
+          convTitle: rec.pendingJump?.convTitle || convTitle,
+          platform: this.platform
+        });
+        focused = Boolean(focusRes && focusRes.dispatched);
+      } catch {}
+    }
+
+    return {
+      ok: true,
+      conversationId: safeId,
+      pendingJump: rec.pendingJump || null,
+      focused
     };
   }
 

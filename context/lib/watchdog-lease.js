@@ -24,9 +24,10 @@ export const WATCHDOG_PHASES = Object.freeze({
 
 const RESERVED_CONV_IDS = new Set(["default", "all", "lifetime", "app"]);
 const SLASH_COMPACT_RE = /^\s*\/compact(?:\s|$)/i;
+export const TTL_KEEPALIVE_PROMPT_RE = /\[agy-dart TTL(?:保活| Keepalive)(?:\s|\])/i;
 export const HEADLESS_FINISH_PROMPT_RE =
   /\bWhen you are done,\s*call the finish tool with your result\./i;
-const SUBAGENT_ROLE_RE =
+export const SUBAGENT_ROLE_RE =
   /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?)(?:$|[-_\s/])/i;
 export const SUBAGENT_TOOL_RE =
   /^(?:subagent|task|agent|delegate|call_subagent|invoke_subagent|schedule|manage_task|send_message|browser_subagent|spawn_subagent|run_subagent)$/i;
@@ -36,6 +37,11 @@ export const KNOWN_MCP_TOOL_RE =
 const HOST_NAMESPACE_RE = /^(?:default_api|builtin|host|antigravity|core|native)$/i;
 const BG_RESPONSE_RE = /\b(?:running as a background task|background task with task id|scheduled|running in the background)\b/i;
 const MAX_PENDING_SLOW_CALLS = 8;
+
+export function isTtlKeepalivePrompt(rawText) {
+  if (typeof rawText !== "string" || !rawText) return false;
+  return TTL_KEEPALIVE_PROMPT_RE.test(rawText);
+}
 
 export function isHeadlessWorkerPrompt(rawText) {
   if (typeof rawText !== "string" || !rawText) return false;
@@ -1145,10 +1151,13 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
         ? String(safePayload.lastUserInput ?? safePayload.last_user_input)
         : "";
     const isMidTurn = invNum !== null && invNum >= 1;
-    if (rawInput.trim()) {
+    const isKeepaliveInput = Boolean(safeOptions.isKeepaliveTurn) || isTtlKeepalivePrompt(rawInput);
+    if (rawInput.trim() && !isKeepaliveInput) {
       next.lastUserInput = sanitizeWatchdogText(rawInput, 240);
       next.isCompactCmd = SLASH_COMPACT_RE.test(rawInput);
-    } else if (!isMidTurn) {
+    } else if (!isMidTurn && !isKeepaliveInput) {
+      next.isCompactCmd = false;
+    } else if (isKeepaliveInput) {
       next.isCompactCmd = false;
     }
     if (invNum !== null) next.invocationNum = invNum;

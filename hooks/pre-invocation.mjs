@@ -396,6 +396,7 @@ async function main() {
   const resolvedDbPath = effectiveCfg.dbPath || path.join(os.homedir(), ".agy-dart", "context.db");
   const watchdogExplicit = effectiveCfg.stallWatchdog && cfgSnapshot.sources.stallWatchdog !== "default";
   const ttlNotifyExplicit = effectiveCfg.ttlDesktopNotify && cfgSnapshot.sources.ttlDesktopNotify !== "default";
+  const ttlKeepaliveCfgExplicit = effectiveCfg.ttlKeepalive && cfgSnapshot.sources.ttlKeepalive !== "default";
   const watermarkNotifyExplicit =
     effectiveCfg.watermarkDesktopNotify === true && cfgSnapshot.sources.watermarkDesktopNotify !== "default";
   const dbExists = fs.existsSync(resolvedDbPath);
@@ -405,6 +406,7 @@ async function main() {
     (effectiveCfg.readDedup ||
       effectiveCfg.stallWatchdog ||
       effectiveCfg.ttlDesktopNotify ||
+      effectiveCfg.ttlKeepalive ||
       effectiveCfg.watermarkDesktopNotify === true ||
       dbExists) &&
     dbExists;
@@ -413,6 +415,7 @@ async function main() {
     !effectiveCfg.diffRead &&
     !watchdogExplicit &&
     !ttlNotifyExplicit &&
+    !ttlKeepaliveCfgExplicit &&
     !watermarkNotifyExplicit &&
     !needExistingDbWork
   ) {
@@ -447,6 +450,7 @@ async function main() {
       effectiveCfg.cacheWatch ||
       effectiveCfg.stallWatchdog ||
       effectiveCfg.ttlDesktopNotify ||
+      effectiveCfg.ttlKeepalive ||
       effectiveCfg.watermarkDesktopNotify === true ||
       dbExists
         ? import("../context/lib/watchdog-lease.js")
@@ -457,21 +461,31 @@ async function main() {
     // Hook mode: bounded SQLite busy timeout & deadline so external write locks fail-open in <1s
     store = new ContextModeStore({ hookMode: true, maxBusyRetries: 4, maxRetryDeadlineMs: 800 });
 
-    const { analyzeTranscriptCache, findTranscriptForConversation, isSlashCompactText, readTranscriptTail } =
-      cacheAnalyzerMod;
+    const {
+      analyzeTranscriptCache,
+      extractStepText,
+      findTranscriptForConversation,
+      isSlashCompactText,
+      readTranscriptTail
+    } = cacheAnalyzerMod;
 
     const targetConvId = directConvId && directConvId !== "default" ? directConvId : sessionId;
     const isSubagentConv = Boolean(directConvId && directConvId !== "default" && directConvId !== sessionId);
 
-    // Advance per-conversation turn sequence on every LLM turn when readDedup or diffRead is active
-    // so non-read turns (edits/commands/chat) accurately age read-dedup & diff-read baselines — even if
-    // cacheWatch is disabled or alerts are paused (PreInvocation is the sole turn clock; read_file never bumps it).
+    // Advance per-conversation turn sequence on genuine LLM turns when readDedup or diffRead is active
+    // (deferred past auto-keepalive detection so background TTL keepalives never age readDedup/diffRead windows).
     let currentTurnSeq = 0;
-    if ((effectiveCfg.diffRead || effectiveCfg.readDedup) && directConvId && directConvId !== "default") {
-      try {
-        currentTurnSeq = store.bumpConversationTurnSeq(directConvId);
-      } catch {}
-    }
+    let bumpedTurnSeq = false;
+    const ensureTurnSeqBumped = () => {
+      if (bumpedTurnSeq) return currentTurnSeq;
+      if ((effectiveCfg.diffRead || effectiveCfg.readDedup) && directConvId && directConvId !== "default") {
+        try {
+          currentTurnSeq = store.bumpConversationTurnSeq(directConvId);
+          bumpedTurnSeq = true;
+        } catch {}
+      }
+      return currentTurnSeq;
+    };
 
     // Parse initialNumSteps & invocationNum for rollback detection and idempotent `/compact` invalidation
     const rawInitialSteps = payload.initialNumSteps ?? payload.initial_num_steps;
@@ -509,49 +523,7 @@ async function main() {
       } catch {}
     }
 
-    // 2. Immediate `/compact` command detection via lastUserInput (idempotent via initialNumSteps;
-    //    never re-invalidates during mid-turn tool loops where invocationNum >= 1).
     const rawLastUserInput = payload.lastUserInput ?? payload.last_user_input ?? "";
-    if (typeof rawLastUserInput === "string" && rawLastUserInput.trim() && targetConvId && targetConvId !== "default") {
-      try {
-        const cmdKey = `compact_invalidated:cmd:${targetConvId}`;
-        if (isSlashCompactText(rawLastUserInput)) {
-          if (!isMidTurnContinuation) {
-            const cmdText = rawLastUserInput.trim().slice(0, 128);
-            let prevCmd = null;
-            const rawPrevCmd = store.getTimedMeta(cmdKey, "");
-            if (rawPrevCmd) {
-              try {
-                prevCmd = JSON.parse(rawPrevCmd);
-              } catch {}
-            }
-            const alreadyStamped = Boolean(
-              prevCmd &&
-                prevCmd.text === cmdText &&
-                (initialNumSteps !== null ? prevCmd.initialNumSteps === initialNumSteps : !isExplicitTurnEntry)
-            );
-            if (!alreadyStamped) {
-              store.invalidateFileReads(targetConvId, null);
-              store.setTimedMeta(
-                cmdKey,
-                JSON.stringify({
-                  text: cmdText,
-                  initialNumSteps,
-                  stepIdx: null,
-                  turnSeq: currentTurnSeq,
-                  ts: Date.now()
-                })
-              );
-            }
-          }
-        } else {
-          // Non-compact user turn resets cmd stamp so a subsequent `/compact` always triggers cleanly
-          if (store.getTimedMeta(cmdKey, "")) {
-            store.deleteMeta(cmdKey);
-          }
-        }
-      } catch {}
-    }
 
     let transcriptPath =
       (typeof payload.transcriptPath === "string" && payload.transcriptPath.trim()) ||
@@ -637,9 +609,10 @@ async function main() {
     let resolvedConvTitle = "";
     let resolvedCwd = "";
     let subprojectPaths = [];
+    let existingLease = null;
     if (targetConvId && targetConvId !== "default" && watchdogLeaseMod) {
       try {
-        const existingLease =
+        existingLease =
           (dbExists || store.db) && typeof watchdogLeaseMod.readWatchdogLease === "function"
             ? watchdogLeaseMod.readWatchdogLease(store, targetConvId)
             : null;
@@ -704,11 +677,165 @@ async function main() {
           typeof store.isTtlDesktopNotifyEnabled === "function" &&
           store.isTtlDesktopNotifyEnabled())
     );
+    const ttlKeepaliveExplicit = Boolean(
+      cfgSnapshot.sources.ttlKeepalive !== "default"
+        ? effectiveCfg.ttlKeepalive
+        : (dbExists || store.db) && store.getMeta("cache:ttl_keepalive_enabled", null) === "true"
+    );
     const watermarkNotifyActive =
       effectiveCfg.watermarkDesktopNotify === true ||
       (effectiveCfg.watermarkDesktopNotify === null && (ttlNotifyActive || desktopStallNotifyActive));
+
+    // Detect auto-keepalive vs genuine user turn so real user messages reset keepalive count -> 0/N.
+    // Note: `agentapi send-message` injects a SYSTEM_MESSAGE step without clearing/replacing `payload.lastUserInput`
+    // (which still holds the PREVIOUS turn's user prompt), so we MUST always scan trailing steps after the last
+    // PLANNER_RESPONSE first rather than skipping transcript inspection when `rawLastUserInput` is non-empty.
+    let isKeepaliveTurn = false;
+    if (!isSubagentConv && targetConvId && targetConvId !== "default" && watchdogLeaseMod) {
+      try {
+        const checkKeepalive = watchdogLeaseMod.isTtlKeepalivePrompt;
+        const trimmedRawInput = typeof rawLastUserInput === "string" ? rawLastUserInput.trim() : "";
+        const matchedDirectKeepalive = Boolean(checkKeepalive && checkKeepalive(trimmedRawInput));
+        let matchedKeepaliveInTrailingSteps = false;
+        let sawUserStepAfterPlanner = false;
+        let priorCompletedUserText = "";
+        if (loadedSteps.length > 0) {
+          // Inspect steps after the last PLANNER_RESPONSE without breaking early so a real USER_INPUT
+          // alongside a SYSTEM_MESSAGE keepalive is NEVER misclassified as a pure keepalive turn;
+          // also capture the latest pre-PLANNER_RESPONSE USER_INPUT for un-flushed stale-input fallback.
+          let passedLastPlanner = false;
+          for (let idx = loadedSteps.length - 1; idx >= 0; idx--) {
+            const stp = loadedSteps[idx];
+            if (!stp || typeof stp !== "object") continue;
+            const stType = String(stp.type || "").toUpperCase();
+            if (stType === "PLANNER_RESPONSE") {
+              passedLastPlanner = true;
+              continue;
+            }
+            if (!passedLastPlanner) {
+              if (!matchedDirectKeepalive && (stType === "USER_INPUT" || stType === "SYSTEM_MESSAGE")) {
+                const extracted = String(
+                  extractStepText ? extractStepText(stp.user_input ?? stp.content ?? stp.text) : (stp.user_input ?? stp.content ?? "")
+                ).trim();
+                if (!extracted) continue;
+                if (checkKeepalive && checkKeepalive(extracted)) {
+                  matchedKeepaliveInTrailingSteps = true;
+                } else if (stType === "USER_INPUT") {
+                  sawUserStepAfterPlanner = true;
+                }
+              }
+            } else if (stType === "USER_INPUT") {
+              const rawPrior = String(
+                extractStepText ? extractStepText(stp.user_input ?? stp.content ?? stp.text) : (stp.user_input ?? stp.content ?? "")
+              ).trim();
+              if (rawPrior && !(checkKeepalive && checkKeepalive(rawPrior))) {
+                const reqMatch = rawPrior.match(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/i);
+                priorCompletedUserText = (reqMatch ? reqMatch[1] : rawPrior).trim();
+                break;
+              }
+            }
+          }
+        }
+        const kaState =
+          (dbExists || store.db) && typeof store.getTtlKeepaliveState === "function"
+            ? store.getTtlKeepaliveState(targetConvId)
+            : null;
+        const sanitizedRawInput =
+          trimmedRawInput && typeof watchdogLeaseMod.sanitizeWatchdogText === "function"
+            ? watchdogLeaseMod.sanitizeWatchdogText(rawLastUserInput, 240)
+            : trimmedRawInput;
+        const sanitizedPriorTxInput =
+          priorCompletedUserText && typeof watchdogLeaseMod.sanitizeWatchdogText === "function"
+            ? watchdogLeaseMod.sanitizeWatchdogText(priorCompletedUserText, 240)
+            : priorCompletedUserText;
+        const isStaleCarryOverInput =
+          !trimmedRawInput ||
+          Boolean(existingLease?.lastUserInput && sanitizedRawInput === existingLease.lastUserInput) ||
+          Boolean(!existingLease?.lastUserInput && sanitizedPriorTxInput && sanitizedRawInput === sanitizedPriorTxInput);
+
+        if (matchedDirectKeepalive || (matchedKeepaliveInTrailingSteps && !sawUserStepAfterPlanner)) {
+          isKeepaliveTurn = true;
+          if (!isMidTurnContinuation && kaState?.pendingAck && typeof store.setTtlKeepaliveState === "function") {
+            store.setTtlKeepaliveState(targetConvId, { pendingAck: false, updatedTs: Date.now() });
+          }
+        } else if (
+          !isMidTurnContinuation &&
+          !sawUserStepAfterPlanner &&
+          isStaleCarryOverInput &&
+          kaState?.pendingAck &&
+          Date.now() - (kaState.lastSentTs || 0) <= 90_000
+        ) {
+          isKeepaliveTurn = true;
+          if (typeof store.setTtlKeepaliveState === "function") {
+            store.setTtlKeepaliveState(targetConvId, { pendingAck: false, updatedTs: Date.now() });
+          }
+        } else if (
+          !isMidTurnContinuation &&
+          kaState &&
+          (kaState.usedCount > 0 || kaState.pendingAck) &&
+          typeof store.resetTtlKeepaliveState === "function"
+        ) {
+          store.resetTtlKeepaliveState(targetConvId);
+        }
+      } catch {}
+    }
+
+    // 2. Immediate `/compact` command detection via lastUserInput (idempotent via initialNumSteps;
+    //    skipped on SYSTEM_MESSAGE keepalive turns where `lastUserInput` may still hold a prior `/compact`).
     if (
-      (watchdogActive || ttlNotifyActive || watermarkNotifyActive) &&
+      !isKeepaliveTurn &&
+      typeof rawLastUserInput === "string" &&
+      rawLastUserInput.trim() &&
+      targetConvId &&
+      targetConvId !== "default"
+    ) {
+      try {
+        const cmdKey = `compact_invalidated:cmd:${targetConvId}`;
+        if (isSlashCompactText(rawLastUserInput)) {
+          if (!isMidTurnContinuation) {
+            const cmdText = rawLastUserInput.trim().slice(0, 128);
+            let prevCmd = null;
+            const rawPrevCmd = store.getTimedMeta(cmdKey, "");
+            if (rawPrevCmd) {
+              try {
+                prevCmd = JSON.parse(rawPrevCmd);
+              } catch {}
+            }
+            const alreadyStamped = Boolean(
+              prevCmd &&
+                prevCmd.text === cmdText &&
+                (initialNumSteps !== null ? prevCmd.initialNumSteps === initialNumSteps : !isExplicitTurnEntry)
+            );
+            if (!alreadyStamped) {
+              ensureTurnSeqBumped();
+              store.invalidateFileReads(targetConvId, null);
+              store.setTimedMeta(
+                cmdKey,
+                JSON.stringify({
+                  text: cmdText,
+                  initialNumSteps,
+                  stepIdx: null,
+                  turnSeq: currentTurnSeq,
+                  ts: Date.now()
+                })
+              );
+            }
+          }
+        } else {
+          // Non-compact user turn resets cmd stamp so a subsequent `/compact` always triggers cleanly
+          if (store.getTimedMeta(cmdKey, "")) {
+            store.deleteMeta(cmdKey);
+          }
+        }
+      } catch {}
+    }
+
+    if (!isKeepaliveTurn) {
+      ensureTurnSeqBumped();
+    }
+
+    if (
+      (watchdogActive || ttlNotifyActive || ttlKeepaliveExplicit || watermarkNotifyActive) &&
       targetConvId &&
       targetConvId !== "default" &&
       watchdogLeaseMod?.recordHookLeaseTransition
@@ -754,6 +881,7 @@ async function main() {
           directConvId: targetConvId,
           rootSessionId: sessionId,
           isSubagent: detectedSubagent,
+          isKeepaliveTurn,
           cwd: resolvedCwd || payload.cwd || "",
           workspaceLabel: resolvedWorkspaceLabel,
           convTitle: resolvedConvTitle,
@@ -775,7 +903,7 @@ async function main() {
     }
 
     // Inherit parent pause state for subagents, while isolating alert suppression keys per direct conversation
-    if (!effectiveCfg.cacheWatch || store.isPaused(sessionId) || (isSubagentConv && store.isPaused(targetConvId)) || !diag) {
+    if (isKeepaliveTurn || !effectiveCfg.cacheWatch || store.isPaused(sessionId) || (isSubagentConv && store.isPaused(targetConvId)) || !diag) {
       store.close();
       store = null;
       process.stdout.write("{}\n");

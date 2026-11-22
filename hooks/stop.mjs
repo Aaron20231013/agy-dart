@@ -13,7 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
-import { getEffectiveConfig } from "../context/lib/config.js";
+import { getConfigSnapshot, getEffectiveConfig } from "../context/lib/config.js";
 
 const STOP_ALLOW_OUTPUT = '{"decision":"allow"}\n';
 
@@ -112,11 +112,17 @@ export async function handleStopPayload(payload = {}, options = {}) {
         ? store.isTtlDesktopNotifyEnabled()
         : effectiveCfg.ttlDesktopNotify
     );
+    const cfgSnap = safeOptions.cfgSnapshot || getConfigSnapshot();
+    const ttlKeepaliveExplicit = Boolean(
+      cfgSnap.sources.ttlKeepalive !== "default"
+        ? cfgSnap.values.ttlKeepalive
+        : typeof store.getMeta === "function" && store.getMeta("cache:ttl_keepalive_enabled", null) === "true"
+    );
     const watermarkNotifyActive =
       effectiveCfg.watermarkDesktopNotify === true ||
       (effectiveCfg.watermarkDesktopNotify === null && ttlNotifyActive);
     const existing = readWatchdogLease(store, directConvId);
-    if (!watchdogActive && !ttlNotifyActive && !watermarkNotifyActive) {
+    if (!watchdogActive && !ttlNotifyActive && !ttlKeepaliveExplicit && !watermarkNotifyActive) {
       if (!existing || existing.phase === WATCHDOG_PHASES.IDLE) {
         return { updated: false, reason: "disabled" };
       }
@@ -160,7 +166,8 @@ export async function handleStopPayload(payload = {}, options = {}) {
 
 async function main() {
   enableVersionedCompileCache();
-  const effectiveCfg = getEffectiveConfig();
+  const cfgSnapshot = getConfigSnapshot();
+  const effectiveCfg = cfgSnapshot.values;
   const resolvedDbPath = effectiveCfg.dbPath || path.join(os.homedir(), ".agy-dart", "context.db");
   if (!fs.existsSync(resolvedDbPath)) {
     process.stdout.write(STOP_ALLOW_OUTPUT);
@@ -185,7 +192,7 @@ async function main() {
     return;
   }
 
-  await handleStopPayload(payload, { effectiveCfg });
+  await handleStopPayload(payload, { effectiveCfg, cfgSnapshot });
   process.stdout.write(STOP_ALLOW_OUTPUT);
 }
 

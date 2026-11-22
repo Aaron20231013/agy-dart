@@ -348,6 +348,9 @@ async function applyMode(targetDir, modeKey, skipDb = false, { explicitMode = tr
           console.log(`  - Preserved existing custom global cutoff (${existingGlobal} B; pass --mode ${modeKey} to override)`);
         }
       }
+      if (typeof store.sanitizeModelTtlState === "function") {
+        store.sanitizeModelTtlState();
+      }
     } finally {
       store.close();
     }
