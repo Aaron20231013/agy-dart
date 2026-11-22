@@ -12,6 +12,20 @@ export const MAX_OUTLINE_CACHE_DB_ENTRIES = 512;
 export const MAX_OUTLINE_JSON_BYTES = 128 * 1024;
 export const DEFAULT_FILE_READ_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_CUTOFF_BYTES = 46080; // 45 KiB — aligns with Antigravity read_file host return cap
+export const CURRENT_SCHEMA_USER_VERSION = 152;
+const REQUIRED_CORE_TABLES = Object.freeze([
+  "meta",
+  "sources",
+  "events",
+  "file_reads",
+  "file_snapshots",
+  "repo_cache",
+  "ghost_interceptions",
+  "session_checkpoints",
+  "outline_cache",
+  "chunks",
+  "chunks_tri"
+]);
 
 export const FILE_CATEGORIES = {
   images: {
@@ -101,7 +115,10 @@ export class SchemaMethods {
     const initStart = Date.now();
     try {
       this.db.exec(`PRAGMA busy_timeout = ${busyMs};`);
-      this.db.exec("PRAGMA journal_mode = WAL;");
+      const jmRow = this.db.prepare("PRAGMA journal_mode").get();
+      if (!jmRow || String(jmRow.journal_mode || "").toLowerCase() !== "wal") {
+        this.db.exec("PRAGMA journal_mode = WAL;");
+      }
       this.db.exec("PRAGMA synchronous = NORMAL;");
     } catch (err) {
       const msg = String(err?.message || err || "");
@@ -110,6 +127,32 @@ export class SchemaMethods {
         throw err;
       }
       // Fallback if PRAGMA configuration is restricted
+    }
+
+    // Hot-path fast skip for short-lived hook processes when DB is already at current schema & all upgraded columns exist
+    try {
+      const uvRow = this.db.prepare("PRAGMA user_version").get();
+      if (Number(uvRow?.user_version ?? 0) === CURRENT_SCHEMA_USER_VERSION) {
+        const tblRow = this.db
+          .prepare(`
+            SELECT COUNT(*) AS cnt
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND (
+                name IN ('meta', 'events', 'repo_cache', 'session_checkpoints', 'outline_cache', 'chunks', 'chunks_tri')
+                OR (name = 'sources' AND sql LIKE '%content_hash%')
+                OR (name = 'file_reads' AND sql LIKE '%ctime_ms%' AND sql LIKE '%ino%' AND sql LIKE '%read_step%' AND sql LIKE '%read_turn_seq%')
+                OR (name = 'file_snapshots' AND sql LIKE '%full_read_ts%' AND sql LIKE '%full_read_seq%' AND sql LIKE '%ino%' AND sql LIKE '%read_step%')
+                OR (name = 'ghost_interceptions' AND sql LIKE '%recall_closed%')
+              )
+          `)
+          .get();
+        if (Number(tblRow?.cnt ?? 0) === REQUIRED_CORE_TABLES.length) {
+          return;
+        }
+      }
+    } catch {
+      // Fall through to full idempotent DDL & column migrations
     }
 
     // Standard tables
@@ -160,6 +203,7 @@ export class SchemaMethods {
 
       CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
       CREATE INDEX IF NOT EXISTS idx_events_turn ON events(session_id, turn);
+      CREATE INDEX IF NOT EXISTS idx_events_tool_sandbox ON events(tool, sandbox_bytes);
 
       CREATE TABLE IF NOT EXISTS file_reads (
         session_id TEXT NOT NULL,
@@ -335,6 +379,8 @@ export class SchemaMethods {
       } else if (versionRow.value !== "3") {
         this.db.prepare("UPDATE meta SET value = '3' WHERE key = 'schema_version'").run();
       }
+      this.db.exec("DELETE FROM outline_cache WHERE symbols_json = '[]';");
+      this.db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_USER_VERSION};`);
     });
   }
 }

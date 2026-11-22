@@ -250,12 +250,13 @@ export function parseLineArg(val) {
 }
 
 const KNOWN_TEXT_EXTENSIONS = new Set([
-  ".md", ".markdown", ".mdown", ".mkd", ".rst", ".adoc",
+  ".md", ".markdown", ".mdown", ".mkd", ".mdx", ".rst", ".adoc",
   ".cs", ".csx", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
   ".py", ".pyw", ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hh",
   ".rs", ".go", ".java", ".kt", ".kts", ".scala", ".rb", ".php",
+  ".dart", ".swift", ".zig", ".lua", ".proto", ".prisma", ".cmake", ".gradle",
   ".sh", ".bash", ".ps1", ".psm1", ".psd1", ".bat", ".cmd",
-  ".html", ".htm", ".xhtml", ".css", ".scss", ".sass", ".less",
+  ".html", ".htm", ".xhtml", ".astro", ".css", ".scss", ".sass", ".less",
   ".json", ".jsonc", ".json5", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
   ".sql", ".graphql", ".gql", ".diff", ".patch", ".txt", ".text", ".log", ".csv", ".tsv",
   ".vue", ".svelte", ".gd"
@@ -428,9 +429,64 @@ function isDenseMinifiedChunk(buf, bytesRead) {
   return avgLineBytes > 512 && maxLineLen > 1024;
 }
 
+/** Per-invocation memoized file reader: eliminates duplicate realpathSync & full-file readFileSync calls */
+export function createFileReadContext(absPath, fileSize = 0) {
+  return {
+    absPath,
+    fileSize,
+    _realPathLoaded: false,
+    _realPath: absPath,
+    _bufLoaded: false,
+    _buf: null,
+    _rangeBytesCache: new Map(),
+    _remainingBytesCache: new Map(),
+    _lineCountCache: null,
+    getRealPath() {
+      if (!this._realPathLoaded) {
+        this._realPathLoaded = true;
+        try {
+          this._realPath = fs.realpathSync(this.absPath);
+        } catch {
+          this._realPath = this.absPath;
+        }
+      }
+      return this._realPath;
+    },
+    getBuffer() {
+      if (this.fileSize > MAX_SLICE_MEASURE_BYTES) return null;
+      if (!this._bufLoaded) {
+        this._bufLoaded = true;
+        try {
+          this._buf = fs.readFileSync(this.absPath);
+        } catch {
+          this._buf = null;
+        }
+      }
+      return this._buf;
+    }
+  };
+}
+
 /** Probe 4 KB head (plus midpoint & tail when >8 KB) to detect minified / single-line dense text even behind >4 KB license headers */
-function probeMinifiedHead(absPath, fileSize = 0) {
+function probeMinifiedHead(absPath, fileSize = 0, readCtx = null) {
   try {
+    if (readCtx && readCtx._bufLoaded && readCtx._buf) {
+      const cached = readCtx._buf;
+      const totalSize = cached.length;
+      if (totalSize === 0) return false;
+      const headSlice = cached.subarray(0, Math.min(4096, totalSize));
+      if (isDenseMinifiedChunk(headSlice, headSlice.length)) return true;
+      if (totalSize > 8192) {
+        const midOffset = Math.max(4096, Math.floor((totalSize - 4096) / 2));
+        const midSlice = cached.subarray(midOffset, Math.min(totalSize, midOffset + 4096));
+        if (isDenseMinifiedChunk(midSlice, midSlice.length)) {
+          const tailOffset = Math.max(4096, totalSize - 4096);
+          const tailSlice = cached.subarray(tailOffset, totalSize);
+          if (isDenseMinifiedChunk(tailSlice, tailSlice.length)) return true;
+        }
+      }
+      return false;
+    }
     const fd = fs.openSync(absPath, "r");
     const buf = Buffer.allocUnsafe(4096);
     try {
@@ -456,14 +512,24 @@ function probeMinifiedHead(absPath, fileSize = 0) {
 }
 
 /** Classify non-binary file into Tier 1 ("noise"), Tier 2 ("source"), or Tier 3 ("review") */
-export function classifyFileTier(absPath, ext, fileSize, noiseProbeThreshold = DEFAULT_NOISE_MAX_READ_BYTES) {
+export function classifyFileTier(
+  absPath,
+  ext,
+  fileSize,
+  noiseProbeThreshold = DEFAULT_NOISE_MAX_READ_BYTES,
+  readCtx = null
+) {
   const lowerExt = (ext || "").toLowerCase();
   const baseLower = path.basename(absPath || "").toLowerCase();
 
   let realAbsPath = absPath;
-  try {
-    realAbsPath = fs.realpathSync(absPath);
-  } catch {}
+  if (readCtx) {
+    realAbsPath = readCtx.getRealPath();
+  } else {
+    try {
+      realAbsPath = fs.realpathSync(absPath);
+    } catch {}
+  }
   const realExt = realAbsPath !== absPath ? path.extname(realAbsPath).toLowerCase() : lowerExt;
   const realBaseLower = realAbsPath !== absPath ? path.basename(realAbsPath).toLowerCase() : baseLower;
 
@@ -481,7 +547,7 @@ export function classifyFileTier(absPath, ext, fileSize, noiseProbeThreshold = D
     return { tier: "review", isMinifiedContent: false };
   }
 
-  if (noiseProbeThreshold > 0 && fileSize > noiseProbeThreshold && probeMinifiedHead(absPath, fileSize)) {
+  if (noiseProbeThreshold > 0 && fileSize > noiseProbeThreshold && probeMinifiedHead(absPath, fileSize, readCtx)) {
     return { tier: "noise", isMinifiedContent: true };
   }
 
@@ -514,15 +580,31 @@ export function isAgentInstructionFile(filePath, absPath) {
   );
 }
 
-function isBinaryFile(absPath, ext) {
+function isBinaryFile(absPath, ext, readCtx = null) {
   const lowerExt = (ext || "").toLowerCase();
   if (KNOWN_TEXT_EXTENSIONS.has(lowerExt)) return false;
   if (BINARY_EXTENSIONS.has(lowerExt)) return true;
   try {
+    if (readCtx && readCtx._bufLoaded && readCtx._buf) {
+      const cached = readCtx._buf;
+      const bytesRead = Math.min(512, cached.length);
+      if (bytesRead === 0) return false;
+      if (bytesRead >= 2 && ((cached[0] === 0xff && cached[1] === 0xfe) || (cached[0] === 0xfe && cached[1] === 0xff))) return false;
+      if (bytesRead >= 3 && cached[0] === 0xef && cached[1] === 0xbb && cached[2] === 0xbf) return false;
+      if (bytesRead >= 4 && cached[0] === 0x25 && cached[1] === 0x50 && cached[2] === 0x44 && cached[3] === 0x46) return true;
+      for (let i = 0; i < bytesRead; i++) {
+        if (cached[i] === 0) return true;
+      }
+      return false;
+    }
     const fd = fs.openSync(absPath, "r");
-    const buf = Buffer.alloc(512);
-    const bytesRead = fs.readSync(fd, buf, 0, 512, 0);
-    fs.closeSync(fd);
+    const buf = Buffer.allocUnsafe(512);
+    let bytesRead = 0;
+    try {
+      bytesRead = fs.readSync(fd, buf, 0, 512, 0);
+    } finally {
+      fs.closeSync(fd);
+    }
     if (bytesRead === 0) return false;
     if (bytesRead >= 2 && ((buf[0] === 0xff && buf[1] === 0xfe) || (buf[0] === 0xfe && buf[1] === 0xff))) return false;
     if (bytesRead >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) return false;
@@ -753,9 +835,11 @@ function recordInterception({
   } catch {}
 }
 
-function readUtf8TextSafe(absPath) {
+function readUtf8TextSafe(absPath, readCtx = null) {
   try {
-    const buf = fs.readFileSync(absPath);
+    const buf =
+      readCtx && readCtx.fileSize <= MAX_SLICE_MEASURE_BYTES ? readCtx.getBuffer() : fs.readFileSync(absPath);
+    if (!buf) return null;
     if (buf.length >= 2 && ((buf[0] === 0xff && buf[1] === 0xfe) || (buf[0] === 0xfe && buf[1] === 0xff))) {
       return null;
     }
@@ -770,15 +854,24 @@ function sha256Text(text) {
 }
 
 /** Measure UTF-8 byte length of 1-based inclusive line range [startLine..endLine] (bounded <=2 MB streaming for huge files) */
-function measureLineRangeBytes(absPath, startLine, endLine, fileSize, fallbackBytes) {
+function measureLineRangeBytes(absPath, startLine, endLine, fileSize, fallbackBytes, readCtx = null) {
   if (endLine === null || endLine === undefined) return fallbackBytes;
   const sLine = Math.max(1, Number(startLine) || 1);
   const eLine = Number(endLine);
   if (!Number.isFinite(eLine) || eLine < sLine) return 0;
+  const cacheKey = `${sLine}:${eLine}`;
+  if (readCtx && readCtx._rangeBytesCache.has(cacheKey)) {
+    return readCtx._rangeBytesCache.get(cacheKey);
+  }
+  const memo = (val) => {
+    if (readCtx) readCtx._rangeBytesCache.set(cacheKey, val);
+    return val;
+  };
   try {
     if (fileSize <= MAX_SLICE_MEASURE_BYTES) {
-      const buf = fs.readFileSync(absPath);
-      if (buf.length === 0) return 0;
+      const buf = readCtx ? readCtx.getBuffer() : fs.readFileSync(absPath);
+      if (!buf) return fallbackBytes;
+      if (buf.length === 0) return memo(0);
       let lineNum = 1;
       let rangeStart = sLine === 1 ? 0 : null;
       let rangeEnd = buf.length;
@@ -794,8 +887,8 @@ function measureLineRangeBytes(absPath, startLine, endLine, fileSize, fallbackBy
           }
         }
       }
-      if (rangeStart === null) return 0;
-      return Math.max(0, rangeEnd - rangeStart);
+      if (rangeStart === null) return memo(0);
+      return memo(Math.max(0, rangeEnd - rangeStart));
     }
 
     // Bounded streaming scan (<= 2 MB) eliminates the >2 MB && sLine > 1 blind spot without risking OOM
@@ -836,54 +929,72 @@ function measureLineRangeBytes(absPath, startLine, endLine, fileSize, fallbackBy
       fs.closeSync(fd);
     }
     if (rangeStart !== null) {
-      return Math.max(0, (rangeEnd !== null ? rangeEnd : scannedBytes) - rangeStart);
+      return memo(Math.max(0, (rangeEnd !== null ? rangeEnd : scannedBytes) - rangeStart));
     }
     if (scannedBytes >= fileSize) {
-      return 0;
+      return memo(0);
     }
     const avgLineBytes = scannedBytes / Math.max(1, scannedNewlines + 1);
     const span = Math.max(1, eLine - sLine + 1);
-    return Math.max(fallbackBytes, Math.min(fileSize, Math.round(avgLineBytes * span)));
+    return memo(Math.max(fallbackBytes, Math.min(fileSize, Math.round(avgLineBytes * span))));
   } catch {
     return fallbackBytes;
   }
 }
 
 /** Measure remaining UTF-8 bytes from 1-based startLine to EOF (used for open-ended StartLine continuations) */
-function measureRemainingFromLineBytes(absPath, startLine, fileSize) {
+function measureRemainingFromLineBytes(absPath, startLine, fileSize, readCtx = null) {
   const sLine = Math.max(1, Number(startLine) || 1);
   if (sLine <= 1) return fileSize;
   if (fileSize > MAX_SLICE_MEASURE_BYTES) return fileSize;
+  if (readCtx && readCtx._remainingBytesCache.has(sLine)) {
+    return readCtx._remainingBytesCache.get(sLine);
+  }
+  const memo = (val) => {
+    if (readCtx) readCtx._remainingBytesCache.set(sLine, val);
+    return val;
+  };
   try {
-    const buf = fs.readFileSync(absPath);
-    if (buf.length === 0) return 0;
+    const buf = readCtx ? readCtx.getBuffer() : fs.readFileSync(absPath);
+    if (!buf) return fileSize;
+    if (buf.length === 0) return memo(0);
     let lineNum = 1;
     for (let i = 0; i < buf.length; i++) {
       if (buf[i] === 0x0a) {
         lineNum++;
         if (lineNum === sLine) {
-          return Math.max(0, buf.length - (i + 1));
+          return memo(Math.max(0, buf.length - (i + 1)));
         }
       }
     }
-    return 0;
+    return memo(0);
   } catch {
     return fileSize;
   }
 }
 
 /** Count exact lines (<= 2 MB) or estimate lines (> 2 MB) for actionable deny/soft-guard guidance */
-function countFileLinesApprox(absPath, fileSize) {
+function countFileLinesApprox(absPath, fileSize, readCtx = null) {
+  if (readCtx && readCtx._lineCountCache !== null) {
+    return readCtx._lineCountCache;
+  }
   try {
     if (fileSize <= MAX_SLICE_MEASURE_BYTES) {
-      const buf = fs.readFileSync(absPath);
-      if (buf.length === 0) return { lines: 0, exact: true };
+      const buf = readCtx ? readCtx.getBuffer() : fs.readFileSync(absPath);
+      if (!buf) return { lines: 0, exact: false };
+      if (buf.length === 0) {
+        const res = { lines: 0, exact: true };
+        if (readCtx) readCtx._lineCountCache = res;
+        return res;
+      }
       let nl = 0;
       for (let i = 0; i < buf.length; i++) {
         if (buf[i] === 0x0a) nl++;
       }
       const lines = nl + (buf[buf.length - 1] !== 0x0a ? 1 : 0);
-      return { lines, exact: true };
+      const res = { lines, exact: true };
+      if (readCtx) readCtx._lineCountCache = res;
+      return res;
     }
     const sampleSize = 65536;
     const buf = Buffer.allocUnsafe(sampleSize);
@@ -900,7 +1011,9 @@ function countFileLinesApprox(absPath, fileSize) {
       if (buf[i] === 0x0a) nl++;
     }
     const avg = bytesRead / Math.max(1, nl + 1);
-    return { lines: Math.max(1, Math.round(fileSize / avg)), exact: false };
+    const res = { lines: Math.max(1, Math.round(fileSize / avg)), exact: false };
+    if (readCtx) readCtx._lineCountCache = res;
+    return res;
   } catch {
     return { lines: 0, exact: false };
   }
@@ -917,7 +1030,8 @@ export function computeEffectiveReadBounds(
   requestedEndLine,
   fileSize,
   maxHostLines = HOST_READ_MAX_LINES,
-  maxHostBytes = HOST_READ_MAX_BYTES
+  maxHostBytes = HOST_READ_MAX_BYTES,
+  readCtx = null
 ) {
   const sLine = Math.max(1, Number(startLine) || 1);
   const reqEnd = Number.isFinite(requestedEndLine) && requestedEndLine > 0 ? Math.floor(requestedEndLine) : null;
@@ -936,7 +1050,14 @@ export function computeEffectiveReadBounds(
   }
 
   try {
-    const buf = fs.readFileSync(absPath);
+    const buf = readCtx ? readCtx.getBuffer() : fs.readFileSync(absPath);
+    if (!buf) {
+      return {
+        effectiveEndLine: reqEnd !== null ? Math.min(reqEnd, lineCapEnd) : lineCapEnd,
+        hostTruncated: true,
+        skipCache: true
+      };
+    }
     if (buf.length === 0) {
       return { effectiveEndLine: reqEnd, hostTruncated: false, skipCache: false };
     }
@@ -1798,8 +1919,11 @@ async function main() {
     });
 
     try {
-      if (fs.existsSync(absPath)) {
-        const rawStat = fs.statSync(absPath, { bigint: true });
+      let rawStat = null;
+      try {
+        rawStat = fs.statSync(absPath, { bigint: true });
+      } catch {}
+      if (rawStat) {
         if (!rawStat.isFile()) {
           return finishAllow();
         }
@@ -1809,6 +1933,7 @@ async function main() {
           ctimeMs: Number(rawStat.ctimeNs / 1000n) / 1000,
           ino: String(rawStat.ino)
         };
+        const readCtx = createFileReadContext(absPath, stat.size);
 
         // Optional sensitive credential file read guard (ALWAYS runs BEFORE Tier 0, exemptions & size guard)
         const rawSensMode = effectiveCfg.sensitiveFileGuard || "off";
@@ -1816,10 +1941,7 @@ async function main() {
           const sec = await ensureSecurityModule();
           const guardMode = sec.getSensitiveFileGuardMode();
           if (guardMode === "warn" || guardMode === "deny") {
-            let realAbsPath = absPath;
-            try {
-              realAbsPath = fs.realpathSync(absPath);
-            } catch {}
+            const realAbsPath = readCtx.getRealPath();
             const sensDirect = sec.detectSensitiveFile(absPath);
             const sensReal =
               realAbsPath !== absPath ? sec.detectSensitiveFile(realAbsPath) : { sensitive: false, reason: null };
@@ -1885,7 +2007,7 @@ async function main() {
           return finishAllow();
         }
 
-        const isBinary = isBinaryFile(absPath, ext);
+        const isBinary = isBinaryFile(absPath, ext, readCtx);
         if (isBinary) {
           return finishAllow();
         }
@@ -1899,12 +2021,12 @@ async function main() {
           estBytes =
             stat.size < readDedupMinBytes && !(diffReadCandidate && stat.size >= MIN_DIFF_READ_BYTES)
               ? Math.min(stat.size, spanEst)
-              : measureLineRangeBytes(absPath, startLine, endLine, stat.size, spanEst);
+              : measureLineRangeBytes(absPath, startLine, endLine, stat.size, spanEst, readCtx);
         } else if (startLine > 1) {
           estBytes =
             stat.size < readDedupMinBytes && !(diffReadCandidate && stat.size >= MIN_DIFF_READ_BYTES)
               ? stat.size
-              : measureRemainingFromLineBytes(absPath, startLine, stat.size);
+              : measureRemainingFromLineBytes(absPath, startLine, stat.size, readCtx);
         } else {
           estBytes = stat.size;
         }
@@ -1945,7 +2067,7 @@ async function main() {
 
         const loadCurrentRange = async () => {
           if (currentRangeText !== null) return true;
-          const rawDisk = readUtf8TextSafe(absPath);
+          const rawDisk = readUtf8TextSafe(absPath, readCtx);
           if (rawDisk === null) return false;
           const { extractLineSlice } = await ensureTextDiffModule();
           currentRangeText = extractLineSlice(rawDisk, startLine, effectiveEndLine, 1);
@@ -2145,7 +2267,15 @@ async function main() {
 
         // Pre-1a Read Cache Priority Check (State 2 unchanged dedup / State 3 diff-read / armed bypass)
         if (canUseReadCache && (meetsDedupMinBytes || meetsDiffMinBytes) && byteOffset <= 0) {
-          readBounds = computeEffectiveReadBounds(absPath, startLine, endLine, stat.size);
+          readBounds = computeEffectiveReadBounds(
+            absPath,
+            startLine,
+            endLine,
+            stat.size,
+            HOST_READ_MAX_LINES,
+            HOST_READ_MAX_BYTES,
+            readCtx
+          );
           effectiveEndLine = readBounds.effectiveEndLine;
           if (!readBounds.skipCache) {
             try {
@@ -2338,10 +2468,7 @@ async function main() {
         }
 
         // Section 1a: Tiered File Size Guard (exemptExtensions / exemptPaths / readGuardMode=off ONLY skip 1a, NEVER 1b readDedup!)
-        let realAbsForGuard = absPath;
-        try {
-          realAbsForGuard = fs.realpathSync(absPath);
-        } catch {}
+        const realAbsForGuard = readCtx.getRealPath();
         const realExtForGuard = realAbsForGuard !== absPath ? path.extname(realAbsForGuard).toLowerCase() : ext;
         const exemptExtensions = getExemptExtensions(sessionId);
         const isExemptExt =
@@ -2370,7 +2497,7 @@ async function main() {
               ? 0
               : Math.min(maxReadBytes, cfgNoiseMax);
 
-          const { tier, isMinifiedContent } = classifyFileTier(absPath, ext, stat.size, noiseProbeThreshold);
+          const { tier, isMinifiedContent } = classifyFileTier(absPath, ext, stat.size, noiseProbeThreshold, readCtx);
           let tierCutoffBytes;
           if (tier === "noise") {
             tierCutoffBytes = noiseIsExplicit
@@ -2442,7 +2569,7 @@ async function main() {
                 }
               }
             } else if (startLine > 1 && endLine === null && !isMinifiedContent) {
-              const remainingFromStart = measureRemainingFromLineBytes(absPath, startLine, stat.size);
+              const remainingFromStart = measureRemainingFromLineBytes(absPath, startLine, stat.size, readCtx);
               if (remainingFromStart <= tierCutoffBytes) {
                 isContinuationAllow = true;
               } else if (readGuardMode !== "strict" && tier !== "noise" && checkPriorLineContinuation(startLine)) {
@@ -2462,7 +2589,7 @@ async function main() {
               const maxPagedSliceBytes = Math.max(HOST_READ_MAX_BYTES, tierCutoffBytes * 2);
               const slicedRangeBytes =
                 isLargeFile && !isWideRange && endLine !== null
-                  ? measureLineRangeBytes(absPath, startLine, endLine, stat.size, 0)
+                  ? measureLineRangeBytes(absPath, startLine, endLine, stat.size, 0, readCtx)
                   : 0;
               const avgSliceLineBytes = slicedRangeBytes / requestedLineSpan;
               const isMinifiedDenseSlice =
@@ -2505,7 +2632,7 @@ async function main() {
                     } catch {}
                   }
 
-                  const lineInfo = countFileLinesApprox(absPath, stat.size);
+                  const lineInfo = countFileLinesApprox(absPath, stat.size, readCtx);
                   const lineMeta =
                     lineInfo.lines > 0
                       ? `, ${lineInfo.exact ? "" : "~"}${lineInfo.lines.toLocaleString()} lines`
@@ -2604,7 +2731,15 @@ async function main() {
         // Record this allowed read (resets bypass_armed = 0) and save compressed snapshot baseline anchored to this full read.
         if (canUseReadCache && (meetsDedupMinBytes || meetsDiffMinBytes) && byteOffset <= 0) {
           if (!readBounds) {
-            readBounds = computeEffectiveReadBounds(absPath, startLine, endLine, stat.size);
+            readBounds = computeEffectiveReadBounds(
+              absPath,
+              startLine,
+              endLine,
+              stat.size,
+              HOST_READ_MAX_LINES,
+              HOST_READ_MAX_BYTES,
+              readCtx
+            );
             effectiveEndLine = readBounds.effectiveEndLine;
           }
           if (!readBounds.skipCache) {
@@ -2658,7 +2793,7 @@ async function main() {
           try {
             const store = getSharedStore();
             if (store.hasGhostInterception(sessionId, absPath)) {
-              const actualBytes = measureLineRangeBytes(absPath, startLine, endLine, stat.size, estBytes);
+              const actualBytes = measureLineRangeBytes(absPath, startLine, endLine, stat.size, estBytes, readCtx);
               store.recordGhostRecall({
                 sessionId,
                 filePath: absPath,

@@ -260,18 +260,36 @@ function scheduleOversizedSocketClose(req, res) {
   });
 }
 
+let cachedPkgVersion = null;
+let cachedHtmlTemplate = { mtimeMs: -1, size: -1, withVer: "" };
+
 function getPackageVersion() {
+  if (cachedPkgVersion) return cachedPkgVersion;
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../../package.json"), "utf8"));
-    if (pkg.version) return pkg.version;
+    if (pkg.version) {
+      cachedPkgVersion = pkg.version;
+      return cachedPkgVersion;
+    }
   } catch {}
-  return "1.5.1";
+  return "1.5.2";
 }
 
 function getRenderedHtml(csrfToken = SIDECAR_CSRF_TOKEN) {
-  const raw = fs.readFileSync(HTML_FILE, "utf8");
-  const ver = getPackageVersion();
-  const withVer = raw.replace('id="dashboard-version">--</span>', `id="dashboard-version">v${ver}</span>`);
+  let withVer = cachedHtmlTemplate.withVer;
+  try {
+    const st = fs.statSync(HTML_FILE);
+    if (!withVer || st.mtimeMs !== cachedHtmlTemplate.mtimeMs || st.size !== cachedHtmlTemplate.size) {
+      const raw = fs.readFileSync(HTML_FILE, "utf8");
+      const ver = getPackageVersion();
+      withVer = raw.replace('id="dashboard-version">--</span>', `id="dashboard-version">v${ver}</span>`);
+      cachedHtmlTemplate = { mtimeMs: st.mtimeMs, size: st.size, withVer };
+    }
+  } catch {
+    const raw = fs.readFileSync(HTML_FILE, "utf8");
+    const ver = getPackageVersion();
+    withVer = raw.replace('id="dashboard-version">--</span>', `id="dashboard-version">v${ver}</span>`);
+  }
   const tokenMeta = `  <meta name="agy-dart-token" content="${csrfToken}">\n</head>`;
   return withVer.includes("</head>") ? withVer.replace("</head>", tokenMeta) : withVer;
 }
@@ -407,14 +425,9 @@ function getStatsPayload(data, defaultConvId = "default") {
   stats.isPaused = store.isPaused(targetSid);
   stats.cliFilterEnabled = store.isCliFilterEnabled(targetSid);
   stats.readDedupEnabled = store.isReadDedupEnabled(targetSid);
-  stats.ghost = store.getGhostStats(
-    targetSid,
-    scope === "app" || scope === "session" ? { sinceTs: appStartTime } : {}
-  );
-  stats.featureRoi = store.getFeatureRoi(
-    targetSid,
-    scope === "app" || scope === "session" ? { sinceTs: appStartTime } : {}
-  );
+  const sinceOpts = scope === "app" || scope === "session" ? { sinceTs: appStartTime } : {};
+  stats.ghost = store.getGhostStats(targetSid, sinceOpts);
+  stats.featureRoi = store.getFeatureRoi(targetSid, { ...sinceOpts, ghost: stats.ghost });
   try {
     stats.starPrompt = store.evaluateStarPrompt({ markTriggered: true });
   } catch {}
@@ -1116,17 +1129,23 @@ function handleSearchPayload(data, queries, defaultConvId = "default") {
     const appStart = getAppStartTime();
     const res = store.search({ queries, sourceId: rawSourceId, scope: "all", limit: 20 });
     if (!Array.isArray(res.hits) || res.hits.length === 0) return res;
-    const allowedHits = [];
-    for (const h of res.hits) {
+    const uniqueIds = Array.from(new Set(res.hits.map((h) => h && h.sourceId).filter(Boolean)));
+    const createdMap = new Map();
+    if (uniqueIds.length > 0) {
       try {
-        const row = store.db.prepare("SELECT created_ts FROM sources WHERE id = ? LIMIT 1").get(h.sourceId);
-        if (!row || Number(row.created_ts) >= appStart) {
-          allowedHits.push(h);
+        const placeholders = uniqueIds.map(() => "?").join(",");
+        const rows = store.db
+          .prepare(`SELECT id, created_ts FROM sources WHERE id IN (${placeholders})`)
+          .all(...uniqueIds);
+        for (const row of rows) {
+          createdMap.set(row.id, Number(row.created_ts));
         }
-      } catch {
-        allowedHits.push(h);
-      }
+      } catch {}
     }
+    const allowedHits = res.hits.filter((h) => {
+      const ts = createdMap.get(h.sourceId);
+      return ts === undefined || ts >= appStart;
+    });
     const sliced = allowedHits.slice(0, 5);
     return {
       ...res,

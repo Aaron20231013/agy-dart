@@ -7,16 +7,14 @@
  *   2. Semi-static workspace structure + git-HEAD-cached import hotspot hubs
  *   3. Volatile git branch / working-tree status last
  */
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
 import { getEffectiveConfig } from "../context/lib/config.js";
+import { buildWorkspaceSnapshot } from "../fast/session-start.mjs";
 
 const __selfPath = path.resolve(fileURLToPath(import.meta.url));
-const __dirname = path.dirname(__selfPath);
-const FAST_SNAPSHOT_SCRIPT = path.resolve(__dirname, "..", "fast", "session-start.mjs");
 
 export const STATIC_COOP_NOTE =
   "agy-dart active: use agy-dart_fast + parallel ranged read_file (45 KiB/800 lines) for code/diffs; use agy-dart_context (ctx_execute / ctx_index / ctx_search) for >16 KB logs, large JSON/CSV/API dumps, or long docs/URLs.";
@@ -228,7 +226,7 @@ export function assemblePrefixStableStartup(snapshotText, hotspotsLine = "", opt
 }
 
 async function main() {
-  const cc = enableVersionedCompileCache();
+  enableVersionedCompileCache();
   const rawInput = (await readStdin()).trim();
   const payload = parseHookPayload(rawInput);
   const workspaceDir = resolveWorkspaceDir(payload);
@@ -238,63 +236,50 @@ async function main() {
     effectiveCfg.stablePrefixOnly === true ||
     (!effectiveCfg.subagentIncludeGit && isSubagent);
 
-  // 1. Reset transient session overrides (primary sessions only!), run lightweight daily DB TTL cleanup, & fetch repo hubs
-  let hotspotsLine = "";
-  let store = null;
-  try {
-    const [{ ContextModeStore }, { getCachedRepoHotspots }] = await Promise.all([
-      import("../context/lib/store.js"),
-      import("../context/lib/repo-skeleton.js")
-    ]);
-    store = new ContextModeStore({ hookMode: true });
-    if (!isSubagent) {
-      store.clearSessionOverrides();
-      store.maybeRunDailyMaintenance(14);
-    }
-    if (workspaceDir && effectiveCfg.repoHubs) {
-      hotspotsLine = getCachedRepoHotspots(workspaceDir, store, { maxFiles: 120, maxHubs: 5 });
-    }
-  } catch {
-    // Non-blocking: never block session start on DB error
-  } finally {
-    if (store) {
+  // Run SQLite maintenance + repo hubs concurrently with in-process workspace snapshot
+  // (0 extra Node child spawn, and 0 git.exe spawns when stablePrefixOnly / subagent is active)
+  const [hotspotsLine, snapshotText] = await Promise.all([
+    (async () => {
+      let store = null;
       try {
-        store.close();
-      } catch {}
-    }
-  }
-
-  // 2. Capture compact workspace snapshot from fast/session-start.mjs (with upstream updater disabled)
-  let snapshotText = "";
-  if (rawInput) {
-    try {
-      const childEnv = { ...process.env, AGY_FAST_AUTO_UPDATE: "off" };
-      if (cc.enabled && cc.cacheDir) {
-        childEnv.NODE_COMPILE_CACHE = cc.cacheDir;
+        const [{ ContextModeStore }, { getCachedRepoHotspots }] = await Promise.all([
+          import("../context/lib/store.js"),
+          import("../context/lib/repo-skeleton.js")
+        ]);
+        store = new ContextModeStore({ hookMode: true });
+        if (!isSubagent) {
+          store.clearSessionOverrides();
+          store.maybeRunDailyMaintenance(14);
+        }
+        if (workspaceDir && effectiveCfg.repoHubs) {
+          return getCachedRepoHotspots(workspaceDir, store, { maxFiles: 120, maxHubs: 5 }) || "";
+        }
+      } catch {
+        // Non-blocking: never block session start on DB error
+      } finally {
+        if (store) {
+          try {
+            store.close();
+          } catch {}
+        }
       }
-      if (stablePrefixOnly) {
-        // Prevent fast/session-start.mjs from running git or letting volatile gitSummary
-        // steal 1500-char budget from Layout (2 levels) on medium/large repos.
-        childEnv.GIT_DIR = path.join(__dirname, ".agy-dart-no-git");
-        delete childEnv.GIT_WORK_TREE;
-        delete childEnv.GIT_INDEX_FILE;
-        delete childEnv.GIT_COMMON_DIR;
+      return "";
+    })(),
+    (async () => {
+      if (!rawInput || !workspaceDir) return "";
+      try {
+        return (
+          (await buildWorkspaceSnapshot(workspaceDir, {
+            maxChars: 1500,
+            gitTimeoutMs: 800,
+            omitGit: stablePrefixOnly
+          })) || ""
+        );
+      } catch {
+        return "";
       }
-      const res = spawnSync(process.execPath, [FAST_SNAPSHOT_SCRIPT], {
-        input: rawInput,
-        encoding: "utf8",
-        timeout: 4000,
-        windowsHide: true,
-        env: childEnv
-      });
-      if (!res.error && res.status === 0 && res.stdout) {
-        const parsed = JSON.parse(res.stdout.trim());
-        snapshotText = parsed?.injectSteps?.[0]?.systemMessage?.systemMessage || "";
-      }
-    } catch {
-      // Fail open: fall back to status line only
-    }
-  }
+    })()
+  ]);
 
   const mergedText = assemblePrefixStableStartup(snapshotText, hotspotsLine, {
     omitVolatileGit: stablePrefixOnly

@@ -28,6 +28,25 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 
 ---
 
+## What's New in v1.5.2 (Hot-Path Hook & SQLite Fast-Skip, HTML/Dart Outlines, UTF-8 Pipes & Concurrent Sidecar Polling)
+
+1. **Hook & SQLite Cold-Start Acceleration**:
+   - Memoized per-invocation `realpathSync`, `<= 2 MB` file buffers, and slice byte counts in `hooks/pre-tool-use.mjs` (`createFileReadContext`), cutting full-file disk reads from `4–6` down to **at most `1`** per `read_file` call and wrapping `isBinaryFile` file descriptors in `try/finally`.
+   - Added `PRAGMA user_version` + `sqlite_master` column-signature verification in `context/lib/store/schema.js` (`initSchema`), skipping redundant 9-table DDL, 4 `PRAGMA table_info` scans, and FTS5 re-init on warm hook invocations while preserving automatic self-healing on legacy/dropped tables, plus `idx_events_tool_sandbox` indexing.
+   - Switched `hooks/session-start.mjs` to run `buildWorkspaceSnapshot` concurrently **in-process** (eliminating the extra child `node` spawn and **all 4 wasted `git` spawns** on subagents/`stablePrefixOnly`) and added Dart/Flutter `pubspec.yaml` manifest detection.
+2. **HTML/Astro & Dart 3 Symbol Outlines + Windows UTF-8 Pipe Safety**:
+   - Upgraded `agy-dart_fast` `read_slices({ outlines })` to extract indented `<style>`, `<body>` landmarks, and `<script>` JS functions/classes in `.html`/`.htm`/`.astro` files (including 5,000+ line dashboards) as well as Dart 3 `class`/`mixin`/`extension`, nullable return types, and expression-body functions in `.dart`.
+   - Enforced UTF-8 pipe output in `context/lib/executor.js` (`ctx_execute`) for Python (`PYTHONIOENCODING=utf-8`, `PYTHONUTF8=1`) and Windows PowerShell (`[Console]::OutputEncoding = UTF8`, preserving leading `param(...)` blocks and exit codes).
+3. **Sidecar Dashboard Concurrency & Query Deduplication**:
+   - Parallelized the 5 independent `/api/*` `POST` requests in `refreshData()` via `Promise.all` with `autoRefreshInFlight` anti-overlap and `document.hidden` background tab suspension (`visibilitychange` instant resume); deduplicated `getGhostStats()` inside `/api/stats`, short-circuited heavy full-table scans once `starPrompt` is resolved, cached `index.html` by `mtimeMs`, and batched `"app"` scope `/api/search` source filtering into a single `WHERE id IN (...)` query.
+
+## What's New in v1.5.1 (Windowed Ghost Recall Calibration & Zero-Residual Chinese UI Polish)
+
+1. **10-Minute Edit-Aware Ghost Recall Window & Host-45K Cutoff Guidance**:
+   - Scoped Ghost Registry recall tracking (`ghost_interceptions.recall_closed`) to immediate (`<= 10m`) pre-edit paged slices (`PostToolUse` closes the window on `edit_file`/`write_file`/`apply_edits`) and distinguished tight cutoffs (`< 45 KiB` → `raise_to_host_45k`) from host-aligned cutoffs (`>= 45 KiB` → `use_outlines_or_exempt`).
+2. **100% Localized Chinese (`zh`) Sidecar Experience**:
+   - Eliminated residual English strings across Ghost efficiency recommendations, cutoff dropdown labels, TTL calibration sources, Loop Watch badges, and cache-bust attribution tooltips when `zh` mode is active.
+
 ## What's New in v1.5.0 (Cross-Session Empirical TTL Calibration, Opt-In Expiry Alert & Keep-Alive Replay)
 
 1. **Cross-Session Per-Model Empirical TTL Calibration (`ttl_calibration:v1:<profileId>`)**:

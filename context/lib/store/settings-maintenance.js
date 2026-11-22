@@ -297,7 +297,10 @@ export class SettingsMaintenanceMethods {
       else if (r.kind === "index") add("fts_index", r);
     }
 
-    const ghost = this.getGhostStats(sid, sinceTs !== null ? { sinceTs } : {});
+    const ghost =
+      options && options.ghost && typeof options.ghost === "object"
+        ? options.ghost
+        : this.getGhostStats(sid, sinceTs !== null ? { sinceTs } : {});
     const features = {};
     for (const [name, b] of Object.entries(buckets)) {
       const estTokensSaved = Math.round(b.savedBytes / 4);
@@ -1341,6 +1344,25 @@ export class SettingsMaintenanceMethods {
   evaluateStarPrompt({ markTriggered = false, nowIso = null } = {}) {
     this.open();
     const current = this.getStarPromptState();
+    if (current.state !== "pending") {
+      const savedBytes = Math.max(0, Math.floor(Number(current.milestoneSavedBytes || 0)));
+      return {
+        state: current.state,
+        triggeredAt: current.triggeredAt,
+        resolvedAt: current.resolvedAt,
+        milestoneSavedBytes: savedBytes,
+        shouldShow: false,
+        triggerReason: null,
+        lifetimeSavedBytes: savedBytes,
+        lifetimeTokensSaved: Math.round(savedBytes / 4),
+        sessionCount: 0,
+        cacheAuditPassed: this.hasCacheAuditPassed(),
+        thresholds: {
+          minSavedBytes: STAR_PROMPT_MIN_SAVED_BYTES,
+          minSessions: STAR_PROMPT_MIN_SESSIONS
+        }
+      };
+    }
     const lifetimeStats = this.getStats("all");
     const lifetimeSavedBytes = Math.max(0, Math.floor(Number(lifetimeStats?.keptOutBytes || 0)));
     const lifetimeTokensSaved = Math.max(

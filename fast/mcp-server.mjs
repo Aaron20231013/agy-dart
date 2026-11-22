@@ -3718,9 +3718,9 @@ function extractRustSymbols(lines) {
 }
 function extractCLikeSymbols(lines) {
   const symbols = [];
-  const typeRe = /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|abstract|sealed|data|open|export|partial)\s+)*(class|interface|enum|struct|record|protocol|namespace)\s+([A-Za-z_]\w*)/;
+  const typeRe = /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|abstract|sealed|data|open|export|partial|base|mixin)\s+)*(class|interface|enum|struct|record|protocol|namespace|mixin|extension)\s+(?:type\s+)?([A-Za-z_]\w*)/;
   const kwFuncRe = /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|override|virtual|inline|async|suspend|open|mutating)\s+)*(?:fun|func)\s+([A-Za-z_]\w*)/;
-  const cMethodRe = /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|abstract|override|virtual|inline|constexpr|extern|async|synchronized|native|unsigned|signed|const)\s+)*(?:[A-Za-z_~][\w:<>,\[\]\s*&]*?\s+)([A-Za-z_~][\w:]*)\s*\([^;]*$/;
+  const cMethodRe = /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|abstract|override|virtual|inline|constexpr|extern|async|synchronized|native|unsigned|signed|const|factory|late|covariant|external)\s+)*(?:[A-Za-z_~][\w:<>,?\[\]\s*&]*?\s+)([A-Za-z_~][\w.:]*)\s*(?:<[^{;()]{1,64}>)?\s*\([^;]*(?:=>.*)?$/;
   const excludedNames = /* @__PURE__ */ new Set([
     "if",
     "for",
@@ -3778,15 +3778,15 @@ function extractCLikeSymbols(lines) {
       continue;
     }
     const cm = cMethodRe.exec(line);
-    if (cm && cm[2] && !excludedNames.has(cm[2]) && !trimmed.includes("=")) {
-      const { hasBrace } = hasArrowOrBraceWithin(lines, i, 8);
-      if (hasBrace) {
+    if (cm && cm[2] && !excludedNames.has(cm[2]) && !(trimmed.includes("=") && !trimmed.includes("=>"))) {
+      const { hasBrace, hasArrow } = hasArrowOrBraceWithin(lines, i, 8);
+      if (hasBrace || hasArrow) {
         const indented = (cm[1]?.length ?? 0) > 0;
         symbols.push({
           kind: indented ? "method" : "function",
           name: cm[2],
           startLine: i + 1,
-          endLine: findBraceBlockEnd(lines, i, "c"),
+          endLine: hasBrace ? findBraceBlockEnd(lines, i, "c") : i + 1,
           depth: indented ? 1 : 0
         });
       }
@@ -4015,14 +4015,84 @@ function extractCssSymbols(lines, compactOnly = false) {
   }
   return symbols;
 }
-function extractSfcSymbols(lines) {
+function dedentBlockLines(blockLines) {
+  let baseIndent = 0;
+  for (const ln of blockLines) {
+    if (!ln || !ln.trim()) continue;
+    const expanded = ln.replace(/\t/g, "  ");
+    baseIndent = expanded.length - expanded.trimStart().length;
+    break;
+  }
+  if (baseIndent <= 0) return blockLines;
+  return blockLines.map((ln) => {
+    if (!ln || !ln.trim()) return "";
+    const expanded = ln.replace(/\t/g, "  ");
+    const lead = expanded.length - expanded.trimStart().length;
+    return expanded.slice(Math.min(lead, baseIndent));
+  });
+}
+function extractHtmlCommentLandmark(text) {
+  if (text.length < 10 || text.length > 200) return null;
+  if (!text.startsWith("<!--") || !text.endsWith("-->")) return null;
+  const inner = text.slice(4, -3);
+  if (inner.includes("<!--") || inner.includes("-->") || inner.includes(">")) return null;
+  const cleaned = inner.replace(/^[\s=\-*#]+/, "").replace(/[\s=\-*#]+$/, "");
+  if (cleaned.length < 3 || cleaned.length > 61) return null;
+  if (cleaned.startsWith("-")) return null;
+  return cleaned;
+}
+function extractSfcSymbols(lines, isHtmlDoc = false) {
   const symbols = [];
   const blockOpenRe = /^<(script|template|style)\b([^>]*)>/i;
+  const semanticTagRe = /^<(header|nav|main|aside|section|footer|dialog|form|[A-Z][A-Za-z0-9]*(?:Modal|Drawer|Dialog|Panel))\b([^>]*)>/;
+  let htmlLandmarks = 0;
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    const m = blockOpenRe.exec(line.trim());
-    if (!m || !m[1] || line.startsWith("  ") || line.startsWith("	")) {
+    const expanded = line.replace(/\t/g, "  ");
+    const indent = expanded.length - expanded.trimStart().length;
+    const trimmed = line.trim();
+    const m = indent <= 8 ? blockOpenRe.exec(trimmed) : null;
+    if (!m || !m[1]) {
+      if (isHtmlDoc && indent <= 10 && htmlLandmarks < 16 && trimmed) {
+        if (/^<body\b/i.test(trimmed)) {
+          symbols.push({
+            kind: "body",
+            name: "<body>",
+            startLine: i + 1,
+            endLine: i + 1,
+            depth: 0
+          });
+          htmlLandmarks++;
+        } else {
+          const landmarkName = extractHtmlCommentLandmark(trimmed);
+          if (landmarkName) {
+            symbols.push({
+              kind: "section",
+              name: landmarkName,
+              startLine: i + 1,
+              endLine: i + 1,
+              depth: 1
+            });
+            htmlLandmarks++;
+          } else {
+            const sm = semanticTagRe.exec(trimmed);
+            if (sm && sm[1]) {
+              const attrStr = sm[2] ?? "";
+              const idMatch = /(?:data-testid|id|class)=["']([^"']+)["']/.exec(attrStr);
+              const tagDesc = idMatch && idMatch[1] ? `<${sm[1]} ${idMatch[1].slice(0, 36)}>` : `<${sm[1]}>`;
+              symbols.push({
+                kind: "block",
+                name: tagDesc,
+                startLine: i + 1,
+                endLine: i + 1,
+                depth: 1
+              });
+              htmlLandmarks++;
+            }
+          }
+        }
+      }
       i++;
       continue;
     }
@@ -4050,7 +4120,7 @@ function extractSfcSymbols(lines) {
       for (let j = i; j < lines.length; j++) {
         endIdx = j;
         if (j > i && closeRe.test(lines[j])) break;
-        if (j === i && closeRe.test(lines[j].slice(m[0].length))) break;
+        if (j === i && closeRe.test(trimmed.slice(m[0].length))) break;
       }
     }
     const headerLabel = attrs ? `<${tag} ${attrs.slice(0, 40)}>` : `<${tag}>`;
@@ -4064,7 +4134,7 @@ function extractSfcSymbols(lines) {
     const innerStart = startIdx + 1;
     const innerLines = lines.slice(innerStart, endIdx);
     if (tag === "script" && innerLines.length > 0) {
-      const innerSyms = extractTsJsSymbols(innerLines);
+      const innerSyms = extractTsJsSymbols(dedentBlockLines(innerLines));
       for (const s of innerSyms) {
         symbols.push({
           kind: s.kind,
@@ -4076,23 +4146,12 @@ function extractSfcSymbols(lines) {
       }
     } else if (tag === "template" && innerLines.length >= 30) {
       let landmarks = 0;
-      const extractHtmlCommentLandmark = (text) => {
-        if (text.length < 10 || text.length > 200) return null;
-        if (!text.startsWith("<!--") || !text.endsWith("-->")) return null;
-        const inner = text.slice(4, -3);
-        if (inner.includes("<!--") || inner.includes("-->") || inner.includes(">")) return null;
-        const cleaned = inner.replace(/^[\s=\-*#]+/, "").replace(/[\s=\-*#]+$/, "");
-        if (cleaned.length < 3 || cleaned.length > 61) return null;
-        if (cleaned.startsWith("-")) return null;
-        return cleaned;
-      };
-      const semanticTagRe = /^<(header|nav|main|aside|section|footer|dialog|form|[A-Z][A-Za-z0-9]*(?:Modal|Drawer|Dialog|Panel))\b([^>]*)>/;
       for (let k = 0; k < innerLines.length && landmarks < 14; k++) {
         const raw = innerLines[k];
-        const indent = raw.length - raw.trimStart().length;
-        if (indent > 8) continue;
-        const trimmed = raw.trim();
-        const landmarkName = extractHtmlCommentLandmark(trimmed);
+        const kIndent = raw.length - raw.trimStart().length;
+        if (kIndent > 8) continue;
+        const kTrimmed = raw.trim();
+        const landmarkName = extractHtmlCommentLandmark(kTrimmed);
         if (landmarkName) {
           symbols.push({
             kind: "section",
@@ -4104,7 +4163,7 @@ function extractSfcSymbols(lines) {
           landmarks++;
           continue;
         }
-        const sm = semanticTagRe.exec(trimmed);
+        const sm = semanticTagRe.exec(kTrimmed);
         if (sm && sm[1]) {
           const attrStr = sm[2] ?? "";
           const idMatch = /(?:data-testid|id|class)=["']([^"']+)["']/.exec(attrStr);
@@ -4120,7 +4179,7 @@ function extractSfcSymbols(lines) {
         }
       }
     } else if (tag === "style" && innerLines.length > 0) {
-      const cssSyms = extractCssSymbols(innerLines, true).slice(0, 12);
+      const cssSyms = extractCssSymbols(dedentBlockLines(innerLines), true).slice(0, 12);
       for (const s of cssSyms) {
         symbols.push({
           kind: s.kind,
@@ -4351,7 +4410,12 @@ function extractSymbolsFromLines(filePath, lines) {
       return extractTsJsSymbols(lines);
     case ".vue":
     case ".svelte":
-      return extractSfcSymbols(lines);
+      return extractSfcSymbols(lines, false);
+    case ".html":
+    case ".htm":
+    case ".xhtml":
+    case ".astro":
+      return extractSfcSymbols(lines, true);
     case ".css":
     case ".scss":
     case ".less":
@@ -4365,6 +4429,7 @@ function extractSymbolsFromLines(filePath, lines) {
       return extractGoSymbols(lines);
     case ".rs":
       return extractRustSymbols(lines);
+    case ".dart":
     case ".java":
     case ".kt":
     case ".kts":

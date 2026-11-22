@@ -3495,7 +3495,11 @@
       }
     }
 
+    let autoRefreshInFlight = false;
+
     async function refreshData(manual = false) {
+      if (!manual && autoRefreshInFlight) return;
+      if (!manual) autoRefreshInFlight = true;
       const reqSeq = ++refreshSeq;
       const reqScope = currentScope;
       const isStale = () => reqSeq !== refreshSeq || currentScope !== reqScope;
@@ -3506,11 +3510,15 @@
         const params = new URLSearchParams(window.location.search);
         const convId = window.sidecar?.conversationId || params.get('conversationId') || '';
         cachedConvId = convId;
+        const scopeBody = JSON.stringify({ scope: reqScope, conversationId: convId });
 
-        const statsRes = await apiFetch('/api/stats', {
-          method: 'POST',
-          body: JSON.stringify({ scope: reqScope, conversationId: convId })
-        });
+        const [statsRes, docRes, kvRes, wdRes, resumeRes] = await Promise.all([
+          apiFetch('/api/stats', { method: 'POST', body: scopeBody }),
+          apiFetch('/api/doctor', { method: 'POST', body: '{}' }).catch(() => null),
+          apiFetch('/api/cache-diag', { method: 'POST', body: scopeBody }).catch(() => null),
+          apiFetch('/api/watchdog', { method: 'POST', body: scopeBody }).catch(() => null),
+          apiFetch('/api/resume', { method: 'POST', body: scopeBody }).catch(() => null)
+        ]);
         if (!statsRes.ok) throw new Error(`Stats HTTP ${statsRes.status}`);
         const s = await statsRes.json();
         if (isStale()) return;
@@ -3574,9 +3582,7 @@
         }
 
         try {
-          const docRes = await apiFetch('/api/doctor', { method: 'POST', body: '{}' });
-          if (isStale()) return;
-          if (docRes.ok) {
+          if (docRes && docRes.ok) {
             const d = await docRes.json();
             if (isStale()) return;
             cachedDoctor = d;
@@ -3592,12 +3598,7 @@
         } catch {}
 
         try {
-          const kvRes = await apiFetch('/api/cache-diag', {
-            method: 'POST',
-            body: JSON.stringify({ scope: reqScope, conversationId: convId })
-          });
-          if (isStale()) return;
-          if (kvRes.ok) {
+          if (kvRes && kvRes.ok) {
             const kv = await kvRes.json();
             if (isStale()) return;
             cachedKv = kv;
@@ -3606,12 +3607,7 @@
         } catch {}
 
         try {
-          const wdRes = await apiFetch('/api/watchdog', {
-            method: 'POST',
-            body: JSON.stringify({ scope: reqScope, conversationId: convId })
-          });
-          if (isStale()) return;
-          if (wdRes.ok) {
+          if (wdRes && wdRes.ok) {
             const wd = await wdRes.json();
             if (isStale()) return;
             cachedWatchdog = wd;
@@ -3619,17 +3615,14 @@
           }
         } catch {}
 
-        const resumeRes = await apiFetch('/api/resume', {
-          method: 'POST',
-          body: JSON.stringify({ scope: reqScope, conversationId: convId })
-        });
-        if (isStale()) return;
-        if (resumeRes.ok) {
-          const r = await resumeRes.json();
-          if (isStale()) return;
-          cachedResume = r;
-          renderRecentSourcesAndEvents(r);
-        }
+        try {
+          if (resumeRes && resumeRes.ok) {
+            const r = await resumeRes.json();
+            if (isStale()) return;
+            cachedResume = r;
+            renderRecentSourcesAndEvents(r);
+          }
+        } catch {}
 
         cachedDisconnectedErr = null;
         cachedLastUpdatedDate = new Date();
@@ -3641,6 +3634,7 @@
         cachedDisconnectedErr = err.message;
         renderTelemetryBanner();
       } finally {
+        if (!manual) autoRefreshInFlight = false;
         if (refreshIcon && reqSeq === refreshSeq) {
           setTimeout(() => refreshIcon.classList.remove('spinning'), 400);
         }
@@ -5035,7 +5029,17 @@
 
     applyLanguageUi();
     refreshData(true);
-    pollTimer = setInterval(() => refreshData(false), 3000);
+    pollTimer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden === true) return;
+      refreshData(false);
+    }, 3000);
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden === false) {
+          refreshData(false);
+        }
+      });
+    }
     window.addEventListener('beforeunload', () => {
       stopKvTtlTimer();
       stopWdLiveTimer();

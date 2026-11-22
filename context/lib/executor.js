@@ -467,6 +467,11 @@ export async function executeCode({
   // 2. Python
   if (normLang === "python" || normLang === "python3" || normLang === "py") {
     const pythonBin = process.platform === "win32" ? "python" : "python3";
+    const pyEnv = {
+      PYTHONIOENCODING: "utf-8",
+      PYTHONUTF8: "1",
+      ...env
+    };
     if (file) {
       const scriptPath = path.isAbsolute(file) ? file : path.resolve(workdir, file);
       return runProcess({
@@ -474,7 +479,7 @@ export async function executeCode({
         args: [scriptPath, ...safeArgs],
         cwd: workdir,
         timeoutMs,
-        env
+        env: pyEnv
       });
     }
     return runProcess({
@@ -482,7 +487,7 @@ export async function executeCode({
       args: ["-c", code, ...safeArgs],
       cwd: workdir,
       timeoutMs,
-      env
+      env: pyEnv
     });
   }
 
@@ -521,12 +526,19 @@ export async function executeCode({
   };
 
   // 3. PowerShell
+  const PS_UTF8_PRELUDE =
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8;";
+  const hasLeadingPsParamBlock = (txt) => /^\s*(?:<#[\s\S]*?#>|\s|#[^\r\n]*)*param\s*\(/i.test(txt);
+  const withPsUtf8Prelude = (txt) => {
+    if (!txt || !txt.trim() || hasLeadingPsParamBlock(txt)) return txt;
+    return `${PS_UTF8_PRELUDE}\n${txt}`;
+  };
   const runPowerShellCommand = async (bin, scriptText) => {
     const psScript = scriptText || "";
     if (safeArgs.length === 0) {
       return runProcess({
         cmd: bin,
-        args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript],
+        args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", withPsUtf8Prelude(psScript)],
         cwd: workdir,
         timeoutMs,
         env
@@ -537,7 +549,7 @@ export async function executeCode({
     let tmpPs1 = "";
     try {
       tmpPs1 = path.join(os.tmpdir(), `agy-dart-ps-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}.ps1`);
-      fs.writeFileSync(tmpPs1, `\uFEFF${psScript}`, { encoding: "utf8", mode: 0o600 });
+      fs.writeFileSync(tmpPs1, `\uFEFF${withPsUtf8Prelude(psScript)}`, { encoding: "utf8", mode: 0o600 });
       return await runProcess({
         cmd: bin,
         args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", tmpPs1, ...safeArgs],
@@ -554,7 +566,7 @@ export async function executeCode({
         clearStmts.push(`Remove-Item Env:${key} -ErrorAction SilentlyContinue`);
         return `$env:${key}`;
       });
-      const wrapper = `$__agyCode = $env:__AGY_PS_CODE; $__agyArgs = @(${psArgItems.join(", ")}); ${clearStmts.join("; ")}; $global:LASTEXITCODE = $null; & ([scriptblock]::Create($__agyCode)) @__agyArgs; if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`;
+      const wrapper = `${PS_UTF8_PRELUDE} $__agyCode = $env:__AGY_PS_CODE; $__agyArgs = @(${psArgItems.join(", ")}); ${clearStmts.join("; ")}; $global:LASTEXITCODE = $null; & ([scriptblock]::Create($__agyCode)) @__agyArgs; if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`;
       return runProcess({
         cmd: bin,
         args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", wrapper],

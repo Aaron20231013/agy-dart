@@ -1,8 +1,9 @@
 // agy-fast SessionStart Hook (bundled zero-dependency ESM)
 
 // src/utils/snapshot.ts
-import { promises as fs } from "node:fs";
+import fsSync, { promises as fs } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // src/utils/exec-utils.ts
 import { spawn } from "node:child_process";
@@ -184,13 +185,8 @@ var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
 
 // src/utils/snapshot.ts
 async function getGitSummary(workspaceDir, timeoutMs) {
-  const [branchRes, symRefRes, statusRes, logRes] = await Promise.all([
+  const [branchRes, statusRes, logRes] = await Promise.all([
     execBinaryAsync("git", ["--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 4096
-    }),
-    execBinaryAsync("git", ["--no-optional-locks", "symbolic-ref", "--short", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 4096
@@ -206,6 +202,14 @@ async function getGitSummary(workspaceDir, timeoutMs) {
       maxOutputBytes: 8192
     })
   ]);
+  let symRefRes = { error: true, exitCode: 1, stdout: "" };
+  if ((branchRes.error || branchRes.exitCode !== 0) && !statusRes.error && statusRes.exitCode === 0) {
+    symRefRes = await execBinaryAsync("git", ["--no-optional-locks", "symbolic-ref", "--short", "HEAD"], {
+      cwd: workspaceDir,
+      timeoutMs,
+      maxOutputBytes: 4096
+    });
+  }
   const hasValidRepo = !branchRes.error && branchRes.exitCode === 0 || !symRefRes.error && symRefRes.exitCode === 0 || !statusRes.error && statusRes.exitCode === 0;
   if (!hasValidRepo) {
     return null;
@@ -500,6 +504,17 @@ async function detectManifestsInDir(dirPath, prefix) {
         hints.push(m?.[1] ? `${prefix}go.mod (${m[1]})` : `${prefix}go.mod`);
       } catch {
       }
+    })(),
+    // pubspec.yaml (Dart / Flutter)
+    (async () => {
+      try {
+        const raw = await fs.readFile(path.join(dirPath, "pubspec.yaml"), "utf8");
+        const nameMatch = /^name\s*:\s*([A-Za-z0-9_.-]+)/m.exec(raw);
+        const isFlutter = /^\s*flutter\s*:/m.test(raw);
+        const meta = [nameMatch?.[1], isFlutter ? "flutter" : "dart"].filter(Boolean).join(", ");
+        hints.push(`${prefix}pubspec.yaml (${meta})`);
+      } catch {
+      }
     })()
   ]);
   return hints;
@@ -542,9 +557,10 @@ function fitSectionToChars(section, budget, marker) {
   return `${trimmed}
 ${marker}`;
 }
-async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
+export async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
   const maxChars = options.maxChars ?? 1500;
   const gitTimeoutMs = options.gitTimeoutMs ?? 800;
+  const omitGit = Boolean(options.omitGit);
   try {
     const stat = await fs.stat(workspaceDir);
     if (!stat.isDirectory()) return null;
@@ -552,7 +568,7 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
     return null;
   }
   const [gitSummary, treeSummary, projectSummary] = await Promise.all([
-    getGitSummary(workspaceDir, gitTimeoutMs),
+    omitGit ? Promise.resolve(null) : getGitSummary(workspaceDir, gitTimeoutMs),
     getTwoLevelTree(workspaceDir),
     getProjectManifestSummary(workspaceDir)
   ]);
@@ -687,4 +703,20 @@ async function main() {
     process.stdout.write("{}\n");
   }
 }
-void main();
+const __fastSelfPath = path.resolve(fileURLToPath(import.meta.url));
+function isSameScriptPath(a, b) {
+  if (!a || !b) return false;
+  const norm = (p) => {
+    const resolved = path.resolve(p);
+    let real = resolved;
+    try {
+      real = fsSync.realpathSync(resolved);
+    } catch {
+    }
+    return process.platform === "win32" ? real.toLowerCase() : real;
+  };
+  return norm(a) === norm(b);
+}
+if (process.argv[1] && isSameScriptPath(process.argv[1], __fastSelfPath)) {
+  void main();
+}

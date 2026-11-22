@@ -28,6 +28,25 @@
 
 ---
 
+## v1.5.2 核心升级（钩子与 SQLite 热路径提速、HTML/Dart 符号大纲、Windows UTF-8 管道与面板并发轮询）
+
+1. **生命周期钩子与 SQLite 冷启动极速快跳**：
+   - `hooks/pre-tool-use.mjs` 引入单次调用级文件读取上下文（`createFileReadContext`），缓存 `realpathSync`、按需单次加载的 `<= 2 MB` `Buffer` 与行区间字节统计，将单次 `read_file` 磁盘全量读取从 `4～6` 次压降至**最多 `1` 次**，并为 `isBinaryFile` 补齐 `try/finally` 句柄保护与 `.dart`/`.astro`/`.mdx`/`.proto` 等文本白名单。
+   - `context/lib/store/schema.js`（`initSchema`）新增 `PRAGMA user_version` + `sqlite_master` 列签名极速快跳，短进程钩子热打开数据库时跳过全部 9 表 DDL、4 次 `PRAGMA table_info` 与 FTS5 重建（同时完整保留旧库与缺表自愈能力），并新增 `idx_events_tool_sandbox` 复合索引。
+   - `hooks/session-start.mjs` 改为进程内 `Promise.all` 并发调用 `buildWorkspaceSnapshot`，消除额外子 Node 进程及子代理/`stablePrefixOnly` 模式下 **4 次无效 `git` 进程创建**，并补齐 Dart/Flutter `pubspec.yaml` 项目识别。
+2. **HTML/Astro 与 Dart 3 符号大纲增强 + Windows UTF-8 管道防乱码**：
+   - `agy-dart_fast` `read_slices({ outlines })` 支持提取带缩进的 `.html`/`.htm`/`.astro` `<style>`、`<body>` 语义地标与 `<script>` 内嵌 JS 函数/类（彻底解决 5,000+ 行单页 HTML 大纲为空的问题），以及 `.dart` 的 `class`/`mixin`/`extension`、可空返回类型与箭头函数。
+   - `context/lib/executor.js`（`ctx_execute`）为 Python 默认注入 `PYTHONIOENCODING=utf-8` / `PYTHONUTF8=1`，为 Windows PowerShell 前置 UTF-8 输出编码（自动兼容首行 `param(...)` 脚本与原始退出码透传），杜绝 CP936 控制台管道中文乱码。
+3. **Sidecar 仪表盘并发轮询与 SQLite 查询瘦身**：
+   - 前端 `refreshData()` 将 5 个独立 `/api/*` `POST` 请求改为 `Promise.all` 并发拉取，新增防重入锁与后台隐藏标签页（`document.hidden`）自动休眠/切回即刷；后端消除 `/api/stats` 重复 `getGhostStats()` 扫描、对已终态 `starPrompt` 短路跳过全表聚合、按 `mtimeMs` 缓存 `index.html` 模板，并将 `"app"` 作用域 `/api/search` 的 N+1 查询合并为单条 `WHERE id IN (...)`。
+
+## v1.5.1 体验打磨（10 分钟编辑感知 Ghost 召回窗口与全中文界面零残留）
+
+1. **10 分钟编辑感知 Ghost 召回校准与阈值建议升级**：
+   - `ghost_interceptions` 新增 `recall_closed`，仅将拦截后 `<= 10` 分钟且未发生文件编辑（`PostToolUse` 捕获 `edit_file`/`write_file`/`apply_edits` 即关窗）的窄切片计入被迫召回，并区分过紧阈值（`< 45 KiB` 建议切回 `host-45k`）与宿主上限阈值（`>= 45 KiB` 建议先用 `read_slices({ outlines })` 或豁免）。
+2. **Sidecar 中文模式（`zh`）全量本地化清零**：
+   - 补齐 Ghost 效率建议、阈值下拉菜单、TTL 校准来源、死循环监控与缓存失效归因提示的全部中文文案，实现中文模式下零英文残留。
+
 ## v1.5.0 核心升级（跨会话实证 TTL 校准、高上下文临期提醒与 Keep-Alive 账本回放）
 
 1. **跨会话按模型实证 TTL 区间校准（`ttl_calibration:v1:<profileId>`）**：
