@@ -102,10 +102,30 @@ function toWorkspaceRel(targetPath, workspaceDir) {
   return rel;
 }
 
+const SAFE_GIT_HEAD_ARGS = Object.freeze([
+  "--no-optional-locks",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "core.hooksPath=",
+  "-c",
+  "diff.external=",
+  "-c",
+  "gpg.program=false",
+  "-c",
+  "gpg.openpgp.program=false",
+  "-c",
+  "gpg.ssh.program=false",
+  "-c",
+  "gpg.x509.program=false",
+  "rev-parse",
+  "HEAD"
+]);
+
 /** Fast git HEAD SHA lookup (returns null if not a git repo or unborn) */
 export function getGitHeadSha(workspaceDir, timeoutMs = 400) {
   try {
-    const res = spawnSync("git", ["--no-optional-locks", "rev-parse", "HEAD"], {
+    const res = spawnSync("git", SAFE_GIT_HEAD_ARGS, {
       cwd: workspaceDir,
       encoding: "utf8",
       timeout: timeoutMs,

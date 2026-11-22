@@ -135,8 +135,9 @@ export function extractInvalidationTargets(toolName, args = {}, cwd = process.cw
   } else if (toolName === "apply_edits" || /(?:^|_)apply_edits$/.test(toolName)) {
     if (!args.dryRun) {
       const editCwd = resolveBaseCwd(args.cwd);
-      if (Array.isArray(args.edits)) {
-        for (const e of args.edits) {
+      const editsList = Array.isArray(args.edits) ? args.edits : parseMaybeJson(args.edits);
+      if (Array.isArray(editsList)) {
+        for (const e of editsList) {
           if (e && e.path) addPath(e.path, editCwd);
         }
       }
@@ -147,8 +148,9 @@ export function extractInvalidationTargets(toolName, args = {}, cwd = process.cw
     if (mcpTool === "apply_edits") {
       if (!mcpArgs.dryRun) {
         const editCwd = resolveBaseCwd(mcpArgs.cwd);
-        if (Array.isArray(mcpArgs.edits)) {
-          for (const e of mcpArgs.edits) {
+        const editsList = Array.isArray(mcpArgs.edits) ? mcpArgs.edits : parseMaybeJson(mcpArgs.edits);
+        if (Array.isArray(editsList)) {
+          for (const e of editsList) {
             if (e && e.path) addPath(e.path, editCwd);
           }
         }
@@ -253,7 +255,8 @@ export function extractVerificationSignal(toolName, args = {}, responseText = ""
     verifyCmd = typeof args.verify === "string" ? args.verify : args.verify?.command || "";
   } else if (toolName === "run_checks" || /(?:^|_)run_checks$/.test(toolName)) {
     isRunChecks = true;
-    const cmds = Array.isArray(args.commands) ? args.commands : [];
+    const parsedCmds = Array.isArray(args.commands) ? args.commands : parseMaybeJson(args.commands);
+    const cmds = Array.isArray(parsedCmds) ? parsedCmds : [];
     runChecksCmd = cmds
       .map((c) => (typeof c === "string" ? c : c?.name || c?.command || ""))
       .filter(Boolean)
@@ -266,7 +269,8 @@ export function extractVerificationSignal(toolName, args = {}, responseText = ""
       verifyCmd = typeof mcpArgs.verify === "string" ? mcpArgs.verify : mcpArgs.verify?.command || "";
     } else if (mcpTool === "run_checks") {
       isRunChecks = true;
-      const cmds = Array.isArray(mcpArgs.commands) ? mcpArgs.commands : [];
+      const parsedCmds = Array.isArray(mcpArgs.commands) ? mcpArgs.commands : parseMaybeJson(mcpArgs.commands);
+      const cmds = Array.isArray(parsedCmds) ? parsedCmds : [];
       runChecksCmd = cmds
         .map((c) => (typeof c === "string" ? c : c?.name || c?.command || ""))
         .filter(Boolean)
@@ -373,7 +377,7 @@ async function main() {
           partialApplied === null &&
           !explicitlyApplied &&
           (responseIsError ||
-            /^\s*(?:(?:Atomic edit aborted|Edit aborted|Validation failed)\s*\(0 files modified\)|Write failed \(changes rolled back\)|Dry run validated|Encountered error in step execution|Tool error \()/i.test(
+            /^\s*(?:(?:Atomic edit aborted|Edit aborted|Validation failed)\s*\(0 files modified\)|Write failed \(changes rolled back\)|Dry run validated|Encountered error in step execution|Tool error \(|Error(?:\s*\[[A-Z0-9_]+\])?:)/i.test(
               responseText
             ));
         const effectivePaths = partialApplied !== null ? partialApplied : abortedNoWrite ? [] : paths;

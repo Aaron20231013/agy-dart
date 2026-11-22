@@ -5,7 +5,20 @@
       "args": [
         "${PLUGIN_ROOT}/fast/mcp-server.mjs"
       ],
-      "eager": true
+      "tools": {
+        "apply_edits": {
+          "eager": true
+        },
+        "batch_search": {
+          "eager": true
+        },
+        "read_slices": {
+          "eager": true
+        },
+        "run_checks": {
+          "eager": true
+        }
+      }
     },
     "context": {
       "command": "node",

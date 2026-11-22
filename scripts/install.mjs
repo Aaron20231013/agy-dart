@@ -68,6 +68,34 @@ const MODES = {
 };
 
 export const TOOL_LOADING_MODES = Object.freeze(["fast-eager", "lazy", "eager"]);
+export const FAST_MCP_TOOL_NAMES = Object.freeze(["apply_edits", "batch_search", "read_slices", "run_checks"]);
+export const CONTEXT_MCP_TOOL_NAMES = Object.freeze([
+  "ctx_batch",
+  "ctx_doctor",
+  "ctx_execute",
+  "ctx_index",
+  "ctx_purge",
+  "ctx_resume",
+  "ctx_search",
+  "ctx_stats"
+]);
+
+function buildEagerToolsConfig(toolNames) {
+  const tools = {};
+  for (const name of toolNames) {
+    tools[name] = { eager: true };
+  }
+  return tools;
+}
+
+export function hasEagerToolsInServerEntry(serverEntry) {
+  if (!serverEntry || typeof serverEntry !== "object") return false;
+  if (serverEntry.eager === true) return true;
+  if (serverEntry.tools && typeof serverEntry.tools === "object") {
+    return Object.values(serverEntry.tools).some((cfg) => Boolean(cfg && typeof cfg === "object" && cfg.eager === true));
+  }
+  return false;
+}
 
 export function normalizeToolLoadingMode(raw) {
   if (typeof raw !== "string") return null;
@@ -85,12 +113,14 @@ export function buildMcpConfigObject(toolLoading = "fast-eager") {
   const fastEntry = {
     command: "node",
     args: ["${PLUGIN_ROOT}/fast/mcp-server.mjs"],
-    ...(normalized === "fast-eager" || normalized === "eager" ? { eager: true } : {})
+    ...(normalized === "fast-eager" || normalized === "eager"
+      ? { tools: buildEagerToolsConfig(FAST_MCP_TOOL_NAMES) }
+      : {})
   };
   const contextEntry = {
     command: "node",
     args: ["${PLUGIN_ROOT}/context/server.js"],
-    ...(normalized === "eager" ? { eager: true } : {})
+    ...(normalized === "eager" ? { tools: buildEagerToolsConfig(CONTEXT_MCP_TOOL_NAMES) } : {})
   };
   return {
     mcpServers: {
@@ -151,10 +181,14 @@ export const RUNTIME_FILES = Object.freeze([
   "hooks.json",
   "package.json",
   "LICENSE",
+  "SECURITY.md",
   "THIRD_PARTY_NOTICES.md",
   "README.md",
   "README.zh-CN.md",
   "assets/logo.svg",
+  "assets/architecture-dark.svg",
+  "assets/architecture-light.svg",
+  "assets/demo-comparison.svg",
   "rules/AGENTS.md",
   "skills/agy-dart/SKILL.md",
   "fast/mcp-server.mjs",
@@ -776,8 +810,8 @@ async function runDoctor(targetDir, { json = false, showStarHint = true } = {}) 
     if (hasMcpConfig) {
       try {
         const mcpRaw = JSON.parse(await fs.readFile(path.join(targetDir, "mcp_config.json"), "utf8"));
-        const fastEager = Boolean(mcpRaw?.mcpServers?.fast?.eager);
-        const ctxEager = Boolean(mcpRaw?.mcpServers?.context?.eager);
+        const fastEager = hasEagerToolsInServerEntry(mcpRaw?.mcpServers?.fast);
+        const ctxEager = hasEagerToolsInServerEntry(mcpRaw?.mcpServers?.context);
         mcpToolLoading = fastEager && ctxEager ? "eager" : fastEager ? "fast-eager" : "lazy";
       } catch {}
     }
@@ -1348,6 +1382,16 @@ async function main() {
       }
       const skipDb = Boolean(opts.isCustomTarget || opts.isProject);
       const cfg = await applyMode(targetResolved, opts.mode, skipDb, { explicitMode: true });
+      if (!opts.isCustomTarget && !opts.isProject && opts.syncHosts !== false) {
+        for (const extraDst of discoverExtraHostPluginTargets({ primaryTargetDir: targetResolved })) {
+          try {
+            if ((await pathExists(extraDst)) && (await hasValidPluginManifest(extraDst))) {
+              await assertNotSymlinkTarget(extraDst);
+              await applyMode(extraDst, opts.mode, true, { explicitMode: true });
+            }
+          } catch {}
+        }
+      }
       console.log(`Switched agy-dart mode at ${targetResolved} -> ${opts.mode} (${cfg.label})`);
       break;
     }
@@ -1369,6 +1413,16 @@ async function main() {
         persist: !skipDb
       });
       await applyToolLoading(targetResolved, eff);
+      if (!opts.isCustomTarget && !opts.isProject && opts.syncHosts !== false) {
+        for (const extraDst of discoverExtraHostPluginTargets({ primaryTargetDir: targetResolved })) {
+          try {
+            if ((await pathExists(extraDst)) && (await hasValidPluginManifest(extraDst))) {
+              await assertNotSymlinkTarget(extraDst);
+              await applyToolLoading(extraDst, eff);
+            }
+          } catch {}
+        }
+      }
       console.log(`Switched agy-dart tool-loading at ${targetResolved} -> ${eff}`);
       break;
     }

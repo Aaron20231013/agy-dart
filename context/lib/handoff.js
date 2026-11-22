@@ -180,11 +180,29 @@ export function isSafeWorkspaceDir(dirPath) {
   return !isUnsafeBroadRoot(resolved);
 }
 
+const SAFE_GIT_BASE_ARGS = Object.freeze([
+  "--no-optional-locks",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "core.hooksPath=",
+  "-c",
+  "diff.external=",
+  "-c",
+  "gpg.program=false",
+  "-c",
+  "gpg.openpgp.program=false",
+  "-c",
+  "gpg.ssh.program=false",
+  "-c",
+  "gpg.x509.program=false"
+]);
+
 function runGitReadOnly(args, workDir) {
   try {
     const res = spawnSync(
       "git",
-      ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=", ...args],
+      [...SAFE_GIT_BASE_ARGS, ...args],
       {
         cwd: workDir,
         encoding: "utf8",

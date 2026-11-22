@@ -22,13 +22,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ScriptPath = $MyInvocation.MyCommand.Path
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-  Write-Error "Node.js >= 22 is required. Install Node.js first: https://nodejs.org/"
-  exit 1
+  $msg = "Node.js >= 22 is required. Install Node.js first: https://nodejs.org/"
+  if ($ScriptPath) { Write-Error $msg; exit 1 } else { throw $msg }
 }
 
-$ScriptPath = $MyInvocation.MyCommand.Path
 $ScriptDir = if ($ScriptPath) { Split-Path -Parent $ScriptPath } else { "" }
 $Installer = if ($ScriptDir) { Join-Path $ScriptDir "scripts\install.mjs" } else { "" }
 $TempWorkDir = ""
@@ -76,7 +76,9 @@ try {
   }
 
   & node @nodeArgs
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  if ($LASTEXITCODE -ne 0) {
+    if ($ScriptPath) { exit $LASTEXITCODE } else { throw "agy-dart installer failed with exit code $LASTEXITCODE" }
+  }
 } finally {
   if ($TempWorkDir -and (Test-Path -LiteralPath $TempWorkDir)) {
     Remove-Item -LiteralPath $TempWorkDir -Recurse -Force -ErrorAction SilentlyContinue

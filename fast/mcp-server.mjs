@@ -161,6 +161,7 @@ var McpStdioServer = class {
   clientSupportsRoots = false;
   cachedRootsDir = null;
   rootsQueried = false;
+  rootsEpoch = 0;
   inFlightRootsPromise = null;
   pendingClientRequests = /* @__PURE__ */ new Map();
   nextClientReqSeq = 1;
@@ -208,7 +209,7 @@ var McpStdioServer = class {
           if (Array.isArray(roots)) {
             for (const item of roots) {
               const candidate = resolveDirectoryCandidateFast(item?.uri || item?.path);
-              if (candidate) {
+              if (candidate && !isInsideInstalledPluginDir(candidate)) {
                 resolve(candidate);
                 return;
               }
@@ -218,10 +219,14 @@ var McpStdioServer = class {
         }
       });
       this.writeClientRequest({ jsonrpc: "2.0", id: reqId, method: "roots/list" });
-    }).finally(() => {
-      this.inFlightRootsPromise = null;
     });
-    return this.inFlightRootsPromise;
+    const trackedPromise = this.inFlightRootsPromise.finally(() => {
+      if (this.inFlightRootsPromise === trackedPromise) {
+        this.inFlightRootsPromise = null;
+      }
+    });
+    this.inFlightRootsPromise = trackedPromise;
+    return trackedPromise;
   }
   async resolveWorkspaceRoot() {
     if (this.initWorkspaceRoot) {
@@ -240,9 +245,16 @@ var McpStdioServer = class {
     if (!shouldQuery) {
       return { dir: process.cwd(), confirmed: false };
     }
+    const epoch = this.rootsEpoch;
     const dir = await this.requestRootsList(1e3);
-    this.rootsQueried = true;
-    this.cachedRootsDir = dir;
+    if (this.rootsEpoch === epoch) {
+      this.rootsQueried = true;
+      this.cachedRootsDir = dir;
+    } else if (this.rootsQueried) {
+      return this.cachedRootsDir
+        ? { dir: this.cachedRootsDir, confirmed: true }
+        : { dir: process.cwd(), confirmed: false };
+    }
     return dir ? { dir, confirmed: true } : { dir: process.cwd(), confirmed: false };
   }
   async handleMessage(raw) {
@@ -272,8 +284,10 @@ var McpStdioServer = class {
     }
     if (!hasId) {
       if (method === "notifications/roots/list_changed") {
+        this.rootsEpoch += 1;
         this.cachedRootsDir = null;
         this.rootsQueried = false;
+        this.inFlightRootsPromise = null;
       }
       return null;
     }
@@ -290,15 +304,19 @@ var McpStdioServer = class {
           typeof msg.params.capabilities === "object" &&
           msg.params.capabilities.roots
       );
-      const wsFolder = Array.isArray(msg.params?.workspaceFolders)
-        ? msg.params.workspaceFolders[0]?.uri
-        : null;
-      const initDir =
-        resolveDirectoryCandidateFast(wsFolder) ||
-        resolveDirectoryCandidateFast(msg.params?.rootUri) ||
-        resolveDirectoryCandidateFast(msg.params?.rootPath);
-      if (initDir) {
-        this.initWorkspaceRoot = initDir;
+      const initCandidates = [
+        ...(Array.isArray(msg.params?.workspaceFolders)
+          ? msg.params.workspaceFolders.map((w) => w?.uri || w?.path)
+          : []),
+        msg.params?.rootUri,
+        msg.params?.rootPath
+      ];
+      for (const cand of initCandidates) {
+        const resolved = resolveDirectoryCandidateFast(cand);
+        if (resolved && !isInsideInstalledPluginDir(resolved)) {
+          this.initWorkspaceRoot = resolved;
+          break;
+        }
       }
       const requested = typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion.trim() : "";
       const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : DEFAULT_PROTOCOL_VERSION;
@@ -3075,14 +3093,54 @@ ${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
 ERROR: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
+function coerceArrayToolField(rawVal, fieldName, { allowSingleString = false, optional = true } = {}) {
+  if (rawVal === void 0 || rawVal === null) {
+    return optional
+      ? { items: [], error: null }
+      : { items: null, error: `Error: '${fieldName}' must be a non-empty array.` };
+  }
+  if (Array.isArray(rawVal)) {
+    return { items: rawVal, error: null };
+  }
+  if (typeof rawVal === "string") {
+    const trimmed = rawVal.trim();
+    if (!trimmed) {
+      return optional
+        ? { items: [], error: null }
+        : { items: null, error: `Error: '${fieldName}' must be a non-empty array.` };
+    }
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return { items: parsed, error: null };
+        }
+      } catch (err) {
+        return {
+          items: null,
+          error: `Error: '${fieldName}' JSON string is invalid (${err instanceof Error ? err.message : String(err)}).`
+        };
+      }
+    }
+    if (allowSingleString) {
+      return { items: [trimmed], error: null };
+    }
+  }
+  return {
+    items: null,
+    error: `Error: '${fieldName}' must be an array${allowSingleString ? " or string" : ""}.`
+  };
+}
 async function runBatchSearch(input, options = {}) {
-  if (!Array.isArray(input.queries) || input.queries.length === 0) {
+  const coercedQueries = coerceArrayToolField(input.queries, "queries", { optional: false });
+  if (coercedQueries.error || !coercedQueries.items || coercedQueries.items.length === 0) {
     return {
-      text: "Error: 'queries' must be a non-empty array of search queries.",
+      text: coercedQueries.error || "Error: 'queries' must be a non-empty array of search queries.",
       isError: true
     };
   }
-  if (input.queries.length > 20) {
+  const queriesList = coercedQueries.items;
+  if (queriesList.length > 20) {
     return {
       text: "Error: 'queries' supports at most 20 queries per call.",
       isError: true
@@ -3104,12 +3162,12 @@ async function runBatchSearch(input, options = {}) {
   const maxChars = clampInt(input.maxChars ?? 8500, 500, DEFAULT_INLINE_MAX_BYTES);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
   // Working-tree git queries (status/diff/log) depend on arbitrary tracked/untracked files across subdirs; bypass cache.
-  const hasGitQuery = input.queries.some((q) => q && q.type === "git");
+  const hasGitQuery = queriesList.some((q) => q && q.type === "git");
   const ttlMs = hasGitQuery ? 0 : getSearchCacheTtlMs();
   let cacheKey = null;
   if (ttlMs > 0) {
-    const worktreeFp = await computeWorktreeFingerprint(baseCwd, input.queries);
-    const canonicalQueriesJson = JSON.stringify(stableSortObject(input.queries));
+    const worktreeFp = await computeWorktreeFingerprint(baseCwd, queriesList);
+    const canonicalQueriesJson = JSON.stringify(stableSortObject(queriesList));
     cacheKey = `${normalizeFileCacheKey(baseCwd)}|${maxChars}|${Boolean(options.forceNodeFallback)}|${canonicalQueriesJson}|${worktreeFp}`;
     const cached = BATCH_SEARCH_CACHE.get(cacheKey);
     if (cached) {
@@ -3125,19 +3183,19 @@ async function runBatchSearch(input, options = {}) {
       BATCH_SEARCH_CACHE.delete(cacheKey);
     }
   }
-  const needsTextSearch = input.queries.some(
+  const needsTextSearch = queriesList.some(
     (q) => q.type === "text" || q.type === "regex"
   );
   const useRg = needsTextSearch && !options.forceNodeFallback && await isRipgrepAvailable();
   const trackCtx = ttlMs > 0 ? { matchedAbsPaths: /* @__PURE__ */ new Set(), hasError: false } : null;
   const sections = await Promise.all(
-    input.queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, trackCtx))
+    queriesList.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, trackCtx))
   );
   const resultText = fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n");
   if (cacheKey && trackCtx && !trackCtx.hasError) {
     try {
       if (trackCtx.matchedAbsPaths.size === 0) {
-        const probePaths = await collectSmallDirProbePaths(baseCwd, input.queries, 24);
+        const probePaths = await collectSmallDirProbePaths(baseCwd, queriesList, 24);
         for (const p of probePaths) trackCtx.matchedAbsPaths.add(p);
       }
       const trackedFiles = await snapshotTrackedFiles(trackCtx.matchedAbsPaths, baseCwd);
@@ -4988,7 +5046,8 @@ function parseFlatLineRangeSpec(rawSpec) {
     throw new Error("lineRanges entry must be a non-empty string in 'path:start-end[,start2-end2]' format");
   }
   const trimmed = rawSpec.trim();
-  const match = /^(.*):\s*(\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*)$/.exec(trimmed);
+  const match =
+    /^(.*):\s*([Ll]?\d+(?:\s*-\s*[Ll]?\d+)?(?:\s*,\s*[Ll]?\d+(?:\s*-\s*[Ll]?\d+)?)*)$/.exec(trimmed);
   if (!match || !match[1] || !match[1].trim()) {
     throw new Error(`Invalid lineRanges entry '${trimmed}': expected 'path:start-end[,start2-end2]'`);
   }
@@ -4996,15 +5055,25 @@ function parseFlatLineRangeSpec(rawSpec) {
   if (process.platform === "win32" && /^[A-Za-z]$/.test(filePath)) {
     throw new Error(`Invalid lineRanges entry '${trimmed}': missing file path after Windows drive letter`);
   }
+  const parseLineToken = (tok) => Number.parseInt(tok.trim().replace(/^[Ll]/, ""), 10);
   const ranges = match[2].split(",").map((part) => {
     const seg = part.trim();
     const dashIdx = seg.indexOf("-");
     if (dashIdx === -1) {
-      const lineNum = Number.parseInt(seg, 10);
+      const lineNum = parseLineToken(seg);
+      if (!Number.isSafeInteger(lineNum) || lineNum < 1) {
+        throw new Error(`Invalid 1-based line number '${seg}' in '${trimmed}'`);
+      }
       return [lineNum, lineNum];
     }
-    const start = Number.parseInt(seg.slice(0, dashIdx).trim(), 10);
-    const end = Number.parseInt(seg.slice(dashIdx + 1).trim(), 10);
+    const start = parseLineToken(seg.slice(0, dashIdx));
+    const end = parseLineToken(seg.slice(dashIdx + 1));
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < 1) {
+      throw new Error(`Line numbers must be >= 1 in '${trimmed}'`);
+    }
+    if (start > end) {
+      throw new Error(`startLine (${start}) > endLine (${end}) in '${trimmed}'`);
+    }
     return [start, end];
   });
   return { path: filePath, ranges };
@@ -5067,9 +5136,15 @@ function selectOutlineSymbols(symbols, limit) {
   return [...keptIndices].sort((a, b) => a - b).map((idx) => symbols[idx]);
 }
 async function runReadSlices(input, options = {}) {
-  const outlines = Array.isArray(input.outlines) ? input.outlines : [];
-  const rawSlices = Array.isArray(input.slices) ? input.slices : [];
-  const rawLineRanges = Array.isArray(input.lineRanges) ? input.lineRanges : [];
+  const outlinesCoerced = coerceArrayToolField(input.outlines, "outlines", { allowSingleString: true });
+  if (outlinesCoerced.error) return { text: outlinesCoerced.error, isError: true };
+  const slicesCoerced = coerceArrayToolField(input.slices, "slices", { allowSingleString: false });
+  if (slicesCoerced.error) return { text: slicesCoerced.error, isError: true };
+  const lineRangesCoerced = coerceArrayToolField(input.lineRanges, "lineRanges", { allowSingleString: true });
+  if (lineRangesCoerced.error) return { text: lineRangesCoerced.error, isError: true };
+  const outlines = outlinesCoerced.items;
+  const rawSlices = slicesCoerced.items;
+  const rawLineRanges = lineRangesCoerced.items;
   if (rawLineRanges.length > MAX_SLICE_FILES) {
     return {
       text: `Error: limits exceeded (max ${MAX_SLICE_FILES} lineRanges entries per call).`,
@@ -5365,13 +5440,15 @@ async function mapWithConcurrency(items, concurrency, worker) {
 }
 async function runChecks(input, options = {}) {
   const callDeadline = perfNode.now() + (options.budgetMs ?? MAX_MCP_CALL_BUDGET_MS);
-  if (!Array.isArray(input.commands) || input.commands.length === 0) {
+  const coercedCmds = coerceArrayToolField(input.commands, "commands", { allowSingleString: true, optional: false });
+  if (coercedCmds.error || !coercedCmds.items || coercedCmds.items.length === 0) {
     return {
-      text: "Error: 'commands' must be a non-empty array of check commands.",
+      text: coercedCmds.error || "Error: 'commands' must be a non-empty array of check commands.",
       isError: true
     };
   }
-  if (input.commands.length > 12) {
+  const commandsList = coercedCmds.items;
+  if (commandsList.length > 12) {
     return {
       text: "Error: 'commands' supports at most 12 commands per call.",
       isError: true
@@ -5400,8 +5477,8 @@ async function runChecks(input, options = {}) {
       ? Math.max(1, Math.round(options.budgetMs / 1e3))
       : MAX_MCP_CALL_BUDGET_SEC;
   const normalized = [];
-  for (let i = 0; i < input.commands.length; i++) {
-    const raw = input.commands[i];
+  for (let i = 0; i < commandsList.length; i++) {
+    const raw = commandsList[i];
     const spec = typeof raw === "string" ? { command: raw } : raw;
     if (!spec || typeof spec.command !== "string" || !spec.command.trim()) {
       return {
@@ -5534,7 +5611,7 @@ async function runChecks(input, options = {}) {
       const body2 = pre.rawBody.length <= bodyAvail ? pre.rawBody : truncateWithNotice(pre.rawBody, bodyAvail);
       return `${pre.headerPrefix}${body2}`;
     }
-    if (pre.passed || pre.rawBody.length <= bodyAvail) {
+    if (pre.rawBody.length <= bodyAvail) {
       return `${pre.headerPrefix}${pre.rawBody}`;
     }
     const fittedBody = formatCompactCommandOutput({

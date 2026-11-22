@@ -102,6 +102,7 @@ let explicitWorkspaceConfigured = Boolean(envWorkspaceDir && !isInsideInstalledP
 let clientSupportsRoots = false;
 let cachedRootsDir = null;
 let rootsQueried = false;
+let rootsEpoch = 0;
 let inFlightRootsPromise = null;
 let nextRootsReqSeq = 1;
 const pendingClientRequests = new Map();
@@ -307,7 +308,7 @@ function requestClientRootsList(timeoutMs = 1000) {
         if (Array.isArray(roots)) {
           for (const item of roots) {
             const candidate = resolveDirectoryCandidate(item?.uri || item?.path);
-            if (candidate) {
+            if (candidate && !isInsideInstalledPluginDir(candidate)) {
               resolve(candidate);
               return;
             }
@@ -317,10 +318,14 @@ function requestClientRootsList(timeoutMs = 1000) {
       }
     });
     sendJsonRpc({ jsonrpc: "2.0", id: reqId, method: "roots/list" });
-  }).finally(() => {
-    inFlightRootsPromise = null;
   });
-  return inFlightRootsPromise;
+  const trackedPromise = inFlightRootsPromise.finally(() => {
+    if (inFlightRootsPromise === trackedPromise) {
+      inFlightRootsPromise = null;
+    }
+  });
+  inFlightRootsPromise = trackedPromise;
+  return trackedPromise;
 }
 
 function sendResponse(id, result) {
@@ -413,8 +418,10 @@ rl.on("line", async (line) => {
   }
   if (!hasId) {
     if (method === "notifications/roots/list_changed") {
+      rootsEpoch += 1;
       cachedRootsDir = null;
       rootsQueried = false;
+      inFlightRootsPromise = null;
     }
     return;
   }
@@ -426,14 +433,20 @@ rl.on("line", async (line) => {
         clientSupportsRoots = Boolean(
           params?.capabilities && typeof params.capabilities === "object" && params.capabilities.roots
         );
-        const wsFolder = Array.isArray(params?.workspaceFolders) ? params.workspaceFolders[0]?.uri : null;
-        const initDir =
-          resolveDirectoryCandidate(wsFolder) ||
-          resolveDirectoryCandidate(params?.rootUri) ||
-          resolveDirectoryCandidate(params?.rootPath);
-        if (initDir) {
-          currentCwd = initDir;
-          explicitWorkspaceConfigured = true;
+        const initCandidates = [
+          ...(Array.isArray(params?.workspaceFolders)
+            ? params.workspaceFolders.map((w) => w?.uri || w?.path)
+            : []),
+          params?.rootUri,
+          params?.rootPath
+        ];
+        for (const cand of initCandidates) {
+          const resolved = resolveDirectoryCandidate(cand);
+          if (resolved && !isInsideInstalledPluginDir(resolved)) {
+            currentCwd = resolved;
+            explicitWorkspaceConfigured = true;
+            break;
+          }
         }
         const initSid = normalizeCallSessionId(params?.sessionId);
         if (initSid) initSessionId = initSid;
@@ -489,9 +502,12 @@ rl.on("line", async (line) => {
           !isExplicitAbsoluteCwdArg(toolArgs.cwd) &&
           (clientSupportsRoots || isInsideInstalledPluginDir(currentCwd))
         ) {
+          const epoch = rootsEpoch;
           const rootsDir = await requestClientRootsList(1000);
-          rootsQueried = true;
-          cachedRootsDir = rootsDir;
+          if (rootsEpoch === epoch) {
+            rootsQueried = true;
+            cachedRootsDir = rootsDir;
+          }
         }
         // Strictly per-call session isolation via AsyncLocalStorage: never mutate process-global
         // session state across concurrent conversations sharing one long-lived MCP stdio server.

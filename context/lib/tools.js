@@ -676,9 +676,11 @@ export function createTools({
         safeUrlForMeta = sanitizeUrlForDisplay(url);
         resolvedLabel = resolvedLabel || safeUrlForMeta;
         rawText = await fetchUrlText(url);
-      } else if (filePath) {
+      } else if (expandedFilePath) {
         resolvedLabel = resolvedLabel || filePath;
-        const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
+        const absPath = path.isAbsolute(expandedFilePath)
+          ? path.normalize(expandedFilePath)
+          : path.resolve(cwd, expandedFilePath);
         let st;
         try {
           st = fs.statSync(absPath);
@@ -773,7 +775,11 @@ export function createTools({
 
     // 4. ctx_search
     async ctx_search({ queries = [], sourceId = null, scope = "session", limit = 5, offset = 0, cwd: argCwd = "" } = {}) {
-      const cwd = resolveCallCwd(argCwd, getCwd());
+      const ws = resolveWs();
+      const cwd = resolveCallCwd(argCwd, ws.cwd, {
+        requireConfirmedWorkspace: scope === "worktree",
+        workspaceConfirmed: ws.confirmed
+      });
       const sessionId = getSessionId();
 
       const res = store.search({
@@ -1009,7 +1015,8 @@ export function createTools({
 
     // 7. ctx_doctor
     async ctx_doctor({ cwd: argCwd = "" } = {}) {
-      const cwd = resolveCallCwd(argCwd, getCwd());
+      const ws = resolveWs();
+      const cwd = resolveCallCwd(argCwd, ws.cwd);
       const doc = store.doctor();
       const cfgSnap = getConfigSnapshot();
       let projectFilters = { exists: false, error: null, loadedCount: 0, rejectedCount: 0, rejected: [] };
@@ -1106,7 +1113,11 @@ export function createTools({
     } = {}) {
       const explicitSid = normalizeExplicitSessionId(argSessionId);
       const sessionId = explicitSid || getSessionId();
-      const cwd = resolveCallCwd(argCwd, getCwd());
+      const ws = resolveWs();
+      const cwd = resolveCallCwd(argCwd, ws.cwd, {
+        requireConfirmedWorkspace: scope === "worktree",
+        workspaceConfirmed: ws.confirmed
+      });
       return store.purge({ scope, sessionId, worktree: cwd, olderThanDays, vacuum });
     }
   };

@@ -376,6 +376,33 @@ test("v1.6-2: Dual MCP servers (fast + context) lazy roots/list, list_changed in
       await fastNoRoots.close();
     }
 
+    // 2A-bis. Host passing PLUGIN_ROOT in initialize.rootUri or roots/list MUST NOT bypass Fail-Fast guard
+    const fastPluginInit = createBidirectionalMcpClient(path.join(installDir, "fast", "mcp-server.mjs"), {
+      cwd: installDir,
+      env: cleanEnv,
+      onServerRequest: (req) => ({
+        jsonrpc: "2.0",
+        id: req.id,
+        result: { roots: [{ uri: pathToFileURL(installDir).href }] }
+      })
+    });
+    try {
+      await fastPluginInit.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: { roots: { listChanged: true } },
+        rootUri: pathToFileURL(installDir).href,
+        clientInfo: { name: "buggy-hub", version: "2.0" }
+      });
+      const guarded = await fastPluginInit.request("tools/call", {
+        name: "batch_search",
+        arguments: { queries: [{ type: "glob", pattern: "*.json" }] }
+      });
+      assert.equal(guarded.result.isError, true, "PLUGIN_ROOT passed via rootUri/roots must never be confirmed as workspace");
+      assert.match(guarded.result.content[0].text, /Workspace root could not be determined/);
+    } finally {
+      await fastPluginInit.close();
+    }
+
     // 2B. Fast MCP WITH roots/list + notifications/roots/list_changed invalidation
     let activeRootDir = wsA;
     const fastWithRoots = createBidirectionalMcpClient(path.join(installDir, "fast", "mcp-server.mjs"), {
@@ -465,6 +492,29 @@ test("v1.6-2: Dual MCP servers (fast + context) lazy roots/list, list_changed in
       });
       assert.equal(blockedRelIdx.result.isError, true);
       assert.match(blockedRelIdx.result.content[0].text, /Workspace root could not be determined/);
+
+      // Worktree-scoped ctx_search & ctx_purge also fail fast when unconfirmed
+      const blockedWtSearch = await ctxClient.request("tools/call", {
+        name: "ctx_search",
+        arguments: { scope: "worktree", queries: ["ALPHA"] }
+      });
+      assert.equal(blockedWtSearch.result.isError, true);
+      assert.match(blockedWtSearch.result.content[0].text, /Workspace root could not be determined/);
+
+      const blockedWtPurge = await ctxClient.request("tools/call", {
+        name: "ctx_purge",
+        arguments: { scope: "worktree" }
+      });
+      assert.equal(blockedWtPurge.result.isError, true);
+      assert.match(blockedWtPurge.result.content[0].text, /Workspace root could not be determined/);
+
+      // Explicit file:// URI path in ctx_index works even before roots/list is confirmed
+      const fileUriIdx = await ctxClient.request("tools/call", {
+        name: "ctx_index",
+        arguments: { path: pathToFileURL(path.join(wsB, "beta.txt")).href }
+      });
+      assert.equal(fileUriIdx.result.isError, false, fileUriIdx.result.content[0].text);
+      assert.match(fileUriIdx.result.content[0].text, /Indexed/);
 
       // Raw text indexing without workspace dependency still works
       const rawIdx = await ctxClient.request("tools/call", {
@@ -557,16 +607,42 @@ test("v1.6-3: Git read-only sandbox blocks external diff/textconv/gpg config exe
     const evilCmd = `${JSON.stringify(process.execPath)} -e "require('fs').writeFileSync(${JSON.stringify(markerPath)}, 'pwned')"`;
     assert.equal(runGit(["config", "diff.external", evilCmd]).status, 0);
     assert.equal(runGit(["config", "diff.evil.textconv", evilCmd]).status, 0);
+    assert.equal(runGit(["config", "core.fsmonitor", evilCmd]).status, 0);
     fs.writeFileSync(path.join(tmpRepo, ".gitattributes"), "*.txt diff=evil\n", "utf8");
     fs.writeFileSync(path.join(tmpRepo, "hello.txt"), "line 1\n", "utf8");
-    assert.equal(runGit(["add", "."]).status, 0);
-    assert.equal(runGit(["commit", "-m", "initial"]).status, 0);
+    assert.equal(
+      spawnSync("git", ["-c", "core.fsmonitor=false", "add", "."], { cwd: tmpRepo, encoding: "utf8", windowsHide: true }).status,
+      0
+    );
+    assert.equal(
+      spawnSync("git", ["-c", "core.fsmonitor=false", "commit", "-m", "initial"], {
+        cwd: tmpRepo,
+        encoding: "utf8",
+        windowsHide: true
+      }).status,
+      0
+    );
     fs.writeFileSync(path.join(tmpRepo, "hello.txt"), "line 1\nline 2\n", "utf8");
 
-    // Snapshot & batch_search(git) must NOT execute diff.external or textconv
+    // Full hooks/session-start.mjs (including repo-skeleton getGitHeadSha) & snapshot must NOT execute fsmonitor/diff.external/textconv
     const snap = await buildWorkspaceSnapshot(tmpRepo, { maxChars: 1500, gitTimeoutMs: 2000 });
     assert.ok(snap.includes("Modified"));
     assert.equal(fs.existsSync(markerPath), false, "SessionStart snapshot must never trigger .git/config hooks");
+
+    const fullHookRes = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "hooks", "session-start.mjs")],
+      {
+        cwd: tmpRepo,
+        input: JSON.stringify({ cwd: tmpRepo, workspacePaths: [tmpRepo], hookEventName: "SessionStart" }),
+        encoding: "utf8",
+        timeout: 6000,
+        windowsHide: true,
+        env: { ...process.env, AGY_DART_DB_PATH: path.join(tmpRepo, ".test-ss.db") }
+      }
+    );
+    assert.equal(fullHookRes.status, 0, fullHookRes.stderr);
+    assert.equal(fs.existsSync(markerPath), false, "hooks/session-start.mjs + repo-skeleton must never trigger core.fsmonitor");
 
     const { runBatchSearch } = await import("../fast/mcp-server.mjs");
     const searchRes = await runBatchSearch({
@@ -618,8 +694,21 @@ test("v1.6-4: 170s shared monotonic call budget, stringified arguments/edits sel
       path: "notes.md",
       ranges: [[42, 42]]
     });
+    assert.deepEqual(parseFlatLineRangeSpec("foo:bar.ts:10-20"), {
+      path: "foo:bar.ts",
+      ranges: [[10, 20]]
+    });
+    assert.deepEqual(parseFlatLineRangeSpec("src/app.ts:L10-L50, l80-90"), {
+      path: "src/app.ts",
+      ranges: [
+        [10, 50],
+        [80, 90]
+      ]
+    });
     assert.throws(() => parseFlatLineRangeSpec(""), /non-empty/);
     assert.throws(() => parseFlatLineRangeSpec("src/no-range.ts"), /Invalid lineRanges/);
+    assert.throws(() => parseFlatLineRangeSpec("src/app.ts:0-10"), /must be >= 1/);
+    assert.throws(() => parseFlatLineRangeSpec("src/app.ts:50-10"), /startLine \(50\) > endLine \(10\)/);
     if (process.platform === "win32") {
       assert.throws(() => parseFlatLineRangeSpec("C:10-20"), /drive letter/);
     }
@@ -639,6 +728,18 @@ test("v1.6-4: 170s shared monotonic call budget, stringified arguments/edits sel
       assert.match(badRes.text, /HOST_SERIALIZATION_CORRUPTION/);
       assert.match(badRes.text, /edit_file/);
     }
+
+    // PostToolUse extractInvalidationTargets parses JSON-stringified edits & runReadSlices rejects malformed lineRanges
+    const { extractInvalidationTargets } = await import("../hooks/post-tool-use.mjs");
+    const invTargets = extractInvalidationTargets(
+      "mcp_agy-dart_fast_apply_edits",
+      { edits: JSON.stringify([{ path: "str-edit.js", create: "x" }]) },
+      tmpDir
+    );
+    assert.deepEqual(invTargets.paths, [path.resolve(tmpDir, "str-edit.js")]);
+
+    const badLrRes = await runReadSlices({ cwd: tmpDir, outlines: ["str-edit.js"], lineRanges: 12345 });
+    assert.equal(badLrRes.isError, true, "Malformed non-array lineRanges must never be silently dropped");
 
     // Stringified params.arguments over live JSON-RPC
     const client = createBidirectionalMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
@@ -748,18 +849,26 @@ test("v1.6-4: 170s shared monotonic call budget, stringified arguments/edits sel
 test("v1.6-5: Phase 3 installer --tool-loading persistence, rules/*.local.md preservation, GEMINI_HOME & T3 ACP multi-host sync, and OSS metadata", () => {
   const tmpDir = makeTmpDir("agy-v16-p3-");
   try {
-    // 5A. buildMcpConfigObject modes
+    // 5A. buildMcpConfigObject modes (per-tool `tools.<name>.eager = true` matching Antigravity host schema)
     const fe = buildMcpConfigObject("fast-eager");
-    assert.equal(fe.mcpServers.fast.eager, true);
-    assert.equal(fe.mcpServers.context.eager, undefined);
+    assert.equal(fe.mcpServers.fast.eager, undefined);
+    assert.deepEqual(Object.keys(fe.mcpServers.fast.tools).sort(), [
+      "apply_edits",
+      "batch_search",
+      "read_slices",
+      "run_checks"
+    ]);
+    assert.equal(fe.mcpServers.fast.tools.apply_edits.eager, true);
+    assert.equal(fe.mcpServers.context.tools, undefined);
 
     const lz = buildMcpConfigObject("lazy");
-    assert.equal(lz.mcpServers.fast.eager, undefined);
-    assert.equal(lz.mcpServers.context.eager, undefined);
+    assert.equal(lz.mcpServers.fast.tools, undefined);
+    assert.equal(lz.mcpServers.context.tools, undefined);
 
     const eg = buildMcpConfigObject("eager");
-    assert.equal(eg.mcpServers.fast.eager, true);
-    assert.equal(eg.mcpServers.context.eager, true);
+    assert.equal(eg.mcpServers.fast.tools.batch_search.eager, true);
+    assert.equal(Object.keys(eg.mcpServers.context.tools).length, 8);
+    assert.equal(eg.mcpServers.context.tools.ctx_execute.eager, true);
 
     // 5B. Install preserves rules/*.local.md & prunes stale files, switches --tool-loading cleanly
     const installDir = path.join(tmpDir, "custom-target");
@@ -774,8 +883,10 @@ test("v1.6-5: Phase 3 installer --tool-loading persistence, rules/*.local.md pre
     );
     assert.equal(r1.status, 0, `${r1.stdout}\n${r1.stderr}`);
     const mcp1 = JSON.parse(fs.readFileSync(path.join(installDir, "mcp_config.json"), "utf8"));
-    assert.equal(mcp1.mcpServers.fast.eager, true);
-    assert.equal(mcp1.mcpServers.context.eager, undefined);
+    assert.equal(mcp1.mcpServers.fast.tools.apply_edits.eager, true);
+    assert.equal(mcp1.mcpServers.context.tools, undefined);
+    assert.equal(fs.existsSync(path.join(installDir, "SECURITY.md")), true);
+    assert.equal(fs.existsSync(path.join(installDir, "assets", "architecture-dark.svg")), true);
 
     // Create user local rule + obsolete file, then re-install with --tool-loading eager
     const localRulePath = path.join(installDir, "rules", "my-team.local.md");
@@ -793,8 +904,8 @@ test("v1.6-5: Phase 3 installer --tool-loading persistence, rules/*.local.md pre
     assert.equal(fs.readFileSync(localRulePath, "utf8"), "# Custom Team Rule\n");
     assert.equal(fs.existsSync(staleHookPath), false, "Stale non-local files MUST still be pruned");
     const mcp2 = JSON.parse(fs.readFileSync(path.join(installDir, "mcp_config.json"), "utf8"));
-    assert.equal(mcp2.mcpServers.fast.eager, true);
-    assert.equal(mcp2.mcpServers.context.eager, true);
+    assert.equal(mcp2.mcpServers.fast.tools.batch_search.eager, true);
+    assert.equal(mcp2.mcpServers.context.tools.ctx_execute.eager, true);
 
     // Switch via `tool-loading lazy` subcommand
     const r3 = spawnSync(
@@ -804,8 +915,8 @@ test("v1.6-5: Phase 3 installer --tool-loading persistence, rules/*.local.md pre
     );
     assert.equal(r3.status, 0, `${r3.stdout}\n${r3.stderr}`);
     const mcp3 = JSON.parse(fs.readFileSync(path.join(installDir, "mcp_config.json"), "utf8"));
-    assert.equal(mcp3.mcpServers.fast.eager, undefined);
-    assert.equal(mcp3.mcpServers.context.eager, undefined);
+    assert.equal(mcp3.mcpServers.fast.tools, undefined);
+    assert.equal(mcp3.mcpServers.context.tools, undefined);
 
     // 5C. Multi-host discovery (GEMINI_HOME + ~/.t3/userdata/providers/antigravity/*/)
     const fakeHome = path.join(tmpDir, "fake-home");
