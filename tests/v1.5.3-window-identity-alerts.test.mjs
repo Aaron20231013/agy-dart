@@ -174,11 +174,11 @@ test("v1.5.3-2: Official conversation_summaries.db read-only title & workspace_u
       assert.equal(lease.windowTokens, 512000);
       assert.equal(lease.watermark, "critical");
 
-      // Subsequent PreToolUse / Stop without options preserves workspaceLabel, convTitle & watermark
+      // Subsequent PreToolUse / Stop with mixed drive case or slash style preserves workspaceLabel, convTitle & watermark
       recordHookLeaseTransition(
         store,
         "PreToolUse",
-        { conversationId: convId, cwd: "e:\\work", toolCall: { name: "read_file", args: { Path: "a.js" } } },
+        { conversationId: convId, cwd: "E:/work/", toolCall: { name: "read_file", args: { Path: "a.js" } } },
         {}
       );
       const afterStop = recordHookLeaseTransition(store, "Stop", { conversationId: convId, cwd: "e:\\work" }, {});

@@ -156,6 +156,18 @@ function sanitizeCwd(raw) {
   return trimmed.slice(0, 512);
 }
 
+export function isSameWorkspacePath(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const norm = (p) => p.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  const na = norm(a);
+  const nb = norm(b);
+  if (!na || !nb) return false;
+  if (/^[a-zA-Z]:(?:\/|$)/.test(na) || /^[a-zA-Z]:(?:\/|$)/.test(nb) || process.platform === "win32") {
+    return na.toLowerCase() === nb.toLowerCase();
+  }
+  return na === nb;
+}
+
 const AMBIGUOUS_LEAF_DIR_RE =
   /^(?:\d+|v\d+(?:[._-]\d+)*|src|app|apps|lib|pkg|packages|package|client|server|web|api|core|main|trunk|dev|prod|test|tests|docs|scripts|build|dist)$/i;
 const INTERNAL_REPO_DIRS_RE =
@@ -1051,9 +1063,9 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
     if (
       base.workspaceLabel &&
       base.cwd &&
-      base.cwd === resolvedCwd &&
+      isSameWorkspacePath(base.cwd, resolvedCwd) &&
       computedWs &&
-      base.workspaceLabel.startsWith(`${computedWs}/`)
+      base.workspaceLabel.toLowerCase().startsWith(`${computedWs.toLowerCase()}/`)
     ) {
       resolvedWorkspaceLabel = base.workspaceLabel;
     } else if (computedWs) {

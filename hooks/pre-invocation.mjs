@@ -667,11 +667,14 @@ async function main() {
         }
         if (resolvedCwd && watchdogLeaseMod.formatWorkspaceWindowLabel) {
           const computedWs = watchdogLeaseMod.formatWorkspaceWindowLabel(resolvedCwd, subprojectPaths);
+          const sameWs = watchdogLeaseMod.isSameWorkspacePath
+            ? watchdogLeaseMod.isSameWorkspacePath(existingLease?.cwd || "", resolvedCwd)
+            : existingLease?.cwd === resolvedCwd;
           if (
             existingLease?.workspaceLabel &&
-            existingLease.cwd === resolvedCwd &&
+            sameWs &&
             computedWs &&
-            existingLease.workspaceLabel.startsWith(`${computedWs}/`)
+            existingLease.workspaceLabel.toLowerCase().startsWith(`${computedWs.toLowerCase()}/`)
           ) {
             resolvedWorkspaceLabel = existingLease.workspaceLabel;
           } else {
