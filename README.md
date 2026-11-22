@@ -118,6 +118,27 @@ Installing separate acceleration and context-guard plugins naively causes fricti
 
 This dedicated section tracks real-world friction reported by the community (preserving the original feedback), along with the exact engineering fixes and underlying design principles shipped in response.
 
+### `[v1.5.0]` 15-Minute Idle KV-Cache Expiry vs. Automatic Keep-Alive Pings
+
+#### 1. Original Community Feedback
+
+> *"`@billy88lsh`: Looking at my records, my cache hit rate is 97%. Your problem is that you keep timing out — once past 15 minutes the cache is gone. The way to improve it is to have the program automatically ping/activate the cache after each turn."*
+>
+> *(Original Chinese: 「@billy88lsh: 我看的记录，我的缓存是97。你的问题是你总是超时，超过15分钟就缓存没了。提升的办法就是回答完一轮，程序自动激活一下缓存」)*
+
+Auditing both Antigravity's plugin sandbox boundaries and prompt-cache billing math clarified why idle timeouts dominate average hit-rate drops — and why blind auto-pinging backfires:
+1. **Hard 300s static profile TTL missed real ~15m server windows**: `v1.4.x` defaulted Gemini 3/4 and unknown tiers to `300s` (5m) and forgot empirical calibration on every new conversation, causing premature expiry warnings and zero downward adaptation when backend LRU windows shrank.
+2. **Plugin-layer auto-keep-alive is impossible without prefix/UI pollution**: Server KV-cache keys bind to the host's full raw request prefix (hidden system prompt, tool schemas, thinking signatures, auth routing). `Stop` hooks are synchronous (`5s` cap), Sidecars lack silent 1-token RPCs, and synthetic messages pollute history and violate zero-prefix-pollution invariants.
+3. **Narrow break-even & Goodhart's Law**: Each keep-alive ping still pays `0.10x`–`0.25x` cached-read cost + output/thinking/request quota. 10 pings at 90% discount (or 4 at 75% discount) already cost as much as a full cold re-prefill, and walk-away sessions burn 100% wasted quota while artificially inflating apparent hit-rate metrics.
+
+#### 2. Solution Shipped (`v1.4.x` → `v1.5.0`)
+
+| Area | Before (`v1.4.x`) | After (`v1.5.0`) |
+| :--- | :--- | :--- |
+| **TTL Estimation** | Static `300s` reset on every new conversation; upward-only single-session floor | **Cross-Session Per-Model Calibration (`ttl_calibration:v1:<profileId>`)**: 14-day bounded ring buffer of warm lower bounds & pure-idle cold upper bounds (`estimateCalibratedTtl`), bidirectional downward convergence, `explicit > session/history > profile` precedence |
+| **Idle Expiry Awareness** | Only in-pane countdown bar; missed when user switches apps | **Opt-In High-Context TTL Desktop Alert**: `ttlDesktopNotify` (`>= 60k` tokens, `(0, 60s]` lead window, debounced 1x per idle anchor + 60s global cooldown, **0 `statSync`**, sleep-jump guarded, works even with `stallWatchdog=false`) |
+| **Keep-Alive Economics** | No way to test whether auto-pinging saves or wastes money on real usage | **`cache:simulate` Keep-Alive Replay**: Added `keepalive-1x` & `keepalive-unlimited` (`--keepalive-tail <sec>`, `hypothetical: true`), reporting both apparent `projectedHitRate` and `userTurnHitRate` plus wasted walk-away pings |
+
 ### `[v1.4.0]` Multi-Turn Silent Hang ("Working Forever With Zero Output")
 
 #### 1. Original Community Feedback
