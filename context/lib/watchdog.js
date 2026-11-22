@@ -16,7 +16,7 @@
  */
 import fs from "node:fs";
 import { spawn } from "node:child_process";
-import { getEffectiveConfig } from "./config.js";
+import { getEffectiveConfig, parseUiLang } from "./config.js";
 import { buildHandoffBrief, inferWorkspaceFromStore, isSafeWorkspaceDir } from "./handoff.js";
 import {
   DEFAULT_CACHE_TTL_SEC,
@@ -1009,6 +1009,27 @@ export class WatchdogMonitor {
     return Boolean(cfg.ttlDesktopNotify);
   }
 
+  _resolveUiLangInfo(store, cfg) {
+    const envParsed = parseUiLang(process.env.AGY_DART_LANG);
+    if (envParsed) {
+      return { lang: envParsed, source: "env" };
+    }
+    if (this._hasCustomConfig) {
+      if (store && typeof store.getMeta === "function") {
+        const raw = parseUiLang(store.getMeta("ui:lang", null));
+        if (raw) return { lang: raw, source: "sqlite" };
+      }
+      const cfgParsed = parseUiLang(cfg.uiLang);
+      if (cfgParsed) return { lang: cfgParsed, source: "config" };
+      return { lang: "en", source: "default" };
+    }
+    if (store && typeof store.getUiLangInfo === "function") {
+      return store.getUiLangInfo();
+    }
+    const cfgParsed = parseUiLang(cfg.uiLang);
+    return { lang: cfgParsed || "en", source: cfgParsed ? "config" : "default" };
+  }
+
   _resolveLeaseEffectiveTtlSec(store, lease, cfg, nowWallMs) {
     if (Number.isFinite(cfg.cacheTtlSec) && cfg.cacheTtlSec > 0) {
       return Math.floor(cfg.cacheTtlSec);
@@ -1031,7 +1052,7 @@ export class WatchdogMonitor {
     return profile?.ttlSec || DEFAULT_CACHE_TTL_SEC;
   }
 
-  _evaluateIdleTtlNotifications(store, leases, { nowWallMs, cfg, ttlDesktopNotifyEnabled, sleepJumpMs }) {
+  _evaluateIdleTtlNotifications(store, leases, { nowWallMs, cfg, ttlDesktopNotifyEnabled, uiLang = "en", sleepJumpMs }) {
     if (!ttlDesktopNotifyEnabled || !Array.isArray(leases) || leases.length === 0) return;
     const minTokens = Math.min(500000, Math.max(4000, Math.floor(Number(cfg.ttlNotifyMinTokens) || 60000)));
     const leadSec = Math.min(300, Math.max(15, Math.floor(Number(cfg.ttlNotifyLeadSec) || 60)));
@@ -1077,9 +1098,12 @@ export class WatchdogMonitor {
       if (this._ttlNotifiedKeys.get(lease.conversationId) === dedupKey) continue;
       if (this._lastTtlNotifyGlobalTs > 0 && nowWallMs - this._lastTtlNotifyGlobalTs < 60_000) continue;
 
-      const title = "agy-dart: KV-Cache Expiring";
+      const isZh = uiLang === "zh";
+      const title = isZh ? "agy-dart：缓存即将过期" : "agy-dart: KV-Cache Expiring";
       const body = sanitizeWatchdogText(
-        `${Math.round(ctxTokens / 1000)}k context warm cache expires in ~${remSec}s (TTL ${fmtDur(effectiveTtlSec)}). Reply to keep warm or /compact after expiry.`,
+        isZh
+          ? `${Math.round(ctxTokens / 1000)}k 上下文热缓存约 ${remSec} 秒后过期（TTL ${fmtDur(effectiveTtlSec)}）。继续发消息可保热，或等过期后执行 /compact。`
+          : `${Math.round(ctxTokens / 1000)}k context warm cache expires in ~${remSec}s (TTL ${fmtDur(effectiveTtlSec)}). Reply to keep warm or /compact after expiry.`,
         220
       );
       this._ttlNotifiedKeys.set(lease.conversationId, dedupKey);
@@ -1115,6 +1139,8 @@ export class WatchdogMonitor {
     const enabled = this._resolveWatchdogEnabled(store, cfg);
     const desktopNotifyEnabled = this._resolveDesktopNotifyEnabled(store, cfg);
     const ttlDesktopNotifyEnabled = this._resolveTtlDesktopNotifyEnabled(store, cfg);
+    const langInfo = this._resolveUiLangInfo(store, cfg);
+    const uiLang = langInfo.lang;
     const sleepJumpMs = this._checkSleepDrift(nowWallMs, nowMonoNs, pollMs);
 
     if (!store || (!enabled && !ttlDesktopNotifyEnabled)) {
@@ -1124,6 +1150,8 @@ export class WatchdogMonitor {
         enabled,
         desktopNotifyEnabled,
         ttlDesktopNotifyEnabled,
+        uiLang,
+        uiLangSource: langInfo.source,
         serverNowMs: nowWallMs,
         evaluated: []
       };
@@ -1141,12 +1169,15 @@ export class WatchdogMonitor {
         nowWallMs,
         cfg,
         ttlDesktopNotifyEnabled,
+        uiLang,
         sleepJumpMs
       });
       return {
         enabled,
         desktopNotifyEnabled,
         ttlDesktopNotifyEnabled,
+        uiLang,
+        uiLangSource: langInfo.source,
         serverNowMs: nowWallMs,
         evaluated: []
       };
@@ -1177,12 +1208,15 @@ export class WatchdogMonitor {
         nowWallMs,
         cfg,
         ttlDesktopNotifyEnabled,
+        uiLang,
         sleepJumpMs
       });
       return {
         enabled,
         desktopNotifyEnabled,
         ttlDesktopNotifyEnabled,
+        uiLang,
+        uiLangSource: langInfo.source,
         serverNowMs: nowWallMs,
         evaluated
       };
@@ -1210,6 +1244,7 @@ export class WatchdogMonitor {
           nowWallMs,
           cfg,
           desktopNotifyEnabled,
+          uiLang,
           sleepJumpMs
         })
       );
@@ -1229,6 +1264,7 @@ export class WatchdogMonitor {
         nowWallMs,
         cfg,
         ttlDesktopNotifyEnabled,
+        uiLang,
         sleepJumpMs
       }
     );
@@ -1242,6 +1278,8 @@ export class WatchdogMonitor {
       enabled,
       desktopNotifyEnabled,
       ttlDesktopNotifyEnabled,
+      uiLang,
+      uiLangSource: langInfo.source,
       serverNowMs: nowWallMs,
       evaluated
     };
@@ -1343,7 +1381,7 @@ export class WatchdogMonitor {
     }
   }
 
-  _evaluateActiveLease(store, leaseInput, { nowWallMs, cfg, desktopNotifyEnabled, sleepJumpMs, _retryDepth = 0 }) {
+  _evaluateActiveLease(store, leaseInput, { nowWallMs, cfg, desktopNotifyEnabled, uiLang = "en", sleepJumpMs, _retryDepth = 0 }) {
     let lease = { ...leaseInput };
     const st = this._getOrCreateConvState(lease.conversationId);
 
@@ -1573,6 +1611,7 @@ export class WatchdogMonitor {
           nowWallMs,
           cfg,
           desktopNotifyEnabled,
+          uiLang,
           sleepJumpMs: 0,
           _retryDepth: _retryDepth + 1
         });
@@ -1668,9 +1707,12 @@ export class WatchdogMonitor {
           st.lastNotifyTs = nowWallMs;
           this.notificationCount += 1;
           try {
+            const isZh = uiLang === "zh";
             this.notifyFn({
-              title: "agy-dart: Session Stalled",
-              body: `${diagnosis?.label || lease.phase} (silent ${silentSec}s). Open Sidecar to copy Rescue Handoff Brief.`,
+              title: isZh ? "agy-dart：对话疑似卡住" : "agy-dart: Session Stalled",
+              body: isZh
+                ? `${diagnosis?.labelZh || diagnosis?.label || lease.phase}（已无响应 ${silentSec} 秒）。请打开右侧 agy-dart 面板复制抢救简报。`
+                : `${diagnosis?.label || lease.phase} (silent ${silentSec}s). Open Sidecar to copy Rescue Handoff Brief.`,
               conversationId: lease.conversationId,
               causeId: diagnosis?.causeId || "",
               silentSec,
@@ -1727,6 +1769,9 @@ export class WatchdogMonitor {
     const ttlDesktopNotifyEnabled = tickRes
       ? tickRes.ttlDesktopNotifyEnabled
       : this._resolveTtlDesktopNotifyEnabled(store, cfg);
+    const langInfo = tickRes
+      ? { lang: tickRes.uiLang || "en", source: tickRes.uiLangSource || "default" }
+      : this._resolveUiLangInfo(store, cfg);
     const ttlNotifyLeadSec = Math.min(300, Math.max(15, Math.floor(Number(cfg.ttlNotifyLeadSec) || 60)));
     const ttlNotifyMinTokens = Math.min(500000, Math.max(4000, Math.floor(Number(cfg.ttlNotifyMinTokens) || 60000)));
 
@@ -1756,6 +1801,8 @@ export class WatchdogMonitor {
       enabled,
       desktopNotifyEnabled,
       ttlDesktopNotifyEnabled,
+      uiLang: langInfo.lang,
+      uiLangSource: langInfo.source,
       ttlNotifyLeadSec,
       ttlNotifyMinTokens,
       serverNowMs: nowWallMs,

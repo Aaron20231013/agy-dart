@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { getConfigSnapshot, getEffectiveConfig } from "../config.js";
+import { getConfigSnapshot, getEffectiveConfig, parseUiLang } from "../config.js";
 import {
   DEFAULT_ACTIVE_CATEGORIES,
   DEFAULT_CUTOFF_BYTES,
@@ -1088,6 +1088,37 @@ export class SettingsMaintenanceMethods {
     const boolVal = Boolean(enabled && enabled !== "false" && enabled !== "0");
     this.setMeta("cache:ttl_desktop_notify", boolVal ? "true" : "false");
     return boolVal;
+  }
+
+  /** Resolve UI/alert language ('zh' | 'en') and provenance ('env' | 'sqlite' | 'config' | 'default') */
+  getUiLangInfo() {
+    const snap = getConfigSnapshot();
+    if (snap.sources.uiLang === "env") {
+      return { lang: snap.values.uiLang, source: "env" };
+    }
+    this.open();
+    const raw = this.getMeta("ui:lang", null);
+    const parsed = parseUiLang(raw);
+    if (parsed) {
+      return { lang: parsed, source: "sqlite" };
+    }
+    if (snap.sources.uiLang === "config") {
+      return { lang: snap.values.uiLang, source: "config" };
+    }
+    return { lang: snap.values.uiLang || "en", source: "default" };
+  }
+
+  /** Read effective UI/alert language ('zh' | 'en') */
+  getUiLang() {
+    return this.getUiLangInfo().lang;
+  }
+
+  /** Persist UI/alert language ('zh' | 'en') in SQLite meta */
+  setUiLang(lang) {
+    const normalized = parseUiLang(lang) || "en";
+    this.open();
+    this.setMeta("ui:lang", normalized);
+    return normalized;
   }
 
   /** Read cross-session empirical TTL calibration ring buffer for a single model profile */

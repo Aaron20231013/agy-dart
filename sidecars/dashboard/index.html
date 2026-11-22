@@ -1429,9 +1429,9 @@
             <span class="star-link-glyph" aria-hidden="true">★</span>
             <span data-i18n="starHeaderLabel">Star</span>
           </a>
-          <div id="lang-toggle" class="segmented" title="Switch Language / 切换界面语言">
-            <button id="lang-zh-btn" onclick="setLanguage('zh')" class="seg-btn" title="切换为中文界面">中文</button>
-            <button id="lang-en-btn" onclick="setLanguage('en')" class="seg-btn is-active" title="Switch to English UI">EN</button>
+          <div id="lang-toggle" class="segmented" title="Switch Language / 切换界面与弹窗语言">
+            <button id="lang-zh-btn" onclick="setLanguage('zh', true)" class="seg-btn" title="切换界面、桌面弹窗与聊天缓存提示为中文">中文</button>
+            <button id="lang-en-btn" onclick="setLanguage('en', true)" class="seg-btn is-active" title="Switch UI, desktop alerts &amp; chat banners to English">EN</button>
           </div>
           <button id="refresh-btn" onclick="refreshData(true)" class="icon-btn" data-i18n-title="refreshTip" title="Refresh Telemetry">
             <svg id="refresh-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -2611,7 +2611,16 @@
       metaEl.textContent = `${sizeLabel}${truncTag}${sumPart}`;
     }
 
-    function setLanguage(lang) {
+    let userSwitchedLang = false;
+    let autoSyncedInitialZh = false;
+
+    async function syncUiLangToServer(lang) {
+      try {
+        await sendWatchdogAction({ action: 'setUiLang', lang });
+      } catch {}
+    }
+
+    function setLanguage(lang, syncServer = false) {
       const next = lang === 'zh' ? 'zh' : 'en';
       currentLang = next;
       try {
@@ -2620,6 +2629,10 @@
         }
       } catch {}
       applyLanguageUi();
+      if (syncServer) {
+        userSwitchedLang = true;
+        syncUiLangToServer(next);
+      }
     }
 
     function applyLanguageUi() {
@@ -4564,6 +4577,19 @@
       updateFeaturePill('wd-notify-btn', t('wdNotifyLabel'), wd.desktopNotifyEnabled === true);
       if (wd.ttlDesktopNotifyEnabled !== undefined) {
         updateFeaturePill('kv-ttl-notify-btn', t('kvTtlNotifyLabel'), wd.ttlDesktopNotifyEnabled === true);
+      }
+      if (wd.uiLangSource === 'default' && currentLang === 'zh' && !autoSyncedInitialZh) {
+        autoSyncedInitialZh = true;
+        syncUiLangToServer('zh');
+      } else if (
+        wd.uiLangSource &&
+        wd.uiLangSource !== 'default' &&
+        (wd.uiLang === 'zh' || wd.uiLang === 'en') &&
+        !userSwitchedLang &&
+        currentLang !== wd.uiLang
+      ) {
+        setLanguage(wd.uiLang, false);
+        return;
       }
 
       if (wd.enabled === false) {

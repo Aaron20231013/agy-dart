@@ -992,13 +992,27 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
     };
   }
+  if (action === "setUiLang") {
+    const requested = typeof data.lang === "string" ? data.lang.trim().toLowerCase() : "";
+    if (requested !== "zh" && requested !== "en") {
+      return { ok: false, status: 400, error: "Invalid 'lang' value: expected 'zh' or 'en'" };
+    }
+    store.setUiLang(requested);
+    const info = store.getUiLangInfo();
+    return {
+      ok: true,
+      uiLang: info.lang,
+      uiLangSource: info.source,
+      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false })
+    };
+  }
   if (action === "tick") {
     return monitor.getStatus({ conversationId: targetConv, scope, refresh: true });
   }
   return {
     ok: false,
     status: 400,
-    error: "Invalid watchdog action: expected 'ack', 'snooze', 'clear', 'markIdle', 'setEnabled', 'setDesktopNotify', 'setTtlDesktopNotify', or 'tick'"
+    error: "Invalid watchdog action: expected 'ack', 'snooze', 'clear', 'markIdle', 'setEnabled', 'setDesktopNotify', 'setTtlDesktopNotify', 'setUiLang', or 'tick'"
   };
 }
 

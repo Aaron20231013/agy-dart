@@ -95,7 +95,7 @@ function formatUsdShort(usd) {
   return n < 0 ? `-$${Math.abs(n).toFixed(2)}` : `$${n.toFixed(2)}`;
 }
 
-function estimateColdReprefillHint(diag) {
+function estimateColdReprefillHint(diag, isZh = false) {
   const pricePer1M = diag.inputPricePer1M ?? diag.modelProfile?.inputPer1M;
   const writeMult =
     Number.isFinite(diag.cacheWriteMultiplier) && diag.cacheWriteMultiplier >= 1
@@ -106,12 +106,20 @@ function estimateColdReprefillHint(diag) {
       ? (diag.currentContextTokens / 1e6) * pricePer1M * writeMult
       : 0;
   const coldUsdStr = formatUsdShort(estColdUsd);
-  return coldUsdStr ? ` (~${coldUsdStr} cold re-prefill)` : "";
+  if (!coldUsdStr) return "";
+  return isZh ? `（冷重算预计约 ${coldUsdStr}）` : ` (~${coldUsdStr} cold re-prefill)`;
 }
 
-export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = null }) {
+export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = null, lang = null }) {
   const alerts = [];
   if (!diag || diag.turnsWithUsage === 0) return alerts;
+  const resolvedLang =
+    lang === "zh" || lang === "en"
+      ? lang
+      : typeof store?.getUiLang === "function"
+        ? store.getUiLang()
+        : "en";
+  const isZh = resolvedLang === "zh";
 
   const parsedInvNum =
     invocationNum !== undefined && invocationNum !== null && invocationNum !== "" && typeof invocationNum !== "boolean"
@@ -135,8 +143,13 @@ export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = nu
   const effectiveCrit = diag.criticalTokens || CONTEXT_CRITICAL_TOKENS;
   const winSource = diag.windowSource || diag.modelProfile?.windowSource;
   const winSourceTag = winSource === "transcript" || winSource === "explicit" ? ` [${winSource}]` : "";
+  const pctUsed = diag.modelProfile?.windowTokens
+    ? Math.round((diag.contextUtilization || diag.currentContextTokens / diag.modelProfile.windowTokens) * 100)
+    : 0;
   const windowLabel = diag.modelProfile?.windowTokens
-    ? `, ${Math.round((diag.contextUtilization || diag.currentContextTokens / diag.modelProfile.windowTokens) * 100)}% of ${formatK(diag.modelProfile.windowTokens)}${winSourceTag}`
+    ? isZh
+      ? `，占 ${formatK(diag.modelProfile.windowTokens)} 窗口 ${pctUsed}%${winSourceTag}`
+      : `, ${pctUsed}% of ${formatK(diag.modelProfile.windowTokens)}${winSourceTag}`
     : "";
   const savedUsdStr = diag.estimatedSavedUsd >= 0.01 ? formatUsdShort(diag.estimatedSavedUsd) : "";
   const wastedUsdStr = diag.estimatedWastedUsd >= 0.01 ? formatUsdShort(diag.estimatedWastedUsd) : "";
@@ -147,11 +160,19 @@ export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = nu
   if (diag.watermark === "critical" && prevWm !== "critical") {
     setAlertMeta(wmKey, "critical");
     const hitPct = (diag.weightedHitRate * 100).toFixed(0);
-    const wasteHint = wastedUsdStr ? `, ~${wastedUsdStr} wasted` : "";
-    const handoffHint = needsHandoffCue ? " (or copy Sidecar **Handoff Brief**)" : "";
-    alerts.push(
-      `Context at **${formatK(diag.currentContextTokens)} tokens** (critical watermark >= ${formatK(effectiveCrit)}${windowLabel}, cache hit ${hitPct}%${wasteHint}). Consider \`/compact\`${handoffHint} at the next milestone, then call \`ctx_resume\`.`
-    );
+    if (isZh) {
+      const wasteHint = wastedUsdStr ? `，重填浪费约 ${wastedUsdStr}` : "";
+      const handoffHint = needsHandoffCue ? "（建议先复制右侧面板「**交接简报**」）" : "";
+      alerts.push(
+        `当前上下文已达 **${formatK(diag.currentContextTokens)} tokens**（告急水位 >= ${formatK(effectiveCrit)}${windowLabel}，缓存命中率 ${hitPct}%${wasteHint}）。建议在当前任务阶段收尾后执行 \`/compact\`${handoffHint}，随后调用 \`ctx_resume\`。`
+      );
+    } else {
+      const wasteHint = wastedUsdStr ? `, ~${wastedUsdStr} wasted` : "";
+      const handoffHint = needsHandoffCue ? " (or copy Sidecar **Handoff Brief**)" : "";
+      alerts.push(
+        `Context at **${formatK(diag.currentContextTokens)} tokens** (critical watermark >= ${formatK(effectiveCrit)}${windowLabel}, cache hit ${hitPct}%${wasteHint}). Consider \`/compact\`${handoffHint} at the next milestone, then call \`ctx_resume\`.`
+      );
+    }
   } else if (diag.watermark === "warn" && prevWm !== "warn" && prevWm !== "critical") {
     if (diag.compactAdvice === "opportunistic_cold_compact" && isMidTurnContinuation) {
       // Suppress cold-compact handoff banner during mid-turn tool execution loops (invocationNum >= 1)
@@ -159,18 +180,31 @@ export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = nu
       setAlertMeta(wmKey, "warn");
       const hitPct = (diag.weightedHitRate * 100).toFixed(0);
       if (diag.compactAdvice === "delay_hot_cache") {
-        const tempLabel = String(diag.cacheTemperature || "warm").toUpperCase();
-        const savedHint = savedUsdStr ? `, ~${savedUsdStr} saved` : "";
-        alerts.push(
-          `Context reached **${formatK(diag.currentContextTokens)} tokens** (cache **${tempLabel}**, hit ${hitPct}%${savedHint}${windowLabel}). **Delay \`/compact\`** while cache is hot to avoid re-prefill; keep tool outputs compact via \`agy-dart_fast\` / \`ctx_execute\`.`
-        );
+        const tempRaw = String(diag.cacheTemperature || "warm").toLowerCase();
+        if (isZh) {
+          const tempZh = tempRaw === "hot" ? "热缓存" : "温缓存";
+          const savedHint = savedUsdStr ? `，已省约 ${savedUsdStr}` : "";
+          alerts.push(
+            `当前上下文已达 **${formatK(diag.currentContextTokens)} tokens**（**${tempZh}**，命中率 ${hitPct}%${savedHint}${windowLabel}）。缓存正热时建议**暂缓 \`/compact\`** 以免触发全量冷重算；请继续通过 \`agy-dart_fast\` / \`ctx_execute\` 控制单次工具输出体积。`
+          );
+        } else {
+          const tempLabel = tempRaw.toUpperCase();
+          const savedHint = savedUsdStr ? `, ~${savedUsdStr} saved` : "";
+          alerts.push(
+            `Context reached **${formatK(diag.currentContextTokens)} tokens** (cache **${tempLabel}**, hit ${hitPct}%${savedHint}${windowLabel}). **Delay \`/compact\`** while cache is hot to avoid re-prefill; keep tool outputs compact via \`agy-dart_fast\` / \`ctx_execute\`.`
+          );
+        }
       } else if (diag.compactAdvice === "opportunistic_cold_compact") {
         alerts.push(
-          `Context reached **${formatK(diag.currentContextTokens)} tokens** (high watermark >= ${formatK(effectiveWarn)}${windowLabel}, cache cold). Good moment for Sidecar **Handoff Brief** + \`/compact\`, then \`ctx_resume\`.`
+          isZh
+            ? `当前上下文已达 **${formatK(diag.currentContextTokens)} tokens**（偏高水位 >= ${formatK(effectiveWarn)}${windowLabel}，缓存已冷）。当前适合复制右侧面板「**交接简报**」后执行 \`/compact\`，再调用 \`ctx_resume\`。`
+            : `Context reached **${formatK(diag.currentContextTokens)} tokens** (high watermark >= ${formatK(effectiveWarn)}${windowLabel}, cache cold). Good moment for Sidecar **Handoff Brief** + \`/compact\`, then \`ctx_resume\`.`
         );
       } else {
         alerts.push(
-          `Context reached **${formatK(diag.currentContextTokens)} tokens** (high watermark >= ${formatK(effectiveWarn)}${windowLabel}, cache hit ${hitPct}%). Keep outputs compact via \`agy-dart_fast\` / \`ctx_execute\`.`
+          isZh
+            ? `当前上下文已达 **${formatK(diag.currentContextTokens)} tokens**（偏高水位 >= ${formatK(effectiveWarn)}${windowLabel}，缓存命中率 ${hitPct}%）。请继续通过 \`agy-dart_fast\` / \`ctx_execute\` 保持输出精简。`
+            : `Context reached **${formatK(diag.currentContextTokens)} tokens** (high watermark >= ${formatK(effectiveWarn)}${windowLabel}, cache hit ${hitPct}%). Keep outputs compact via \`agy-dart_fast\` / \`ctx_execute\`.`
         );
       }
     }
@@ -186,19 +220,34 @@ export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = nu
       const lastAlertedTurn = getAlertMeta(ttlKey, "");
       if (lastAlertedTurn !== diag.lastPlannerAt) {
         setAlertMeta(ttlKey, diag.lastPlannerAt);
-        const ttlSourceTag =
-          diag.ttlSource === "empirical"
-            ? " calibrated"
-            : diag.ttlSource === "explicit"
-              ? " configured"
-              : "";
-        const costHint = estimateColdReprefillHint(diag);
-        const compactTail = needsHandoffCue
-          ? "Good moment to copy Sidecar **Handoff Brief** + `/compact`, then `ctx_resume`."
-          : "Good moment to `/compact` if switching tasks.";
-        alerts.push(
-          `Idle **${formatDuration(diag.idleSeconds)}** (>${formatDuration(diag.cacheTtlSec)}${ttlSourceTag} KV-cache TTL) at **${formatK(diag.currentContextTokens)} tokens**${costHint} — next turn will re-prefill cold. ${compactTail}`
-        );
+        const costHint = estimateColdReprefillHint(diag, isZh);
+        if (isZh) {
+          const ttlSourceZh =
+            diag.ttlSource === "empirical"
+              ? "实证校准 "
+              : diag.ttlSource === "explicit"
+                ? "自定义 "
+                : "";
+          const compactTailZh = needsHandoffCue
+            ? "若准备压缩，建议先复制右侧面板「**交接简报**」再执行 `/compact`，随后调用 `ctx_resume`。"
+            : "若准备切换任务，适合顺手执行 `/compact`。";
+          alerts.push(
+            `已空闲 **${formatDuration(diag.idleSeconds)}**（超过 ${ttlSourceZh}${formatDuration(diag.cacheTtlSec)} 缓存 TTL），当前上下文 **${formatK(diag.currentContextTokens)} tokens**${costHint}——下一轮将触发冷重填。${compactTailZh}`
+          );
+        } else {
+          const ttlSourceTag =
+            diag.ttlSource === "empirical"
+              ? " calibrated"
+              : diag.ttlSource === "explicit"
+                ? " configured"
+                : "";
+          const compactTail = needsHandoffCue
+            ? "Good moment to copy Sidecar **Handoff Brief** + `/compact`, then `ctx_resume`."
+            : "Good moment to `/compact` if switching tasks.";
+          alerts.push(
+            `Idle **${formatDuration(diag.idleSeconds)}** (>${formatDuration(diag.cacheTtlSec)}${ttlSourceTag} KV-cache TTL) at **${formatK(diag.currentContextTokens)} tokens**${costHint} — next turn will re-prefill cold. ${compactTail}`
+          );
+        }
       }
     } else if (diag.ttlStatus === "expiring" && diag.currentContextTokens >= ttlMinContext && diag.lastPlannerAt) {
       const lastAlertedExpiring = getAlertMeta(ttlExpiringKey, "");
@@ -206,9 +255,11 @@ export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = nu
         setAlertMeta(ttlExpiringKey, diag.lastPlannerAt);
         const remSec = Math.max(0, Math.round(Number(diag.ttlRemainingSec ?? 0)));
         const remLabel = remSec <= 60 ? `${remSec}s` : formatDuration(remSec);
-        const costHint = estimateColdReprefillHint(diag);
+        const costHint = estimateColdReprefillHint(diag, isZh);
         alerts.push(
-          `KV-cache expiring in **${remLabel}** at **${formatK(diag.currentContextTokens)} tokens**${costHint} — send your next turn soon to stay warm, or copy Sidecar **Handoff Brief** before \`/compact\`.`
+          isZh
+            ? `**${formatK(diag.currentContextTokens)} tokens** 热缓存将在 **${remLabel}** 后过期${costHint}——尽快发送下一句可续热，或在过期后复制右侧面板「**交接简报**」执行 \`/compact\`。`
+            : `KV-cache expiring in **${remLabel}** at **${formatK(diag.currentContextTokens)} tokens**${costHint} — send your next turn soon to stay warm, or copy Sidecar **Handoff Brief** before \`/compact\`.`
         );
       }
     }
@@ -220,7 +271,9 @@ export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = nu
     if (!alreadyAlerted) {
       setAlertMeta(mediaKey, "1");
       alerts.push(
-        `${diag.totalMediaCount} media/image item(s) active in a **${formatK(diag.currentContextTokens)}-token** session (3–7x TTFT cliff risk). Delegate screenshot checks to a text-only subagent or \`/compact\`.`
+        isZh
+          ? `当前 **${formatK(diag.currentContextTokens)} tokens** 会话中包含 **${diag.totalMediaCount} 个图片/多模态附件**（首字延迟可能放大 3–7 倍）。建议将截图检查委派给纯文本子代理或执行 \`/compact\`。`
+          : `${diag.totalMediaCount} media/image item(s) active in a **${formatK(diag.currentContextTokens)}-token** session (3–7x TTFT cliff risk). Delegate screenshot checks to a text-only subagent or \`/compact\`.`
       );
     }
   }
@@ -236,19 +289,29 @@ export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = nu
       setAlertMeta(loopKey, lw.status);
       const details = [];
       if (lw.editFailOscillations >= 2) {
-        const filesPart =
-          Array.isArray(lw.oscillatingFiles) && lw.oscillatingFiles.length > 0
-            ? ` on \`${lw.oscillatingFiles.join("`, `")}\``
-            : "";
-        details.push(`**${lw.editFailOscillations}x edit↔fail oscillation**${filesPart}`);
+        const hasFiles = Array.isArray(lw.oscillatingFiles) && lw.oscillatingFiles.length > 0;
+        if (isZh) {
+          const filesPartZh = hasFiles ? `（\`${lw.oscillatingFiles.join("`, `")}\`）` : "";
+          details.push(`**${lw.editFailOscillations} 次改错↔失败震荡**${filesPartZh}`);
+        } else {
+          const filesPart = hasFiles ? ` on \`${lw.oscillatingFiles.join("`, `")}\`` : "";
+          details.push(`**${lw.editFailOscillations}x edit↔fail oscillation**${filesPart}`);
+        }
       }
       const hasRepeat = lw.reason === "repeat_loop" || lw.reason === "repeat_and_oscillation";
       if (hasRepeat && lw.maxRepeatCount >= 3) {
-        const callPart = lw.topRepeatedCall ? ` (\`${lw.topRepeatedCall}\` ×${lw.maxRepeatCount})` : ` (×${lw.maxRepeatCount})`;
-        details.push(`**${Math.round((lw.repeatRate || 0) * 100)}% tool repeat rate**${callPart}`);
+        if (isZh) {
+          const callPartZh = lw.topRepeatedCall ? `（\`${lw.topRepeatedCall}\` ×${lw.maxRepeatCount}）` : `（×${lw.maxRepeatCount}）`;
+          details.push(`**${Math.round((lw.repeatRate || 0) * 100)}% 重复工具调用**${callPartZh}`);
+        } else {
+          const callPart = lw.topRepeatedCall ? ` (\`${lw.topRepeatedCall}\` ×${lw.maxRepeatCount})` : ` (×${lw.maxRepeatCount})`;
+          details.push(`**${Math.round((lw.repeatRate || 0) * 100)}% tool repeat rate**${callPart}`);
+        }
       }
       alerts.push(
-        `Convergence watch (${lw.status.toUpperCase()}): ${details.join(" + ")}. Pause repetitive patching, re-check root cause/assumptions, or pivot strategy.`
+        isZh
+          ? `死循环收敛监控（${lw.status.toUpperCase()}）：${details.join(" + ")}。建议暂停重复打补丁，重新核查根因或切换策略。`
+          : `Convergence watch (${lw.status.toUpperCase()}): ${details.join(" + ")}. Pause repetitive patching, re-check root cause/assumptions, or pivot strategy.`
       );
     }
   } else if (lw && lw.status === "ok" && getAlertMeta(loopKey, "")) {
@@ -562,10 +625,13 @@ async function main() {
       return;
     }
 
+    const uiLang =
+      typeof store.getUiLang === "function" ? store.getUiLang() : effectiveCfg.uiLang || "en";
     const alerts = evaluateCacheAlerts(diag, {
       sessionId: targetConvId,
       store,
-      invocationNum: payload?.invocationNum ?? payload?.invocation_num ?? null
+      invocationNum: payload?.invocationNum ?? payload?.invocation_num ?? null,
+      lang: uiLang
     });
     store.close();
     store = null;
@@ -575,7 +641,8 @@ async function main() {
       return;
     }
 
-    const markdown = alerts.map((a) => `> **[agy-dart KV-Cache Watch]** ${a}`).join("\n");
+    const prefixBadge = uiLang === "zh" ? "[agy-dart 缓存守卫]" : "[agy-dart KV-Cache Watch]";
+    const markdown = alerts.map((a) => `> **${prefixBadge}** ${a}`).join("\n");
     // Zero-prefix-pollution UI-only step: systemMessage is "" so the model receives 0 tokens!
     process.stdout.write(
       JSON.stringify({

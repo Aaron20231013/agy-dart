@@ -59,7 +59,8 @@ export const CONFIG_DEFAULTS = Object.freeze({
   watchdogNotifyCooldownSec: 300,
   ttlDesktopNotify: false,
   ttlNotifyLeadSec: 60,
-  ttlNotifyMinTokens: 60000
+  ttlNotifyMinTokens: 60000,
+  uiLang: "en"
 });
 
 let cachedFileState = {
@@ -129,6 +130,15 @@ function parseGuardMode(raw) {
   if (s === "deny" || s === "block" || s === "strict") return "deny";
   if (s === "warn" || s === "1" || s === "true" || s === "remind") return "warn";
   if (s === "off" || s === "0" || s === "false" || s === "none") return "off";
+  return undefined;
+}
+
+export function parseUiLang(raw) {
+  if (raw === undefined || raw === null) return undefined;
+  const s = String(raw).trim().toLowerCase();
+  if (!s) return undefined;
+  if (s === "zh" || s === "cn" || s.startsWith("zh-") || s.startsWith("zh_")) return "zh";
+  if (s === "en" || s.startsWith("en-") || s.startsWith("en_")) return "en";
   return undefined;
 }
 
@@ -486,6 +496,7 @@ export function getConfigSnapshot(options = {}) {
     clampInt(parsePositiveInt(env?.AGY_DART_TTL_NOTIFY_MIN_TOKENS), 4000, 500000),
     clampInt(parsePositiveInt(cfg.ttlNotifyMinTokens), 4000, 500000)
   );
+  pick("uiLang", parseUiLang(env?.AGY_DART_LANG), parseUiLang(cfg.uiLang));
 
   return {
     configPath: loaded.path,
@@ -566,7 +577,7 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra
   );
   lines.push(
     `  - TTL alert     : desktopNotify=${values.ttlDesktopNotify} (${sources.ttlDesktopNotify}), ` +
-      `lead=${values.ttlNotifyLeadSec}s, minTokens=${values.ttlNotifyMinTokens}`
+      `lead=${values.ttlNotifyLeadSec}s, minTokens=${values.ttlNotifyMinTokens}, lang=${values.uiLang} (${sources.uiLang})`
   );
 
   const overrides = Object.keys(sources)

@@ -1020,3 +1020,156 @@ test("v1.5-6: cache:simulate Keep-Alive replay (keepalive-1x & keepalive-unlimit
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
+
+test("v1.5-7: Chinese (uiLang='zh') localization across desktop popups, PreInvocation UI-only banners & Sidecar 中文/EN sync", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-v15-zh-i18n-"));
+  const dbPath = path.join(tmpDir, "context.db");
+  const fakeHome = path.join(tmpDir, "home");
+  const convId = "conv-zh-alerts";
+  const logDir = path.join(fakeHome, ".gemini", "antigravity", "brain", convId, ".system_generated", "logs");
+  fs.mkdirSync(logDir, { recursive: true });
+  const txPath = path.join(logDir, "transcript.jsonl");
+
+  const now = Date.now();
+  fs.writeFileSync(
+    txPath,
+    JSON.stringify({
+      type: "PLANNER_RESPONSE",
+      step_index: 1,
+      created_at: new Date(now - 600 * 1000).toISOString(), // 10m idle (>5m TTL)
+      model: "Gemini 4 Carbon (High)",
+      media: [{ tokens: 1200 }],
+      input_tokens: 420000, // critical watermark (>=410k on 512k) + multimodal (>=150k) + expired TTL
+      cache_read_tokens: 0
+    }) + "\n",
+    "utf8"
+  );
+
+  const store = new ContextModeStore({ dbPath });
+  const prevEnv = {
+    USERPROFILE: process.env.USERPROFILE,
+    HOME: process.env.HOME,
+    AGY_DART_DB_PATH: process.env.AGY_DART_DB_PATH,
+    AGY_DART_CONFIG_PATH: process.env.AGY_DART_CONFIG_PATH,
+    AGY_DART_LANG: process.env.AGY_DART_LANG
+  };
+  process.env.USERPROFILE = fakeHome;
+  process.env.HOME = fakeHome;
+  process.env.AGY_DART_DB_PATH = dbPath;
+  process.env.AGY_DART_CONFIG_PATH = path.join(tmpDir, "missing-cfg.json");
+  delete process.env.AGY_DART_LANG;
+  closeRuntimeStore();
+  resetConfigCache();
+
+  const csrfToken = "1234567890abcdef1234567890abcdef";
+  const srv = createStandaloneServer({ csrfToken });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  const port = srv.address().port;
+  const authHeaders = { "X-Agy-Dart-Token": csrfToken };
+
+  try {
+    // 1. Toggle uiLang to 'zh' via Sidecar /api/watchdog/action -> persists in SQLite; AGY_DART_LANG=en overrides SQLite
+    const setZh = await httpJsonRequest(port, "/api/watchdog/action", {
+      method: "POST",
+      headers: authHeaders,
+      body: { action: "setUiLang", lang: "zh", conversationId: convId }
+    });
+    assert.equal(setZh.status, 200);
+    assert.equal(setZh.json.uiLang, "zh");
+    assert.equal(setZh.json.uiLangSource, "sqlite");
+    assert.equal(store.getUiLang(), "zh");
+
+    process.env.AGY_DART_LANG = "en";
+    resetConfigCache();
+    assert.equal(store.getUiLang(), "en", "AGY_DART_LANG=en must override SQLite ui:lang=zh");
+    delete process.env.AGY_DART_LANG;
+    resetConfigCache();
+    assert.equal(store.getUiLang(), "zh");
+
+    // 2. Live PreInvocation hook emits localized Chinese banners with strictly empty systemMessage: "" (0 model tokens)
+    const hookZh = runHookRaw(
+      "hooks/pre-invocation.mjs",
+      { conversationId: convId, transcriptPath: txPath },
+      dbPath,
+      { USERPROFILE: fakeHome, HOME: fakeHome }
+    );
+    assert.equal(hookZh.status, 0);
+    assert.equal(Buffer.byteLength(hookZh.stderr || "", "utf8"), 0);
+    const parsedHook = JSON.parse(hookZh.stdout);
+    assert.equal(parsedHook.injectSteps?.length, 1);
+    assert.equal(parsedHook.injectSteps[0].systemMessage.systemMessage, "");
+    const userMd = parsedHook.injectSteps[0].systemMessage.metadata?.user_markdown || "";
+    assert.ok(userMd.includes("[agy-dart 缓存守卫]"), `Expected Chinese badge: ${userMd}`);
+    assert.ok(userMd.includes("告急水位") && userMd.includes("交接简报"), `Expected Chinese critical watermark alert: ${userMd}`);
+    assert.ok(userMd.includes("已空闲") && userMd.includes("冷重填"), `Expected Chinese TTL expired alert: ${userMd}`);
+    assert.ok(userMd.includes("多模态附件"), `Expected Chinese multimodal alert: ${userMd}`);
+
+    // 3. Both TTL Expiring AND Stall Watchdog OS desktop notifications emit UTF-8-safe Chinese (<=60B title, <=220B body)
+    const desktopPopups = [];
+    let simMs = 1_765_000_000_000;
+    let monoNs = 20_000_000_000n;
+    const zhMonitor = new WatchdogMonitor({
+      getStore: () => store,
+      getConfig: () => ({
+        stallWatchdog: true,
+        watchdogDesktopNotify: true,
+        ttlDesktopNotify: true,
+        ttlNotifyLeadSec: 60,
+        ttlNotifyMinTokens: 60000
+      }),
+      nowFn: () => simMs,
+      monoNsFn: () => monoNs,
+      findTranscriptFn: () => null,
+      notifyFn: (p) => {
+        desktopPopups.push(p);
+        return { dispatched: true };
+      }
+    });
+
+    // 3a. Idle TTL expiring popup in Chinese
+    recordHookLeaseTransition(
+      store,
+      "PreInvocation",
+      { conversationId: "conv-zh-ttl", lastUserInput: "SECRET_PROMPT_NEVER_LEAK" },
+      { nowMs: simMs - 260_000, contextTokens: 90000, cacheTtlSec: 300 }
+    );
+    recordHookLeaseTransition(store, "Stop", { conversationId: "conv-zh-ttl" }, { nowMs: simMs - 255_000 });
+
+    // 3b. Active stalled tool popup in Chinese
+    recordHookLeaseTransition(
+      store,
+      "PreToolUse",
+      { conversationId: "conv-zh-stall", toolCall: { id: "tc-1", name: "run_command", args: { CommandLine: "npm test" } } },
+      { nowMs: simMs - 320_000, contextTokens: 50000 }
+    );
+
+    zhMonitor.tick();
+    assert.equal(desktopPopups.length, 2);
+    const stallPop = desktopPopups.find((p) => p.conversationId === "conv-zh-stall");
+    const ttlPop = desktopPopups.find((p) => p.conversationId === "conv-zh-ttl");
+
+    for (const pop of [stallPop, ttlPop]) {
+      assert.ok(pop, "Expected both Chinese stall & TTL desktop popups");
+      assert.ok(!pop.title.includes("\uFFFD") && !pop.body.includes("\uFFFD"), "Must never split UTF-8 CJK characters");
+      assert.ok(Buffer.byteLength(pop.title, "utf8") <= 60, `Title must be <=60B: ${pop.title}`);
+      assert.ok(Buffer.byteLength(pop.body, "utf8") <= 220, `Body must be <=220B: ${pop.body}`);
+      assert.equal(pop.body.includes("SECRET_PROMPT_NEVER_LEAK"), false);
+      const winSpec = buildDesktopNotificationCommand({ title: pop.title, body: pop.body, platform: "win32", baseEnv: {} });
+      assert.equal(winSpec.env.AGY_DART_NOTIFY_TITLE, pop.title);
+    }
+    assert.equal(stallPop.title, "agy-dart：对话疑似卡住");
+    assert.ok(stallPop.body.includes("抢救简报"));
+    assert.equal(ttlPop.title, "agy-dart：缓存即将过期");
+    assert.ok(ttlPop.body.includes("90k 上下文热缓存"));
+  } finally {
+    await new Promise((resolve) => srv.close(resolve));
+    closeRuntimeStore();
+    store.close();
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    resetConfigCache();
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
