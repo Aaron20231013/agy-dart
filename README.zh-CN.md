@@ -121,6 +121,37 @@
 4. **严格解耦「有宿主封顶通道」与「无封顶通道」**：`read_file` 有宿主 45 KiB 兜底，但 `cat` / `curl` / `git diff` 没有任何原生上限——放宽 `read_file` 绝不能放宽 `cat`/`curl`（独立 `shellDumpMaxBytes`），也不能靠 `skipFlags` 绕过 `cli-filter.mjs`（否则 5 MB diff 会无封顶、无脱敏直吐）；跳过大文件首次拦截也绝不等于跳过 `readDedup` 去重。
 5. **安全与威胁模型守恒**：`exemptPaths` / `exemptExtensions` 仅从可信用户级 `~/.agy-dart/config.json` 与环境变量加载（不默认信任仓库内配置防上下文 DoS），严格执行于 `sensitiveFileGuard` 之后，且全部经 `fs.realpathSync` 校验与线性段匹配防 ReDoS。
 
+### `[v1.2.2]` 启用后难以运行长任务、短时间内自动停机/交接
+
+#### 1. 社区反馈原文
+
+> 「使用了dart之后，就很难进行长任务了，会自动在很短的时间内交接」
+
+结合 Antigravity 执行器循环与 `v1.2.1` 全链路复盘，“短时间内自动交接”同时对应**模型提前结束当前轮次把控制权交回用户**与**聊天流频繁弹出「交接简报（Handoff Brief）/ `/compact`」提示**两类现象，背后共有 **5 处工程根因**：
+1. **高优规则措辞诱导阶段边界主动停机**：`rules/AGENTS.md` 原文包含祈使句 `compact at cold/phase boundaries then call ctx_resume`。由于 `/compact` 是纯前端斜杠指令、模型无法自行调用工具完成，严格服从 `<user_rules>` 的模型在刚跑完第 1 小阶段（几分钟内）就会主动停止工具调用，向用户输出阶段总结请求手动 `/compact` 交接。
+2. **MCP 沙盒硬编码 `30s` 超时强杀长脚本**：原生 `run_command` 超过等待窗口可无缝转入后台异步长跑，但 `ctx_execute` 硬编码 `30,000 ms` 即强杀进程树（`exitCode: 124`）且未暴露超时参数，`run_checks` 默认也仅 `60s`，导致全量构建或数据批处理在半分钟到一分钟内报错中断并交接给用户。
+3. **透明 CLI 改写与终端沙盒 / 后台流式任务的冲突**：`cli-filter.mjs` 全量内存缓冲导致后台运行期间 `manage_task(status)` 无实时流式输出；同时在 `Default`/`Auto` 终端沙盒下，用户主目录内的 `~/.gemini/config/plugins/agy-dart` 默认不在挂载白名单中，改写后的命令会因找不到脚本而申请沙盒外运行（Unsandboxed），触发人工审批弹窗打断无人值守长任务。
+4. **工具循环中段与 1M 模型低水位误报「交接简报」**：`PreInvocation` 未区分“用户闲置”与“长耗时工具/子代理运行间隔”，当单个工具或子代理耗时满 4～5 分钟唤醒下一轮（`invocationNum >= 1`）时误弹 TTL 交接提醒；且 `ttlMinContext` 被 `Math.min(..., 60000)` 锁死在 `60k`（仅占 1M 窗口模型的 6%，两三轮即触发）。
+5. **无衰减读去重挤压单轮 `MAX_INVOCATIONS` 步数预算**：跨数十步的超长任务后半程，模型在编辑前合理复核早期读过的文件仍会被 `read-dedup` 先 `deny` 一轮，累积消耗宿主单轮最大调用步数上限。
+
+#### 2. 改进方案（`v1.2.1` → `v1.2.2`）
+
+| 维度 | 旧版 `v1.2.1` | 新版 `v1.2.2` 改造 |
+| :--- | :--- | :--- |
+| **规则层阶段交接指令** | 祈使句要求在冷缓存/阶段边界执行 `/compact` | 改为**被动响应规则**：严禁任务中途停机索要 `/compact`，保持长任务连续推进，仅在用户已主动压缩后调用 `ctx_resume`；明确 `>60s` 与异步命令直走原生 `run_command` |
+| **MCP 沙盒执行超时** | `ctx_execute` 硬编码 `30s` 强杀，无超时参数 | 默认超时提至 **`120s`**（`execTimeoutMs`），开放单次 `timeoutSec: 1..300`；超时显式返回 `timedOut: true` 与改用原生后台 `run_command` 指引 |
+| **终端沙盒与异步后台流** | 统一改写吞流式日志；沙盒内缺插件读权限；Windows 仅杀父 Shell | `WaitMsBeforeAsync <= 2000ms`（`cliFilterAsyncBypassMs`）与 `IsDaemon` 直通原生流式后台；同步 `overwrite` 附带插件目录只读 `permissionOverrides`；补齐 Windows `taskkill /T /F` 与 POSIX `detached` 进程组树级回收 |
+| **工具循环与动态水位预警** | 工具循环中段照常弹交接横幅；1M 模型 `60k` 即催交接 | 结合 `invocationNum >= 1` 与 `diag.inToolLoop` **在多步工具循环中段静默空闲 TTL 与冷压缩交接横幅**；`ttlMinContext` 对齐模型 `coldCompactTokens`（200k 模型保持 `60k`，1M 模型提至 **`300k`**） |
+| **长轨迹读去重步距衰减** | 整场会话无限步距拦截未变更重读 | `file_reads` 记录轨迹步序 `read_step`，跨越 `readDedupMaxSteps`（默认 **`40` 步**）自动放行复核并刷新基线，避免深层长任务空耗 `MAX_INVOCATIONS` 步数 |
+
+#### 3. 底层设计原理（为什么这样改，而不是一刀切关掉护栏与提醒）
+
+1. **最高优先级 `<user_rules>` 严禁写入“模型无权自执行的祈使句”**：Antigravity 将 `AGENTS.md` 注入强制执行的系统规则层，而 `/compact` 只能由用户在输入框触发。一旦规则写成“在阶段边界压缩”，听话的模型唯一合规的行为就是在阶段末尾主动停机把接力棒交回用户；改为“绝不中途停机索要压缩、仅在用户压缩后恢复”，才能从源头消除自发阶段交接。
+2. **严格区分「同步数据过滤」与「异步长任务托管」**：MCP `tools/call` 是同步请求-响应模型（受宿主调用时限与 5 分钟流空闲超时约束），适合 `<=120s` 的高噪日志/JSON 沙盒浓缩；而长构建、全量测试与持续进程依赖宿主后台 Task 的实时流式输出（`manage_task`）与完成事件回调，按 `WaitMsBeforeAsync <= 2000ms` 与 `>60s` 边界自动分流，才能兼顾短命令降噪与长任务不断流。
+3. **终端沙盒最小权限原则（只读代码挂载 vs 状态库隔离）**：为解决沙盒内找不到 `~/.gemini/config/plugins/agy-dart/hooks/cli-filter.mjs` 触发沙盒外审批打断，绝不能把 `~/.agy-dart` 状态目录读写挂载进沙盒（否则不可信仓库的测试代码可篡改 `context.db`）。仅注入 `read_file(<PLUGIN_ROOT>)` 只读挂载插件不可变脚本，配合 `cli-filter` 写库 `try/catch` Fail-Open，实现了零审批中断与严格写隔离的统一。
+4. **区分「用户真闲置（Turn Entry）」与「工具执行耗时（Mid-Turn Continuation）」**：当 `invocationNum >= 1` 且处于工具调用链（`inToolLoop`）时，`now - lastPlannerAt` 代表长工具或子代理的执行耗时而非用户离开，且执行中途用户无法输入 `/compact`；同时按模型窗口 `30%`（`coldCompactTokens`）动态缩放提醒门槛，彻底消除 1M 大窗口模型在 6% 低水位时的噪音干扰。
+5. **注意力衰减窗口与步数预算平衡**：短步距（`<= 40` 步）内的重复读取属于纯上下文浪费，拦截收益极高；但跨越 40 步以上的深层长任务末尾，模型对早期文件细节的注意力已自然衰减，编辑前重读校对属于防幻觉刚需——按轨迹步距自动衰减放行，既保住高频去重 ROI，又守住单轮 `MAX_INVOCATIONS` 步数预算。
+
 ---
 
 ## 设计来源与开源致谢（Credits & Inspirations）

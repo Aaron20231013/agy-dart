@@ -125,6 +125,39 @@ End-to-end codebase auditing against these reports exposed **5 deeper root cause
 4. **Strictly decouple host-capped channels from uncapped channels**: `read_file` has a 45 KiB host cap, whereas `cat`, `curl`, and `git diff` do not. Relaxing `read_file` must never relax shell dump guards (`shellDumpMaxBytes`) or bypass `cli-filter.mjs` via `skipFlags` (which would expose unbounded 5 MB diffs without secret redaction), and skipping first-read size checks must never disable `readDedup`.
 5. **Preserve the security threat model**: `exemptPaths` and `exemptExtensions` are loaded exclusively from trusted user-level `~/.agy-dart/config.json` and env vars (never from untrusted repo configs), run strictly after `sensitiveFileGuard`, validate symlink targets via `fs.realpathSync`, and use linear segment matching to eliminate ReDoS.
 
+### `[v1.2.2]` Premature Handoffs & Interrupted Long-Running Tasks
+
+#### 1. Original Community Feedback
+
+> *"After enabling dart (`agy-dart`), it becomes very hard to run long tasks — it automatically hands off within a very short time."*
+>
+> *(Original Chinese: 「使用了dart之后，就很难进行长任务了，会自动在很短的时间内交接」)*
+
+Auditing Antigravity's executor loop alongside `v1.2.1` revealed that "premature automatic handoffs" reflected both **early turn termination yielding control back to the user** and **frequent `Handoff Brief` / `/compact` banners firing after just a few minutes**, driven by **5 concrete root causes**:
+1. **Imperative phase-boundary `/compact` rule inducing self-handoffs**: `rules/AGENTS.md` instructed the agent to *"compact at cold/phase boundaries then call `ctx_resume`"*. Because `/compact` is a UI-only slash command that the model cannot invoke via tools, obedient models following `<user_rules>` stopped calling tools at the end of Phase 1 (within minutes) and handed control back to the user asking them to run `/compact`.
+2. **Hardcoded `30s` MCP sandbox kill on long scripts**: While native `run_command` transitions seamlessly into asynchronous background tasks after `WaitMsBeforeAsync`, `ctx_execute` hardcoded a `30,000 ms` kill timer (`exitCode: 124`) with no timeout parameter (and `run_checks` defaulted to `60s`), killing long builds or batch scripts within 30–60s and forcing an error handoff.
+3. **`PreToolUse.overwrite` friction with Terminal Sandbox & async background streams**: `cli-filter.mjs` buffered stdout/stderr until process exit (leaving `manage_task(status)` blank during background runs). Worse, under `Default`/`Auto` Terminal Sandbox presets, `~/.gemini/config/plugins/agy-dart` sits outside the workspace mount—causing rewritten commands to fail inside the sandbox, request unsandboxed execution, and pause for manual user approval.
+4. **Mid-turn tool-loop & 1M-window false `Handoff Brief` alerts**: `PreInvocation` did not distinguish user idle time from long tool/subagent execution gaps (`invocationNum >= 1`), firing 5-minute TTL handoff banners mid-task; meanwhile `ttlMinContext` was clamped via `Math.min(..., 60000)` to `60k`—just 6% of a 1M-token window.
+5. **Unbounded `read-dedup` burning `MAX_INVOCATIONS` budget**: In deep 50+ step tasks, re-verifying a file read dozens of steps earlier still triggered a Strike-1 `deny`, consuming extra model invocations against the host's per-turn `MAX_INVOCATIONS` ceiling.
+
+#### 2. Solution Shipped (`v1.2.1` → `v1.2.2`)
+
+| Area | Before (`v1.2.1`) | After (`v1.2.2`) |
+| :--- | :--- | :--- |
+| **Phase-Boundary Rule (`AGENTS.md`)** | Imperative prompt to compact at cold/phase boundaries | **Strictly passive rule**: never pause mid-task to ask for `/compact`; keep long tasks continuous and call `ctx_resume` only after user compaction; route `>60s` & async commands to native `run_command` |
+| **MCP Sandbox Timeout** | Hardcoded `30s` kill in `ctx_execute` with no parameter | Raised default to **`120s`** (`execTimeoutMs`), exposed per-call `timeoutSec: 1..300`, and added explicit `timedOut: true` + native background `run_command` fallback guidance |
+| **Sandbox & Async Stream Bypass** | Rewrote async commands (buffering live logs); lacked sandbox read grant; orphan shells on kill | Bypass `cli-filter` when `WaitMsBeforeAsync <= 2000ms` (`cliFilterAsyncBypassMs`) or `IsDaemon: true`; attach read-only `permissionOverrides` (`read_file(<PLUGIN_ROOT>)`) on sync `overwrite`; full Windows `taskkill /T /F` & POSIX `detached` process-group teardown |
+| **Mid-Turn & 1M Watermark Alerts** | Fired TTL/handoff banners mid-loop and at `60k` on 1M models | Suppress idle TTL & cold-compact handoff banners during mid-turn tool loops (`invocationNum >= 1` & `diag.inToolLoop`); scale `ttlMinContext` to model `coldCompactTokens` (`60k` on 200k models, **`300k`** on 1M models) |
+| **Step-Decayed Read Dedup** | Session-wide dedup regardless of trajectory depth | Track `read_step` in `file_reads` and auto-allow re-reads after `readDedupMaxSteps` (default **`40` steps**), preserving `MAX_INVOCATIONS` budget in deep tasks |
+
+#### 3. Underlying Design Principles
+
+1. **Never put user-only actions as imperative commands inside `<user_rules>`**: Antigravity injects `AGENTS.md` as highest-priority mandatory instructions. Because an agent cannot execute UI slash commands like `/compact`, any imperative to "compact at phase boundaries" forces compliant models to halt execution and hand off to the human. Framing compaction strictly as a post-hoc recovery hook (`ctx_resume` after user action) keeps multi-phase execution uninterrupted.
+2. **Separate synchronous data filtering from asynchronous lifecycle management**: MCP `tools/call` is inherently synchronous and bounded by RPC/stream idle timeouts—ideal for `<=120s` sandbox data reduction (`ctx_execute`), whereas long builds, test suites, and daemons rely on Antigravity's native background task streaming (`manage_task`) and reactive wakeup. Routing by `WaitMsBeforeAsync <= 2000ms` and `>60s` preserves both fast inline filtering and multi-hour background durability.
+3. **Least-privilege sandbox bridging (read-only code vs. isolated DB state)**: Mounting `~/.agy-dart` read-write into the Terminal Sandbox would let untrusted repo test scripts tamper with `context.db`. Granting only `read_file(<PLUGIN_ROOT>)` via `permissionOverrides` exposes immutable plugin JS so rewritten commands never trigger unsandboxed approval prompts, while `cli-filter.mjs` degrades gracefully in memory whenever SQLite writes are sandbox-restricted.
+4. **Distinguish turn-entry user idle from mid-turn tool execution**: When `invocationNum >= 1` inside an active tool loop (`inToolLoop`), elapsed time since `lastPlannerAt` reflects a long tool or subagent run—not human inactivity—and the user cannot run `/compact` mid-turn anyway. Scaling `ttlMinContext` to `30%` of the active model's window (`coldCompactTokens`) keeps alerts meaningful across both 200k and 1M context models.
+5. **Balance attention decay against `MAX_INVOCATIONS` step budgets**: Blocking duplicate reads within `<= 40` steps eliminates pure token waste, but 40+ steps into a complex refactor, re-reading a target file before editing prevents stale-context hallucinations without burning extra `deny`/retry turns.
+
 ---
 
 ## Credits & Open-Source Inspirations
