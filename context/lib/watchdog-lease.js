@@ -28,7 +28,10 @@ export const TTL_KEEPALIVE_PROMPT_RE = /\[agy-dart TTL(?:保活| Keepalive)(?:\s
 export const HEADLESS_FINISH_PROMPT_RE =
   /\bWhen you are done,\s*call the finish tool with your result\./i;
 export const SUBAGENT_ROLE_RE =
-  /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?)(?:$|[-_\s/])/i;
+  /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?|browser|image[-_]?generator)(?:$|[-_\s/])|^(?:DeepCoder|DeepInvestigator)[A-Za-z0-9_-]*$/i;
+const PRIMARY_HOST_AGENT_NAME_RE = /^(?:antigravity|main|default|primary|chat|user|assistant|cascade)$/i;
+const SUBAGENT_GENESIS_SYS_MSG_RE =
+  /\[Message\]\s+timestamp=\S+\s+sender=[0-9a-f-]{8,}|<original_task>|<subagent_reminder>|\brunning as a subagent,\s*invoked by a caller agent\b/i;
 export const SUBAGENT_TOOL_RE =
   /^(?:subagent|task|agent|delegate|call_subagent|invoke_subagent|schedule|manage_task|send_message|browser_subagent|spawn_subagent|run_subagent)$/i;
 export const LONG_MCP_TOOL_RE = /^(?:ctx_execute|ctx_batch|run_checks)$/i;
@@ -48,53 +51,384 @@ export function isHeadlessWorkerPrompt(rawText) {
   return HEADLESS_FINISH_PROMPT_RE.test(rawText);
 }
 
+export function isSummaryMetadataSubagent({
+  conversationId = "",
+  parentConversationId = "",
+  rootConversationId = "",
+  nestingDepth = 0,
+  agentName = "",
+  title = "",
+  allowUntitledCustomAgent = true
+} = {}) {
+  const safeConv = sanitizeConversationId(conversationId);
+  const safeParent = sanitizeConversationId(parentConversationId);
+  if (safeParent && safeParent !== safeConv) return true;
+  const safeRoot = sanitizeConversationId(rootConversationId);
+  if (safeRoot && safeConv && safeRoot !== safeConv) return true;
+  const depthNum = Number(nestingDepth);
+  if (Number.isFinite(depthNum) && depthNum > 0) return true;
+  const cleanAgent = typeof agentName === "string" ? agentName.trim() : "";
+  if (!cleanAgent || PRIMARY_HOST_AGENT_NAME_RE.test(cleanAgent)) return false;
+  if (cleanAgent.toLowerCase() === "self" || SUBAGENT_ROLE_RE.test(cleanAgent)) return true;
+  const cleanTitle = typeof title === "string" ? title.trim() : "";
+  if (!cleanTitle && allowUntitledCustomAgent !== false) return true;
+  return false;
+}
+
+export function isTrajectoryMetadataSubagent(conversationId = "", metaEventOrObj = {}) {
+  if (!metaEventOrObj || typeof metaEventOrObj !== "object" || Array.isArray(metaEventOrObj)) {
+    return false;
+  }
+  const metaEvent = metaEventOrObj;
+  const metaObj =
+    metaEvent.metadata && typeof metaEvent.metadata === "object" && !Array.isArray(metaEvent.metadata)
+      ? metaEvent.metadata
+      : metaEvent;
+  if (
+    metaObj.subagent === true ||
+    metaObj.isSubagent === true ||
+    metaObj.is_subagent === true ||
+    metaEvent.subagent === true ||
+    metaEvent.isSubagent === true ||
+    metaEvent.is_subagent === true
+  ) {
+    return true;
+  }
+  const subagentSpec =
+    metaObj.subagentSpec ??
+    metaObj.subagent_spec ??
+    metaEvent.subagentSpec ??
+    metaEvent.subagent_spec ??
+    null;
+  if (subagentSpec && typeof subagentSpec === "object" && !Array.isArray(subagentSpec) && Object.keys(subagentSpec).length > 0) {
+    return true;
+  }
+  const isBattleFork = Boolean(
+    metaObj.isBattleModeFork ||
+      metaObj.is_battle_mode_fork ||
+      metaObj.isBattleMode ||
+      metaObj.is_battle_mode ||
+      metaEvent.isBattleModeFork ||
+      metaEvent.is_battle_mode_fork
+  );
+  const safeConv = sanitizeConversationId(conversationId);
+  const safeRoot = sanitizeConversationId(
+    metaObj.rootConversationId ||
+      metaObj.root_conversation_id ||
+      metaEvent.rootConversationId ||
+      metaEvent.root_conversation_id ||
+      ""
+  );
+  if (!isBattleFork && safeConv && safeRoot && safeRoot !== safeConv) {
+    return true;
+  }
+  const staticCfg =
+    metaObj.staticConfig && typeof metaObj.staticConfig === "object"
+      ? metaObj.staticConfig
+      : metaObj.static_config && typeof metaObj.static_config === "object"
+        ? metaObj.static_config
+        : null;
+  const resolvedAgentName =
+    (typeof subagentSpec?.name === "string" && subagentSpec.name) ||
+    (typeof subagentSpec?.agentName === "string" && subagentSpec.agentName) ||
+    (typeof subagentSpec?.agent_name === "string" && subagentSpec.agent_name) ||
+    (typeof subagentSpec?.typeName === "string" && subagentSpec.typeName) ||
+    (typeof subagentSpec?.type_name === "string" && subagentSpec.type_name) ||
+    (typeof staticCfg?.name === "string" && staticCfg.name) ||
+    (typeof staticCfg?.agentName === "string" && staticCfg.agentName) ||
+    (typeof staticCfg?.agent_name === "string" && staticCfg.agent_name) ||
+    metaObj.agentName ||
+    metaObj.agent_name ||
+    metaEvent.agentName ||
+    metaEvent.agent_name ||
+    "";
+  const hasExplicitTitleField = Boolean(
+    Object.prototype.hasOwnProperty.call(metaObj, "title") ||
+      Object.prototype.hasOwnProperty.call(metaEvent, "title") ||
+      (metaEvent.annotations && typeof metaEvent.annotations === "object")
+  );
+  const resolvedTitle =
+    metaObj.title ||
+    metaEvent.title ||
+    metaEvent.annotations?.title ||
+    "";
+  return isSummaryMetadataSubagent({
+    conversationId,
+    parentConversationId:
+      metaObj.parentConversationId ||
+      metaObj.parent_conversation_id ||
+      metaEvent.parentConversationId ||
+      metaEvent.parent_conversation_id ||
+      "",
+    rootConversationId: isBattleFork ? "" : safeRoot,
+    nestingDepth:
+      metaObj.nestingDepth ??
+      metaObj.nesting_depth ??
+      metaEvent.nestingDepth ??
+      metaEvent.nesting_depth ??
+      0,
+    agentName: resolvedAgentName,
+    title: resolvedTitle,
+    allowUntitledCustomAgent: hasExplicitTitleField
+  });
+}
+
+function extractGenesisStepText(step) {
+  if (!step || typeof step !== "object") return "";
+  for (const key of ["user_input", "content", "text", "message"]) {
+    const val = step[key];
+    if (typeof val === "string" && val) return val;
+    if (Array.isArray(val)) {
+      const joined = val
+        .map((p) => (typeof p === "string" ? p : p && typeof p.text === "string" ? p.text : ""))
+        .filter(Boolean)
+        .join("\n");
+      if (joined) return joined;
+    } else if (val && typeof val === "object" && typeof val.text === "string" && val.text) {
+      return val.text;
+    }
+  }
+  return "";
+}
+
+export function classifyTranscriptGenesisSteps(steps = [], { isFromStart = false } = {}) {
+  if (!Array.isArray(steps) || steps.length === 0) return "unknown";
+  for (const s of steps) {
+    if (!s || typeof s !== "object") continue;
+    const stType = String(s.type || "").toUpperCase();
+    const stRole = String(s.role || "").toLowerCase();
+    if (stType === "USER_INPUT" || stRole === "user" || typeof s.user_input === "string") {
+      const uTxt = extractGenesisStepText(s);
+      if (uTxt && isHeadlessWorkerPrompt(uTxt)) return "subagent";
+    }
+    for (const arr of [s.tool_calls, s.toolCalls, s.function_calls, s.functionCalls]) {
+      if (!Array.isArray(arr)) continue;
+      for (const c of arr) {
+        if (!c || typeof c !== "object") continue;
+        const n = c.name || c.tool || c.function?.name || "";
+        if (extractBareToolName(n) === "finish") return "subagent";
+      }
+    }
+  }
+
+  const startsAtZero = Boolean(isFromStart || steps[0]?.step_index === 0);
+  if (!startsAtZero) return "unknown";
+
+  let sawSysStep0 = false;
+  let sawSubagentSysMsg = false;
+  let sawRealUserInput = false;
+  for (let i = 0; i < steps.length && i < 10; i++) {
+    const o = steps[i];
+    if (!o || typeof o !== "object") continue;
+    const t = String(o.type || "").toUpperCase();
+    const role = String(o.role || "").toLowerCase();
+    if (t === "PLANNER_RESPONSE" || role === "assistant" || role === "model") {
+      break;
+    }
+    const txt = extractGenesisStepText(o);
+    if (txt && isHeadlessWorkerPrompt(txt)) return "subagent";
+    if (t === "USER_INPUT" || role === "user") {
+      sawRealUserInput = true;
+      break;
+    }
+    if (t === "SYSTEM_MESSAGE") {
+      if (o.step_index === 0 || (i === 0 && isFromStart && o.step_index === undefined)) {
+        sawSysStep0 = true;
+      }
+      if (o.source === "SYSTEM" || (txt && SUBAGENT_GENESIS_SYS_MSG_RE.test(txt))) {
+        sawSubagentSysMsg = true;
+      }
+    }
+  }
+  if (sawSysStep0 && sawSubagentSysMsg && !sawRealUserInput) return "subagent";
+  if (sawRealUserInput) return "human";
+  return "unknown";
+}
+
+export function detectSubagentFromTranscriptSteps(steps = [], options = {}) {
+  return classifyTranscriptGenesisSteps(steps, options) === "subagent";
+}
+
+export function classifyTranscriptGenesisFile(transcriptPath, maxBytes = 262144) {
+  if (typeof transcriptPath !== "string" || !transcriptPath.trim()) return "unknown";
+  let fd = null;
+  try {
+    const cleanPath = transcriptPath.trim();
+    if (!fs.existsSync(cleanPath)) return "unknown";
+    const cap = Math.min(524288, Math.max(8192, Math.floor(Number(maxBytes) || 262144)));
+    fd = fs.openSync(cleanPath, "r");
+    const fstat = fs.fstatSync(fd);
+    if (!fstat.isFile() || fstat.size <= 0) return "unknown";
+    const toRead = Math.min(cap, fstat.size);
+    const buf = Buffer.allocUnsafe(toRead);
+    const bytesRead = fs.readSync(fd, buf, 0, toRead, 0);
+    if (bytesRead <= 0) return "unknown";
+
+    const headText = buf.subarray(0, bytesRead).toString("utf8");
+    const rawLines = headText.split(/\r?\n/);
+    const parsedSteps = [];
+    let partialSubagentSysLine = false;
+    let partialUserLine = false;
+
+    for (let i = 0; i < rawLines.length && parsedSteps.length < 10; i++) {
+      const line = rawLines[i].trim();
+      if (!line) continue;
+      try {
+        const obj = JSON.parse(line);
+        if (obj && typeof obj === "object") parsedSteps.push(obj);
+      } catch {
+        // Truncated oversized genesis line at buffer boundary
+        if (/^\{\s*(?:"[^"]+"\s*:\s*[^,]+,\s*){0,6}"type"\s*:\s*"USER_INPUT"/.test(line)) {
+          if (HEADLESS_FINISH_PROMPT_RE.test(line)) return "subagent";
+          partialUserLine = true;
+        } else if (
+          /^\{\s*(?:"[^"]+"\s*:\s*[^,]+,\s*){0,6}"type"\s*:\s*"SYSTEM_MESSAGE"/.test(line) &&
+          (/"source"\s*:\s*"SYSTEM"\b/.test(line) || SUBAGENT_GENESIS_SYS_MSG_RE.test(line))
+        ) {
+          partialSubagentSysLine = true;
+        }
+        break;
+      }
+    }
+
+    const stepCls = classifyTranscriptGenesisSteps(parsedSteps, { isFromStart: true });
+    if (stepCls === "subagent" || stepCls === "human") {
+      return stepCls;
+    }
+    const hasPlannerOrUserInParsed = parsedSteps.some((s) => {
+      const t = String(s?.type || "").toUpperCase();
+      const r = String(s?.role || "").toLowerCase();
+      return t === "USER_INPUT" || r === "user" || t === "PLANNER_RESPONSE" || r === "assistant" || r === "model";
+    });
+    if (partialUserLine && !hasPlannerOrUserInParsed) {
+      return "human";
+    }
+    if (
+      partialSubagentSysLine &&
+      !partialUserLine &&
+      !hasPlannerOrUserInParsed &&
+      (parsedSteps.length === 0 || String(parsedSteps[0]?.type || "").toUpperCase() === "SYSTEM_MESSAGE")
+    ) {
+      return "subagent";
+    }
+    return "unknown";
+  } catch {
+    return "unknown";
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+export function detectSubagentFromTranscriptFile(transcriptPath, maxBytes = 262144) {
+  return classifyTranscriptGenesisFile(transcriptPath, maxBytes) === "subagent";
+}
+
 export function isSubagentLeasePayload(payload = {}, env = process.env) {
   const envSub = String(env?.ANTIGRAVITY_SUBAGENT || "").trim().toLowerCase();
   if (envSub === "1" || envSub === "true") return true;
   if (env?.ANTIGRAVITY_PARENT_CONVERSATION_ID) return true;
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
-  if (payload.subagent === true || payload.isSubagent === true || payload.is_subagent === true) return true;
-  if (
-    (typeof payload.subagentId === "string" && payload.subagentId.trim()) ||
-    (typeof payload.subagent_id === "string" && payload.subagent_id.trim())
-  ) {
-    return true;
-  }
-  const meta = payload.metadata && typeof payload.metadata === "object" ? payload.metadata : null;
-  if (meta) {
+  const common =
+    payload.common && typeof payload.common === "object" && !Array.isArray(payload.common) ? payload.common : null;
+  const meta =
+    payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
+      ? payload.metadata
+      : null;
+
+  for (const bag of [payload, common, meta]) {
+    if (!bag) continue;
+    if (bag.subagent === true || bag.isSubagent === true || bag.is_subagent === true) return true;
     if (
-      meta.subagent === true ||
-      meta.isSubagent === true ||
-      meta.is_subagent === true ||
-      (typeof meta.subagentId === "string" && meta.subagentId.trim()) ||
-      (typeof meta.subagent_id === "string" && meta.subagent_id.trim()) ||
-      meta.parentConversationId ||
-      meta.parent_conversation_id ||
-      meta.parentSessionId ||
-      meta.parent_session_id
+      (typeof bag.subagentId === "string" && bag.subagentId.trim()) ||
+      (typeof bag.subagent_id === "string" && bag.subagent_id.trim())
     ) {
       return true;
     }
+    const spec = bag.subagentSpec ?? bag.subagent_spec ?? null;
+    if (spec && typeof spec === "object" && !Array.isArray(spec) && Object.keys(spec).length > 0) {
+      return true;
+    }
+    const depth = Number(bag.nestingDepth ?? bag.nesting_depth);
+    if (Number.isFinite(depth) && depth > 0) return true;
   }
+
+  const convId = sanitizeConversationId(
+    payload.conversationId ||
+      payload.conversation_id ||
+      common?.conversationId ||
+      common?.conversation_id ||
+      payload.sessionId ||
+      payload.session_id ||
+      ""
+  );
+  const directParent = sanitizeConversationId(
+    payload.parentConversationId ||
+      payload.parent_conversation_id ||
+      common?.parentConversationId ||
+      common?.parent_conversation_id ||
+      meta?.parentConversationId ||
+      meta?.parent_conversation_id ||
+      payload.parentSessionId ||
+      payload.parent_session_id ||
+      meta?.parentSessionId ||
+      meta?.parent_session_id ||
+      ""
+  );
+  if (directParent && directParent !== convId) return true;
+
+  const isBattle = Boolean(
+    payload.isBattleMode ||
+      payload.is_battle_mode ||
+      common?.isBattleMode ||
+      common?.is_battle_mode ||
+      meta?.isBattleModeFork ||
+      meta?.is_battle_mode_fork
+  );
+  const rootId = sanitizeConversationId(
+    payload.rootConversationId ||
+      payload.root_conversation_id ||
+      common?.rootConversationId ||
+      common?.root_conversation_id ||
+      meta?.rootConversationId ||
+      meta?.root_conversation_id ||
+      env?.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
+      ""
+  );
+  if (!isBattle && convId && rootId && rootId !== convId) return true;
+
   const roleCandidates = [
     payload.role,
     payload.agentRole,
     payload.agent_role,
     payload.agentType,
     payload.agent_type,
+    payload.agentName,
+    payload.agent_name,
     payload.sessionType,
     payload.session_type,
     payload.sessionKind,
     payload.session_kind,
+    common?.agentName,
+    common?.agent_name,
+    common?.role,
     meta?.role,
     meta?.agentRole,
     meta?.agent_role,
     meta?.agentType,
-    meta?.agent_type
+    meta?.agent_type,
+    meta?.agentName,
+    meta?.agent_name
   ];
   for (const candidate of roleCandidates) {
-    if (typeof candidate === "string" && candidate.trim() && SUBAGENT_ROLE_RE.test(candidate.trim())) {
-      return true;
+    if (typeof candidate === "string" && candidate.trim()) {
+      const clean = candidate.trim();
+      if (!PRIMARY_HOST_AGENT_NAME_RE.test(clean) && (clean.toLowerCase() === "self" || SUBAGENT_ROLE_RE.test(clean))) {
+        return true;
+      }
     }
   }
   return false;
@@ -461,6 +795,70 @@ function resolveCandidateSummaryDbPaths({ transcriptPath = "", summaryDbPath = "
   return out;
 }
 
+export function resolveCandidateTranscriptPath(
+  conversationId,
+  { transcriptPath = "", summaryDbPath = "", allowDefaultDb = true } = {}
+) {
+  const safeId = sanitizeConversationId(conversationId);
+  if (typeof transcriptPath === "string" && transcriptPath.trim()) {
+    const direct = transcriptPath.trim();
+    try {
+      if (fs.existsSync(direct)) return direct;
+    } catch {}
+  }
+  if (!safeId) return "";
+
+  const brainRoots = [];
+  const seenRoots = new Set();
+  const pushBrainRoot = (rootDir) => {
+    if (typeof rootDir !== "string" || !rootDir.trim()) return;
+    const resolved = path.resolve(rootDir.trim());
+    const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (!seenRoots.has(key)) {
+      seenRoots.add(key);
+      brainRoots.push(resolved);
+    }
+  };
+
+  if (typeof summaryDbPath === "string" && summaryDbPath.trim()) {
+    pushBrainRoot(path.join(path.dirname(path.resolve(summaryDbPath.trim())), "brain"));
+  }
+  if (typeof process.env.AGY_DART_SUMMARY_DB_PATH === "string" && process.env.AGY_DART_SUMMARY_DB_PATH.trim()) {
+    pushBrainRoot(path.join(path.dirname(path.resolve(process.env.AGY_DART_SUMMARY_DB_PATH.trim())), "brain"));
+  }
+  if (allowDefaultDb !== false) {
+    const home = os.homedir();
+    if (home) {
+      pushBrainRoot(path.join(home, ".gemini", "antigravity", "brain"));
+      pushBrainRoot(path.join(home, ".gemini", "antigravity-ide", "brain"));
+      pushBrainRoot(path.join(home, ".gemini", "antigravity-cli", "brain"));
+    }
+  }
+
+  for (const root of brainRoots) {
+    const relPaths = [
+      path.join(safeId, ".system_generated", "logs", "transcript_full.jsonl"),
+      path.join(safeId, ".system_generated", "logs", "transcript.jsonl"),
+      path.join(safeId, ".system_generated", "transcript_full.jsonl"),
+      path.join(safeId, ".system_generated", "transcript.jsonl")
+    ];
+    for (const relSub of relPaths) {
+      const cand = path.resolve(root, relSub);
+      const rel = path.relative(
+        process.platform === "win32" ? root.toLowerCase() : root,
+        process.platform === "win32" ? cand.toLowerCase() : cand
+      );
+      if (!rel || rel === ".." || rel.startsWith(`..${path.sep}`) || rel.startsWith("../") || path.isAbsolute(rel)) {
+        continue;
+      }
+      try {
+        if (fs.existsSync(cand)) return cand;
+      } catch {}
+    }
+  }
+  return "";
+}
+
 /**
  * Read-only, fail-open lookup of Antigravity's official short conversation title
  * and fallback workspace root from `conversation_summaries.db` (zero user-prompt leakage).
@@ -470,11 +868,42 @@ export function lookupConversationSummary(conversationId, options = {}) {
   const safeOpts = options && typeof options !== "string" ? options : {};
   const inlineTitle = extractInlinePayloadTitle(safeOpts.payload);
   const inlineCwd = extractPayloadWorkspaceRoot(safeOpts.payload) || decodeFileUriOrPath(safeOpts.cwd || "");
+  const inlineParentRaw = sanitizeConversationId(
+    safeOpts.payload?.parentConversationId ||
+      safeOpts.payload?.parent_conversation_id ||
+      safeOpts.payload?.common?.parentConversationId ||
+      safeOpts.payload?.common?.parent_conversation_id ||
+      safeOpts.payload?.metadata?.parentConversationId ||
+      safeOpts.payload?.metadata?.parent_conversation_id ||
+      ""
+  );
+  const inlineParent = inlineParentRaw && inlineParentRaw !== safeId ? inlineParentRaw : "";
+  const inlineSubagent = Boolean(
+    inlineParent || (safeOpts.payload && isSubagentLeasePayload(safeOpts.payload))
+  );
   if (!safeId) {
-    return { title: inlineTitle, cwd: inlineCwd };
+    return {
+      found: false,
+      title: inlineTitle,
+      cwd: inlineCwd,
+      isSubagent: inlineSubagent,
+      killed: false,
+      parentConversationId: inlineParent,
+      nestingDepth: 0,
+      agentName: ""
+    };
   }
-  if (inlineTitle && inlineCwd) {
-    return { title: inlineTitle, cwd: inlineCwd };
+  if (inlineTitle && inlineCwd && !safeOpts.checkSubagent) {
+    return {
+      found: false,
+      title: inlineTitle,
+      cwd: inlineCwd,
+      isSubagent: inlineSubagent,
+      killed: false,
+      parentConversationId: inlineParent,
+      nestingDepth: 0,
+      agentName: ""
+    };
   }
 
   const dbCandidates = resolveCandidateSummaryDbPaths({
@@ -496,15 +925,56 @@ export function lookupConversationSummary(conversationId, options = {}) {
           db.exec("PRAGMA busy_timeout = 250;");
         } catch {}
       }
-      const row = db
-        .prepare("SELECT title, workspace_uris FROM conversation_summaries WHERE conversation_id = ? LIMIT 1")
-        .get(safeId);
+      let row = null;
+      try {
+        row = db
+          .prepare(
+            "SELECT title, workspace_uris, parent_conversation_id, nesting_depth, agent_name, killed FROM conversation_summaries WHERE conversation_id = ? LIMIT 1"
+          )
+          .get(safeId);
+      } catch {
+        try {
+          row = db
+            .prepare(
+              "SELECT title, workspace_uris, parent_conversation_id, nesting_depth, agent_name FROM conversation_summaries WHERE conversation_id = ? LIMIT 1"
+            )
+            .get(safeId);
+        } catch {
+          row = db
+            .prepare("SELECT title, workspace_uris FROM conversation_summaries WHERE conversation_id = ? LIMIT 1")
+            .get(safeId);
+        }
+      }
       if (row) {
         const dbTitle = typeof row.title === "string" ? sanitizeWatchdogText(row.title, 36) : "";
         const dbCwd = typeof row.workspace_uris === "string" ? parseWorkspaceUriToPath(row.workspace_uris) : "";
+        const rawDbParent =
+          typeof row.parent_conversation_id === "string"
+            ? sanitizeConversationId(row.parent_conversation_id)
+            : "";
+        const dbParent = rawDbParent && rawDbParent !== safeId ? rawDbParent : "";
+        const dbDepth = Number.isFinite(Number(row.nesting_depth))
+          ? Math.max(0, Math.floor(Number(row.nesting_depth)))
+          : 0;
+        const dbAgent = typeof row.agent_name === "string" ? row.agent_name.trim().slice(0, 96) : "";
+        const dbKilled = Boolean(row.killed === true || (Number.isFinite(Number(row.killed)) && Number(row.killed) > 0));
+        const dbSubagent = isSummaryMetadataSubagent({
+          conversationId: safeId,
+          parentConversationId: dbParent,
+          nestingDepth: dbDepth,
+          agentName: dbAgent,
+          title: dbTitle,
+          allowUntitledCustomAgent: safeOpts.allowUntitledCustomAgent !== false
+        });
         return {
+          found: true,
           title: inlineTitle || dbTitle,
-          cwd: inlineCwd || dbCwd
+          cwd: inlineCwd || dbCwd,
+          isSubagent: Boolean(inlineSubagent || dbSubagent),
+          killed: dbKilled,
+          parentConversationId: inlineParent || dbParent,
+          nestingDepth: dbDepth,
+          agentName: dbAgent
         };
       }
     } catch {
@@ -518,7 +988,16 @@ export function lookupConversationSummary(conversationId, options = {}) {
     }
   }
 
-  return { title: inlineTitle, cwd: inlineCwd };
+  return {
+    found: false,
+    title: inlineTitle,
+    cwd: inlineCwd,
+    isSubagent: inlineSubagent,
+    killed: false,
+    parentConversationId: inlineParent,
+    nestingDepth: 0,
+    agentName: ""
+  };
 }
 
 export function lookupConversationTitle(conversationId, options = {}) {
@@ -968,8 +1447,9 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
         process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID ||
         ""
     ) || directConvId;
-  const parentConversationId = sanitizeConversationId(
-    safePayload.parentConversationId ||
+  let parentConversationId = sanitizeConversationId(
+    safeOptions.parentConversationId ||
+      safePayload.parentConversationId ||
       safePayload.parent_conversation_id ||
       process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID ||
       ""
@@ -978,13 +1458,15 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
     typeof (safePayload.lastUserInput ?? safePayload.last_user_input) === "string"
       ? String(safePayload.lastUserInput ?? safePayload.last_user_input)
       : "";
-  const isSubagent = Boolean(
-    safeOptions.isSubagent ||
-      (parentConversationId && parentConversationId !== directConvId) ||
-      (rootSessionId && rootSessionId !== directConvId) ||
-      isSubagentLeasePayload(safePayload) ||
-      isHeadlessWorkerPrompt(rawPromptForHeadlessCheck)
-  );
+  let isSubagent = safeOptions.suppressPayloadSubagent
+    ? Boolean(safeOptions.isSubagent)
+    : Boolean(
+        safeOptions.isSubagent ||
+          (parentConversationId && parentConversationId !== directConvId) ||
+          (rootSessionId && rootSessionId !== directConvId) ||
+          isSubagentLeasePayload(safePayload) ||
+          isHeadlessWorkerPrompt(rawPromptForHeadlessCheck)
+      );
 
   const existing = readWatchdogLease(store, directConvId);
   const base = existing || {
@@ -1047,7 +1529,7 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
     resolvedTitle = extractInlinePayloadTitle(safePayload);
   }
   if (
-    (!resolvedTitle || !resolvedCwd) &&
+    (!resolvedTitle || !resolvedCwd || (!isSubagent && !base.isSubagent && !base.convTitle)) &&
     (safeOptions.summaryDbPath || safeOptions.lookupSummary === true)
   ) {
     const summary = lookupConversationSummary(directConvId, {
@@ -1055,10 +1537,15 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
       cwd: resolvedCwd,
       transcriptPath: resolvedTranscriptPath,
       summaryDbPath: safeOptions.summaryDbPath || "",
-      allowDefaultDb: safeOptions.allowDefaultDb !== false
+      allowDefaultDb: safeOptions.allowDefaultDb !== false,
+      checkSubagent: !isSubagent && !base.isSubagent
     });
     if (!resolvedTitle && summary.title) resolvedTitle = summary.title;
     if (!resolvedCwd && summary.cwd) resolvedCwd = summary.cwd;
+    if (summary.isSubagent) isSubagent = true;
+    if (!parentConversationId && summary.parentConversationId && summary.parentConversationId !== directConvId) {
+      parentConversationId = summary.parentConversationId;
+    }
   }
 
   let resolvedWorkspaceLabel = base.workspaceLabel || "";
@@ -1079,10 +1566,19 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
     }
   }
 
+  const effectiveRootSessionId =
+    rootSessionId && rootSessionId !== directConvId
+      ? rootSessionId
+      : base.rootSessionId && base.rootSessionId !== directConvId
+        ? base.rootSessionId
+        : parentConversationId && parentConversationId !== directConvId
+          ? parentConversationId
+          : directConvId;
+
   const next = {
     ...base,
     conversationId: directConvId,
-    rootSessionId: rootSessionId || base.rootSessionId || directConvId,
+    rootSessionId: effectiveRootSessionId,
     parentConversationId:
       parentConversationId && parentConversationId !== directConvId
         ? parentConversationId

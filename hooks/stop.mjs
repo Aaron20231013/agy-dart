@@ -50,10 +50,16 @@ function resolveSessionId(payload = {}) {
   return (
     payload.rootConversationId ||
     payload.root_conversation_id ||
+    payload.common?.rootConversationId ||
+    payload.common?.root_conversation_id ||
     payload.parentConversationId ||
     payload.parent_conversation_id ||
+    payload.common?.parentConversationId ||
+    payload.common?.parent_conversation_id ||
     payload.conversationId ||
     payload.conversation_id ||
+    payload.common?.conversationId ||
+    payload.common?.conversation_id ||
     payload.sessionId ||
     payload.session_id ||
     process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
@@ -67,6 +73,8 @@ function resolveDirectConversationId(payload = {}) {
   return (
     payload.conversationId ||
     payload.conversation_id ||
+    payload.common?.conversationId ||
+    payload.common?.conversation_id ||
     payload.sessionId ||
     payload.session_id ||
     process.env.ANTIGRAVITY_CONVERSATION_ID ||
@@ -89,9 +97,16 @@ export async function handleStopPayload(payload = {}, options = {}) {
 
   let ownedStore = null;
   try {
-    const { readWatchdogLease, recordHookLeaseTransition, WATCHDOG_PHASES } = await import(
-      "../context/lib/watchdog-lease.js"
-    );
+    const {
+      detectSubagentFromTranscriptFile,
+      isHeadlessWorkerPrompt,
+      isSubagentLeasePayload,
+      lookupConversationSummary,
+      readWatchdogLease,
+      recordHookLeaseTransition,
+      resolveCandidateTranscriptPath,
+      WATCHDOG_PHASES
+    } = await import("../context/lib/watchdog-lease.js");
     let store = safeOptions.store || null;
     if (!store) {
       const { ContextModeStore } = await import("../context/lib/store.js");
@@ -113,21 +128,86 @@ export async function handleStopPayload(payload = {}, options = {}) {
         : effectiveCfg.ttlDesktopNotify
     );
     const cfgSnap = safeOptions.cfgSnapshot || getConfigSnapshot();
-    const ttlKeepaliveExplicit = Boolean(
-      cfgSnap.sources.ttlKeepalive !== "default"
-        ? cfgSnap.values.ttlKeepalive
-        : typeof store.getMeta === "function" && store.getMeta("cache:ttl_keepalive_enabled", null) === "true"
+    const sessionId = resolveSessionId(safePayload);
+    const existing = readWatchdogLease(store, directConvId);
+    const rawLastInput =
+      typeof (safePayload.lastUserInput ?? safePayload.last_user_input ?? safePayload.common?.lastUserInput) === "string"
+        ? String(safePayload.lastUserInput ?? safePayload.last_user_input ?? safePayload.common?.lastUserInput)
+        : "";
+    let detectedSubagent = Boolean(
+      safeOptions.isSubagent ||
+        existing?.isSubagent ||
+        (sessionId && sessionId !== "default" && sessionId !== directConvId) ||
+        isSubagentLeasePayload(safePayload) ||
+        isHeadlessWorkerPrompt(rawLastInput)
     );
+    let resolvedParentConvId = existing?.parentConversationId || "";
+    let resolvedSummaryTitle = "";
+    const allowDefaultSummaryDb =
+      Boolean(process.env.AGY_DART_SUMMARY_DB_PATH) ||
+      Boolean(safeOptions.summaryDbPath) ||
+      cfgSnap.sources.dbPath === "default";
+    let txPath =
+      existing?.transcriptPath ||
+      (typeof safePayload.transcriptPath === "string" && safePayload.transcriptPath.trim()) ||
+      (typeof safePayload.transcript_path === "string" && safePayload.transcript_path.trim()) ||
+      (typeof safePayload.common?.transcriptPath === "string" && safePayload.common.transcriptPath.trim()) ||
+      (typeof safePayload.common?.transcript_path === "string" && safePayload.common.transcript_path.trim()) ||
+      "";
+    if (!txPath && !detectedSubagent && !existing?.convTitle) {
+      txPath = resolveCandidateTranscriptPath(directConvId, {
+        summaryDbPath: safeOptions.summaryDbPath || "",
+        allowDefaultDb: allowDefaultSummaryDb
+      });
+    }
+    if (!detectedSubagent && !existing?.convTitle) {
+      if (allowDefaultSummaryDb || txPath) {
+        try {
+          const summary = lookupConversationSummary(directConvId, {
+            payload: safePayload,
+            transcriptPath: txPath,
+            summaryDbPath: safeOptions.summaryDbPath || "",
+            allowDefaultDb: allowDefaultSummaryDb,
+            checkSubagent: true
+          });
+          if (summary.isSubagent) detectedSubagent = true;
+          if (summary.parentConversationId && summary.parentConversationId !== directConvId) {
+            resolvedParentConvId = summary.parentConversationId;
+            detectedSubagent = true;
+          }
+          if (summary.title) resolvedSummaryTitle = summary.title;
+        } catch {}
+      }
+      if (!detectedSubagent && !resolvedSummaryTitle && txPath) {
+        try {
+          if (detectSubagentFromTranscriptFile(txPath)) {
+            detectedSubagent = true;
+          }
+        } catch {}
+      }
+    }
+    let ttlKeepaliveExplicit = false;
+    if (!detectedSubagent) {
+      if (cfgSnap.sources.ttlKeepalive === "env") {
+        ttlKeepaliveExplicit = Boolean(cfgSnap.values.ttlKeepalive);
+      } else {
+        const convKaState =
+          typeof store.getTtlKeepaliveState === "function" ? store.getTtlKeepaliveState(directConvId) : null;
+        if (convKaState && typeof convKaState.enabled === "boolean") {
+          ttlKeepaliveExplicit = convKaState.enabled;
+        } else if (cfgSnap.sources.ttlKeepalive !== "default") {
+          ttlKeepaliveExplicit = Boolean(cfgSnap.values.ttlKeepalive);
+        }
+      }
+    }
     const watermarkNotifyActive =
       effectiveCfg.watermarkDesktopNotify === true ||
       (effectiveCfg.watermarkDesktopNotify === null && ttlNotifyActive);
-    const existing = readWatchdogLease(store, directConvId);
     if (!watchdogActive && !ttlNotifyActive && !ttlKeepaliveExplicit && !watermarkNotifyActive) {
       if (!existing || existing.phase === WATCHDOG_PHASES.IDLE) {
         return { updated: false, reason: "disabled" };
       }
     }
-    const sessionId = resolveSessionId(safePayload);
     let stopModifiedPaths = [];
     if (
       existing?.cwd &&
@@ -145,8 +225,15 @@ export async function handleStopPayload(payload = {}, options = {}) {
     }
     const lease = recordHookLeaseTransition(store, "Stop", safePayload, {
       directConvId,
-      rootSessionId: sessionId,
-      cwd: safePayload.cwd || "",
+      rootSessionId:
+        sessionId && sessionId !== directConvId
+          ? sessionId
+          : resolvedParentConvId || sessionId,
+      parentConversationId: resolvedParentConvId,
+      isSubagent: detectedSubagent,
+      cwd: safePayload.cwd || safePayload.common?.cwd || "",
+      ...(txPath && !existing?.transcriptPath ? { transcriptPath: txPath } : {}),
+      ...(resolvedSummaryTitle ? { convTitle: resolvedSummaryTitle } : {}),
       ...(stopModifiedPaths.length > 0 ? { modifiedOrReadPaths: stopModifiedPaths } : {}),
       ...(safeOptions.stopReason !== undefined ? { stopReason: safeOptions.stopReason } : {}),
       ...(safeOptions.fullyIdle !== undefined ? { fullyIdle: safeOptions.fullyIdle } : {}),

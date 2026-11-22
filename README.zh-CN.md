@@ -8,9 +8,26 @@
 
 不用额外装依赖 · 装好自动在后台工作 · 自带右侧面板
 
-简体中文 · [English](README.md) · [怎么安装](#怎么安装) · [更新日志](#更新日志) · [开源致谢](THIRD_PARTY_NOTICES.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-10b981.svg)](LICENSE)
+[![Node.js >= 22](https://img.shields.io/badge/Node.js-%3E%3D22-38bdf8.svg)](package.json)
+[![Security Policy](https://img.shields.io/badge/Security-Policy-818cf8.svg)](SECURITY.md)
+[![Glama MCP](https://glama.ai/mcp/servers/zou172866/agy-dart/badge)](https://glama.ai/mcp/servers/zou172866/agy-dart)
+
+简体中文 · [English](README.md) · [怎么安装](#怎么安装) · [更新日志](#更新日志) · [安全说明](SECURITY.md) · [开源致谢](THIRD_PARTY_NOTICES.md)
 
 </div>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/architecture-light.svg" />
+    <img alt="agy-dart 架构示意图" src="assets/architecture-dark.svg" width="860" />
+  </picture>
+</p>
+
+<p align="center">
+  <img alt="开启 agy-dart 前后对比" src="assets/demo-comparison.svg" width="860" />
+</p>
 
 ---
 
@@ -39,8 +56,8 @@ AI 要搜好几个词时一次同时搜完，要改多个文件时一次改完�
 3. **大日志与大表格先在本地跑脚本筛选**：遇到几十 MB 的日志、CSV 或几万行 JSON，AI 可以在本地沙盒跑几行脚本先做统计（比如筛出报错最多的 5 个接口），只把算出来的结果发回对话；大 JSON 还会自动摘出报错的异常条。
 4. **新对话自动附带目录结构**：刚开对话时自动给出一份精简的项目目录、脚本和核心文件清单。
 5. **死循环提示**：AI 连续出现「改代码 → 报错 → 改回去 → 又报错」或反复调同一个工具没进展时，在聊天界面弹一行只给用户看的提示（不塞进模型上下文）。
-6. **密钥打码与敏感文件拦截**：日志或网页里的 API Key、口令自动打码；可拦截 AI 误读 `.env` 等配置文件。
-7. **单次返回卡在 8.8 KB 以内**：Antigravity 工具单次返回超过约 10 KB 会自动落成临时文件让 AI 多读一轮，插件把返回内容控制在 8.8 KB 内，一轮读完。
+6. **密钥打码、敏感文件与 Git 沙盒防护**：日志或网页里的 API Key、口令自动打码；可拦截 AI 误读 `.env` 等配置文件，并封堵陌生仓库 `.git/config` 挂载外部命令的入口。
+7. **单次返回卡在 8.8 KB 以内（智能匀配额）**：Antigravity 工具单次返回超过约 10 KB 会自动落成临时文件让 AI 多读一轮；插件把返回内容控制在 8.8 KB 内，并自动把短检查省下的空间让给真正报错的长堆栈。
 8. **面板细分统计与离线测算**：右侧面板能查看上下文花在读文件、终端输出还是子智能体上，以及最近 15 轮缓存命中走势和失效原因；可选开启大文件修改后只读改动行（默认关闭）；命令行支持拿历史记录测算缓存命中与自动续期账本。
 
 > Antigravity 官方更新很勤，可以点一下右上角 **Star** 方便跟进后续兼容更新。
@@ -51,7 +68,21 @@ AI 要搜好几个词时一次同时搜完，要改多个文件时一次改完�
 
 需要 **Node.js 22 或更高版本**（不用跑 `npm install`）。
 
-### 方法一：直接发给 Antigravity 装
+### 方法一：终端一行命令直装（免手动克隆）
+
+**Windows（PowerShell）：**
+
+```powershell
+irm https://raw.githubusercontent.com/zou172866/agy-dart/main/install.ps1 | iex
+```
+
+**macOS / Linux：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zou172866/agy-dart/main/install.sh | sh
+```
+
+### 方法二：直接发给 Antigravity 装
 
 复制这句发给 Antigravity：
 
@@ -59,37 +90,29 @@ AI 要搜好几个词时一次同时搜完，要改多个文件时一次改完�
 请将 https://github.com/zou172866/agy-dart.git 克隆到临时目录，运行其中的 scripts/install.mjs install 完成全局安装并跑 doctor 自检（Windows 如未安装 rg 请同时传 --install-rg）。
 ```
 
-### 方法二：命令行安装
-
-**Windows（PowerShell）：**
+### 方法三：克隆仓库自定义安装
 
 ```powershell
 git clone https://github.com/zou172866/agy-dart.git
 cd agy-dart
 
-.\install.ps1
-# 顺手装上快速搜索工具 rg（推荐）
+# Windows PowerShell（加 -InstallRg 可顺手自动安装快速搜索工具 rg）
 .\install.ps1 -InstallRg
-```
 
-**macOS / Linux：**
-
-```bash
-git clone https://github.com/zou172866/agy-dart.git
-cd agy-dart
+# macOS / Linux
 ./install.sh
 ```
 
 **其他命令：**
 
 ```bash
-node scripts/install.mjs install                     # 全局安装
+node scripts/install.mjs install                     # 全局安装（若本机存在 GEMINI_HOME 或 T3 ACP 目录会自动同步）
 node scripts/install.mjs install --project /项目路径  # 只装到单个项目
 node scripts/install.mjs doctor                      # 检查安装状态
 node scripts/install.mjs uninstall                   # 卸载
 ```
 
-装完重启或刷新一下 Antigravity 窗口，新开对话生效。以前单独装过 `agy-fast` 或 `antigravity-plugin-context-mode` 的话，去插件列表关掉旧的。
+装完重启或刷新一下 Antigravity 窗口，新开对话生效。升级重装时会自动保留插件目录下你自建的 `rules/*.local.md`。以前单独装过 `agy-fast` 或 `antigravity-plugin-context-mode` 的话，去插件列表关掉旧的。
 
 ---
 
@@ -97,23 +120,34 @@ node scripts/install.mjs uninstall                   # 卸载
 
 平时不用管。想改设置直接点右侧边栏 **agy-dart Context** 面板，可以开关自动续期、桌面提醒、暂停保护、清理本地旧记录，或改文件大小限制。
 
-也可以用命令切档位：
+也可以用命令切拦截档位与工具加载方式：
 
 ```bash
-node scripts/install.mjs mode host-45k      # 默认：普通代码 45 KB、补丁 128 KB 内直读，大日志超 16 KB 拦截
-node scripts/install.mjs mode balanced-16k  # 超过 16 KB 先看目录挑重点读
-node scripts/install.mjs mode fast-32k      # 普通文件放宽到 32 KB
-node scripts/install.mjs mode strict-8k     # 超过 8 KB 拦截
-node scripts/install.mjs mode no-read-hook  # 读文件不拦，只拦终端刷屏大日志
+node scripts/install.mjs mode host-45k              # 默认：普通代码 45 KB、补丁 128 KB 内直读，大日志超 16 KB 拦截
+node scripts/install.mjs mode balanced-16k          # 超过 16 KB 先看目录挑重点读
+node scripts/install.mjs mode fast-32k              # 普通文件放宽到 32 KB
+node scripts/install.mjs mode strict-8k             # 超过 8 KB 拦截
+node scripts/install.mjs mode no-read-hook          # 读文件不拦，只拦终端刷屏大日志
+
+node scripts/install.mjs tool-loading fast-eager    # 默认：4 个高频 fast 工具直连预载，8 个 context 工具按需懒加载
+node scripts/install.mjs tool-loading lazy          # 12 个工具全部按需懒加载
+node scripts/install.mjs tool-loading eager         # 12 个工具全部预载
 ```
 
 ---
 
 ## 更新日志
 
+### v1.6.0
+- **跨目录钩子启动与 Desktop 2.0 防误改守卫**：修复 Windows / CLI 在任意项目目录下触发钩子时的路径漂移；双 MCP 服务支持按需查询 `roots/list`，省略 `cwd` 落入插件安装目录时立即拦截报错，防止误搜或误改插件自身文件。
+- **默认 `fast-eager` 预载与坏参自愈**：默认开启 4 个高频 `fast` 工具预载（可用 `--tool-loading` 切换），兼容字符串化 `edits` 参数，遇到宿主 `call_mcp_tool` 空数组损坏时自动熔断引导改用原生编辑工具。
+- **扁平 `lineRanges` 与动态配额匀水**：`read_slices` 支持 `"path:10-50,80-120"` 简写（兼容 `E:\work\foo.mjs:1-60` 盘符路径）；`run_checks` 与多文件目录提取会自动把短项省下的字数额度让给长报错堆栈和大文件。
+- **Git 只读沙盒、`170s` 预算封顶与一键免克隆安装**：封堵陌生仓库 `.git/config` 挂载外部 diff/GPG/textconv 命令及 `status -v`；单次 MCP 检查共享 `170s` 时钟上限避开宿主 `180s` 强杀；修复 Windows 退出管道卡死；升级保留 `rules/*.local.md`，支持 `irm | iex` 一行直装及 T3 ACP / `GEMINI_HOME` 自动同步。
+- **单会话吸顶续温气泡与细节打磨**：吸顶栏按当前对话独立控制缓存续温次数，严密跳过后台子智能体与批处理任务，并补齐中英文界面细节。
+
 ### v1.5.4
 - **点击提醒直达对应会话**：点右下角弹窗或右侧面板里的跨窗口告警，自动切出对应项目窗口并跳进那段对话；面板新增多窗口会话切换栏。
-- **缓存自动续期**：缓存快到期前自动发轻量信号延长热度，面板顶部可按对话独立开关、调次数（默认最多 3 次，发新消息归零）。
+- **缓存自动续期**：主对话缓存快到期前自动发轻量信号延长热度（自动跳过后台子智能体与批处理任务），面板顶部可按对话独立开关、调次数（默认最多 3 次，发新消息归零）。
 - 把当前上下文用量、缓存倒计时和已拦废话量放大移到面板第一栏。
 
 ### v1.5.3

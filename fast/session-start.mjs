@@ -184,19 +184,36 @@ var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
 ]);
 
 // src/utils/snapshot.ts
+var SAFE_GIT_CONFIG_ARGS = Object.freeze([
+  "--no-optional-locks",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "core.hooksPath=",
+  "-c",
+  "diff.external=",
+  "-c",
+  "gpg.program=false",
+  "-c",
+  "gpg.openpgp.program=false",
+  "-c",
+  "gpg.ssh.program=false",
+  "-c",
+  "gpg.x509.program=false"
+]);
 async function getGitSummary(workspaceDir, timeoutMs) {
   const [branchRes, statusRes, logRes] = await Promise.all([
-    execBinaryAsync("git", ["--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD"], {
+    execBinaryAsync("git", [...SAFE_GIT_CONFIG_ARGS, "rev-parse", "--abbrev-ref", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 4096
     }),
-    execBinaryAsync("git", ["--no-optional-locks", "status", "--porcelain=v1"], {
+    execBinaryAsync("git", [...SAFE_GIT_CONFIG_ARGS, "status", "--porcelain=v1"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 32768
     }),
-    execBinaryAsync("git", ["--no-optional-locks", "log", "-n", "3", "--format=%h %s"], {
+    execBinaryAsync("git", [...SAFE_GIT_CONFIG_ARGS, "log", "--no-ext-diff", "--no-textconv", "-n", "3", "--format=%h %s"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 8192
@@ -204,7 +221,7 @@ async function getGitSummary(workspaceDir, timeoutMs) {
   ]);
   let symRefRes = { error: true, exitCode: 1, stdout: "" };
   if ((branchRes.error || branchRes.exitCode !== 0) && !statusRes.error && statusRes.exitCode === 0) {
-    symRefRes = await execBinaryAsync("git", ["--no-optional-locks", "symbolic-ref", "--short", "HEAD"], {
+    symRefRes = await execBinaryAsync("git", [...SAFE_GIT_CONFIG_ARGS, "symbolic-ref", "--short", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 4096

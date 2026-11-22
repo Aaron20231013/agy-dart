@@ -1,9 +1,75 @@
 // agy-fast MCP Stdio Server (bundled zero-dependency ESM)
 import fsSyncNode from "node:fs";
+import pathNodeTop from "node:path";
+import { performance as perfNode } from "node:perf_hooks";
+import { fileURLToPath as fileURLToPathTop } from "node:url";
 import { enableVersionedCompileCache } from "../hooks/compile-cache.mjs";
 import { getEffectiveConfig } from "../context/lib/config.js";
 import { detectSensitiveFile, redactSecrets } from "../context/lib/security.js";
 import { stableSortObject } from "../context/lib/stable-json.js";
+const FAST_SELF_PATH = pathNodeTop.resolve(fileURLToPathTop(import.meta.url));
+const FAST_PLUGIN_ROOT = pathNodeTop.resolve(pathNodeTop.dirname(FAST_SELF_PATH), "..");
+const IS_INSTALLED_FAST_PLUGIN_COPY = !fsSyncNode.existsSync(pathNodeTop.join(FAST_PLUGIN_ROOT, ".git"));
+const INSTALLED_PLUGIN_PATH_RE =
+  /\/(?:\.gemini\/(?:config|antigravity)\/plugins|\.agents\/plugins|\.t3\/userdata\/providers\/antigravity\/[^/]+\/(?:\.gemini\/config\/)?plugins)\/agy-dart(?:\/|$)/i;
+const MAX_MCP_CALL_BUDGET_SEC = 170;
+const MAX_MCP_CALL_BUDGET_MS = MAX_MCP_CALL_BUDGET_SEC * 1e3;
+
+function normalizeCompareDirFast(dirPath) {
+  let resolved = pathNodeTop.resolve(String(dirPath || ""));
+  try {
+    resolved = fsSyncNode.realpathSync(resolved);
+  } catch {}
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isSameOrSubDirFast(candidateNorm, parentNorm) {
+  if (!candidateNorm || !parentNorm) return false;
+  const rel = pathNodeTop.relative(parentNorm, candidateNorm);
+  return (
+    rel === "" ||
+    (rel !== ".." &&
+      !rel.startsWith(`..${pathNodeTop.sep}`) &&
+      !rel.startsWith("../") &&
+      !pathNodeTop.isAbsolute(rel))
+  );
+}
+
+const FAST_PLUGIN_ROOT_NORM = normalizeCompareDirFast(FAST_PLUGIN_ROOT);
+
+function isInsideInstalledPluginDir(candidateDir) {
+  if (typeof candidateDir !== "string" || !candidateDir.trim()) return false;
+  const candNorm = normalizeCompareDirFast(candidateDir);
+  const candPosix = candNorm.replace(/\\/g, "/");
+  if (INSTALLED_PLUGIN_PATH_RE.test(candPosix)) return true;
+  for (const envVar of [process.env.PLUGIN_ROOT, process.env.AGY_PLUGIN_ROOT]) {
+    if (typeof envVar === "string" && envVar.trim()) {
+      if (isSameOrSubDirFast(candNorm, normalizeCompareDirFast(envVar.trim()))) return true;
+    }
+  }
+  if (IS_INSTALLED_FAST_PLUGIN_COPY && isSameOrSubDirFast(candNorm, FAST_PLUGIN_ROOT_NORM)) {
+    return true;
+  }
+  return false;
+}
+
+function resolveDirectoryCandidateFast(raw) {
+  if (typeof raw !== "string") return null;
+  let candidate = raw.trim();
+  if (!candidate) return null;
+  if (/^file:\/\//i.test(candidate)) {
+    try {
+      candidate = fileURLToPathTop(candidate);
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const abs = pathNodeTop.resolve(candidate);
+    if (fsSyncNode.statSync(abs).isDirectory()) return abs;
+  } catch {}
+  return null;
+}
 let isSafeRegex = (pattern) => typeof pattern === "string" && pattern.length <= 512;
 try {
   const filterRulesMod = await import("../hooks/filter-rules.mjs");
@@ -91,12 +157,93 @@ var McpStdioServer = class {
   inFlight = 0;
   stdinEnded = false;
   onDrainExit;
+  initWorkspaceRoot = null;
+  clientSupportsRoots = false;
+  cachedRootsDir = null;
+  rootsQueried = false;
+  inFlightRootsPromise = null;
+  pendingClientRequests = /* @__PURE__ */ new Map();
+  nextClientReqSeq = 1;
+  writeClientRequest = null;
+  lastUseContentLength = false;
   constructor(options) {
     this.serverName = options.name;
     this.serverVersion = options.version;
+    const envWs =
+      resolveDirectoryCandidateFast(process.env.ANTIGRAVITY_WORKSPACE_ROOT) ||
+      resolveDirectoryCandidateFast(process.env.VSCODE_CWD);
+    if (envWs && !isInsideInstalledPluginDir(envWs)) {
+      this.initWorkspaceRoot = envWs;
+    }
   }
   registerTool(definition, handler) {
     this.tools.set(definition.name, { definition, handler });
+  }
+  cancelPendingClientRequests() {
+    for (const [, pending] of this.pendingClientRequests) {
+      clearTimeout(pending.timer);
+      pending.resolve(null);
+    }
+    this.pendingClientRequests.clear();
+  }
+  requestRootsList(timeoutMs = 1e3) {
+    if (this.stdinEnded || !this.writeClientRequest) {
+      return Promise.resolve(null);
+    }
+    if (this.inFlightRootsPromise) {
+      return this.inFlightRootsPromise;
+    }
+    this.inFlightRootsPromise = new Promise((resolve) => {
+      const reqId = `agy-fast-roots-${this.nextClientReqSeq++}`;
+      const timer = setTimeout(() => {
+        this.pendingClientRequests.delete(reqId);
+        resolve(null);
+      }, timeoutMs);
+      timer.unref();
+      this.pendingClientRequests.set(reqId, {
+        timer,
+        resolve: (respMsg) => {
+          clearTimeout(timer);
+          const roots = respMsg?.result?.roots;
+          if (Array.isArray(roots)) {
+            for (const item of roots) {
+              const candidate = resolveDirectoryCandidateFast(item?.uri || item?.path);
+              if (candidate) {
+                resolve(candidate);
+                return;
+              }
+            }
+          }
+          resolve(null);
+        }
+      });
+      this.writeClientRequest({ jsonrpc: "2.0", id: reqId, method: "roots/list" });
+    }).finally(() => {
+      this.inFlightRootsPromise = null;
+    });
+    return this.inFlightRootsPromise;
+  }
+  async resolveWorkspaceRoot() {
+    if (this.initWorkspaceRoot) {
+      return { dir: this.initWorkspaceRoot, confirmed: true };
+    }
+    if (this.rootsQueried) {
+      return this.cachedRootsDir
+        ? { dir: this.cachedRootsDir, confirmed: true }
+        : { dir: process.cwd(), confirmed: false };
+    }
+    const shouldQuery = Boolean(
+      this.writeClientRequest &&
+        !this.stdinEnded &&
+        (this.clientSupportsRoots || isInsideInstalledPluginDir(process.cwd()))
+    );
+    if (!shouldQuery) {
+      return { dir: process.cwd(), confirmed: false };
+    }
+    const dir = await this.requestRootsList(1e3);
+    this.rootsQueried = true;
+    this.cachedRootsDir = dir;
+    return dir ? { dir, confirmed: true } : { dir: process.cwd(), confirmed: false };
   }
   async handleMessage(raw) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -110,7 +257,24 @@ var McpStdioServer = class {
     const hasId = Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== void 0;
     const id = hasId ? msg.id ?? null : null;
     const method = typeof msg.method === "string" ? msg.method : "";
+    if (
+      hasId &&
+      !method &&
+      (Object.prototype.hasOwnProperty.call(msg, "result") ||
+        Object.prototype.hasOwnProperty.call(msg, "error"))
+    ) {
+      const pending = this.pendingClientRequests.get(String(id));
+      if (pending) {
+        this.pendingClientRequests.delete(String(id));
+        pending.resolve(msg);
+      }
+      return null;
+    }
     if (!hasId) {
+      if (method === "notifications/roots/list_changed") {
+        this.cachedRootsDir = null;
+        this.rootsQueried = false;
+      }
       return null;
     }
     if (!method) {
@@ -121,6 +285,21 @@ var McpStdioServer = class {
       };
     }
     if (method === "initialize") {
+      this.clientSupportsRoots = Boolean(
+        msg.params?.capabilities &&
+          typeof msg.params.capabilities === "object" &&
+          msg.params.capabilities.roots
+      );
+      const wsFolder = Array.isArray(msg.params?.workspaceFolders)
+        ? msg.params.workspaceFolders[0]?.uri
+        : null;
+      const initDir =
+        resolveDirectoryCandidateFast(wsFolder) ||
+        resolveDirectoryCandidateFast(msg.params?.rootUri) ||
+        resolveDirectoryCandidateFast(msg.params?.rootPath);
+      if (initDir) {
+        this.initWorkspaceRoot = initDir;
+      }
       const requested = typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion.trim() : "";
       const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : DEFAULT_PROTOCOL_VERSION;
       return {
@@ -167,9 +346,38 @@ var McpStdioServer = class {
         };
       }
       const rawArgs = msg.params?.arguments;
-      const args = rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs) ? rawArgs : {};
+      let args = {};
+      if (rawArgs !== void 0 && rawArgs !== null) {
+        if (typeof rawArgs === "string") {
+          try {
+            const parsedArgs = JSON.parse(rawArgs);
+            if (!parsedArgs || typeof parsedArgs !== "object" || Array.isArray(parsedArgs)) {
+              return {
+                jsonrpc: "2.0",
+                id,
+                error: { code: -32602, message: "Invalid params: 'arguments' must decode to a JSON object" }
+              };
+            }
+            args = parsedArgs;
+          } catch {
+            return {
+              jsonrpc: "2.0",
+              id,
+              error: { code: -32602, message: "Invalid params: 'arguments' string is not valid JSON" }
+            };
+          }
+        } else if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+          args = rawArgs;
+        } else {
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: { code: -32602, message: "Invalid params: 'arguments' must be a JSON object" }
+          };
+        }
+      }
       try {
-        const res = await tool.handler(args);
+        const res = await tool.handler(args, { server: this });
         return buildBoundedToolRpcResponse(id, res.text, Boolean(res.isError), DEFAULT_INLINE_MAX_BYTES);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -187,17 +395,23 @@ var McpStdioServer = class {
     let buffer = Buffer.alloc(0);
     const writeResponse = (payload, useContentLength) => {
       const serialized = JSON.stringify(payload);
-      if (useContentLength) {
-        const len = Buffer.byteLength(serialized, "utf8");
-        output.write(`Content-Length: ${len}\r
+      try {
+        if (useContentLength) {
+          const len = Buffer.byteLength(serialized, "utf8");
+          output.write(`Content-Length: ${len}\r
 \r
 ${serialized}`);
-      } else {
-        output.write(`${serialized}
+        } else {
+          output.write(`${serialized}
 `);
-      }
+        }
+      } catch {}
+    };
+    this.writeClientRequest = (reqPayload) => {
+      writeResponse(reqPayload, this.lastUseContentLength);
     };
     const dispatchRawJson = (jsonText, useContentLength) => {
+      this.lastUseContentLength = Boolean(useContentLength);
       let parsed;
       try {
         parsed = JSON.parse(jsonText);
@@ -210,6 +424,19 @@ ${serialized}`);
           },
           useContentLength
         );
+        return;
+      }
+      // Fast-flush client responses immediately before counting/queuing batch requests to prevent self-deadlocks
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        Object.prototype.hasOwnProperty.call(parsed, "id") &&
+        !parsed.method &&
+        (Object.prototype.hasOwnProperty.call(parsed, "result") ||
+          Object.prototype.hasOwnProperty.call(parsed, "error"))
+      ) {
+        this.handleMessage(parsed).catch(() => {});
         return;
       }
       this.inFlight += 1;
@@ -337,12 +564,14 @@ ${serialized}`);
         dispatchRawJson(remaining, false);
       }
       this.stdinEnded = true;
+      this.cancelPendingClientRequests();
       if (this.inFlight === 0) {
         this.onDrainExit?.();
       }
     });
     input.on("error", () => {
       this.stdinEnded = true;
+      this.cancelPendingClientRequests();
       if (this.inFlight === 0) {
         this.onDrainExit?.();
       }
@@ -556,9 +785,38 @@ function expandHome(inputPath) {
   return inputPath;
 }
 function resolvePath(inputPath, baseDir) {
-  const expanded = expandHome(inputPath.trim());
+  let raw = inputPath.trim();
+  if (/^file:\/\//i.test(raw)) {
+    try {
+      raw = fileURLToPathTop(raw);
+    } catch {}
+  }
+  const expanded = expandHome(raw);
   const root = baseDir ? path.resolve(expandHome(baseDir)) : process.cwd();
   return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(root, expanded);
+}
+async function resolveToolWorkspaceCwd(rawCwd, server) {
+  let rawStr = typeof rawCwd === "string" ? rawCwd.trim() : "";
+  if (rawStr && /^file:\/\//i.test(rawStr)) {
+    try {
+      rawStr = fileURLToPathTop(rawStr);
+    } catch {}
+  }
+  const expandedRaw = rawStr ? expandHome(rawStr) : "";
+  if (expandedRaw && path.isAbsolute(expandedRaw)) {
+    return { cwd: path.normalize(expandedRaw), error: null };
+  }
+  const { dir: baseRoot, confirmed } = server
+    ? await server.resolveWorkspaceRoot()
+    : { dir: process.cwd(), confirmed: false };
+  const resolved = expandedRaw ? resolvePath(expandedRaw, baseRoot) : resolvePath(baseRoot);
+  if (!confirmed && isInsideInstalledPluginDir(resolved)) {
+    return {
+      cwd: null,
+      error: `Error: Workspace root could not be determined (server cwd is inside plugin directory '${resolved}'). Pass the active workspace absolute path in 'cwd'.`
+    };
+  }
+  return { cwd: resolved, error: null };
 }
 function toPosixPath(p) {
   return p.split(path.sep).join("/");
@@ -1388,24 +1646,60 @@ async function commitPlannedWrites(plans) {
     throw err;
   }
 }
-async function runApplyEdits(input) {
-  if (!Array.isArray(input.edits) || input.edits.length === 0) {
+async function runApplyEdits(input, options = {}) {
+  const callDeadline = perfNode.now() + (options.budgetMs ?? MAX_MCP_CALL_BUDGET_MS);
+  let editsList = input.edits;
+  if (typeof editsList === "string") {
+    const trimmed = editsList.trim();
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!Array.isArray(parsed)) {
+        return {
+          text: "Error: 'edits' JSON string must decode to a non-empty array of file edit objects.",
+          isError: true
+        };
+      }
+      editsList = parsed;
+    } catch (err) {
+      return {
+        text: `Error: 'edits' must be an array or valid JSON array string (${err instanceof Error ? err.message : String(err)}).`,
+        isError: true
+      };
+    }
+  }
+  if (!Array.isArray(editsList)) {
     return {
       text: "Error: 'edits' must be a non-empty array of file edit objects.",
       isError: true
     };
   }
-  if (input.edits.length > 50) {
+  const hasCorruptedElement =
+    editsList.length === 0 ||
+    editsList.some((entry) => entry === null || typeof entry !== "object" || Array.isArray(entry));
+  if (hasCorruptedElement) {
+    return {
+      text:
+        "Error [HOST_SERIALIZATION_CORRUPTION]: 'edits' must be a non-empty array of file edit objects, " +
+        "but arrived empty or with corrupted non-object elements (known Antigravity call_mcp_tool nested-array serialization bug). " +
+        "Do NOT retry apply_edits in this turn — immediately fall back to built-in parallel edit_file / write_file calls.",
+      isError: true
+    };
+  }
+  if (editsList.length > 50) {
     return {
       text: "Error: 'edits' supports at most 50 file entries per call.",
       isError: true
     };
   }
-  const baseCwd = resolvePath(input.cwd || process.cwd());
+  const wsRes = await resolveToolWorkspaceCwd(input.cwd, options.server);
+  if (wsRes.error) {
+    return { text: wsRes.error, isError: true };
+  }
+  const baseCwd = wsRes.cwd;
   const mergedByPath = /* @__PURE__ */ new Map();
   const errors = [];
-  for (let i = 0; i < input.edits.length; i++) {
-    const entry = input.edits[i];
+  for (let i = 0; i < editsList.length; i++) {
+    const entry = editsList[i];
     if (!entry || typeof entry.path !== "string" || !entry.path.trim()) {
       errors.push(`edits[${i}]: 'path' must be a non-empty string`);
       continue;
@@ -1634,37 +1928,46 @@ ${summaryLines.join("\n")}`];
     const verifySpec = typeof input.verify === "string" ? { command: input.verify } : input.verify;
     if (verifySpec.command && verifySpec.command.trim()) {
       const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
-      const timeoutMs = clampIntWithDefault(
-        verifySpec.timeoutSec ?? input.verifyTimeoutSec,
-        60,
-        1,
-        300
-      ) * 1e3;
-      const maxVerifyChars = clampIntWithDefault(
-        input.maxVerifyChars,
-        4e3,
-        300,
-        7500
-      );
-      const res = await runShellCommandAsync(verifySpec.command, {
-        cwd: verifyCwd,
-        timeoutMs
-      });
-      BATCH_SEARCH_CACHE.clear();
-      const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
-      const formatted = formatCompactCommandOutput({
-        stdout: res.stdout,
-        stderr: res.stderr,
-        exitCode: res.exitCode,
-        timedOut: res.timedOut,
-        error: res.error,
-        maxChars: maxVerifyChars
-      });
-      parts.push(
-        `
+      const requestedTimeoutMs =
+        clampIntWithDefault(
+          verifySpec.timeoutSec ?? input.verifyTimeoutSec,
+          60,
+          1,
+          MAX_MCP_CALL_BUDGET_SEC
+        ) * 1e3;
+      const remainingMs = callDeadline - perfNode.now();
+      if (remainingMs < 500) {
+        parts.push(
+          `\nVerify [NOT RUN: ${MAX_MCP_CALL_BUDGET_SEC}s MCP call budget exhausted] \`${verifySpec.command}\``
+        );
+      } else {
+        const timeoutMs = Math.max(100, Math.min(requestedTimeoutMs, Math.floor(remainingMs)));
+        const maxVerifyChars = clampIntWithDefault(
+          input.maxVerifyChars,
+          4e3,
+          300,
+          7500
+        );
+        const res = await runShellCommandAsync(verifySpec.command, {
+          cwd: verifyCwd,
+          timeoutMs
+        });
+        BATCH_SEARCH_CACHE.clear();
+        const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
+        const formatted = formatCompactCommandOutput({
+          stdout: res.stdout,
+          stderr: res.stderr,
+          exitCode: res.exitCode,
+          timedOut: res.timedOut,
+          error: res.error,
+          maxChars: maxVerifyChars
+        });
+        parts.push(
+          `
 Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
 ${formatted}`
-      );
+        );
+      }
     }
   }
   const outText = parts.join("\n");
@@ -1688,6 +1991,23 @@ var READONLY_GIT_SUBCOMMANDS = /* @__PURE__ */ new Set([
   "describe",
   "tag",
   "remote"
+]);
+var SAFE_GIT_CONFIG_ARGS = Object.freeze([
+  "--no-optional-locks",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "core.hooksPath=",
+  "-c",
+  "diff.external=",
+  "-c",
+  "gpg.program=false",
+  "-c",
+  "gpg.openpgp.program=false",
+  "-c",
+  "gpg.ssh.program=false",
+  "-c",
+  "gpg.x509.program=false"
 ]);
 var FORBIDDEN_GIT_GLOBAL_FLAGS = /* @__PURE__ */ new Set([
   "-c",
@@ -1836,10 +2156,24 @@ function validateReadonlyGitArgs(pattern) {
     const flagName = arg.includes("=") ? arg.slice(0, arg.indexOf("=")) : arg;
     if (
       FORBIDDEN_GIT_GLOBAL_FLAGS.has(flagName) ||
+      flagName.startsWith("--ext") ||
+      flagName.startsWith("--textc") ||
       arg.startsWith("--output=") ||
       (!isSortOrFormatVal && arg.startsWith("-c") && arg.length > 2)
     ) {
       throw new Error(`Flag '${arg}' is not allowed in read-only git query`);
+    }
+  }
+  if (subcmd === "status") {
+    for (const arg of rest) {
+      if (arg === "--") break;
+      if (
+        arg === "--verbose" ||
+        arg.startsWith("--verbose=") ||
+        (arg.startsWith("-") && !arg.startsWith("--") && arg.slice(1).includes("v"))
+      ) {
+        throw new Error(`Flag '${arg}' is not allowed in read-only git status query`);
+      }
     }
   }
   if (subcmd === "branch") {
@@ -2002,8 +2336,11 @@ function validateReadonlyGitArgs(pattern) {
       if (showIdx !== -1) rest.splice(showIdx + 1, 0, "-n");
     }
   }
-  if (subcmd === "diff" || subcmd === "log" || subcmd === "show") {
+  if (subcmd === "diff" || subcmd === "log" || subcmd === "show" || subcmd === "shortlog") {
     return ["--no-pager", subcmd, "--no-ext-diff", "--no-textconv", ...rest];
+  }
+  if (subcmd === "blame") {
+    return ["--no-pager", subcmd, "--no-textconv", ...rest];
   }
   return ["--no-pager", subcmd, ...rest];
 }
@@ -2415,7 +2752,7 @@ async function runGitQuery(query, searchRoot) {
   const gitArgs = validateReadonlyGitArgs(query.pattern);
   const res = await execBinaryAsync(
     "git",
-    ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=", ...gitArgs],
+    [...SAFE_GIT_CONFIG_ARGS, ...gitArgs],
     {
       cwd: searchRoot,
       timeoutMs: 1e4,
@@ -2751,7 +3088,11 @@ async function runBatchSearch(input, options = {}) {
       isError: true
     };
   }
-  const baseCwd = resolvePath(input.cwd || process.cwd());
+  const wsRes = await resolveToolWorkspaceCwd(input.cwd, options.server);
+  if (wsRes.error) {
+    return { text: wsRes.error, isError: true };
+  }
+  const baseCwd = wsRes.cwd;
   try {
     const st = await fs3.stat(baseCwd);
     if (!st.isDirectory()) {
@@ -4607,6 +4948,113 @@ async function invalidateFileCaches(absPaths) {
 }
 var SLICE_TRUNCATION_TIP = "\n[tip: MCP responses are hard-capped <=8.8KB inline; for >150 lines across files, use parallel read_file(StartLine, EndLine) (46KB/call, 0 remote check)]";
 var OUTLINE_BATCH_TIP = "\n[tip: outlining >20 files splits the 8.8KB cap thinly; batch 10-20 files per call for fuller outlines]";
+function computeWaterFillBudgets(itemLengths, totalBudget, _minFloor = 160) {
+  if (!Array.isArray(itemLengths) || itemLengths.length === 0) return [];
+  const n = itemLengths.length;
+  const cap = Math.max(0, Math.floor(Number(totalBudget) || 0));
+  const lens = itemLengths.map((v) => {
+    const num = Number(v);
+    return Number.isFinite(num) && num > 0 ? Math.floor(num) : 0;
+  });
+  const totalLen = lens.reduce((acc, v) => acc + v, 0);
+  if (totalLen <= cap) {
+    return [...lens];
+  }
+  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => lens[a] - lens[b] || a - b);
+  const budgets = new Array(n).fill(0);
+  let remainingBudget = cap;
+  let remainingCount = n;
+  for (let k = 0; k < n; k++) {
+    const idx = order[k];
+    const fair = Math.floor(remainingBudget / remainingCount);
+    if (lens[idx] <= fair) {
+      budgets[idx] = lens[idx];
+      remainingBudget -= lens[idx];
+      remainingCount -= 1;
+    } else {
+      const base = Math.floor(remainingBudget / remainingCount);
+      const extra = remainingBudget - base * remainingCount;
+      const tailIndices = order.slice(k).sort((a, b) => a - b);
+      for (let m = 0; m < tailIndices.length; m++) {
+        budgets[tailIndices[m]] = base + (m < extra ? 1 : 0);
+      }
+      break;
+    }
+  }
+  return budgets;
+}
+function parseFlatLineRangeSpec(rawSpec) {
+  if (typeof rawSpec !== "string" || !rawSpec.trim()) {
+    throw new Error("lineRanges entry must be a non-empty string in 'path:start-end[,start2-end2]' format");
+  }
+  const trimmed = rawSpec.trim();
+  const match = /^(.*):\s*(\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*)$/.exec(trimmed);
+  if (!match || !match[1] || !match[1].trim()) {
+    throw new Error(`Invalid lineRanges entry '${trimmed}': expected 'path:start-end[,start2-end2]'`);
+  }
+  const filePath = match[1].trim();
+  if (process.platform === "win32" && /^[A-Za-z]$/.test(filePath)) {
+    throw new Error(`Invalid lineRanges entry '${trimmed}': missing file path after Windows drive letter`);
+  }
+  const ranges = match[2].split(",").map((part) => {
+    const seg = part.trim();
+    const dashIdx = seg.indexOf("-");
+    if (dashIdx === -1) {
+      const lineNum = Number.parseInt(seg, 10);
+      return [lineNum, lineNum];
+    }
+    const start = Number.parseInt(seg.slice(0, dashIdx).trim(), 10);
+    const end = Number.parseInt(seg.slice(dashIdx + 1).trim(), 10);
+    return [start, end];
+  });
+  return { path: filePath, ranges };
+}
+function formatSymbolLine(s) {
+  const indent = "  ".repeat(s.depth);
+  const span = s.endLine > s.startLine ? `L${s.startLine}-L${s.endLine}` : `L${s.startLine}`;
+  return `${indent}${span} [${s.kind}] ${s.name}`;
+}
+function renderOutlineWithinBudget(relPath, lineCount, symbols, charBudget, totalOutlinesCount) {
+  const header = `## Outline: ${relPath} (${lineCount} lines)`;
+  if (symbols.length === 0) {
+    return `${header}\n(no top-level symbols detected)`;
+  }
+  const maxHardSymbols = 160;
+  const candidatePool = selectOutlineSymbols(symbols, maxHardSymbols);
+  const formatPicked = (picked) => {
+    const formatted = picked.map(formatSymbolLine);
+    const omitted = symbols.length - picked.length;
+    const extra =
+      omitted > 0
+        ? totalOutlinesCount > 10
+          ? `\n... (+${omitted} more symbols)`
+          : `\n... (${omitted} more symbols omitted; outline this file alone for full list)`
+        : "";
+    return `${header}\n${formatted.join("\n")}${extra}`;
+  };
+  const fullRendered = formatPicked(candidatePool);
+  if (charBudget === null || fullRendered.length <= charBudget) {
+    return fullRendered;
+  }
+  const effBudget = Math.max(160, charBudget);
+  const priorityOrder = [
+    ...candidatePool.map((s, idx) => ({ s, idx })).filter((x) => x.s.depth === 0),
+    ...candidatePool.map((s, idx) => ({ s, idx })).filter((x) => x.s.depth > 0)
+  ];
+  const chosenIndices = [];
+  let runningChars = header.length + 1 + 64;
+  for (const item of priorityOrder) {
+    const lineLen = formatSymbolLine(item.s).length + 1;
+    if (chosenIndices.length > 0 && runningChars + lineLen > effBudget) {
+      continue;
+    }
+    chosenIndices.push(item.idx);
+    runningChars += lineLen;
+  }
+  chosenIndices.sort((a, b) => a - b);
+  const picked = chosenIndices.map((idx) => candidatePool[idx]);
+  return formatPicked(picked);
+}
 function selectOutlineSymbols(symbols, limit) {
   if (symbols.length <= limit) return symbols;
   const keptIndices = /* @__PURE__ */ new Set();
@@ -4618,12 +5066,31 @@ function selectOutlineSymbols(symbols, limit) {
   }
   return [...keptIndices].sort((a, b) => a - b).map((idx) => symbols[idx]);
 }
-async function runReadSlices(input) {
+async function runReadSlices(input, options = {}) {
   const outlines = Array.isArray(input.outlines) ? input.outlines : [];
-  const slices = Array.isArray(input.slices) ? input.slices : [];
+  const rawSlices = Array.isArray(input.slices) ? input.slices : [];
+  const rawLineRanges = Array.isArray(input.lineRanges) ? input.lineRanges : [];
+  if (rawLineRanges.length > MAX_SLICE_FILES) {
+    return {
+      text: `Error: limits exceeded (max ${MAX_SLICE_FILES} lineRanges entries per call).`,
+      isError: true
+    };
+  }
+  const parsedLineRanges = [];
+  for (let i = 0; i < rawLineRanges.length; i++) {
+    try {
+      parsedLineRanges.push(parseFlatLineRangeSpec(rawLineRanges[i]));
+    } catch (err) {
+      return {
+        text: `Error in lineRanges[${i}]: ${err instanceof Error ? err.message : String(err)}`,
+        isError: true
+      };
+    }
+  }
+  const slices = [...rawSlices, ...parsedLineRanges];
   if (outlines.length === 0 && slices.length === 0) {
     return {
-      text: "Error: provide at least one entry in 'outlines' or 'slices'.",
+      text: "Error: provide at least one entry in 'outlines', 'slices', or 'lineRanges'.",
       isError: true
     };
   }
@@ -4633,7 +5100,11 @@ async function runReadSlices(input) {
       isError: true
     };
   }
-  const baseCwd = resolvePath(input.cwd || process.cwd());
+  const wsRes = await resolveToolWorkspaceCwd(input.cwd, options.server);
+  if (wsRes.error) {
+    return { text: wsRes.error, isError: true };
+  }
+  const baseCwd = wsRes.cwd;
   const maxChars = clampIntWithDefault(
     input.maxChars,
     8500,
@@ -4641,7 +5112,6 @@ async function runReadSlices(input) {
     DEFAULT_INLINE_MAX_BYTES
   );
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
-  const perFileSymbolLimit = outlines.length <= 1 ? 120 : outlines.length <= 4 ? 60 : outlines.length <= 10 ? 30 : outlines.length <= 20 ? 16 : 10;
   const fileCache = /* @__PURE__ */ new Map();
   const normalizeCacheKey = normalizeFileCacheKey;
   async function loadLines(absPath, { useSliceCache = false, existingStat = null } = {}) {
@@ -4743,21 +5213,8 @@ async function runReadSlices(input) {
               }
             }
           }
-          if (symbols.length === 0) {
-            return `## Outline: ${relPath} (${lineCount} lines)
-(no top-level symbols detected)`;
-          }
-          const picked = selectOutlineSymbols(symbols, perFileSymbolLimit);
-          const formatted = picked.map((s) => {
-            const indent = "  ".repeat(s.depth);
-            const span = s.endLine > s.startLine ? `L${s.startLine}-L${s.endLine}` : `L${s.startLine}`;
-            return `${indent}${span} [${s.kind}] ${s.name}`;
-          });
-          const extra = symbols.length > picked.length ? outlines.length > 10 ? `
-... (+${symbols.length - picked.length} more symbols)` : `
-... (${symbols.length - picked.length} more symbols omitted; outline this file alone for full list)` : "";
-          return `## Outline: ${relPath} (${lineCount} lines)
-${formatted.join("\n")}${extra}`;
+          const fullPreview = renderOutlineWithinBudget(relPath, lineCount, symbols, null, outlines.length);
+          return { ok: true, relPath, lineCount, symbols, fullPreview };
         } catch (err) {
           if (err && err.code === "ENOENT") {
             OUTLINE_SYMBOL_CACHE.delete(cacheKey);
@@ -4769,12 +5226,27 @@ ${formatted.join("\n")}${extra}`;
               }
             }
           }
-          return `## Outline: ${relPath}
-ERROR: ${err instanceof Error ? err.message : String(err)}`;
+          const errText = `## Outline: ${relPath}\nERROR: ${err instanceof Error ? err.message : String(err)}`;
+          return { ok: false, relPath, fullPreview: errText };
         }
       })
     );
-    sections.push(...outlineResults);
+    const outlinePoolBudget =
+      slices.length > 0
+        ? Math.max(600, Math.floor(maxChars * 0.55))
+        : Math.max(600, maxChars - Math.max(0, outlines.length - 1) * 2);
+    const naturalLengths = outlineResults.map((r) => r.fullPreview.length);
+    const waterBudgets = computeWaterFillBudgets(naturalLengths, outlinePoolBudget, 160);
+    for (let i = 0; i < outlineResults.length; i++) {
+      const r = outlineResults[i];
+      if (!r.ok) {
+        sections.push(r.fullPreview);
+      } else {
+        sections.push(
+          renderOutlineWithinBudget(r.relPath, r.lineCount, r.symbols, waterBudgets[i], outlines.length)
+        );
+      }
+    }
   }
   if (slices.length > 0) {
     const sliceResults = await Promise.all(
@@ -4891,7 +5363,8 @@ async function mapWithConcurrency(items, concurrency, worker) {
   await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
   return results;
 }
-async function runChecks(input) {
+async function runChecks(input, options = {}) {
+  const callDeadline = perfNode.now() + (options.budgetMs ?? MAX_MCP_CALL_BUDGET_MS);
   if (!Array.isArray(input.commands) || input.commands.length === 0) {
     return {
       text: "Error: 'commands' must be a non-empty array of check commands.",
@@ -4904,7 +5377,11 @@ async function runChecks(input) {
       isError: true
     };
   }
-  const baseCwd = resolvePath(input.cwd || process.cwd());
+  const wsRes = await resolveToolWorkspaceCwd(input.cwd, options.server);
+  if (wsRes.error) {
+    return { text: wsRes.error, isError: true };
+  }
+  const baseCwd = wsRes.cwd;
   try {
     const st = await fs4.stat(baseCwd);
     if (!st.isDirectory()) {
@@ -4914,10 +5391,14 @@ async function runChecks(input) {
     return { text: `Error: cwd does not exist: ${baseCwd}`, isError: true };
   }
   const concurrency = clampInt2(input.concurrency ?? 4, 1, 8);
-  const defaultTimeoutSec = clampInt2(input.timeoutSec ?? 60, 1, 300);
+  const defaultTimeoutSec = clampInt2(input.timeoutSec ?? 60, 1, MAX_MCP_CALL_BUDGET_SEC);
   const outputMode = input.outputMode === "full" ? "full" : "compact";
   const maxChars = clampInt2(input.maxChars ?? 8e3, 500, DEFAULT_INLINE_MAX_BYTES);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
+  const budgetSecDisplay =
+    options.budgetMs !== void 0
+      ? Math.max(1, Math.round(options.budgetMs / 1e3))
+      : MAX_MCP_CALL_BUDGET_SEC;
   const normalized = [];
   for (let i = 0; i < input.commands.length; i++) {
     const raw = input.commands[i];
@@ -4948,7 +5429,7 @@ async function runChecks(input) {
     const cmdTimeoutSec = clampInt2(
       spec.timeoutSec ?? defaultTimeoutSec,
       1,
-      300
+      MAX_MCP_CALL_BUDGET_SEC
     );
     normalized.push({
       index: i,
@@ -4963,12 +5444,31 @@ async function runChecks(input) {
     normalized,
     concurrency,
     async (spec) => {
+      const remainingMs = callDeadline - perfNode.now();
+      if (remainingMs < 500) {
+        return {
+          spec,
+          skippedForBudget: true,
+          passed: false,
+          result: {
+            exitCode: null,
+            signal: null,
+            timedOut: false,
+            durationMs: 0,
+            stdout: "",
+            stderr: "",
+            truncated: false,
+            error: null
+          }
+        };
+      }
+      const effectiveTimeoutMs = Math.max(100, Math.min(spec.timeoutMs, Math.floor(remainingMs)));
       const result = await runShellCommandAsync(spec.command, {
         cwd: spec.cwd,
-        timeoutMs: spec.timeoutMs
+        timeoutMs: effectiveTimeoutMs
       });
       const passed = !result.error && !result.timedOut && result.exitCode === 0;
-      return { spec, result, passed };
+      return { spec, skippedForBudget: false, result, passed };
     }
   );
   BATCH_SEARCH_CACHE.clear();
@@ -4977,37 +5477,75 @@ async function runChecks(input) {
   const failedCount = outcomes.length - passedCount;
   const summaryHeader = failedCount === 0 ? `Checks: ${passedCount}/${outcomes.length} passed (wall: ${wallMs}ms)` : `Checks: ${passedCount}/${outcomes.length} passed, ${failedCount} failed (wall: ${wallMs}ms)`;
   const usableChars = Math.max(200, maxChars - summaryHeader.length - 4);
-  const failedBudget = failedCount > 0 ? Math.max(160, Math.floor((usableChars - passedCount * 120) / failedCount)) : 320;
-  const fullPerCmdBudget = Math.max(
-    160,
-    Math.floor(usableChars / outcomes.length)
-  );
-  const blocks = outcomes.map(({ spec, result, passed }) => {
+  const preFormatted = outcomes.map(({ spec, skippedForBudget, result, passed }) => {
+    if (skippedForBudget) {
+      const msg = `[NOT RUN: ${budgetSecDisplay}s MCP call budget exhausted]`;
+      const block = `## [SKIPPED] ${spec.name}\n$ ${spec.command}\n${msg}`;
+      return { skippedForBudget: true, passed: false, naturalLen: block.length, fixedBlock: block };
+    }
     const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (exit ${result.exitCode ?? "err"})`;
     if (outputMode === "full") {
       const combined = [
         normalizeTerminalOutput(result.stdout),
         normalizeTerminalOutput(result.stderr)
       ].filter(Boolean).join("\n");
-      const body2 = result.error ? `spawn error: ${result.error}` : truncateWithNotice(combined || "(no output)", fullPerCmdBudget);
-      return `## [${badge}] ${spec.name} (${result.durationMs}ms)
-$ ${spec.command}
-${body2}`;
+      const rawBody = result.error ? `spawn error: ${result.error}` : combined || "(no output)";
+      const headerPrefix = `## [${badge}] ${spec.name} (${result.durationMs}ms)\n$ ${spec.command}\n`;
+      return {
+        skippedForBudget: false,
+        passed,
+        badge,
+        headerPrefix,
+        rawBody,
+        naturalLen: headerPrefix.length + rawBody.length
+      };
     }
-    const body = formatCompactCommandOutput({
+    const maxProbe = passed ? 300 : usableChars;
+    const rawCompact = formatCompactCommandOutput({
       stdout: result.stdout,
       stderr: result.stderr,
       exitCode: result.exitCode,
       timedOut: result.timedOut,
       error: result.error,
-      maxChars: passed ? 300 : failedBudget
+      maxChars: maxProbe
     });
-    if (passed) {
-      return `- [PASS ${result.durationMs}ms] ${spec.name} (\`${spec.command}\`): ${body}`;
+    const headerPrefix = passed
+      ? `- [PASS ${result.durationMs}ms] ${spec.name} (\`${spec.command}\`): `
+      : `## [${badge} ${result.durationMs}ms] ${spec.name}\n$ ${spec.command}\n`;
+    return {
+      skippedForBudget: false,
+      passed,
+      badge,
+      headerPrefix,
+      rawBody: rawCompact,
+      naturalLen: headerPrefix.length + rawCompact.length
+    };
+  });
+  const itemBudgets = computeWaterFillBudgets(
+    preFormatted.map((p) => p.naturalLen),
+    usableChars,
+    160
+  );
+  const blocks = outcomes.map(({ result }, idx) => {
+    const pre = preFormatted[idx];
+    if (pre.skippedForBudget) return pre.fixedBlock;
+    const bodyAvail = Math.max(160, itemBudgets[idx] - pre.headerPrefix.length);
+    if (outputMode === "full") {
+      const body2 = pre.rawBody.length <= bodyAvail ? pre.rawBody : truncateWithNotice(pre.rawBody, bodyAvail);
+      return `${pre.headerPrefix}${body2}`;
     }
-    return `## [${badge} ${result.durationMs}ms] ${spec.name}
-$ ${spec.command}
-${body}`;
+    if (pre.passed || pre.rawBody.length <= bodyAvail) {
+      return `${pre.headerPrefix}${pre.rawBody}`;
+    }
+    const fittedBody = formatCompactCommandOutput({
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      error: result.error,
+      maxChars: bodyAvail
+    });
+    return `${pre.headerPrefix}${fittedBody}`;
   });
   const bodyBudget = Math.max(0, maxChars - summaryHeader.length - 2);
   const bodyByteBudget = maxBytes !== void 0 ? Math.max(0, maxBytes - Buffer.byteLength(summaryHeader, "utf8") - 2) : void 0;
@@ -5071,7 +5609,7 @@ function createAgyFastServer() {
         required: ["queries"]
       }
     },
-    (args) => runBatchSearch(args)
+    (args, ctx) => runBatchSearch(args, ctx)
   );
   server.registerTool(
     {
@@ -5112,13 +5650,13 @@ function createAgyFastServer() {
           dryRun: { type: "boolean" },
           bestEffort: { type: "boolean", description: "Commit valid files even if others fail" },
           verify: { type: "string", description: "Post-write shell command" },
-          verifyTimeoutSec: { type: "integer", minimum: 1, maximum: 300 },
+          verifyTimeoutSec: { type: "integer", minimum: 1, maximum: 170 },
           maxVerifyChars: { type: "integer", minimum: 300, maximum: 7500 }
         },
         required: ["edits"]
       }
     },
-    (args) => runApplyEdits(args)
+    (args, ctx) => runApplyEdits(args, ctx)
   );
   server.registerTool(
     {
@@ -5156,11 +5694,17 @@ function createAgyFastServer() {
               required: ["path", "ranges"]
             }
           },
+          lineRanges: {
+            type: "array",
+            maxItems: 30,
+            items: { type: "string" },
+            description: "Shorthand 'path:start-end,s2-e2'"
+          },
           maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
         }
       }
     },
-    (args) => runReadSlices(args)
+    (args, ctx) => runReadSlices(args, ctx)
   );
   server.registerTool(
     {
@@ -5180,13 +5724,13 @@ function createAgyFastServer() {
                 name: { type: "string" },
                 command: { type: "string" },
                 cwd: { type: "string" },
-                timeoutSec: { type: "integer", minimum: 1, maximum: 300 }
+                timeoutSec: { type: "integer", minimum: 1, maximum: 170 }
               },
               required: ["command"]
             }
           },
           concurrency: { type: "integer", minimum: 1, maximum: 8 },
-          timeoutSec: { type: "integer", minimum: 1, maximum: 300 },
+          timeoutSec: { type: "integer", minimum: 1, maximum: 170 },
           outputMode: {
             type: "string",
             enum: ["compact", "full"],
@@ -5197,30 +5741,63 @@ function createAgyFastServer() {
         required: ["commands"]
       }
     },
-    (args) => runChecks(args)
+    (args, ctx) => runChecks(args, ctx)
   );
   return server;
 }
 function main() {
+  process.stdout.on("error", (err) => {
+    if (err && (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED")) return;
+  });
   const server = createAgyFastServer();
   const exitImmediately = () => {
     closeOutlineDbStore();
     process.exit(0);
   };
+  let flushing = false;
   const flushAndExit = () => {
+    if (flushing) return;
+    flushing = true;
     closeOutlineDbStore();
-    process.stdout.end(() => {
+    const forceTimer = setTimeout(() => {
       process.exit(0);
-    });
+    }, 150);
+    forceTimer.unref();
+    try {
+      process.stdout.end(() => {
+        clearTimeout(forceTimer);
+        process.exit(0);
+      });
+    } catch {
+      process.exit(0);
+    }
   };
   process.on("SIGINT", exitImmediately);
   process.on("SIGTERM", exitImmediately);
+  if (process.platform === "win32") {
+    process.on("SIGBREAK", exitImmediately);
+  }
   process.on("exit", () => {
     closeOutlineDbStore();
   });
   server.listen(process.stdin, process.stdout, flushAndExit);
 }
-main();
+const isDirectFastRun = Boolean(
+  process.argv[1] &&
+    normalizeCompareDirFast(process.argv[1]) === normalizeCompareDirFast(FAST_SELF_PATH)
+);
+if (isDirectFastRun) {
+  main();
+}
 export {
-  createAgyFastServer
+  SAFE_GIT_CONFIG_ARGS,
+  computeWaterFillBudgets,
+  createAgyFastServer,
+  isInsideInstalledPluginDir,
+  parseFlatLineRangeSpec,
+  runApplyEdits,
+  runBatchSearch,
+  runChecks,
+  runReadSlices,
+  validateReadonlyGitArgs
 };

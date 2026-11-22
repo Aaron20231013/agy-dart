@@ -67,6 +67,84 @@ const MODES = {
   "no-read-hook": { cutoffBytes: 46080, readHook: false, label: "Ultra-fast Scheme B (command guard only, no read_file hook)" }
 };
 
+export const TOOL_LOADING_MODES = Object.freeze(["fast-eager", "lazy", "eager"]);
+
+export function normalizeToolLoadingMode(raw) {
+  if (typeof raw !== "string") return null;
+  const s = raw.trim().toLowerCase();
+  if (s === "fast-eager" || s === "fast_eager" || s === "fasteager" || s === "hybrid" || s === "default") {
+    return "fast-eager";
+  }
+  if (s === "lazy" || s === "on-demand" || s === "ondemand") return "lazy";
+  if (s === "eager" || s === "all-eager" || s === "alleager" || s === "all") return "eager";
+  return null;
+}
+
+export function buildMcpConfigObject(toolLoading = "fast-eager") {
+  const normalized = normalizeToolLoadingMode(toolLoading) || "fast-eager";
+  const fastEntry = {
+    command: "node",
+    args: ["${PLUGIN_ROOT}/fast/mcp-server.mjs"],
+    ...(normalized === "fast-eager" || normalized === "eager" ? { eager: true } : {})
+  };
+  const contextEntry = {
+    command: "node",
+    args: ["${PLUGIN_ROOT}/context/server.js"],
+    ...(normalized === "eager" ? { eager: true } : {})
+  };
+  return {
+    mcpServers: {
+      fast: fastEntry,
+      context: contextEntry
+    }
+  };
+}
+
+export function buildHookBootstrapCommand(pluginName = PLUGIN_NAME, relScriptPath = "") {
+  const safePlugin = String(pluginName || "").trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(safePlugin)) {
+    throw new Error(`Invalid plugin name for hook bootstrap: '${pluginName}'`);
+  }
+  const cleanRel = String(relScriptPath || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/^\/+/, "");
+  const parts = cleanRel.split("/").filter(Boolean);
+  if (
+    parts.length !== 2 ||
+    !/^[A-Za-z0-9_.-]+$/.test(parts[0]) ||
+    !/^[A-Za-z0-9_.-]+\.(?:m?js|cjs)$/.test(parts[1]) ||
+    cleanRel.includes("..")
+  ) {
+    throw new Error(`Invalid relative hook script path: '${relScriptPath}'`);
+  }
+  // Universal polyglot JS bootstrapper (`node -e /\''/;...;//'`):
+  // - Zero double quotes, zero spaces, zero &, |, <, >, $, `, %, !
+  // - Executes identically under POSIX `sh -c`, Windows `cmd /d /s /c` (`shell: true`),
+  //   AND non-verbatim `spawnSync("cmd", ["/c", cmd])` without `windowsVerbatimArguments`.
+  // - Injects `process.argv[1] = targetScript` BEFORE dynamic `import()` so all hooks'
+  //   `isDirectRun` guards execute `main()`, failing open to `{}` on missing/broken files.
+  const js =
+    `Promise.all([import(/node:fs/.source),import(/node:path/.source),import(/node:os/.source),import(/node:url/.source)])` +
+    `.then(function(a,f,p,o,u,e,n,s0,s1,g,cg,pl,ag,h,cs,w,tg){` +
+    `f=a[0];p=a[1];o=a[2];u=a[3];e=process.env;n=/${safePlugin}/.source;s0=/${parts[0]}/.source;s1=/${parts[1]}/.source;` +
+    `g=/.gemini/.source;cg=/config/.source;pl=/plugins/.source;ag=/.agents/.source;` +
+    `h=e.USERPROFILE?e.USERPROFILE:e.HOME?e.HOME:o.homedir();` +
+    `cs=[e.PLUGIN_ROOT,e.AGY_PLUGIN_ROOT,/./.source];w=process.cwd();` +
+    `[0,1,2,3,4,5,6,7].forEach(function(x,up){if(w){cs.push(p.join(w,ag,pl,n));up=p.dirname(w);w=up===w?0:up}});` +
+    `cs.push(e.ANTIGRAVITY_CONFIG_DIR?p.join(e.ANTIGRAVITY_CONFIG_DIR,pl,n):0,` +
+    `e.GEMINI_CONFIG_DIR?p.join(e.GEMINI_CONFIG_DIR,pl,n):0,` +
+    `e.GEMINI_HOME?p.join(e.GEMINI_HOME,g,cg,pl,n):0,` +
+    `e.GEMINI_HOME?p.join(e.GEMINI_HOME,cg,pl,n):0,` +
+    `h?p.join(h,g,cg,pl,n):0);` +
+    `cs.forEach(function(c,d,s,m){if(tg){}else{if(c){d=p.resolve(c);s=p.join(d,s0,s1);m=p.join(d,/plugin.json/.source);` +
+    `try{if(f.existsSync(s)){if(f.existsSync(m)){if(JSON.parse(f.readFileSync(m,/utf8/.source).trim()).name===n){tg=s}}}}catch{}}}});` +
+    `tg?(process.argv[1]=tg,import(u.pathToFileURL(tg).href).catch(function(){console.log(JSON.stringify({}))})):console.log(JSON.stringify({}))` +
+    `}).catch(function(){console.log(JSON.stringify({}))})`;
+  return `node -e /\\''/;${js};//'`;
+}
+
 export const RUNTIME_FILES = Object.freeze([
   "plugin.json",
   "mcp_config.json",
@@ -158,7 +236,7 @@ async function pathExists(p) {
   }
 }
 
-const KNOWN_COMMANDS = new Set(["install", "doctor", "status", "mode", "uninstall"]);
+const KNOWN_COMMANDS = new Set(["install", "doctor", "status", "mode", "tool-loading", "uninstall"]);
 
 function parseArgs(argv) {
   const args = argv.slice(2);
@@ -167,6 +245,9 @@ function parseArgs(argv) {
   let projectDir = "";
   let mode = "host-45k";
   let explicitMode = false;
+  let toolLoading = "fast-eager";
+  let explicitToolLoading = false;
+  let syncHosts = true;
   let installRg = false;
   let withDevtools = false;
   let json = false;
@@ -185,6 +266,16 @@ function parseArgs(argv) {
       withDevtools = true;
     } else if (a === "--runtime-only") {
       withDevtools = false;
+    } else if (a === "--no-sync-hosts") {
+      syncHosts = false;
+    } else if (a === "--tool-loading" || a.startsWith("--tool-loading=")) {
+      const next = a === "--tool-loading" ? args[++i] : a.slice("--tool-loading=".length);
+      const parsed = normalizeToolLoadingMode(next);
+      if (!parsed) {
+        throw new Error(`Invalid --tool-loading '${next}'. Expected one of: ${TOOL_LOADING_MODES.join(", ")}`);
+      }
+      toolLoading = parsed;
+      explicitToolLoading = true;
     } else if (a === "--mode") {
       const next = args[++i];
       if (!next || !MODES[next]) {
@@ -218,6 +309,14 @@ function parseArgs(argv) {
     mode = positional[1];
     explicitMode = true;
   }
+  if (command === "tool-loading" && positional.length >= 2) {
+    const parsed = normalizeToolLoadingMode(positional[1]);
+    if (!parsed) {
+      throw new Error(`Unknown tool-loading mode '${positional[1]}'. Expected one of: ${TOOL_LOADING_MODES.join(", ")}`);
+    }
+    toolLoading = parsed;
+    explicitToolLoading = true;
+  }
 
   const isCustomTarget = Boolean(targetDir);
   if (!targetDir) {
@@ -234,6 +333,9 @@ function parseArgs(argv) {
     isCustomTarget,
     mode,
     explicitMode,
+    toolLoading,
+    explicitToolLoading,
+    syncHosts,
     installRg,
     withDevtools,
     json,
@@ -248,18 +350,85 @@ Usage:
   node scripts/install.mjs install [options]     Install agy-dart globally (default) or to a project
   node scripts/install.mjs doctor [options]      Verify both MCP servers, hooks, SQLite, Sidecar, config & rg
   node scripts/install.mjs mode <mode> [opts]    Switch protection mode (${Object.keys(MODES).join(" | ")})
+  node scripts/install.mjs tool-loading <mode>   Switch MCP tool loading (${TOOL_LOADING_MODES.join(" | ")})
   node scripts/install.mjs uninstall [options]   Remove installed agy-dart plugin
 
 Options:
   --project [dir]        Install into <dir>/.agents/plugins/agy-dart
   --target <dir>         Install into a custom directory
   --mode <mode>          host-45k (default) | fast-32k | balanced-16k | strict-8k | no-read-hook
+  --tool-loading <mode>  fast-eager (default: 4 fast eager + 8 context lazy) | lazy | eager
+  --no-sync-hosts        Skip auto-syncing secondary GEMINI_HOME / T3 Code ACP plugin dirs
   --with-devtools        Also copy offline CLI devtools (benchmark, cache-simulator, cache-audit, prefix-budget, verify-package-graph, gen-review-brief)
   --runtime-only         Install runtime files only (default)
   --install-rg           On Windows x64, download official ripgrep (rg.exe) to ~/.local/bin and add to PATH
   --json                 Output machine-readable JSON (for 'doctor')
   -h, --help             Show this help
 `);
+}
+
+function resolveUserConfigFilePath(env = process.env) {
+  const custom = typeof env?.AGY_DART_CONFIG_PATH === "string" ? env.AGY_DART_CONFIG_PATH.trim() : "";
+  if (custom) return path.resolve(custom);
+  return path.join(getHomeDir(), ".agy-dart", "config.json");
+}
+
+async function resolveAndPersistToolLoading(
+  requestedMode,
+  { explicitToolLoading = false, persist = true, env = process.env } = {}
+) {
+  const cfgPath = resolveUserConfigFilePath(env);
+  let existingObj = {};
+  let canWrite = true;
+  try {
+    const st = await fs.lstat(cfgPath);
+    if (st.isSymbolicLink()) {
+      throw new Error(`Refusing to read/write config.json through symlink: ${cfgPath}`);
+    }
+    if (st.isFile()) {
+      const raw = (await fs.readFile(cfgPath, "utf8")).replace(/^\uFEFF/, "");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        existingObj = parsed;
+      } else {
+        canWrite = false;
+      }
+    }
+  } catch (err) {
+    if (err && String(err.message || "").includes("symlink")) throw err;
+    if (err && err.code !== "ENOENT") {
+      canWrite = false;
+    }
+  }
+
+  let effective = normalizeToolLoadingMode(requestedMode) || "fast-eager";
+  if (!explicitToolLoading) {
+    const saved = normalizeToolLoadingMode(existingObj.toolLoading);
+    if (saved) effective = saved;
+  }
+
+  if (persist && canWrite && (explicitToolLoading || existingObj.toolLoading !== undefined)) {
+    const nextObj = { ...existingObj, toolLoading: effective };
+    await fs.mkdir(path.dirname(cfgPath), { recursive: true });
+    await fs.writeFile(cfgPath, JSON.stringify(nextObj, null, 2) + "\n", "utf8");
+  }
+  return effective;
+}
+
+async function applyToolLoading(targetDir, toolLoadingMode = "fast-eager") {
+  const effective = normalizeToolLoadingMode(toolLoadingMode) || "fast-eager";
+  const mcpPath = path.join(targetDir, "mcp_config.json");
+  try {
+    const st = await fs.lstat(mcpPath);
+    if (st.isSymbolicLink()) {
+      throw new Error(`Refusing to write mcp_config.json through symlink: ${mcpPath}`);
+    }
+  } catch (err) {
+    if (err && err.code !== "ENOENT") throw err;
+  }
+  const mcpObj = buildMcpConfigObject(effective);
+  await fs.writeFile(mcpPath, JSON.stringify(mcpObj, null, 2) + "\n", "utf8");
+  return effective;
 }
 
 async function applyMode(targetDir, modeKey, skipDb = false, { explicitMode = true } = {}) {
@@ -270,7 +439,7 @@ async function applyMode(targetDir, modeKey, skipDb = false, { explicitMode = tr
       SessionStart: [
         {
           type: "command",
-          command: "node ./hooks/session-start.mjs",
+          command: buildHookBootstrapCommand(PLUGIN_NAME, "./hooks/session-start.mjs"),
           timeout: 8
         }
       ],
@@ -280,7 +449,7 @@ async function applyMode(targetDir, modeKey, skipDb = false, { explicitMode = tr
           hooks: [
             {
               type: "command",
-              command: "node ./hooks/pre-tool-use.mjs",
+              command: buildHookBootstrapCommand(PLUGIN_NAME, "./hooks/pre-tool-use.mjs"),
               timeout: 10
             }
           ]
@@ -292,7 +461,7 @@ async function applyMode(targetDir, modeKey, skipDb = false, { explicitMode = tr
           hooks: [
             {
               type: "command",
-              command: "node ./hooks/post-tool-use.mjs",
+              command: buildHookBootstrapCommand(PLUGIN_NAME, "./hooks/post-tool-use.mjs"),
               timeout: 5
             }
           ]
@@ -301,14 +470,14 @@ async function applyMode(targetDir, modeKey, skipDb = false, { explicitMode = tr
       PreInvocation: [
         {
           type: "command",
-          command: "node ./hooks/pre-invocation.mjs",
+          command: buildHookBootstrapCommand(PLUGIN_NAME, "./hooks/pre-invocation.mjs"),
           timeout: 5
         }
       ],
       Stop: [
         {
           type: "command",
-          command: "node ./hooks/stop.mjs",
+          command: buildHookBootstrapCommand(PLUGIN_NAME, "./hooks/stop.mjs"),
           timeout: 5
         }
       ]
@@ -469,10 +638,11 @@ async function verifyMcpServer(scriptPath, extraEnv = {}) {
   });
 }
 
-async function verifySessionStart(hookScript, sampleDir, dbPath) {
+async function verifySessionStart(hookScript, sampleDir, dbPath, { hooksJsonPath = "", foreignCwd = "" } = {}) {
   const t0 = Date.now();
+  const payload = JSON.stringify({ cwd: sampleDir, workspacePaths: [sampleDir], hookEventName: "SessionStart" });
   const res = spawnSync(process.execPath, [hookScript], {
-    input: JSON.stringify({ cwd: sampleDir, workspacePaths: [sampleDir], hookEventName: "SessionStart" }),
+    input: payload,
     encoding: "utf8",
     timeout: 6000,
     windowsHide: true,
@@ -483,6 +653,30 @@ async function verifySessionStart(hookScript, sampleDir, dbPath) {
   }
   const parsed = JSON.parse(res.stdout.trim());
   const msg = parsed?.injectSteps?.[0]?.systemMessage?.systemMessage || "";
+  if (hooksJsonPath && foreignCwd) {
+    const hooksRaw = JSON.parse(await fs.readFile(hooksJsonPath, "utf8"));
+    const bootCmd = hooksRaw?.["agy-dart-lifecycle"]?.SessionStart?.[0]?.command || "";
+    if (bootCmd) {
+      const pluginDir = path.dirname(hooksJsonPath);
+      const bootRes = spawnSync(bootCmd, {
+        shell: true,
+        cwd: foreignCwd,
+        input: payload,
+        encoding: "utf8",
+        timeout: 6000,
+        windowsHide: true,
+        env: { ...process.env, PLUGIN_ROOT: pluginDir, AGY_DART_DB_PATH: dbPath }
+      });
+      if (bootRes.error || bootRes.status !== 0) {
+        throw new Error(`hooks.json cross-CWD bootstrap failed: ${bootRes.stderr || bootRes.error?.message}`);
+      }
+      const bootParsed = JSON.parse((bootRes.stdout || "").trim() || "{}");
+      const bootMsg = bootParsed?.injectSteps?.[0]?.systemMessage?.systemMessage || "";
+      if (!bootMsg) {
+        throw new Error("hooks.json cross-CWD bootstrap returned empty SessionStart output");
+      }
+    }
+  }
   return { durationMs: Date.now() - t0, bytes: Buffer.byteLength(msg, "utf8") };
 }
 
@@ -505,7 +699,10 @@ async function runDoctor(targetDir, { json = false, showStarHint = true } = {}) 
   try {
     const fastCheck = await verifyMcpServer(path.join(targetDir, "fast", "mcp-server.mjs"));
     const ctxCheck = await verifyMcpServer(path.join(targetDir, "context", "server.js"), { AGY_DART_DB_PATH: tmpDb });
-    const hookCheck = await verifySessionStart(path.join(targetDir, "hooks", "session-start.mjs"), targetDir, tmpDb);
+    const hookCheck = await verifySessionStart(path.join(targetDir, "hooks", "session-start.mjs"), targetDir, tmpDb, {
+      hooksJsonPath: path.join(targetDir, "hooks.json"),
+      foreignCwd: tmpDir
+    });
     const hasPluginJson = await pathExists(path.join(targetDir, "plugin.json"));
     const hasMcpConfig = await pathExists(path.join(targetDir, "mcp_config.json"));
     const hasSidecarJson = await pathExists(path.join(targetDir, "sidecars", "dashboard", "sidecar.json"));
@@ -575,6 +772,15 @@ async function runDoctor(targetDir, { json = false, showStarHint = true } = {}) 
     const hasPostCfg = Array.isArray(hooksRaw?.["agy-dart-lifecycle"]?.PostToolUse);
     const hasPreInvCfg = Array.isArray(hooksRaw?.["agy-dart-lifecycle"]?.PreInvocation);
     const hasStopCfg = Array.isArray(hooksRaw?.["agy-dart-lifecycle"]?.Stop);
+    let mcpToolLoading = "lazy";
+    if (hasMcpConfig) {
+      try {
+        const mcpRaw = JSON.parse(await fs.readFile(path.join(targetDir, "mcp_config.json"), "utf8"));
+        const fastEager = Boolean(mcpRaw?.mcpServers?.fast?.eager);
+        const ctxEager = Boolean(mcpRaw?.mcpServers?.context?.eager);
+        mcpToolLoading = fastEager && ctxEager ? "eager" : fastEager ? "fast-eager" : "lazy";
+      } catch {}
+    }
 
     const legacy = [];
     const globalRoot = getGlobalPluginsRoot();
@@ -615,6 +821,7 @@ async function runDoctor(targetDir, { json = false, showStarHint = true } = {}) 
             ripgrep: hasRg,
             mcpFast: { ok: fastCheck.tools.length === 4, tools: fastCheck.tools },
             mcpContext: { ok: ctxCheck.tools.length === 8, tools: ctxCheck.tools },
+            toolLoading: mcpToolLoading,
             sessionStart: { ok: hookCheck.bytes > 0, ...hookCheck },
             hooks: {
               preToolUse: hasPreHook,
@@ -645,6 +852,7 @@ async function runDoctor(targetDir, { json = false, showStarHint = true } = {}) 
     console.log(`  - ripgrep (rg)  : ${hasRg ? "available (fast search active)" : "not found (Node.js fallback active; rerun with --install-rg on Windows)"}`);
     console.log(`  - MCP [fast]    : OK (${fastCheck.tools.length} tools: ${fastCheck.tools.join(", ")})`);
     console.log(`  - MCP [context] : OK (${ctxCheck.tools.length} tools: ${ctxCheck.tools.join(", ")})`);
+    console.log(`  - Tool loading  : ${mcpToolLoading}`);
     console.log(`  - SessionStart  : OK (${hookCheck.durationMs}ms, ${hookCheck.bytes} bytes)`);
     console.log(`  - PreToolUse    : ${hasPreHook ? "OK" : "MISSING"} (matcher: ${matcher}; cli-filter: ${hasCliFilter ? "OK" : "MISSING"})`);
     console.log(`  - PostToolUse   : ${hasPostHook && hasPostCfg ? "OK (edit/compaction read-dedup & watchdog lease update)" : "MISSING"}`);
@@ -803,7 +1011,10 @@ async function pruneStaleEntries(dstRoot, keepRelSet) {
             lockedDirs.push(relPosix);
           }
         }
-      } else if (!keepRelSet.has(process.platform === "win32" ? relPosix.toLowerCase() : relPosix)) {
+      } else if (
+        !/^rules\/[^/]+\.local\.md$/i.test(relPosix) &&
+        !keepRelSet.has(process.platform === "win32" ? relPosix.toLowerCase() : relPosix)
+      ) {
         try {
           await fs.rm(fullPath, { force: true });
         } catch (err) {
@@ -950,19 +1161,66 @@ async function hasValidPluginManifest(dir) {
   }
 }
 
-async function runInstall(opts) {
-  checkNodeAndSqlite();
-  await import("node:sqlite");
-
-  const srcRoot = path.resolve(REPO_ROOT);
-  const dstRoot = path.resolve(opts.targetDir);
-  const manifest = opts.withDevtools ? FILES_TO_COPY : RUNTIME_FILES;
-
-  if (isProtectedTargetDir(dstRoot, srcRoot, { allowInstalledSelf: false })) {
-    throw new Error(`Refusing to install into protected directory: ${dstRoot}`);
+export function discoverExtraHostPluginTargets({
+  homeDir = getHomeDir(),
+  env = process.env,
+  primaryTargetDir = ""
+} = {}) {
+  const found = [];
+  const seen = new Set();
+  if (primaryTargetDir) {
+    seen.add(normalizeComparePath(primaryTargetDir));
   }
-  await assertNotSymlinkTarget(dstRoot, opts.projectDir);
+  const addTarget = (candidatePluginDir) => {
+    if (!candidatePluginDir || isUncOrDevicePath(candidatePluginDir)) return;
+    const resolved = path.resolve(candidatePluginDir);
+    const key = normalizeComparePath(resolved);
+    if (seen.has(key)) return;
+    if (isProtectedTargetDir(resolved, REPO_ROOT, { allowInstalledSelf: true })) return;
+    seen.add(key);
+    found.push(resolved);
+  };
 
+  const geminiHome = typeof env?.GEMINI_HOME === "string" ? env.GEMINI_HOME.trim() : "";
+  if (geminiHome) {
+    try {
+      const ghResolved = path.resolve(geminiHome);
+      const ghStat = fsSync.lstatSync(ghResolved);
+      if (ghStat.isDirectory() && !ghStat.isSymbolicLink()) {
+        const dotGeminiCfg = path.join(ghResolved, ".gemini", "config");
+        const directCfg = path.join(ghResolved, "config");
+        if (fsSync.existsSync(directCfg) && !fsSync.existsSync(dotGeminiCfg)) {
+          addTarget(path.join(directCfg, "plugins", PLUGIN_NAME));
+        } else {
+          addTarget(path.join(dotGeminiCfg, "plugins", PLUGIN_NAME));
+        }
+      }
+    } catch {}
+  }
+
+  const t3AntigravityRoot = path.join(path.resolve(homeDir), ".t3", "userdata", "providers", "antigravity");
+  try {
+    const t3Stat = fsSync.lstatSync(t3AntigravityRoot);
+    if (t3Stat.isDirectory() && !t3Stat.isSymbolicLink()) {
+      const entries = fsSync.readdirSync(t3AntigravityRoot, { withFileTypes: true });
+      for (const ent of entries) {
+        if (!ent.isDirectory() || ent.isSymbolicLink() || ent.name.startsWith(".")) continue;
+        const profileDir = path.join(t3AntigravityRoot, ent.name);
+        const directPlugins = path.join(profileDir, "plugins");
+        const dotGeminiPlugins = path.join(profileDir, ".gemini", "config", "plugins");
+        if (fsSync.existsSync(directPlugins) && !fsSync.existsSync(path.join(profileDir, ".gemini"))) {
+          addTarget(path.join(directPlugins, PLUGIN_NAME));
+        } else {
+          addTarget(path.join(dotGeminiPlugins, PLUGIN_NAME));
+        }
+      }
+    }
+  } catch {}
+
+  return found;
+}
+
+async function copyManifestToTargetDir(srcRoot, dstRoot, manifest) {
   let dstStat = null;
   try {
     dstStat = await fs.stat(dstRoot);
@@ -982,7 +1240,33 @@ async function runInstall(opts) {
         `Refusing to install into non-empty directory ${dstRoot}: directory does not contain an '${PLUGIN_NAME}' plugin.json manifest.`
       );
     }
+    await purgeSymlinksInsideDir(dstRoot);
   }
+  await fs.mkdir(dstRoot, { recursive: true });
+  const keepRelSet = new Set();
+  for (const rel of manifest) {
+    const src = path.join(srcRoot, rel);
+    const dst = path.join(dstRoot, rel);
+    await fs.mkdir(path.dirname(dst), { recursive: true });
+    await fs.copyFile(src, dst);
+    const normRel = rel.replace(/\\/g, "/");
+    keepRelSet.add(process.platform === "win32" ? normRel.toLowerCase() : normRel);
+  }
+  return pruneStaleEntries(dstRoot, keepRelSet);
+}
+
+async function runInstall(opts) {
+  checkNodeAndSqlite();
+  await import("node:sqlite");
+
+  const srcRoot = path.resolve(REPO_ROOT);
+  const dstRoot = path.resolve(opts.targetDir);
+  const manifest = opts.withDevtools ? FILES_TO_COPY : RUNTIME_FILES;
+
+  if (isProtectedTargetDir(dstRoot, srcRoot, { allowInstalledSelf: false })) {
+    throw new Error(`Refusing to install into protected directory: ${dstRoot}`);
+  }
+  await assertNotSymlinkTarget(dstRoot, opts.projectDir);
 
   // Pre-validate all manifest source files BEFORE modifying destination so partial broken installs never occur
   const missingSources = [];
@@ -996,35 +1280,38 @@ async function runInstall(opts) {
     throw new Error(`Missing required source file(s): ${missingSources.join(", ")}`);
   }
 
-  // Remove any pre-existing internal symlinks or Windows junctions inside dstRoot BEFORE writing files
-  // so mkdir/copyFile can never escape dstRoot into external directories.
-  if (dstStat) {
-    await purgeSymlinksInsideDir(dstRoot);
-  }
-
-  // Copy/overwrite all manifest files in-place FIRST, then prune stale entries.
-  // On Windows, running Antigravity MCP/Sidecar processes hold CWD handles on dstRoot
-  // (causing `fs.rm(dstRoot, { recursive: true })` to throw EBUSY after partially deleting files).
-  // In-place sync + stale pruning is atomic-safe for live upgrades while Antigravity is running.
-  await fs.mkdir(dstRoot, { recursive: true });
-  const keepRelSet = new Set();
-  for (const rel of manifest) {
-    const src = path.join(srcRoot, rel);
-    const dst = path.join(dstRoot, rel);
-    await fs.mkdir(path.dirname(dst), { recursive: true });
-    await fs.copyFile(src, dst);
-    const normRel = rel.replace(/\\/g, "/");
-    keepRelSet.add(process.platform === "win32" ? normRel.toLowerCase() : normRel);
-  }
-  const locked = await pruneStaleEntries(dstRoot, keepRelSet);
+  // Copy/overwrite all manifest files in-place FIRST, then prune stale entries (preserving rules/*.local.md).
+  const locked = await copyManifestToTargetDir(srcRoot, dstRoot, manifest);
   console.log(`Installed agy-dart (${opts.withDevtools ? "runtime+devtools" : "runtime-only"}, ${manifest.length} files) to ${dstRoot}`);
   if (locked.length > 0) {
     console.log(`  - Note          : Skipped removing busy path(s) held by a running process (${locked.join(", ")}); restart Antigravity to complete cleanup.`);
   }
 
   const skipDb = Boolean(opts.isCustomTarget || opts.isProject);
+  const effectiveToolLoading = await resolveAndPersistToolLoading(opts.toolLoading, {
+    explicitToolLoading: opts.explicitToolLoading,
+    persist: !skipDb
+  });
+  await applyToolLoading(dstRoot, effectiveToolLoading);
   const modeCfg = await applyMode(dstRoot, opts.mode, skipDb, { explicitMode: opts.explicitMode });
-  console.log(`Configured mode: ${opts.mode} — ${modeCfg.label}`);
+  console.log(`Configured mode: ${opts.mode} — ${modeCfg.label} (tool-loading: ${effectiveToolLoading})`);
+
+  if (!opts.isCustomTarget && !opts.isProject && opts.syncHosts !== false) {
+    const extraTargets = discoverExtraHostPluginTargets({ primaryTargetDir: dstRoot });
+    for (const extraDst of extraTargets) {
+      try {
+        await assertNotSymlinkTarget(extraDst);
+        await copyManifestToTargetDir(srcRoot, extraDst, manifest);
+        await applyToolLoading(extraDst, effectiveToolLoading);
+        await applyMode(extraDst, opts.mode, true, { explicitMode: opts.explicitMode });
+        console.log(`  - Synced secondary host plugin dir: ${extraDst}`);
+      } catch (syncErr) {
+        console.log(
+          `  - Note          : Skipped secondary host sync at ${extraDst} (${syncErr instanceof Error ? syncErr.message : String(syncErr)})`
+        );
+      }
+    }
+  }
 
   if (opts.installRg) {
     installRipgrepWindows();
@@ -1062,6 +1349,27 @@ async function main() {
       const skipDb = Boolean(opts.isCustomTarget || opts.isProject);
       const cfg = await applyMode(targetResolved, opts.mode, skipDb, { explicitMode: true });
       console.log(`Switched agy-dart mode at ${targetResolved} -> ${opts.mode} (${cfg.label})`);
+      break;
+    }
+    case "tool-loading": {
+      const targetResolved = path.resolve(opts.targetDir);
+      if (isProtectedTargetDir(targetResolved, REPO_ROOT, { allowInstalledSelf: true })) {
+        throw new Error(`Refusing to modify protected directory: ${targetResolved}`);
+      }
+      await assertNotSymlinkTarget(targetResolved, opts.projectDir);
+      if (!(await pathExists(targetResolved))) {
+        throw new Error(`agy-dart is not installed at ${targetResolved}. Run 'install' first.`);
+      }
+      if (!(await hasValidPluginManifest(targetResolved))) {
+        throw new Error(`Refusing to switch tool-loading at ${targetResolved}: directory does not contain an '${PLUGIN_NAME}' plugin.json manifest.`);
+      }
+      const skipDb = Boolean(opts.isCustomTarget || opts.isProject);
+      const eff = await resolveAndPersistToolLoading(opts.toolLoading, {
+        explicitToolLoading: true,
+        persist: !skipDb
+      });
+      await applyToolLoading(targetResolved, eff);
+      console.log(`Switched agy-dart tool-loading at ${targetResolved} -> ${eff}`);
       break;
     }
     case "doctor":

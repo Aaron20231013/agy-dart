@@ -48,10 +48,16 @@ function resolveSessionId(payload = {}) {
   return (
     payload.rootConversationId ||
     payload.root_conversation_id ||
+    payload.common?.rootConversationId ||
+    payload.common?.root_conversation_id ||
     payload.parentConversationId ||
     payload.parent_conversation_id ||
+    payload.common?.parentConversationId ||
+    payload.common?.parent_conversation_id ||
     payload.conversationId ||
     payload.conversation_id ||
+    payload.common?.conversationId ||
+    payload.common?.conversation_id ||
     payload.sessionId ||
     payload.session_id ||
     process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
@@ -65,6 +71,8 @@ function resolveDirectConversationId(payload = {}) {
   return (
     payload.conversationId ||
     payload.conversation_id ||
+    payload.common?.conversationId ||
+    payload.common?.conversation_id ||
     payload.sessionId ||
     payload.session_id ||
     process.env.ANTIGRAVITY_CONVERSATION_ID ||
@@ -523,15 +531,27 @@ async function main() {
       } catch {}
     }
 
-    const rawLastUserInput = payload.lastUserInput ?? payload.last_user_input ?? "";
+    const rawLastUserInput =
+      payload.lastUserInput ??
+      payload.last_user_input ??
+      payload.common?.lastUserInput ??
+      payload.common?.last_user_input ??
+      "";
 
     let transcriptPath =
       (typeof payload.transcriptPath === "string" && payload.transcriptPath.trim()) ||
       (typeof payload.transcript_path === "string" && payload.transcript_path.trim()) ||
+      (typeof payload.common?.transcriptPath === "string" && payload.common.transcriptPath.trim()) ||
+      (typeof payload.common?.transcript_path === "string" && payload.common.transcript_path.trim()) ||
       "";
     if (!transcriptPath || !fs.existsSync(transcriptPath)) {
       if (targetConvId && targetConvId !== "default") {
-        transcriptPath = findTranscriptForConversation(targetConvId, { exactOnly: true }) || "";
+        transcriptPath =
+          watchdogLeaseMod?.resolveCandidateTranscriptPath?.(targetConvId, {
+            allowDefaultDb: Boolean(process.env.AGY_DART_SUMMARY_DB_PATH) || cfgSnapshot.sources.dbPath === "default"
+          }) ||
+          findTranscriptForConversation(targetConvId, { exactOnly: true }) ||
+          "";
       }
     }
 
@@ -604,59 +624,110 @@ async function main() {
       }
     }
 
-    // Resolve window/subproject identity & official short conversation title once per PreInvocation
+    // Resolve window/subproject identity, official short conversation title & authoritative subagent status once per PreInvocation
     let resolvedWorkspaceLabel = "";
     let resolvedConvTitle = "";
     let resolvedCwd = "";
+    let resolvedParentConvId = "";
+    let detectedSubagent = isSubagentConv;
     let subprojectPaths = [];
     let existingLease = null;
-    if (targetConvId && targetConvId !== "default" && watchdogLeaseMod) {
-      try {
-        existingLease =
-          (dbExists || store.db) && typeof watchdogLeaseMod.readWatchdogLease === "function"
-            ? watchdogLeaseMod.readWatchdogLease(store, targetConvId)
-            : null;
-        const allowDefaultSummaryDb =
-          Boolean(process.env.AGY_DART_SUMMARY_DB_PATH) || cfgSnapshot.sources.dbPath === "default";
-        const summary = watchdogLeaseMod.lookupConversationSummary
-          ? watchdogLeaseMod.lookupConversationSummary(targetConvId, {
-              payload,
-              transcriptPath,
-              allowDefaultDb: allowDefaultSummaryDb
-            })
-          : { title: "", cwd: "" };
-        resolvedConvTitle = summary.title || existingLease?.convTitle || "";
-        const payloadCwd = watchdogLeaseMod.extractPayloadWorkspaceRoot
-          ? watchdogLeaseMod.extractPayloadWorkspaceRoot(payload)
-          : payload.cwd || "";
-        resolvedCwd = payloadCwd || summary.cwd || existingLease?.cwd || "";
+    if (watchdogLeaseMod) {
+      if (
+        !detectedSubagent &&
+        (watchdogLeaseMod.isSubagentLeasePayload?.(payload) ||
+          (typeof rawLastUserInput === "string" && watchdogLeaseMod.isHeadlessWorkerPrompt?.(rawLastUserInput)))
+      ) {
+        detectedSubagent = true;
+      }
+      if (targetConvId && targetConvId !== "default") {
+        try {
+          existingLease =
+            (dbExists || store.db) && typeof watchdogLeaseMod.readWatchdogLease === "function"
+              ? watchdogLeaseMod.readWatchdogLease(store, targetConvId)
+              : null;
+          if (existingLease?.isSubagent) {
+            detectedSubagent = true;
+          }
+          if (existingLease?.parentConversationId && existingLease.parentConversationId !== targetConvId) {
+            resolvedParentConvId = existingLease.parentConversationId;
+            detectedSubagent = true;
+          }
+          const allowDefaultSummaryDb =
+            Boolean(process.env.AGY_DART_SUMMARY_DB_PATH) || cfgSnapshot.sources.dbPath === "default";
+          const hasGenuineTurn0HumanInput = Boolean(
+            !isMidTurnContinuation &&
+              !existingLease &&
+              typeof rawLastUserInput === "string" &&
+              rawLastUserInput.trim() &&
+              !watchdogLeaseMod.isHeadlessWorkerPrompt?.(rawLastUserInput) &&
+              !watchdogLeaseMod.isTtlKeepalivePrompt?.(rawLastUserInput)
+          );
+          const summary = watchdogLeaseMod.lookupConversationSummary
+            ? watchdogLeaseMod.lookupConversationSummary(targetConvId, {
+                payload,
+                transcriptPath,
+                allowDefaultDb: allowDefaultSummaryDb,
+                checkSubagent: !detectedSubagent && !existingLease?.convTitle,
+                allowUntitledCustomAgent: !hasGenuineTurn0HumanInput
+              })
+            : { title: "", cwd: "", isSubagent: false, parentConversationId: "" };
+          resolvedConvTitle = summary.title || existingLease?.convTitle || "";
+          if (summary.isSubagent) {
+            detectedSubagent = true;
+          }
+          if (summary.parentConversationId && summary.parentConversationId !== targetConvId) {
+            resolvedParentConvId = summary.parentConversationId;
+            detectedSubagent = true;
+          }
+          if (!detectedSubagent && !resolvedConvTitle) {
+            if (
+              loadedSteps.length > 0 &&
+              watchdogLeaseMod.detectSubagentFromTranscriptSteps?.(loadedSteps, {
+                isFromStart: txStatSize > 0 && txStatSize <= 131072
+              })
+            ) {
+              detectedSubagent = true;
+            } else if (
+              transcriptPath &&
+              (!existingLease || txStatSize > 131072) &&
+              watchdogLeaseMod.detectSubagentFromTranscriptFile?.(transcriptPath)
+            ) {
+              detectedSubagent = true;
+            }
+          }
+          const payloadCwd = watchdogLeaseMod.extractPayloadWorkspaceRoot
+            ? watchdogLeaseMod.extractPayloadWorkspaceRoot(payload)
+            : payload.cwd || "";
+          resolvedCwd = payloadCwd || summary.cwd || existingLease?.cwd || "";
 
-        if (dbExists || store.db) {
-          const activity = collectSessionSubprojectPaths(store, targetConvId, sessionId);
-          subprojectPaths = activity.paths;
-          if (!resolvedCwd && activity.worktree) {
-            resolvedCwd = activity.worktree;
+          if (dbExists || store.db) {
+            const activity = collectSessionSubprojectPaths(store, targetConvId, sessionId);
+            subprojectPaths = activity.paths;
+            if (!resolvedCwd && activity.worktree) {
+              resolvedCwd = activity.worktree;
+            }
           }
-        }
-        if (resolvedCwd && watchdogLeaseMod.formatWorkspaceWindowLabel) {
-          const computedWs = watchdogLeaseMod.formatWorkspaceWindowLabel(resolvedCwd, subprojectPaths);
-          const sameWs = watchdogLeaseMod.isSameWorkspacePath
-            ? watchdogLeaseMod.isSameWorkspacePath(existingLease?.cwd || "", resolvedCwd)
-            : existingLease?.cwd === resolvedCwd;
-          if (
-            existingLease?.workspaceLabel &&
-            sameWs &&
-            computedWs &&
-            existingLease.workspaceLabel.toLowerCase().startsWith(`${computedWs.toLowerCase()}/`)
-          ) {
+          if (resolvedCwd && watchdogLeaseMod.formatWorkspaceWindowLabel) {
+            const computedWs = watchdogLeaseMod.formatWorkspaceWindowLabel(resolvedCwd, subprojectPaths);
+            const sameWs = watchdogLeaseMod.isSameWorkspacePath
+              ? watchdogLeaseMod.isSameWorkspacePath(existingLease?.cwd || "", resolvedCwd)
+              : existingLease?.cwd === resolvedCwd;
+            if (
+              existingLease?.workspaceLabel &&
+              sameWs &&
+              computedWs &&
+              existingLease.workspaceLabel.toLowerCase().startsWith(`${computedWs.toLowerCase()}/`)
+            ) {
+              resolvedWorkspaceLabel = existingLease.workspaceLabel;
+            } else {
+              resolvedWorkspaceLabel = computedWs || existingLease?.workspaceLabel || "";
+            }
+          } else if (existingLease?.workspaceLabel) {
             resolvedWorkspaceLabel = existingLease.workspaceLabel;
-          } else {
-            resolvedWorkspaceLabel = computedWs || existingLease?.workspaceLabel || "";
           }
-        } else if (existingLease?.workspaceLabel) {
-          resolvedWorkspaceLabel = existingLease.workspaceLabel;
-        }
-      } catch {}
+        } catch {}
+      }
     }
 
     // Record Sidecar Stall Watchdog / Idle TTL / Watermark execution lease (isolated by direct conversationId)
@@ -677,11 +748,41 @@ async function main() {
           typeof store.isTtlDesktopNotifyEnabled === "function" &&
           store.isTtlDesktopNotifyEnabled())
     );
-    const ttlKeepaliveExplicit = Boolean(
-      cfgSnapshot.sources.ttlKeepalive !== "default"
-        ? effectiveCfg.ttlKeepalive
-        : (dbExists || store.db) && store.getMeta("cache:ttl_keepalive_enabled", null) === "true"
-    );
+    // Migrate any pending empty-tab (`__unbound__`) keepalive setting onto a brand-new Turn-0 primary conversation
+    if (
+      (dbExists || store.db) &&
+      !detectedSubagent &&
+      !isMidTurnContinuation &&
+      !existingLease &&
+      targetConvId &&
+      targetConvId !== "default" &&
+      typeof store.claimPendingUnboundTtlKeepalive === "function" &&
+      !loadedSteps.some((s) => String(s?.type || "").toUpperCase() === "PLANNER_RESPONSE")
+    ) {
+      try {
+        store.claimPendingUnboundTtlKeepalive(targetConvId);
+      } catch {}
+    }
+
+    let ttlKeepaliveExplicit = false;
+    if (!detectedSubagent) {
+      if (cfgSnapshot.sources.ttlKeepalive === "env") {
+        ttlKeepaliveExplicit = Boolean(effectiveCfg.ttlKeepalive);
+      } else {
+        const convKaState =
+          (dbExists || store.db) &&
+          targetConvId &&
+          targetConvId !== "default" &&
+          typeof store.getTtlKeepaliveState === "function"
+            ? store.getTtlKeepaliveState(targetConvId)
+            : null;
+        if (convKaState && typeof convKaState.enabled === "boolean") {
+          ttlKeepaliveExplicit = convKaState.enabled;
+        } else if (cfgSnapshot.sources.ttlKeepalive !== "default") {
+          ttlKeepaliveExplicit = Boolean(effectiveCfg.ttlKeepalive);
+        }
+      }
+    }
     const watermarkNotifyActive =
       effectiveCfg.watermarkDesktopNotify === true ||
       (effectiveCfg.watermarkDesktopNotify === null && (ttlNotifyActive || desktopStallNotifyActive));
@@ -691,7 +792,7 @@ async function main() {
     // (which still holds the PREVIOUS turn's user prompt), so we MUST always scan trailing steps after the last
     // PLANNER_RESPONSE first rather than skipping transcript inspection when `rawLastUserInput` is non-empty.
     let isKeepaliveTurn = false;
-    if (!isSubagentConv && targetConvId && targetConvId !== "default" && watchdogLeaseMod) {
+    if (!detectedSubagent && targetConvId && targetConvId !== "default" && watchdogLeaseMod) {
       try {
         const checkKeepalive = watchdogLeaseMod.isTtlKeepalivePrompt;
         const trimmedRawInput = typeof rawLastUserInput === "string" ? rawLastUserInput.trim() : "";
@@ -776,6 +877,14 @@ async function main() {
           typeof store.resetTtlKeepaliveState === "function"
         ) {
           store.resetTtlKeepaliveState(targetConvId);
+        } else if (
+          !isMidTurnContinuation &&
+          kaState &&
+          (typeof kaState.enabled === "boolean" || typeof kaState.maxCount === "number") &&
+          Date.now() - (kaState.updatedTs || 0) > 3600_000 &&
+          typeof store.setTtlKeepaliveState === "function"
+        ) {
+          store.setTtlKeepaliveState(targetConvId, { updatedTs: Date.now() });
         }
       } catch {}
     }
@@ -841,45 +950,13 @@ async function main() {
       watchdogLeaseMod?.recordHookLeaseTransition
     ) {
       try {
-        let detectedSubagent = isSubagentConv;
-        if (!detectedSubagent) {
-          if (
-            watchdogLeaseMod.isSubagentLeasePayload?.(payload) ||
-            (typeof rawLastUserInput === "string" && watchdogLeaseMod.isHeadlessWorkerPrompt?.(rawLastUserInput))
-          ) {
-            detectedSubagent = true;
-          } else if (loadedSteps.length > 0) {
-            for (const s of loadedSteps) {
-              if (!s || typeof s !== "object") continue;
-              const stType = String(s.type || "").toUpperCase();
-              if (stType === "USER_INPUT" || String(s.role || "").toLowerCase() === "user") {
-                const uTxt =
-                  typeof s.user_input === "string"
-                    ? s.user_input
-                    : typeof s.content === "string"
-                      ? s.content
-                      : "";
-                if (uTxt && watchdogLeaseMod.isHeadlessWorkerPrompt?.(uTxt)) {
-                  detectedSubagent = true;
-                  break;
-                }
-              }
-              if (Array.isArray(s.tool_calls)) {
-                const hasFinish = s.tool_calls.some((c) => {
-                  const n = c && typeof c === "object" ? c.name || c.tool || c.function?.name || "" : "";
-                  return watchdogLeaseMod.extractBareToolName?.(n) === "finish";
-                });
-                if (hasFinish) {
-                  detectedSubagent = true;
-                  break;
-                }
-              }
-            }
-          }
-        }
         watchdogLeaseMod.recordHookLeaseTransition(store, "PreInvocation", payload, {
           directConvId: targetConvId,
-          rootSessionId: sessionId,
+          rootSessionId:
+            sessionId && sessionId !== targetConvId
+              ? sessionId
+              : resolvedParentConvId || sessionId,
+          parentConversationId: resolvedParentConvId,
           isSubagent: detectedSubagent,
           isKeepaliveTurn,
           cwd: resolvedCwd || payload.cwd || "",

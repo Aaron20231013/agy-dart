@@ -1,0 +1,843 @@
+import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { resetConfigCache } from "../context/lib/config.js";
+import {
+  SAFE_GIT_CONFIG_ARGS,
+  computeWaterFillBudgets,
+  isInsideInstalledPluginDir,
+  parseFlatLineRangeSpec,
+  runApplyEdits,
+  runChecks,
+  runReadSlices,
+  validateReadonlyGitArgs
+} from "../fast/mcp-server.mjs";
+import { buildWorkspaceSnapshot } from "../fast/session-start.mjs";
+import {
+  buildHookBootstrapCommand,
+  buildMcpConfigObject,
+  discoverExtraHostPluginTargets
+} from "../scripts/install.mjs";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, "..");
+
+function makeTmpDir(prefix = "agy-v16-") {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function cleanTmpDir(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  } catch {}
+}
+
+/**
+ * Interactive bidirectional JSON-RPC stdio client supporting server-initiated
+ * requests such as `roots/list` as well as client notifications.
+ */
+function createBidirectionalMcpClient(scriptPath, { cwd = ROOT, env = {}, onServerRequest = null } = {}) {
+  const child = spawn(process.execPath, [scriptPath], {
+    cwd,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    env: { ...process.env, ...env }
+  });
+  let stderr = "";
+  let buf = "";
+  const pending = new Map();
+  const serverRequests = [];
+  let nextId = 1;
+
+  child.stderr.on("data", (d) => {
+    stderr += d.toString("utf8");
+  });
+
+  child.stdout.on("data", (chunk) => {
+    buf += chunk.toString("utf8");
+    let nl;
+    while ((nl = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (msg && typeof msg.method === "string" && msg.id !== undefined) {
+        serverRequests.push(msg);
+        if (typeof onServerRequest === "function") {
+          Promise.resolve(onServerRequest(msg)).then((reply) => {
+            if (reply !== undefined) {
+              child.stdin.write(JSON.stringify(reply) + "\n");
+            }
+          });
+        }
+        continue;
+      }
+      if (msg && msg.id !== undefined && pending.has(msg.id)) {
+        const { resolve, timer } = pending.get(msg.id);
+        clearTimeout(timer);
+        pending.delete(msg.id);
+        resolve(msg);
+      }
+    }
+  });
+
+  return {
+    serverRequests,
+    getStderr: () => stderr,
+    sendRaw(obj) {
+      child.stdin.write(JSON.stringify(obj) + "\n");
+    },
+    request(method, params, timeoutMs = 5000) {
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`MCP request '${method}' timed out. stderr=${stderr}`));
+        }, timeoutMs);
+        timer.unref();
+        pending.set(id, { resolve, timer });
+        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      });
+    },
+    close() {
+      return new Promise((resolve) => {
+        const killTimer = setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {}
+          resolve();
+        }, 2000);
+        killTimer.unref();
+        child.once("close", () => {
+          clearTimeout(killTimer);
+          resolve();
+        });
+        try {
+          child.stdin.end();
+        } catch {
+          resolve();
+        }
+      });
+    }
+  };
+}
+
+test("v1.6-1: Cross-workspace hooks.json polyglot bootstrapper runs all 5 hooks across PLUGIN_ROOT, .agents/plugins, and HOME, and fails open cleanly", () => {
+  const tmpDir = makeTmpDir("agy-v16-hooks-");
+  try {
+    const hooksCfg = JSON.parse(fs.readFileSync(path.join(ROOT, "hooks.json"), "utf8"));
+    const lc = hooksCfg["agy-dart-lifecycle"];
+    const foreignWs = path.join(tmpDir, "foreign-workspace");
+    const dbPath = path.join(tmpDir, "hooks.db");
+    fs.mkdirSync(foreignWs, { recursive: true });
+    fs.writeFileSync(path.join(foreignWs, "package.json"), '{"name":"demo-ws"}\n', "utf8");
+
+    const baseEnv = {
+      ...process.env,
+      PLUGIN_ROOT: ROOT,
+      AGY_DART_DB_PATH: dbPath,
+      AGY_DART_CONFIG_PATH: path.join(tmpDir, "nonexistent.json"),
+      ANTIGRAVITY_PARENT_CONVERSATION_ID: "",
+      ANTIGRAVITY_SUBAGENT: ""
+    };
+
+    // 1A. Execute SessionStart via both `shell: true` AND non-verbatim `cmd /c` (or `sh -c`) from foreign CWD
+    const ssCmd = lc.SessionStart[0].command;
+    const ssInput = JSON.stringify({
+      cwd: foreignWs,
+      workspacePaths: [foreignWs],
+      hookEventName: "SessionStart"
+    });
+    const ssShell = spawnSync(ssCmd, {
+      shell: true,
+      cwd: foreignWs,
+      input: ssInput,
+      encoding: "utf8",
+      timeout: 6000,
+      windowsHide: true,
+      env: baseEnv
+    });
+    assert.equal(ssShell.status, 0, ssShell.stderr);
+    assert.equal(ssShell.stderr, "");
+    const ssOut = JSON.parse(ssShell.stdout.trim());
+    assert.ok(ssOut.injectSteps?.[0]?.systemMessage?.systemMessage?.includes("demo-ws"));
+
+    if (process.platform === "win32") {
+      const ssCmdExe = spawnSync("cmd", ["/c", ssCmd], {
+        cwd: foreignWs,
+        input: ssInput,
+        encoding: "utf8",
+        timeout: 6000,
+        windowsHide: true,
+        env: baseEnv
+      });
+      assert.equal(ssCmdExe.status, 0, ssCmdExe.stderr);
+      assert.ok(JSON.parse(ssCmdExe.stdout.trim()).injectSteps?.length === 1);
+    }
+
+    // 1B. Verify PreToolUse, PostToolUse, PreInvocation, and Stop all trigger main() from foreign CWD
+    const bigFile = path.join(foreignWs, "huge.log");
+    fs.writeFileSync(bigFile, "ERROR line\n".repeat(3000), "utf8");
+
+    const preCmd = lc.PreToolUse[0].hooks[0].command;
+    const preRes = spawnSync(preCmd, {
+      shell: true,
+      cwd: foreignWs,
+      input: JSON.stringify({
+        conversationId: "boot-conv-1",
+        cwd: foreignWs,
+        toolCall: { name: "read_file", args: { Path: bigFile } }
+      }),
+      encoding: "utf8",
+      timeout: 6000,
+      windowsHide: true,
+      env: baseEnv
+    });
+    assert.equal(preRes.status, 0, preRes.stderr);
+    assert.equal(JSON.parse(preRes.stdout.trim()).decision, "deny", "PreToolUse must actively guard >16KB .log from foreign CWD");
+
+    const postCmd = lc.PostToolUse[0].hooks[0].command;
+    const postRes = spawnSync(postCmd, {
+      shell: true,
+      cwd: foreignWs,
+      input: JSON.stringify({
+        conversationId: "boot-conv-1",
+        cwd: foreignWs,
+        toolCall: { name: "write_file", args: { Path: path.join(foreignWs, "src.js") } },
+        toolResponse: "ok"
+      }),
+      encoding: "utf8",
+      timeout: 6000,
+      windowsHide: true,
+      env: baseEnv
+    });
+    assert.equal(postRes.status, 0, postRes.stderr);
+    assert.deepEqual(JSON.parse(postRes.stdout.trim()), {});
+
+    const preInvCmd = lc.PreInvocation[0].command;
+    const preInvRes = spawnSync(preInvCmd, {
+      shell: true,
+      cwd: foreignWs,
+      input: JSON.stringify({ conversationId: "boot-conv-1", cwd: foreignWs, lastUserInput: "hello" }),
+      encoding: "utf8",
+      timeout: 6000,
+      windowsHide: true,
+      env: baseEnv
+    });
+    assert.equal(preInvRes.status, 0, preInvRes.stderr);
+    assert.equal(typeof JSON.parse(preInvRes.stdout.trim()), "object");
+
+    const stopCmd = lc.Stop[0].command;
+    const stopRes = spawnSync(stopCmd, {
+      shell: true,
+      cwd: foreignWs,
+      input: JSON.stringify({ conversationId: "boot-conv-1", terminationReason: "IDLE_READY", fullyIdle: true }),
+      encoding: "utf8",
+      timeout: 6000,
+      windowsHide: true,
+      env: baseEnv
+    });
+    assert.equal(stopRes.status, 0, stopRes.stderr);
+    assert.deepEqual(JSON.parse(stopRes.stdout.trim()), { decision: "allow" });
+
+    // 1C. Discovery via ancestor `.agents/plugins/agy-dart` without PLUGIN_ROOT
+    const projRoot = path.join(tmpDir, "monorepo");
+    const nestedDir = path.join(projRoot, "packages", "web");
+    fs.mkdirSync(nestedDir, { recursive: true });
+    const projInstall = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "scripts", "install.mjs"), "install", "--project", projRoot],
+      { encoding: "utf8", windowsHide: true, env: { ...baseEnv, PLUGIN_ROOT: "" } }
+    );
+    assert.equal(projInstall.status, 0, `${projInstall.stdout}\n${projInstall.stderr}`);
+
+    const stopFromNested = spawnSync(stopCmd, {
+      shell: true,
+      cwd: nestedDir,
+      input: JSON.stringify({ conversationId: "nested-1", fullyIdle: true }),
+      encoding: "utf8",
+      timeout: 6000,
+      windowsHide: true,
+      env: {
+        ...baseEnv,
+        PLUGIN_ROOT: "",
+        AGY_PLUGIN_ROOT: "",
+        USERPROFILE: path.join(tmpDir, "empty-home"),
+        HOME: path.join(tmpDir, "empty-home")
+      }
+    });
+    assert.equal(stopFromNested.status, 0, stopFromNested.stderr);
+    assert.deepEqual(JSON.parse(stopFromNested.stdout.trim()), { decision: "allow" });
+
+    // 1D. Missing plugin fail-open -> `{}` with exit 0 and empty stderr
+    const ghostCmd = buildHookBootstrapCommand("nonexistent-ghost-plugin", "./hooks/stop.mjs");
+    const ghostRes = spawnSync(ghostCmd, {
+      shell: true,
+      cwd: foreignWs,
+      input: "{}",
+      encoding: "utf8",
+      timeout: 6000,
+      windowsHide: true,
+      env: { ...baseEnv, PLUGIN_ROOT: "", AGY_PLUGIN_ROOT: "" }
+    });
+    assert.equal(ghostRes.status, 0);
+    assert.equal(ghostRes.stderr, "");
+    assert.deepEqual(JSON.parse(ghostRes.stdout.trim()), {});
+  } finally {
+    cleanTmpDir(tmpDir);
+  }
+});
+
+test("v1.6-2: Dual MCP servers (fast + context) lazy roots/list, list_changed invalidation, zero-latency explicit cwd & PLUGIN_ROOT Fail-Fast guard", async () => {
+  const tmpDir = makeTmpDir("agy-v16-roots-");
+  try {
+    const installDir = path.join(tmpDir, "installed-agy-dart");
+    const wsA = path.join(tmpDir, "workspace-alpha");
+    const wsB = path.join(tmpDir, "workspace-beta");
+    const dbPath = path.join(tmpDir, "roots.db");
+    fs.mkdirSync(wsA, { recursive: true });
+    fs.mkdirSync(wsB, { recursive: true });
+    fs.writeFileSync(path.join(wsA, "alpha.txt"), "ALPHA_WORKSPACE_MARKER\n", "utf8");
+    fs.writeFileSync(path.join(wsB, "beta.txt"), "BETA_WORKSPACE_MARKER\n", "utf8");
+
+    const ins = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "scripts", "install.mjs"), "install", "--target", installDir],
+      {
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, AGY_DART_DB_PATH: dbPath, AGY_DART_CONFIG_PATH: path.join(tmpDir, "cfg.json") }
+      }
+    );
+    assert.equal(ins.status, 0, `${ins.stdout}\n${ins.stderr}`);
+
+    const cleanEnv = {
+      AGY_DART_DB_PATH: dbPath,
+      AGY_DART_CONFIG_PATH: path.join(tmpDir, "cfg.json"),
+      ANTIGRAVITY_WORKSPACE_ROOT: "",
+      VSCODE_CWD: "",
+      PLUGIN_ROOT: installDir
+    };
+
+    // 2A. Fast MCP inside installed plugin dir WITHOUT roots/list:
+    //     - omitting cwd fails fast
+    //     - relative cwd fails fast
+    //     - explicit absolute cwd succeeds with 0 roots/list calls!
+    const fastNoRoots = createBidirectionalMcpClient(path.join(installDir, "fast", "mcp-server.mjs"), {
+      cwd: installDir,
+      env: cleanEnv,
+      onServerRequest: (req) => ({ jsonrpc: "2.0", id: req.id, result: { roots: [] } })
+    });
+    try {
+      await fastNoRoots.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "hub-test", version: "2.0" }
+      });
+      await fastNoRoots.request("tools/list", {});
+      assert.equal(fastNoRoots.serverRequests.length, 0, "Handshake & tools/list must be 100% one-way");
+
+      // Explicit absolute cwd skips roots/list completely
+      const explicitCall = await fastNoRoots.request("tools/call", {
+        name: "batch_search",
+        arguments: { cwd: wsA, queries: [{ type: "text", pattern: "ALPHA_WORKSPACE_MARKER" }] }
+      });
+      assert.equal(explicitCall.result.isError, false);
+      assert.ok(explicitCall.result.content[0].text.includes("alpha.txt"));
+      assert.equal(fastNoRoots.serverRequests.length, 0, "Explicit absolute cwd must send 0 roots/list requests");
+
+      // Omitted cwd fails fast with PLUGIN_ROOT guard
+      const omittedCall = await fastNoRoots.request("tools/call", {
+        name: "batch_search",
+        arguments: { queries: [{ type: "glob", pattern: "*.json" }] }
+      });
+      assert.equal(omittedCall.result.isError, true);
+      assert.match(omittedCall.result.content[0].text, /Workspace root could not be determined/);
+
+      // Relative cwd also fails fast when base workspace is unconfirmed plugin dir
+      const relEditCall = await fastNoRoots.request("tools/call", {
+        name: "apply_edits",
+        arguments: { cwd: "./rules", edits: [{ path: "hack.md", create: "bad" }] }
+      });
+      assert.equal(relEditCall.result.isError, true);
+      assert.match(relEditCall.result.content[0].text, /Workspace root could not be determined/);
+      assert.equal(fs.existsSync(path.join(installDir, "rules", "hack.md")), false);
+    } finally {
+      await fastNoRoots.close();
+    }
+
+    // 2B. Fast MCP WITH roots/list + notifications/roots/list_changed invalidation
+    let activeRootDir = wsA;
+    const fastWithRoots = createBidirectionalMcpClient(path.join(installDir, "fast", "mcp-server.mjs"), {
+      cwd: installDir,
+      env: cleanEnv,
+      onServerRequest: (req) => {
+        if (req.method === "roots/list") {
+          return {
+            jsonrpc: "2.0",
+            id: req.id,
+            result: { roots: [{ uri: pathToFileURL(activeRootDir).href, name: "ws" }] }
+          };
+        }
+        return undefined;
+      }
+    });
+    try {
+      await fastWithRoots.request("initialize", {
+        protocolVersion: "2025-03-26",
+        capabilities: { roots: { listChanged: true } },
+        clientInfo: { name: "desktop-hub", version: "2.0" }
+      });
+      assert.equal(fastWithRoots.serverRequests.length, 0);
+
+      const firstSearch = await fastWithRoots.request("tools/call", {
+        name: "batch_search",
+        arguments: { queries: [{ type: "text", pattern: "ALPHA_WORKSPACE_MARKER" }] }
+      });
+      assert.equal(firstSearch.result.isError, false);
+      assert.ok(firstSearch.result.content[0].text.includes("alpha.txt"));
+      assert.equal(fastWithRoots.serverRequests.length, 1);
+
+      // Cached on 2nd call
+      await fastWithRoots.request("tools/call", {
+        name: "batch_search",
+        arguments: { queries: [{ type: "text", pattern: "ALPHA_WORKSPACE_MARKER" }] }
+      });
+      assert.equal(fastWithRoots.serverRequests.length, 1, "Second call must reuse cached roots/list result");
+
+      // Switch workspace via notifications/roots/list_changed
+      activeRootDir = wsB;
+      fastWithRoots.sendRaw({ jsonrpc: "2.0", method: "notifications/roots/list_changed" });
+      const switchedSearch = await fastWithRoots.request("tools/call", {
+        name: "batch_search",
+        arguments: { queries: [{ type: "text", pattern: "BETA_WORKSPACE_MARKER" }] }
+      });
+      assert.equal(switchedSearch.result.isError, false);
+      assert.ok(switchedSearch.result.content[0].text.includes("beta.txt"));
+      assert.equal(fastWithRoots.serverRequests.length, 2);
+    } finally {
+      await fastWithRoots.close();
+    }
+
+    // 2C. Context MCP server: PLUGIN_ROOT fail-fast when unconfirmed + roots/list resolution
+    let ctxProvideRoot = false;
+    const ctxClient = createBidirectionalMcpClient(path.join(installDir, "context", "server.js"), {
+      cwd: installDir,
+      env: { ...cleanEnv, AGY_DART_DB_PATH: path.join(tmpDir, "fresh-ctx.db") },
+      onServerRequest: (req) => {
+        if (req.method === "roots/list") {
+          return {
+            jsonrpc: "2.0",
+            id: req.id,
+            result: { roots: ctxProvideRoot ? [{ uri: pathToFileURL(wsA).href }] : [] }
+          };
+        }
+        return undefined;
+      }
+    });
+    try {
+      await ctxClient.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: { roots: { listChanged: true } },
+        clientInfo: { name: "ctx-hub", version: "2.0" }
+      });
+      // Unconfirmed plugin cwd blocks ctx_execute & relative ctx_index
+      const blockedExec = await ctxClient.request("tools/call", {
+        name: "ctx_execute",
+        arguments: { language: "javascript", code: "console.log(process.cwd())" }
+      });
+      assert.equal(blockedExec.result.isError, true);
+      assert.match(blockedExec.result.content[0].text, /Workspace root could not be determined/);
+
+      const blockedRelIdx = await ctxClient.request("tools/call", {
+        name: "ctx_index",
+        arguments: { path: "alpha.txt" }
+      });
+      assert.equal(blockedRelIdx.result.isError, true);
+      assert.match(blockedRelIdx.result.content[0].text, /Workspace root could not be determined/);
+
+      // Raw text indexing without workspace dependency still works
+      const rawIdx = await ctxClient.request("tools/call", {
+        name: "ctx_index",
+        arguments: { content: "# Heading\nPure text content", label: "mem-doc" }
+      });
+      assert.equal(rawIdx.result.isError, false);
+
+      // Now enable roots/list and trigger list_changed -> relative ctx_index resolves wsA/alpha.txt!
+      ctxProvideRoot = true;
+      ctxClient.sendRaw({ jsonrpc: "2.0", method: "notifications/roots/list_changed" });
+      const okRelIdx = await ctxClient.request("tools/call", {
+        name: "ctx_index",
+        arguments: { path: "alpha.txt" }
+      });
+      assert.equal(okRelIdx.result.isError, false);
+      assert.match(okRelIdx.result.content[0].text, /Indexed/);
+    } finally {
+      await ctxClient.close();
+    }
+
+    // Standard path pattern recognition even if `.git` exists inside ~/.gemini/config/plugins/agy-dart
+    const fakeClonedGlobal = path.join(tmpDir, ".gemini", "config", "plugins", "agy-dart");
+    fs.mkdirSync(path.join(fakeClonedGlobal, ".git"), { recursive: true });
+    assert.equal(isInsideInstalledPluginDir(fakeClonedGlobal), true);
+  } finally {
+    cleanTmpDir(tmpDir);
+  }
+});
+
+test("v1.6-3: Git read-only sandbox blocks external diff/textconv/gpg config execution, status -v, and injects -n on remote show", async () => {
+  // 3A. Flag validation unit checks
+  assert.ok(SAFE_GIT_CONFIG_ARGS.includes("diff.external="));
+  assert.ok(SAFE_GIT_CONFIG_ARGS.includes("gpg.program=false"));
+  assert.ok(SAFE_GIT_CONFIG_ARGS.includes("gpg.ssh.program=false"));
+
+  for (const blocked of [
+    "status -v",
+    "status --verbose",
+    "status -sv",
+    "status -bvv",
+    "diff --ext-diff",
+    "diff --ext",
+    "log --textconv",
+    "log --textc",
+    "show --output=hack.txt",
+    "log -c core.pager=evil"
+  ]) {
+    assert.throws(
+      () => validateReadonlyGitArgs(blocked),
+      /not allowed/,
+      `Expected '${blocked}' to be rejected by validateReadonlyGitArgs`
+    );
+  }
+
+  assert.deepEqual(validateReadonlyGitArgs("remote show origin"), [
+    "--no-pager",
+    "remote",
+    "show",
+    "-n",
+    "origin"
+  ]);
+  assert.deepEqual(validateReadonlyGitArgs("shortlog -sn HEAD"), [
+    "--no-pager",
+    "shortlog",
+    "--no-ext-diff",
+    "--no-textconv",
+    "-sn",
+    "HEAD"
+  ]);
+  assert.deepEqual(validateReadonlyGitArgs("blame -L 1,5 a.txt"), [
+    "--no-pager",
+    "blame",
+    "--no-textconv",
+    "-L",
+    "1,5",
+    "a.txt"
+  ]);
+
+  // 3B. Live untrusted repository with malicious diff.external & textconv in .git/config
+  const tmpRepo = makeTmpDir("agy-v16-gitsandbox-");
+  try {
+    const runGit = (args) =>
+      spawnSync("git", args, { cwd: tmpRepo, encoding: "utf8", windowsHide: true });
+    assert.equal(runGit(["init"]).status, 0);
+    assert.equal(runGit(["config", "user.email", "test@example.com"]).status, 0);
+    assert.equal(runGit(["config", "user.name", "Test"]).status, 0);
+
+    const markerPath = path.join(tmpRepo, "PWNED_MARKER.txt").replace(/\\/g, "/");
+    const evilCmd = `${JSON.stringify(process.execPath)} -e "require('fs').writeFileSync(${JSON.stringify(markerPath)}, 'pwned')"`;
+    assert.equal(runGit(["config", "diff.external", evilCmd]).status, 0);
+    assert.equal(runGit(["config", "diff.evil.textconv", evilCmd]).status, 0);
+    fs.writeFileSync(path.join(tmpRepo, ".gitattributes"), "*.txt diff=evil\n", "utf8");
+    fs.writeFileSync(path.join(tmpRepo, "hello.txt"), "line 1\n", "utf8");
+    assert.equal(runGit(["add", "."]).status, 0);
+    assert.equal(runGit(["commit", "-m", "initial"]).status, 0);
+    fs.writeFileSync(path.join(tmpRepo, "hello.txt"), "line 1\nline 2\n", "utf8");
+
+    // Snapshot & batch_search(git) must NOT execute diff.external or textconv
+    const snap = await buildWorkspaceSnapshot(tmpRepo, { maxChars: 1500, gitTimeoutMs: 2000 });
+    assert.ok(snap.includes("Modified"));
+    assert.equal(fs.existsSync(markerPath), false, "SessionStart snapshot must never trigger .git/config hooks");
+
+    const { runBatchSearch } = await import("../fast/mcp-server.mjs");
+    const searchRes = await runBatchSearch({
+      cwd: tmpRepo,
+      queries: [
+        { type: "git", pattern: "diff" },
+        { type: "git", pattern: "log -p -n 1" },
+        { type: "git", pattern: "blame hello.txt" }
+      ]
+    });
+    assert.equal(searchRes.isError, false);
+    assert.ok(searchRes.text.includes("+line 2"));
+    assert.equal(fs.existsSync(markerPath), false, "batch_search(git) must block diff.external & textconv");
+  } finally {
+    cleanTmpDir(tmpRepo);
+  }
+});
+
+test("v1.6-4: 170s shared monotonic call budget, stringified arguments/edits self-healing, flat lineRanges & Water-Filling quota", async () => {
+  const tmpDir = makeTmpDir("agy-v16-p2-");
+  try {
+    // 4A. computeWaterFillBudgets invariants
+    assert.deepEqual(computeWaterFillBudgets([], 1000), []);
+    assert.deepEqual(computeWaterFillBudgets([100, 200], 0), [0, 0]);
+    assert.deepEqual(computeWaterFillBudgets([-5, NaN, 120], 500), [0, 0, 120]);
+    assert.deepEqual(computeWaterFillBudgets([80, 90, 100, 110, 120, 8000], 6000), [
+      80, 90, 100, 110, 120, 5500
+    ]);
+    const equal3 = computeWaterFillBudgets([2000, 2000, 2000], 1000);
+    assert.equal(equal3.reduce((a, b) => a + b, 0), 1000);
+    assert.ok(equal3.every((v) => v >= 333 && v <= 334));
+
+    // 4B. parseFlatLineRangeSpec (POSIX + Windows drive letters + invalid cases)
+    assert.deepEqual(parseFlatLineRangeSpec("src/app.ts:10-50,80-120"), {
+      path: "src/app.ts",
+      ranges: [
+        [10, 50],
+        [80, 120]
+      ]
+    });
+    assert.deepEqual(parseFlatLineRangeSpec("E:\\work\\agy-dart\\fast\\mcp-server.mjs:1-60, 90-100"), {
+      path: "E:\\work\\agy-dart\\fast\\mcp-server.mjs",
+      ranges: [
+        [1, 60],
+        [90, 100]
+      ]
+    });
+    assert.deepEqual(parseFlatLineRangeSpec("notes.md:42"), {
+      path: "notes.md",
+      ranges: [[42, 42]]
+    });
+    assert.throws(() => parseFlatLineRangeSpec(""), /non-empty/);
+    assert.throws(() => parseFlatLineRangeSpec("src/no-range.ts"), /Invalid lineRanges/);
+    if (process.platform === "win32") {
+      assert.throws(() => parseFlatLineRangeSpec("C:10-20"), /drive letter/);
+    }
+
+    // 4C. apply_edits JSON-stringified edits + empty/corrupted circuit breaker
+    const targetFile = path.join(tmpDir, "str-edit.js");
+    const strEditRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: JSON.stringify([{ path: "str-edit.js", create: "const x = 1;\nconst y = 2;\n" }])
+    });
+    assert.equal(strEditRes.isError, false, strEditRes.text);
+    assert.equal(fs.readFileSync(targetFile, "utf8"), "const x = 1;\nconst y = 2;\n");
+
+    for (const corrupted of [[], "[]", [null], [true], [42], ["not-an-obj"]]) {
+      const badRes = await runApplyEdits({ cwd: tmpDir, edits: corrupted });
+      assert.equal(badRes.isError, true);
+      assert.match(badRes.text, /HOST_SERIALIZATION_CORRUPTION/);
+      assert.match(badRes.text, /edit_file/);
+    }
+
+    // Stringified params.arguments over live JSON-RPC
+    const client = createBidirectionalMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
+    try {
+      await client.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "p2-client", version: "1.0" }
+      });
+      const listResp = await client.request("tools/list", {});
+      const byName = new Map(listResp.result.tools.map((t) => [t.name, t]));
+      assert.equal(byName.get("apply_edits").inputSchema.properties.verifyTimeoutSec.maximum, 170);
+      assert.equal(byName.get("run_checks").inputSchema.properties.timeoutSec.maximum, 170);
+      assert.equal(byName.get("run_checks").inputSchema.properties.commands.items.properties.timeoutSec.maximum, 170);
+
+      const strArgsCall = await client.request("tools/call", {
+        name: "read_slices",
+        arguments: JSON.stringify({
+          lineRanges: [`${targetFile}:1-2`]
+        })
+      });
+      assert.equal(strArgsCall.result.isError, false);
+      assert.ok(strArgsCall.result.content[0].text.includes("const y = 2;"));
+
+      const badArgsCall = await client.request("tools/call", {
+        name: "read_slices",
+        arguments: "[1,2,3]"
+      });
+      assert.equal(badArgsCall.error?.code, -32602);
+    } finally {
+      await client.close();
+    }
+
+    // 4D. Shared monotonic budget exhaustion in runChecks
+    const budgetRes = await runChecks(
+      {
+        cwd: tmpDir,
+        concurrency: 1,
+        commands: [
+          { name: "slow-1", command: `${JSON.stringify(process.execPath)} -e "setTimeout(()=>{}, 450)"` },
+          { name: "skipped-2", command: `${JSON.stringify(process.execPath)} -e "console.log('NEVER_' + 'EXECUTED_TOKEN')"` }
+        ]
+      },
+      { budgetMs: 600 }
+    );
+    assert.equal(budgetRes.isError, false);
+    assert.match(budgetRes.text, /MCP call budget exhausted/);
+    assert.equal(budgetRes.text.includes("NEVER_EXECUTED_TOKEN"), false);
+
+    // 4E. Water-Filling in run_checks (5 short passes + 1 long failing stack trace)
+    const stackFile = path.join(tmpDir, "emit-long-fail.cjs");
+    fs.writeFileSync(
+      stackFile,
+      `const frames = Array.from({length: 45}, (_, i) => '    at step_' + i + ' (src/module_' + i + '.js:' + (i+10) + ':5)').join('\\n');\n` +
+        `console.error('Error: WATER_FILL_DEEP_TAIL_SENTINEL_START\\n' + frames + '\\nWATER_FILL_DEEP_TAIL_SENTINEL_END');\n` +
+        `process.exit(1);\n`,
+      "utf8"
+    );
+    const wfCheckRes = await runChecks({
+      cwd: tmpDir,
+      outputMode: "full",
+      maxChars: 8000,
+      commands: [
+        { name: "p1", command: `${JSON.stringify(process.execPath)} -e "console.log('ok1')"` },
+        { name: "p2", command: `${JSON.stringify(process.execPath)} -e "console.log('ok2')"` },
+        { name: "p3", command: `${JSON.stringify(process.execPath)} -e "console.log('ok3')"` },
+        { name: "p4", command: `${JSON.stringify(process.execPath)} -e "console.log('ok4')"` },
+        { name: "p5", command: `${JSON.stringify(process.execPath)} -e "console.log('ok5')"` },
+        { name: "big-fail", command: `${JSON.stringify(process.execPath)} ${JSON.stringify(stackFile)}` }
+      ]
+    });
+    assert.equal(wfCheckRes.isError, false);
+    assert.ok(Buffer.byteLength(wfCheckRes.text, "utf8") <= 8800);
+    assert.ok(wfCheckRes.text.includes("WATER_FILL_DEEP_TAIL_SENTINEL_START"));
+    assert.ok(
+      wfCheckRes.text.includes("WATER_FILL_DEEP_TAIL_SENTINEL_END"),
+      `Water-filling should preserve ~2.5KB error stack when 5 sibling checks are short:\n${wfCheckRes.text}`
+    );
+
+    // 4F. Water-Filling in multi-file read_slices({ outlines })
+    const tinyFiles = [];
+    for (let i = 0; i < 11; i++) {
+      const fp = path.join(tmpDir, `tiny_${i}.js`);
+      fs.writeFileSync(fp, `export function tinyFn_${i}() { return ${i}; }\n`, "utf8");
+      tinyFiles.push(`tiny_${i}.js`);
+    }
+    const bigHubLines = [];
+    for (let i = 0; i < 40; i++) {
+      bigHubLines.push(`export function hubSymbol_${i}() {\n  return ${i};\n}`);
+    }
+    fs.writeFileSync(path.join(tmpDir, "big_hub.js"), bigHubLines.join("\n") + "\n", "utf8");
+    const multiOutline = await runReadSlices({
+      cwd: tmpDir,
+      outlines: [...tinyFiles, "big_hub.js"]
+    });
+    assert.equal(multiOutline.isError, false);
+    assert.ok(Buffer.byteLength(multiOutline.text, "utf8") <= 8800);
+    assert.ok(
+      multiOutline.text.includes("hubSymbol_39"),
+      "Water-filling should allow big_hub.js to show all 40 top-level symbols alongside 11 tiny files"
+    );
+  } finally {
+    cleanTmpDir(tmpDir);
+  }
+});
+
+test("v1.6-5: Phase 3 installer --tool-loading persistence, rules/*.local.md preservation, GEMINI_HOME & T3 ACP multi-host sync, and OSS metadata", () => {
+  const tmpDir = makeTmpDir("agy-v16-p3-");
+  try {
+    // 5A. buildMcpConfigObject modes
+    const fe = buildMcpConfigObject("fast-eager");
+    assert.equal(fe.mcpServers.fast.eager, true);
+    assert.equal(fe.mcpServers.context.eager, undefined);
+
+    const lz = buildMcpConfigObject("lazy");
+    assert.equal(lz.mcpServers.fast.eager, undefined);
+    assert.equal(lz.mcpServers.context.eager, undefined);
+
+    const eg = buildMcpConfigObject("eager");
+    assert.equal(eg.mcpServers.fast.eager, true);
+    assert.equal(eg.mcpServers.context.eager, true);
+
+    // 5B. Install preserves rules/*.local.md & prunes stale files, switches --tool-loading cleanly
+    const installDir = path.join(tmpDir, "custom-target");
+    const cfgFile = path.join(tmpDir, "user-config.json");
+    const dbFile = path.join(tmpDir, "inst.db");
+    const instEnv = { ...process.env, AGY_DART_CONFIG_PATH: cfgFile, AGY_DART_DB_PATH: dbFile };
+
+    const r1 = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "scripts", "install.mjs"), "install", "--target", installDir],
+      { encoding: "utf8", windowsHide: true, env: instEnv }
+    );
+    assert.equal(r1.status, 0, `${r1.stdout}\n${r1.stderr}`);
+    const mcp1 = JSON.parse(fs.readFileSync(path.join(installDir, "mcp_config.json"), "utf8"));
+    assert.equal(mcp1.mcpServers.fast.eager, true);
+    assert.equal(mcp1.mcpServers.context.eager, undefined);
+
+    // Create user local rule + obsolete file, then re-install with --tool-loading eager
+    const localRulePath = path.join(installDir, "rules", "my-team.local.md");
+    const staleHookPath = path.join(installDir, "hooks", "obsolete-old.mjs");
+    fs.writeFileSync(localRulePath, "# Custom Team Rule\n", "utf8");
+    fs.writeFileSync(staleHookPath, "// stale\n", "utf8");
+
+    const r2 = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "scripts", "install.mjs"), "install", "--target", installDir, "--tool-loading", "eager"],
+      { encoding: "utf8", windowsHide: true, env: instEnv }
+    );
+    assert.equal(r2.status, 0, `${r2.stdout}\n${r2.stderr}`);
+    assert.equal(fs.existsSync(localRulePath), true, "rules/*.local.md MUST be preserved across upgrades");
+    assert.equal(fs.readFileSync(localRulePath, "utf8"), "# Custom Team Rule\n");
+    assert.equal(fs.existsSync(staleHookPath), false, "Stale non-local files MUST still be pruned");
+    const mcp2 = JSON.parse(fs.readFileSync(path.join(installDir, "mcp_config.json"), "utf8"));
+    assert.equal(mcp2.mcpServers.fast.eager, true);
+    assert.equal(mcp2.mcpServers.context.eager, true);
+
+    // Switch via `tool-loading lazy` subcommand
+    const r3 = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "scripts", "install.mjs"), "tool-loading", "lazy", "--target", installDir],
+      { encoding: "utf8", windowsHide: true, env: instEnv }
+    );
+    assert.equal(r3.status, 0, `${r3.stdout}\n${r3.stderr}`);
+    const mcp3 = JSON.parse(fs.readFileSync(path.join(installDir, "mcp_config.json"), "utf8"));
+    assert.equal(mcp3.mcpServers.fast.eager, undefined);
+    assert.equal(mcp3.mcpServers.context.eager, undefined);
+
+    // 5C. Multi-host discovery (GEMINI_HOME + ~/.t3/userdata/providers/antigravity/*/)
+    const fakeHome = path.join(tmpDir, "fake-home");
+    const fakeGeminiHome = path.join(tmpDir, "custom-gemini-home");
+    const t3ProfileA = path.join(fakeHome, ".t3", "userdata", "providers", "antigravity", "profile-alpha");
+    const t3ProfileB = path.join(fakeHome, ".t3", "userdata", "providers", "antigravity", "profile-beta", "plugins");
+    fs.mkdirSync(fakeGeminiHome, { recursive: true });
+    fs.mkdirSync(t3ProfileA, { recursive: true });
+    fs.mkdirSync(t3ProfileB, { recursive: true });
+
+    const extraTargets = discoverExtraHostPluginTargets({
+      homeDir: fakeHome,
+      env: { GEMINI_HOME: fakeGeminiHome },
+      primaryTargetDir: path.join(fakeHome, ".gemini", "config", "plugins", "agy-dart")
+    });
+    assert.equal(extraTargets.length, 3);
+    assert.ok(extraTargets.some((p) => p.includes("custom-gemini-home")));
+    assert.ok(extraTargets.some((p) => p.includes("profile-alpha")));
+    assert.ok(extraTargets.some((p) => p.includes("profile-beta")));
+
+    // 5D. Glama / Security / Dockerfile / Adaptive SVG assets
+    const glama = JSON.parse(fs.readFileSync(path.join(ROOT, "glama.json"), "utf8"));
+    assert.equal(glama.$schema, "https://glama.ai/mcp/schemas/server.json");
+    assert.ok(Array.isArray(glama.maintainers) && glama.maintainers.includes("zou172866"));
+    assert.ok(fs.existsSync(path.join(ROOT, "SECURITY.md")));
+    const dockerfile = fs.readFileSync(path.join(ROOT, "Dockerfile"), "utf8");
+    assert.match(dockerfile, /^USER node$/m);
+    assert.ok(fs.existsSync(path.join(ROOT, "assets", "architecture-dark.svg")));
+    assert.ok(fs.existsSync(path.join(ROOT, "assets", "architecture-light.svg")));
+    assert.ok(fs.existsSync(path.join(ROOT, "assets", "demo-comparison.svg")));
+  } finally {
+    resetConfigCache();
+    cleanTmpDir(tmpDir);
+  }
+});

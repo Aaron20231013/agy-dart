@@ -8,7 +8,16 @@ import { execFile, execSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { getEffectiveConfig } from "../../context/lib/config.js";
 import { buildHandoffBrief, inferWorkspaceFromStore } from "../../context/lib/handoff.js";
-import { WatchdogMonitor } from "../../context/lib/watchdog.js";
+import {
+  WatchdogMonitor,
+  detectSubagentFromTranscriptFile,
+  isHeadlessWorkerPrompt,
+  isSameWorkspacePath,
+  isTrajectoryMetadataSubagent,
+  lookupConversationSummary,
+  readWatchdogLease,
+  resolveCandidateTranscriptPath
+} from "../../context/lib/watchdog.js";
 import {
   analyzeTranscriptCache,
   computeCacheWarmth,
@@ -66,35 +75,127 @@ function runAgentApiAsync(args, { projectId = "", timeoutMs = 12000 } = {}) {
   });
 }
 
-export async function sendSidecarKeepaliveMessage(conversationId, message, { execFn = runAgentApiAsync } = {}) {
-  if (!isSafeConversationId(conversationId) || /^-/.test(conversationId)) {
+function isDefaultRuntimeStoreDb(store) {
+  if (typeof process.env.AGY_DART_SUMMARY_DB_PATH === "string" && process.env.AGY_DART_SUMMARY_DB_PATH.trim()) {
+    return true;
+  }
+  if (store && typeof store.dbPath === "string" && store.dbPath.trim()) {
+    return isSameWorkspacePath(store.dbPath, path.join(os.homedir(), ".agy-dart", "context.db"));
+  }
+  return false;
+}
+
+function isSidecarConversationSubagent(conversationId, { store = null, transcriptPath = "", allowDefaultDb = null } = {}) {
+  if (!conversationId || conversationId === "__unbound__" || !isSafeConversationId(conversationId)) {
+    return false;
+  }
+  const activeStore = store || _runtimeStore;
+  if (_watchdogMonitor && activeStore) {
+    return _watchdogMonitor._isConversationSubagent(activeStore, conversationId);
+  }
+  const lease = activeStore ? readWatchdogLease(activeStore, conversationId) : null;
+  if (lease) {
+    if (
+      lease.isSubagent ||
+      (lease.parentConversationId && lease.parentConversationId !== conversationId) ||
+      (lease.rootSessionId && lease.rootSessionId !== conversationId) ||
+      (lease.lastUserInput && isHeadlessWorkerPrompt(lease.lastUserInput))
+    ) {
+      return true;
+    }
+    if (lease.convTitle) return false;
+  }
+  const effectiveAllowDefaultDb = allowDefaultDb !== null ? Boolean(allowDefaultDb) : isDefaultRuntimeStoreDb(activeStore);
+  const txPath =
+    transcriptPath ||
+    lease?.transcriptPath ||
+    resolveCandidateTranscriptPath(conversationId, { allowDefaultDb: effectiveAllowDefaultDb });
+  let foundTitle = "";
+  if (effectiveAllowDefaultDb || txPath) {
+    const summary = lookupConversationSummary(conversationId, {
+      transcriptPath: txPath,
+      allowDefaultDb: effectiveAllowDefaultDb,
+      checkSubagent: true
+    });
+    if (summary.isSubagent) return true;
+    if (summary.title) foundTitle = summary.title;
+  }
+  if (!foundTitle && txPath && detectSubagentFromTranscriptFile(txPath)) {
+    return true;
+  }
+  return false;
+}
+
+function isSidecarConversationKilled(conversationId, { store = null, transcriptPath = "", allowDefaultDb = null } = {}) {
+  if (!conversationId || conversationId === "__unbound__" || !isSafeConversationId(conversationId)) {
+    return false;
+  }
+  const activeStore = store || _runtimeStore;
+  const effectiveAllowDefaultDb = allowDefaultDb !== null ? Boolean(allowDefaultDb) : isDefaultRuntimeStoreDb(activeStore);
+  const lease = activeStore ? readWatchdogLease(activeStore, conversationId) : null;
+  const txPath = transcriptPath || lease?.transcriptPath || "";
+  if (!effectiveAllowDefaultDb && !txPath) return false;
+  const summary = lookupConversationSummary(conversationId, {
+    transcriptPath: txPath,
+    allowDefaultDb: effectiveAllowDefaultDb
+  });
+  return Boolean(summary.killed);
+}
+
+export async function sendSidecarKeepaliveMessage(
+  conversationId,
+  message,
+  { execFn = runAgentApiAsync, allowDefaultSummaryDb = null } = {}
+) {
+  if (!isSafeConversationId(conversationId) || /^-/.test(conversationId) || conversationId === "__unbound__") {
     return { ok: false, error: "invalid_conversation_id" };
   }
   const cleanMsg = String(message || "").trim();
   if (!cleanMsg) {
     return { ok: false, error: "empty_message" };
   }
+  if (isSidecarConversationSubagent(conversationId, { allowDefaultDb: allowDefaultSummaryDb })) {
+    _convProjectIdCache.delete(conversationId);
+    return { ok: false, skippedSubagent: true, error: "subagent_keepalive_suppressed" };
+  }
+  if (isSidecarConversationKilled(conversationId, { allowDefaultDb: allowDefaultSummaryDb })) {
+    _convProjectIdCache.delete(conversationId);
+    return { ok: false, skippedKilled: true, error: "killed_conversation_keepalive_suppressed" };
+  }
 
-  let projectId = _convProjectIdCache.get(conversationId) || "";
-  if (!projectId) {
-    try {
-      const metaRes = await execFn(["get-conversation-metadata", conversationId], { timeoutMs: 8000 });
-      const metaEvent = metaRes?.response?.conversationMetadata || metaRes?.response?.conversation_metadata;
-      const resolvedId = metaEvent?.metadata?.projectId || metaEvent?.metadata?.project_id || "";
-      if (typeof resolvedId === "string" && resolvedId.trim()) {
-        projectId = resolvedId.trim();
-        if (_convProjectIdCache.size >= 100) {
-          const oldest = _convProjectIdCache.keys().next().value;
-          if (oldest !== undefined) _convProjectIdCache.delete(oldest);
-        }
-        _convProjectIdCache.set(conversationId, projectId);
-      }
-    } catch {
-      // Fall back to ambient ANTIGRAVITY_PROJECT_ID if metadata lookup is unavailable
+  const cachedProjectId = _convProjectIdCache.get(conversationId) || "";
+  let projectId = "";
+  try {
+    const metaRes = await execFn(["get-conversation-metadata", conversationId], { timeoutMs: 8000 });
+    const metaEvent = metaRes?.response?.conversationMetadata || metaRes?.response?.conversation_metadata;
+    const metaObj = metaEvent?.metadata && typeof metaEvent.metadata === "object" ? metaEvent.metadata : metaEvent || {};
+    if (isTrajectoryMetadataSubagent(conversationId, metaEvent || metaObj)) {
+      _convProjectIdCache.delete(conversationId);
+      return { ok: false, skippedSubagent: true, error: "subagent_keepalive_suppressed" };
     }
+    if (
+      metaObj.killed === true ||
+      metaEvent?.killed === true ||
+      (Number.isFinite(Number(metaObj.killed)) && Number(metaObj.killed) > 0) ||
+      (Number.isFinite(Number(metaEvent?.killed)) && Number(metaEvent?.killed) > 0)
+    ) {
+      _convProjectIdCache.delete(conversationId);
+      return { ok: false, skippedKilled: true, error: "killed_conversation_keepalive_suppressed" };
+    }
+    const resolvedId = metaObj.projectId || metaObj.project_id || "";
+    if (typeof resolvedId === "string" && resolvedId.trim()) {
+      projectId = resolvedId.trim();
+      if (_convProjectIdCache.size >= 100 && !_convProjectIdCache.has(conversationId)) {
+        const oldest = _convProjectIdCache.keys().next().value;
+        if (oldest !== undefined) _convProjectIdCache.delete(oldest);
+      }
+      _convProjectIdCache.set(conversationId, projectId);
+    }
+  } catch {
+    // Fall back to cached or ambient ANTIGRAVITY_PROJECT_ID if metadata lookup is unavailable
   }
   if (!projectId) {
-    projectId = process.env.ANTIGRAVITY_PROJECT_ID || "";
+    projectId = cachedProjectId || process.env.ANTIGRAVITY_PROJECT_ID || "";
   }
 
   try {
@@ -164,13 +265,14 @@ function getRuntimeStore() {
   if (!_runtimeInitialized) {
     _runtimeInitialized = true;
     const startTs = getAppStartTime();
-    // Clear session-level overrides on app session restart
+    // Clear session-level overrides on app session restart & scrub legacy global keepalive keys
     try {
       const recordedSessionTime = _runtimeStore.getMeta("app_session_start_time");
       if (!recordedSessionTime || recordedSessionTime !== String(startTs)) {
         _runtimeStore.clearSessionOverrides();
         _runtimeStore.setMeta("app_session_start_time", String(startTs));
       }
+      _runtimeStore.sanitizeModelTtlState?.();
     } catch {}
   }
   return _runtimeStore;
@@ -340,7 +442,7 @@ function getPackageVersion() {
       return cachedPkgVersion;
     }
   } catch {}
-  return "1.5.4";
+  return "1.6.0";
 }
 
 function getRenderedHtml(csrfToken = SIDECAR_CSRF_TOKEN) {
@@ -586,18 +688,38 @@ function inferConvIdFromTranscriptPath(transcriptPath, fallbackConvId = "") {
   return "";
 }
 
+function isUnboundSidecarHostRequest(data = {}) {
+  const rawExplicitConv = typeof data?.conversationId === "string" ? data.conversationId.trim() : "";
+  if (rawExplicitConv === "__unbound__") return true;
+  if (data?.fromSidecarHost !== true) return false;
+  return !rawExplicitConv;
+}
+
 function getCacheDiagPayload(data, defaultConvId = "default") {
-  const { scope, convId } = resolveTargetSession(data, defaultConvId);
+  const unboundHostTab = isUnboundSidecarHostRequest(data);
+  const { scope, convId } = resolveTargetSession(data, unboundHostTab ? "default" : defaultConvId);
   const cfg = getEffectiveConfig();
   const store = getRuntimeStore();
   const ttlDesktopNotifyEnabled = store.isTtlDesktopNotifyEnabled();
   const isSpecificConvForKa = Boolean(
     convId && convId !== "default" && convId !== "all" && convId !== "app"
   );
-  const kaState = isSpecificConvForKa ? store.getTtlKeepaliveState(convId) : { usedCount: 0, lastSentTs: 0, lastError: "" };
+  const kaConvId = unboundHostTab ? "__unbound__" : isSpecificConvForKa ? convId : "";
+  const isExplicitSubagentForKa = Boolean(
+    kaConvId &&
+      kaConvId !== "__unbound__" &&
+      isSidecarConversationSubagent(kaConvId, { store })
+  );
+  const kaState =
+    !isExplicitSubagentForKa && kaConvId
+      ? store.getTtlKeepaliveState(kaConvId)
+      : { usedCount: 0, lastSentTs: 0, lastError: "" };
   const ttlKeepalive = {
-    enabled: store.isTtlKeepaliveEnabled(),
-    maxCount: store.getTtlKeepaliveMaxCount(),
+    conversationId: kaConvId,
+    enabled: isExplicitSubagentForKa ? false : store.isTtlKeepaliveEnabled(kaConvId || null),
+    supported: !isExplicitSubagentForKa,
+    isSubagent: isExplicitSubagentForKa,
+    maxCount: store.getTtlKeepaliveMaxCount(kaConvId || null),
     usedCount: kaState.usedCount,
     leadSec: Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30))),
     lastSentTs: kaState.lastSentTs || 0,
@@ -610,7 +732,9 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
   const envCritTokens = parseOptionalPositiveNumber(cfg.criticalTokens);
   const isSpecificConv = scope === "conversation" && convId && convId !== "default" && convId !== "all" && convId !== "app";
   let transcriptPath = null;
-  if (isSpecificConv) {
+  if (unboundHostTab && scope === "conversation") {
+    transcriptPath = null;
+  } else if (isSpecificConv) {
     transcriptPath = isSafeConversationId(convId)
       ? findTranscriptForConversation(convId, { exactOnly: true })
       : null;
@@ -710,14 +834,37 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     const st = fs.statSync(transcriptPath);
     const resolvedObsConvId = inferConvIdFromTranscriptPath(transcriptPath, isSpecificConv ? convId : "");
     let effectiveTtlKeepalive = ttlKeepalive;
-    if (!isSpecificConvForKa && resolvedObsConvId) {
-      const resolvedKa = store.getTtlKeepaliveState(resolvedObsConvId);
-      effectiveTtlKeepalive = {
-        ...ttlKeepalive,
-        usedCount: resolvedKa.usedCount,
-        lastSentTs: resolvedKa.lastSentTs || 0,
-        lastError: resolvedKa.lastError || ""
-      };
+    if (isSpecificConvForKa && isSafeConversationId(kaConvId) && !isExplicitSubagentForKa) {
+      if (isSidecarConversationSubagent(kaConvId, { store, transcriptPath })) {
+        effectiveTtlKeepalive = {
+          ...ttlKeepalive,
+          enabled: false,
+          supported: false,
+          isSubagent: true,
+          usedCount: 0,
+          lastSentTs: 0,
+          lastError: ""
+        };
+      }
+    } else if (!unboundHostTab && !isSpecificConvForKa && resolvedObsConvId) {
+      const obsIsSubagent = isSidecarConversationSubagent(resolvedObsConvId, { store, transcriptPath });
+      const fallbackPrimaryConvId = obsIsSubagent
+        ? getWatchdogMonitor().getStatus({ scope, refresh: false })?.ttlKeepalive?.conversationId || ""
+        : resolvedObsConvId;
+      if (fallbackPrimaryConvId) {
+        const resolvedKa = store.getTtlKeepaliveState(fallbackPrimaryConvId);
+        effectiveTtlKeepalive = {
+          ...ttlKeepalive,
+          conversationId: fallbackPrimaryConvId,
+          enabled: store.isTtlKeepaliveEnabled(fallbackPrimaryConvId),
+          supported: true,
+          isSubagent: false,
+          maxCount: store.getTtlKeepaliveMaxCount(fallbackPrimaryConvId),
+          usedCount: resolvedKa.usedCount,
+          lastSentTs: resolvedKa.lastSentTs || 0,
+          lastError: resolvedKa.lastError || ""
+        };
+      }
     }
     const historicalTtlByProfile = store.getAllModelTtlCalibrations();
     const calStamp = formatCalibrationCacheStamp(historicalTtlByProfile);
@@ -1028,9 +1175,10 @@ function getHandoffPayload(data = {}, defaultConvId = "default") {
 }
 
 function getWatchdogPayload(data = {}, defaultConvId = "default") {
-  const { scope, convId } = resolveTargetSession(data, defaultConvId);
+  const unboundHostTab = isUnboundSidecarHostRequest(data);
+  const { scope, convId } = resolveTargetSession(data, unboundHostTab ? "default" : defaultConvId);
   const monitor = getWatchdogMonitor();
-  const targetConv = convId && convId !== "default" ? convId : "";
+  const targetConv = unboundHostTab ? "__unbound__" : convId && convId !== "default" ? convId : "";
   const status = monitor.getStatus({
     conversationId: targetConv,
     scope,
@@ -1039,14 +1187,20 @@ function getWatchdogPayload(data = {}, defaultConvId = "default") {
   return {
     ...status,
     scope,
-    conversationId: convId
+    conversationId: unboundHostTab
+      ? (typeof data?.conversationId === "string" && data.conversationId.trim() === "__unbound__" ? "__unbound__" : "")
+      : convId
   };
 }
 
 function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
+  if (data.fromSidecarHost !== undefined && typeof data.fromSidecarHost !== "boolean") {
+    return { ok: false, status: 400, error: "Field 'fromSidecarHost' must be a boolean" };
+  }
   const store = getRuntimeStore();
   const monitor = getWatchdogMonitor();
-  const { scope, convId } = resolveTargetSession(data, defaultConvId);
+  const unboundHostTab = isUnboundSidecarHostRequest(data);
+  const { scope, convId } = resolveTargetSession(data, unboundHostTab ? "default" : defaultConvId);
   const targetConv = convId && convId !== "default" ? convId : "";
   const action = typeof data.action === "string" && data.action.trim() ? data.action.trim() : "";
 
@@ -1072,7 +1226,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       enabled: effective,
-      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
+      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
     };
   }
   if (action === "setDesktopNotify") {
@@ -1084,7 +1238,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       desktopNotifyEnabled: effective,
-      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
+      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
     };
   }
   if (action === "setTtlDesktopNotify") {
@@ -1096,47 +1250,80 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       ttlDesktopNotifyEnabled: effective,
-      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
+      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
     };
   }
-  if (action === "setTtlKeepalive") {
-    if (data.maxCount !== undefined) {
-      const rawMax = data.maxCount;
-      const invalidType =
-        rawMax === null ||
-        typeof rawMax === "boolean" ||
-        typeof rawMax === "object" ||
-        (typeof rawMax === "string" && rawMax.trim() === "");
-      const parsedMax = invalidType ? NaN : Number(rawMax);
-      if (!Number.isFinite(parsedMax) || !Number.isInteger(parsedMax) || parsedMax < 1 || parsedMax > 20) {
-        return { ok: false, status: 400, error: "Invalid 'maxCount' value: expected integer between 1 and 20" };
+  if (action === "setTtlKeepalive" || action === "resetTtlKeepalive") {
+    const rawExplicitConv = typeof data.conversationId === "string" ? data.conversationId.trim() : "";
+    const hasExplicitEmptyConv = typeof data.conversationId === "string" && rawExplicitConv === "";
+    const isReservedConv =
+      rawExplicitConv === "" ||
+      rawExplicitConv === "default" ||
+      rawExplicitConv === "all" ||
+      rawExplicitConv === "lifetime" ||
+      rawExplicitConv === "app";
+    if (!isReservedConv && rawExplicitConv !== "__unbound__" && !isSafeConversationId(rawExplicitConv)) {
+      return { ok: false, status: 400, error: "Invalid 'conversationId' value" };
+    }
+    const kaConv =
+      unboundHostTab
+        ? "__unbound__"
+        : !hasExplicitEmptyConv && targetConv && isSafeConversationId(targetConv)
+          ? targetConv
+          : monitor.getStatus({ scope, refresh: false })?.ttlKeepalive?.conversationId || "__unbound__";
+
+    if (kaConv !== "__unbound__" && monitor._isConversationSubagent(store, kaConv)) {
+      try {
+        store.deleteMeta(`cache:ttl_keepalive_state:${kaConv}`);
+      } catch {}
+      return {
+        ok: true,
+        conversationId: kaConv,
+        isSubagent: true,
+        ttlKeepaliveEnabled: false,
+        ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(null),
+        status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
+      };
+    }
+
+    if (action === "setTtlKeepalive") {
+      if (data.maxCount !== undefined) {
+        const rawMax = data.maxCount;
+        const invalidType =
+          rawMax === null ||
+          typeof rawMax === "boolean" ||
+          typeof rawMax === "object" ||
+          (typeof rawMax === "string" && rawMax.trim() === "");
+        const parsedMax = invalidType ? NaN : Number(rawMax);
+        if (!Number.isFinite(parsedMax) || !Number.isInteger(parsedMax) || parsedMax < 1 || parsedMax > 20) {
+          return { ok: false, status: 400, error: "Invalid 'maxCount' value: expected integer between 1 and 20" };
+        }
+        store.setTtlKeepaliveMaxCount(parsedMax, kaConv);
       }
-      store.setTtlKeepaliveMaxCount(parsedMax);
+      if (data.enabled !== undefined) {
+        const next = data.enabled === true || data.enabled === "true" || data.enabled === "1";
+        store.setTtlKeepaliveEnabled(next, kaConv);
+      } else if (data.maxCount === undefined) {
+        const cur = store.isTtlKeepaliveEnabled(kaConv);
+        store.setTtlKeepaliveEnabled(!cur, kaConv);
+      }
+      if (data.resetCount === true && kaConv) {
+        store.resetTtlKeepaliveState(kaConv);
+      }
+      return {
+        ok: true,
+        conversationId: kaConv,
+        ttlKeepaliveEnabled: store.isTtlKeepaliveEnabled(kaConv),
+        ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(kaConv),
+        status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
+      };
     }
-    if (data.enabled !== undefined) {
-      const next = data.enabled === true || data.enabled === "true" || data.enabled === "1";
-      store.setTtlKeepaliveEnabled(next);
-    } else if (data.maxCount === undefined) {
-      const cur = store.isTtlKeepaliveEnabled();
-      store.setTtlKeepaliveEnabled(!cur);
-    }
-    if (data.resetCount === true && targetConv) {
-      store.resetTtlKeepaliveState(targetConv);
-    }
+
+    store.resetTtlKeepaliveState(kaConv);
     return {
       ok: true,
-      ttlKeepaliveEnabled: store.isTtlKeepaliveEnabled(),
-      ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(),
-      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
-    };
-  }
-  if (action === "resetTtlKeepalive") {
-    if (targetConv) {
-      store.resetTtlKeepaliveState(targetConv);
-    }
-    return {
-      ok: true,
-      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: true })
+      conversationId: kaConv,
+      status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
     };
   }
   if (action === "setUiLang") {
@@ -1150,7 +1337,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       ok: true,
       uiLang: info.lang,
       uiLangSource: info.source,
-      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false })
+      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: false })
     };
   }
   if (action === "focusConversation") {
@@ -1580,6 +1767,10 @@ export function createStandaloneServer({
           return;
         }
         if (url.pathname === "/api/cache-diag") {
+          if (data.fromSidecarHost !== undefined && typeof data.fromSidecarHost !== "boolean") {
+            sendJson(res, 400, { error: "Field 'fromSidecarHost' must be a boolean" });
+            return;
+          }
           sendJson(res, 200, getCacheDiagPayload(data));
           return;
         }
@@ -1588,6 +1779,10 @@ export function createStandaloneServer({
           return;
         }
         if (url.pathname === "/api/watchdog") {
+          if (data.fromSidecarHost !== undefined && typeof data.fromSidecarHost !== "boolean") {
+            sendJson(res, 400, { error: "Field 'fromSidecarHost' must be a boolean" });
+            return;
+          }
           sendJson(res, 200, getWatchdogPayload(data));
           return;
         }
@@ -1736,11 +1931,72 @@ if (isDirectRun) {
   }
 
   if (isSidecarEnv) {
+    const extraWatchFile =
+      typeof process.env.AGY_DART_SIDECAR_WATCH_FILE === "string" && process.env.AGY_DART_SIDECAR_WATCH_FILE.trim()
+        ? [path.resolve(process.env.AGY_DART_SIDECAR_WATCH_FILE.trim())]
+        : [];
+    const watchedBackendFiles = [
+      __selfPath,
+      path.resolve(__dirname, "../../context/lib/watchdog.js"),
+      path.resolve(__dirname, "../../context/lib/watchdog-lease.js"),
+      path.resolve(__dirname, "../../context/lib/store.js"),
+      path.resolve(__dirname, "../../context/lib/store/settings-maintenance.js"),
+      path.resolve(__dirname, "../../context/lib/cache-analyzer.js"),
+      path.resolve(__dirname, "../../context/lib/config.js"),
+      ...extraWatchFile
+    ];
+    const snapshotSidecarMtimes = () =>
+      watchedBackendFiles
+        .map((fp) => {
+          try {
+            return Math.round(fs.statSync(fp).mtimeMs);
+          } catch {
+            return 0;
+          }
+        })
+        .join("|");
+
     getRuntimeStore();
     const app = new SidecarApp();
-    getWatchdogMonitor({
+    const monitor = getWatchdogMonitor({
       keepaliveSendFn: ({ conversationId, message }) => sendSidecarKeepaliveMessage(conversationId, message)
-    }).start();
+    });
+    monitor.start();
+
+    let shuttingDown = false;
+    const shutdownCleanly = async (code = 0) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      closeRuntimeStore();
+      try {
+        await app.close?.();
+      } catch {}
+      process.exit(code);
+    };
+    process.once("SIGTERM", () => {
+      void shutdownCleanly(0);
+    });
+    process.once("SIGINT", () => {
+      void shutdownCleanly(0);
+    });
+
+    if (process.env.AGY_DART_DISABLE_SIDECAR_AUTORELOAD !== "1") {
+      const bootMtimeSig = snapshotSidecarMtimes();
+      const rawPoll = Number(process.env.AGY_DART_SIDECAR_RELOAD_POLL_MS);
+      const reloadPollMs = Number.isFinite(rawPoll) && rawPoll >= 150 ? Math.floor(rawPoll) : 3000;
+      const reloadTimer = setInterval(() => {
+        if (shuttingDown) return;
+        if (monitor._keepaliveInFlight && monitor._keepaliveInFlight.size > 0) return;
+        const nextSig = snapshotSidecarMtimes();
+        if (nextSig !== bootMtimeSig && !nextSig.split("|").includes("0")) {
+          clearInterval(reloadTimer);
+          // sidecar.json configures `"restart_policy": "always"`, so exiting 0 lets
+          // Antigravity's language_server respawn server.mjs with updated ESM code automatically.
+          void shutdownCleanly(0);
+        }
+      }, reloadPollMs);
+      reloadTimer.unref?.();
+    }
 
     const makeBadRequest = (error) =>
       SidecarResponse
@@ -1827,6 +2083,9 @@ export function registerSidecarRoutes(app) {
     if (!data) return makeBadRequest("Request body must be a JSON object");
     const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
     if (!check.ok) return makeBadRequest(check.error);
+    if (data.fromSidecarHost !== undefined && typeof data.fromSidecarHost !== "boolean") {
+      return makeBadRequest("Field 'fromSidecarHost' must be a boolean");
+    }
     return getCacheDiagPayload(data, app.config?.conversationId);
   }, "POST");
   app.api("/api/handoff", (rawData) => {
@@ -1906,6 +2165,9 @@ export function registerSidecarRoutes(app) {
     if (!data) return makeBadRequest("Request body must be a JSON object");
     const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
     if (!check.ok) return makeBadRequest(check.error);
+    if (data.fromSidecarHost !== undefined && typeof data.fromSidecarHost !== "boolean") {
+      return makeBadRequest("Field 'fromSidecarHost' must be a boolean");
+    }
     return getWatchdogPayload(data, app.config?.conversationId);
   }, "POST");
   app.api("/api/watchdog/action", (rawData) => {

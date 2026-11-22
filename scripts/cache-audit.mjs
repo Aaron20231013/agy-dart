@@ -910,7 +910,7 @@ function probeMcpServerOnce({ command, args, cwd, env, timeoutMs }) {
       params: {
         protocolVersion: "2024-11-05",
         capabilities: {},
-        clientInfo: { name: "agy-dart-cache-audit", version: "1.5.4" }
+        clientInfo: { name: "agy-dart-cache-audit", version: "1.6.0" }
       }
     });
   });
@@ -2192,7 +2192,26 @@ function resolveHookTarget(rawCommand, baseDir, workspaceDir) {
       }
     } else {
       if (INLINE_CODE_FLAGS.has(tok) && idx + 1 < tokens.length) {
-        return { kind: "inline", scriptPath: null, inlineCode: tokens[idx + 1] };
+        const inlineSnippet = tokens.slice(idx + 1).join(" ");
+        const polyglotHookMatch = rawCommand.match(
+          /s0=\/([A-Za-z0-9_.-]+)\/\.source;s1=\/([A-Za-z0-9_.-]+\.(?:m?js|cjs))\/\.source/
+        );
+        if (polyglotHookMatch && polyglotHookMatch[1] && polyglotHookMatch[2]) {
+          const candidateAbs = path.resolve(baseDir, polyglotHookMatch[1], polyglotHookMatch[2]);
+          if (isFile(candidateAbs)) {
+            return { kind: "script", scriptPath: candidateAbs, inlineCode: null };
+          }
+        }
+        const bootstrapHookMatch = inlineSnippet.match(
+          /\br\s*=\s*['"](\.?\/?hooks\/[A-Za-z0-9_./-]+\.(?:m?js|cjs))['"]/
+        );
+        if (bootstrapHookMatch && bootstrapHookMatch[1]) {
+          const candidateAbs = path.resolve(baseDir, bootstrapHookMatch[1]);
+          if (isFile(candidateAbs)) {
+            return { kind: "script", scriptPath: candidateAbs, inlineCode: null };
+          }
+        }
+        return { kind: "inline", scriptPath: null, inlineCode: inlineSnippet };
       }
       if (VALUE_FLAGS.has(tok)) {
         idx += 2;

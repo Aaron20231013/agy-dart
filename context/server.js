@@ -22,13 +22,50 @@ const inferWorkspaceFromStore =
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
 const IS_INSTALLED_PLUGIN_COPY = !fs.existsSync(path.join(PLUGIN_ROOT, ".git"));
-let pkgVersion = "1.5.4";
+let pkgVersion = "1.6.0";
 try {
   const pkg = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "package.json"), "utf8"));
   if (pkg.version) pkgVersion = pkg.version;
 } catch {}
 
 const RESERVED_SESSION_SENTINELS = new Set(["all", "lifetime", "app"]);
+const INSTALLED_PLUGIN_PATH_RE =
+  /\/(?:\.gemini\/(?:config|antigravity)\/plugins|\.agents\/plugins|\.t3\/userdata\/providers\/antigravity\/[^/]+\/(?:\.gemini\/config\/)?plugins)\/agy-dart(?:\/|$)/i;
+
+function normalizeCompareDir(dirPath) {
+  let resolved = path.resolve(String(dirPath || ""));
+  try {
+    resolved = fs.realpathSync(resolved);
+  } catch {}
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isSameOrSubDir(candidateNorm, parentNorm) {
+  if (!candidateNorm || !parentNorm) return false;
+  const rel = path.relative(parentNorm, candidateNorm);
+  return (
+    rel === "" ||
+    (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !rel.startsWith("../") && !path.isAbsolute(rel))
+  );
+}
+
+const PLUGIN_ROOT_NORM = normalizeCompareDir(PLUGIN_ROOT);
+
+function isInsideInstalledPluginDir(candidateDir) {
+  if (typeof candidateDir !== "string" || !candidateDir.trim()) return false;
+  const candNorm = normalizeCompareDir(candidateDir);
+  const candPosix = candNorm.replace(/\\/g, "/");
+  if (INSTALLED_PLUGIN_PATH_RE.test(candPosix)) return true;
+  for (const envVar of [process.env.PLUGIN_ROOT, process.env.AGY_PLUGIN_ROOT]) {
+    if (typeof envVar === "string" && envVar.trim()) {
+      if (isSameOrSubDir(candNorm, normalizeCompareDir(envVar.trim()))) return true;
+    }
+  }
+  if (IS_INSTALLED_PLUGIN_COPY && isSameOrSubDir(candNorm, PLUGIN_ROOT_NORM)) {
+    return true;
+  }
+  return false;
+}
 
 function resolveDirectoryCandidate(raw) {
   if (typeof raw !== "string") return null;
@@ -48,15 +85,26 @@ function resolveDirectoryCandidate(raw) {
   return null;
 }
 
+function isExplicitAbsoluteCwdArg(raw) {
+  if (typeof raw !== "string") return false;
+  const s = raw.trim();
+  if (!s) return false;
+  if (/^file:\/\//i.test(s) || s === "~" || s.startsWith("~/") || s.startsWith("~\\")) return true;
+  return path.isAbsolute(s);
+}
+
 const store = new ContextModeStore();
-let currentCwd =
+const envWorkspaceDir =
   resolveDirectoryCandidate(process.env.ANTIGRAVITY_WORKSPACE_ROOT) ||
-  resolveDirectoryCandidate(process.env.VSCODE_CWD) ||
-  process.cwd();
-let explicitWorkspaceConfigured = Boolean(
-  resolveDirectoryCandidate(process.env.ANTIGRAVITY_WORKSPACE_ROOT) ||
-    resolveDirectoryCandidate(process.env.VSCODE_CWD)
-);
+  resolveDirectoryCandidate(process.env.VSCODE_CWD);
+let currentCwd = envWorkspaceDir || process.cwd();
+let explicitWorkspaceConfigured = Boolean(envWorkspaceDir && !isInsideInstalledPluginDir(envWorkspaceDir));
+let clientSupportsRoots = false;
+let cachedRootsDir = null;
+let rootsQueried = false;
+let inFlightRootsPromise = null;
+let nextRootsReqSeq = 1;
+const pendingClientRequests = new Map();
 let initSessionId = null;
 const callContext = new AsyncLocalStorage();
 
@@ -81,22 +129,31 @@ function resolveSessionIdForCall() {
   );
 }
 
-function resolveActiveWorkspaceCwd() {
-  if (explicitWorkspaceConfigured) return currentCwd;
-  const sameAsPlugin =
-    process.platform === "win32"
-      ? path.resolve(currentCwd).toLowerCase() === PLUGIN_ROOT.toLowerCase()
-      : path.resolve(currentCwd) === PLUGIN_ROOT;
-  if (sameAsPlugin && IS_INSTALLED_PLUGIN_COPY && inferWorkspaceFromStore) {
-    const inferred = inferWorkspaceFromStore(store, resolveSessionIdForCall());
-    if (inferred) return inferred;
+function resolveActiveWorkspaceState() {
+  if (explicitWorkspaceConfigured) {
+    return { cwd: currentCwd, confirmed: true };
   }
-  return currentCwd;
+  if (cachedRootsDir) {
+    return { cwd: cachedRootsDir, confirmed: true };
+  }
+  const insidePlugin = isInsideInstalledPluginDir(currentCwd);
+  if (insidePlugin && inferWorkspaceFromStore) {
+    const inferred = inferWorkspaceFromStore(store, resolveSessionIdForCall());
+    if (inferred && !isInsideInstalledPluginDir(inferred)) {
+      return { cwd: inferred, confirmed: true };
+    }
+  }
+  return { cwd: currentCwd, confirmed: !insidePlugin };
+}
+
+function resolveActiveWorkspaceCwd() {
+  return resolveActiveWorkspaceState().cwd;
 }
 
 const tools = createTools({
   store,
   getCwd: resolveActiveWorkspaceCwd,
+  getWorkspaceState: resolveActiveWorkspaceState,
   getSessionId: resolveSessionIdForCall,
   getDirectConversationId: () =>
     callContext.getStore()?.directConversationId ||
@@ -222,8 +279,48 @@ export const TOOL_DEFINITIONS = Object.freeze(
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
 );
 
+process.stdout.on("error", (err) => {
+  if (err && (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED")) return;
+});
+
 function sendJsonRpc(obj) {
-  process.stdout.write(JSON.stringify(obj) + "\n");
+  try {
+    process.stdout.write(JSON.stringify(obj) + "\n");
+  } catch {}
+}
+
+function requestClientRootsList(timeoutMs = 1000) {
+  if (stdinClosed) return Promise.resolve(null);
+  if (inFlightRootsPromise) return inFlightRootsPromise;
+  inFlightRootsPromise = new Promise((resolve) => {
+    const reqId = `agy-ctx-roots-${nextRootsReqSeq++}`;
+    const timer = setTimeout(() => {
+      pendingClientRequests.delete(reqId);
+      resolve(null);
+    }, timeoutMs);
+    timer.unref();
+    pendingClientRequests.set(reqId, {
+      timer,
+      resolve: (respMsg) => {
+        clearTimeout(timer);
+        const roots = respMsg?.result?.roots;
+        if (Array.isArray(roots)) {
+          for (const item of roots) {
+            const candidate = resolveDirectoryCandidate(item?.uri || item?.path);
+            if (candidate) {
+              resolve(candidate);
+              return;
+            }
+          }
+        }
+        resolve(null);
+      }
+    });
+    sendJsonRpc({ jsonrpc: "2.0", id: reqId, method: "roots/list" });
+  }).finally(() => {
+    inFlightRootsPromise = null;
+  });
+  return inFlightRootsPromise;
 }
 
 function sendResponse(id, result) {
@@ -246,12 +343,39 @@ const rl = readline.createInterface({
 
 let inFlightCalls = 0;
 let stdinClosed = false;
+let shuttingDown = false;
+
+function cancelPendingClientRequests() {
+  for (const [, pending] of pendingClientRequests) {
+    clearTimeout(pending.timer);
+    pending.resolve(null);
+  }
+  pendingClientRequests.clear();
+}
+
+function gracefulFlushAndExit() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    store.close();
+  } catch {}
+  const forceTimer = setTimeout(() => {
+    process.exit(0);
+  }, 150);
+  forceTimer.unref();
+  try {
+    process.stdout.end(() => {
+      clearTimeout(forceTimer);
+      process.exit(0);
+    });
+  } catch {
+    process.exit(0);
+  }
+}
 
 function maybeCloseStoreOnDrain() {
   if (stdinClosed && inFlightCalls === 0) {
-    try {
-      store.close();
-    } catch {}
+    gracefulFlushAndExit();
   }
 }
 
@@ -273,12 +397,35 @@ rl.on("line", async (line) => {
   }
 
   const { id, method, params } = msg;
-  if (id === undefined || id === null) return;
+  const hasId = id !== undefined && id !== null;
+  if (
+    hasId &&
+    !method &&
+    (Object.prototype.hasOwnProperty.call(msg, "result") ||
+      Object.prototype.hasOwnProperty.call(msg, "error"))
+  ) {
+    const pending = pendingClientRequests.get(String(id));
+    if (pending) {
+      pendingClientRequests.delete(String(id));
+      pending.resolve(msg);
+    }
+    return;
+  }
+  if (!hasId) {
+    if (method === "notifications/roots/list_changed") {
+      cachedRootsDir = null;
+      rootsQueried = false;
+    }
+    return;
+  }
 
   inFlightCalls += 1;
   try {
     switch (method) {
       case "initialize": {
+        clientSupportsRoots = Boolean(
+          params?.capabilities && typeof params.capabilities === "object" && params.capabilities.roots
+        );
         const wsFolder = Array.isArray(params?.workspaceFolders) ? params.workspaceFolders[0]?.uri : null;
         const initDir =
           resolveDirectoryCandidate(wsFolder) ||
@@ -313,7 +460,39 @@ rl.on("line", async (line) => {
 
       case "tools/call": {
         const toolName = params?.name;
-        const toolArgs = params?.arguments || {};
+        const rawToolArgs = params?.arguments;
+        let toolArgs = {};
+        if (rawToolArgs !== undefined && rawToolArgs !== null) {
+          if (typeof rawToolArgs === "string") {
+            try {
+              const parsedArgs = JSON.parse(rawToolArgs);
+              if (!parsedArgs || typeof parsedArgs !== "object" || Array.isArray(parsedArgs)) {
+                sendError(id, -32602, "Invalid params: 'arguments' must decode to a JSON object");
+                break;
+              }
+              toolArgs = parsedArgs;
+            } catch {
+              sendError(id, -32602, "Invalid params: 'arguments' string is not valid JSON");
+              break;
+            }
+          } else if (typeof rawToolArgs === "object" && !Array.isArray(rawToolArgs)) {
+            toolArgs = rawToolArgs;
+          } else {
+            sendError(id, -32602, "Invalid params: 'arguments' must be a JSON object");
+            break;
+          }
+        }
+        if (
+          !explicitWorkspaceConfigured &&
+          !rootsQueried &&
+          !stdinClosed &&
+          !isExplicitAbsoluteCwdArg(toolArgs.cwd) &&
+          (clientSupportsRoots || isInsideInstalledPluginDir(currentCwd))
+        ) {
+          const rootsDir = await requestClientRootsList(1000);
+          rootsQueried = true;
+          cachedRootsDir = rootsDir;
+        }
         // Strictly per-call session isolation via AsyncLocalStorage: never mutate process-global
         // session state across concurrent conversations sharing one long-lived MCP stdio server.
         const callSessionId =
@@ -386,15 +565,19 @@ rl.on("line", async (line) => {
 
 rl.on("close", () => {
   stdinClosed = true;
+  cancelPendingClientRequests();
   maybeCloseStoreOnDrain();
 });
 
-process.on("SIGINT", () => {
-  store.close();
+const exitImmediately = () => {
+  try {
+    store.close();
+  } catch {}
   process.exit(0);
-});
+};
 
-process.on("SIGTERM", () => {
-  store.close();
-  process.exit(0);
-});
+process.on("SIGINT", exitImmediately);
+process.on("SIGTERM", exitImmediately);
+if (process.platform === "win32") {
+  process.on("SIGBREAK", exitImmediately);
+}

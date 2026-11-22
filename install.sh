@@ -1,14 +1,50 @@
 #!/usr/bin/env sh
+# One-command installer for agy-dart (supports both `curl -fsSL .../install.sh | sh` and local repo runs)
 set -eu
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 if ! command -v node >/dev/null 2>&1; then
   echo "Error: Node.js >= 22 is required. Install Node.js first: https://nodejs.org/" >&2
   exit 1
 fi
 
-if [ "$#" -eq 0 ]; then
-  exec node "$SCRIPT_DIR/scripts/install.mjs" install
+SCRIPT_DIR=""
+case "${0:-}" in
+  */*)
+    if [ -f "$0" ]; then
+      SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+    fi
+    ;;
+esac
+
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/scripts/install.mjs" ]; then
+  if [ "$#" -eq 0 ]; then
+    exec node "$SCRIPT_DIR/scripts/install.mjs" install
+  else
+    exec node "$SCRIPT_DIR/scripts/install.mjs" "$@"
+  fi
+fi
+
+TMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t 'agy-dart-install')"
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+REPO_DIR="$TMP_DIR/repo"
+if command -v git >/dev/null 2>&1; then
+  echo "[agy-dart] Fetching latest release from GitHub..."
+  git clone --depth 1 --quiet "https://github.com/zou172866/agy-dart.git" "$REPO_DIR"
+elif command -v curl >/dev/null 2>&1; then
+  echo "[agy-dart] Downloading archive from GitHub..."
+  mkdir -p "$REPO_DIR"
+  curl -fsSL "https://github.com/zou172866/agy-dart/archive/refs/heads/main.tar.gz" | tar -xz --strip-components=1 -C "$REPO_DIR"
 else
-  exec node "$SCRIPT_DIR/scripts/install.mjs" "$@"
+  echo "Error: Either git or curl is required for remote installation." >&2
+  exit 1
+fi
+
+if [ "$#" -eq 0 ]; then
+  node "$REPO_DIR/scripts/install.mjs" install
+else
+  node "$REPO_DIR/scripts/install.mjs" "$@"
 fi

@@ -4,7 +4,8 @@
       "command": "node",
       "args": [
         "${PLUGIN_ROOT}/fast/mcp-server.mjs"
-      ]
+      ],
+      "eager": true
     },
     "context": {
       "command": "node",

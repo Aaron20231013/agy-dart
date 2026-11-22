@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import https from "node:https";
+import { fileURLToPath } from "node:url";
 import { getConfigSnapshot } from "./config.js";
 import { executeCode, resolveExecTimeoutMs, runProcess, OUTPUT_CAP } from "./executor.js";
 import { SNIPPET_MAX_BYTES } from "./store.js";
@@ -31,10 +33,45 @@ function normalizeExplicitSessionId(raw) {
   return trimmed;
 }
 
-function resolveCallCwd(argCwd, fallbackCwd) {
+function expandArgPath(raw) {
+  if (typeof raw !== "string") return "";
+  let s = raw.trim();
+  if (!s) return "";
+  if (/^file:\/\//i.test(s)) {
+    try {
+      s = fileURLToPath(s);
+    } catch {
+      return s;
+    }
+  } else if (s === "~") {
+    s = os.homedir();
+  } else if (s.startsWith("~/") || s.startsWith("~\\")) {
+    s = path.join(os.homedir(), s.slice(2));
+  }
+  return s;
+}
+
+function resolveCallCwd(
+  argCwd,
+  fallbackCwd,
+  { requireConfirmedWorkspace = false, workspaceConfirmed = true } = {}
+) {
   const base = fallbackCwd || process.cwd();
-  if (typeof argCwd !== "string" || !argCwd.trim()) return base;
-  const resolved = path.resolve(base, argCwd.trim());
+  const cleanedArg = expandArgPath(argCwd);
+  if (!cleanedArg) {
+    if (requireConfirmedWorkspace && !workspaceConfirmed) {
+      throw new Error(
+        `Workspace root could not be determined (server cwd is inside plugin directory '${base}'). Pass the active workspace absolute path in 'cwd'.`
+      );
+    }
+    return base;
+  }
+  if (!path.isAbsolute(cleanedArg) && requireConfirmedWorkspace && !workspaceConfirmed) {
+    throw new Error(
+      `Workspace root could not be determined (server cwd is inside plugin directory '${base}'). Pass the active workspace absolute path in 'cwd'.`
+    );
+  }
+  const resolved = path.resolve(base, cleanedArg);
   let st;
   try {
     st = fs.statSync(resolved);
@@ -299,9 +336,22 @@ export function formatBytes(bytes) {
 export function createTools({
   store,
   getCwd = () => process.cwd(),
+  getWorkspaceState = null,
   getSessionId = () => "default",
   getDirectConversationId = null
 }) {
+  const resolveWs = () => {
+    if (typeof getWorkspaceState === "function") {
+      const st = getWorkspaceState();
+      if (st && typeof st === "object") {
+        return {
+          cwd: st.cwd || getCwd(),
+          confirmed: st.confirmed !== false
+        };
+      }
+    }
+    return { cwd: getCwd(), confirmed: true };
+  };
   return {
     // 1. ctx_execute
     async ctx_execute({
@@ -315,7 +365,11 @@ export function createTools({
       timeoutMs: argTimeoutMs = undefined
     } = {}) {
       const startTime = Date.now();
-      const cwd = resolveCallCwd(argCwd, getCwd());
+      const ws = resolveWs();
+      const cwd = resolveCallCwd(argCwd, ws.cwd, {
+        requireConfirmedWorkspace: true,
+        workspaceConfirmed: ws.confirmed
+      });
       const sessionId = getSessionId();
 
       if (file) {
@@ -501,7 +555,11 @@ export function createTools({
 
     // 2. ctx_batch
     async ctx_batch({ commands = [], queries = [], cwd: argCwd = "" } = {}) {
-      const cwd = resolveCallCwd(argCwd, getCwd());
+      const ws = resolveWs();
+      const cwd = resolveCallCwd(argCwd, ws.cwd, {
+        requireConfirmedWorkspace: true,
+        workspaceConfirmed: ws.confirmed
+      });
       const sessionId = getSessionId();
       const cmdList = Array.isArray(commands) ? commands : [commands];
       const outputs = [];
@@ -601,7 +659,13 @@ export function createTools({
 
     // 3. ctx_index
     async ctx_index({ path: filePath = "", url = "", content = "", label = "", cwd: argCwd = "" } = {}) {
-      const cwd = resolveCallCwd(argCwd, getCwd());
+      const ws = resolveWs();
+      const expandedFilePath = filePath ? expandArgPath(filePath) : "";
+      const needsWorkspaceForRelativeFile = Boolean(expandedFilePath && !path.isAbsolute(expandedFilePath));
+      const cwd = resolveCallCwd(argCwd, ws.cwd, {
+        requireConfirmedWorkspace: needsWorkspaceForRelativeFile,
+        workspaceConfirmed: ws.confirmed
+      });
       const sessionId = getSessionId();
       let rawText = content || "";
       let resolvedLabel = label;

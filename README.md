@@ -8,9 +8,26 @@
 
 No extra dependencies · Works automatically in the background · Built-in side panel
 
-[简体中文](README.zh-CN.md) · English · [How to Install](#how-to-install) · [Changelog](#changelog) · [Third-Party Notices](THIRD_PARTY_NOTICES.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-10b981.svg)](LICENSE)
+[![Node.js >= 22](https://img.shields.io/badge/Node.js-%3E%3D22-38bdf8.svg)](package.json)
+[![Security Policy](https://img.shields.io/badge/Security-Policy-818cf8.svg)](SECURITY.md)
+[![Glama MCP](https://glama.ai/mcp/servers/zou172866/agy-dart/badge)](https://glama.ai/mcp/servers/zou172866/agy-dart)
+
+[简体中文](README.zh-CN.md) · English · [How to Install](#how-to-install) · [Changelog](#changelog) · [Security](SECURITY.md) · [Third-Party Notices](THIRD_PARTY_NOTICES.md)
 
 </div>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/architecture-light.svg" />
+    <img alt="agy-dart architecture" src="assets/architecture-dark.svg" width="860" />
+  </picture>
+</p>
+
+<p align="center">
+  <img alt="Before vs With agy-dart comparison" src="assets/demo-comparison.svg" width="860" />
+</p>
 
 ---
 
@@ -39,8 +56,8 @@ With multiple project windows open, if a background window is nearly out of cont
 3. **Local script filtering for giant logs & tables**: On multi-MB logs, CSVs, or huge JSON dumps, the AI runs a short local script to compute counts or extract rows (e.g., top 5 failing endpoints) and returns only the result; large JSON outputs also surface error rows automatically.
 4. **Workspace layout on new chats**: Supplies a compact directory, script, and core-file summary at the start of a new conversation.
 5. **Loop warnings**: Shows a UI-only note (not injected into model context) when the AI repeats `edit → fail → revert → fail` cycles or calls the same tool with no progress.
-6. **Secret masking & sensitive-file blocking**: Masks API keys and tokens in logs or fetched pages, and can block accidental reads of `.env` files.
-7. **Hard 8.8 KB response cap**: Antigravity spills tool outputs above ~10 KB into a temp file that costs an extra read turn; all plugin responses stay within 8.8 KB.
+6. **Secret masking & sensitive-file blocking**: Masks API keys and tokens in logs or fetched pages, blocks accidental reads of `.env` files when configured, and sandboxes read-only `git` queries against untrusted `.git/config` hooks.
+7. **Hard 8.8 KB response cap with dynamic quota**: Antigravity spills tool outputs above ~10 KB into a temp file that costs an extra read turn; all plugin responses stay within 8.8 KB, dynamically giving short passing checks' unused space to failing stack traces.
 8. **Detailed panel breakdown & offline simulation**: Inspect context usage across file reads, terminal output, and subagents, check 15-turn cache hit trends and miss causes, optionally read only changed lines after edits (off by default), or replay past chat history via CLI to measure cache hit rates and keepalive cost.
 
 > Antigravity updates frequently — click **Star** at the top right to follow compatibility updates.
@@ -51,7 +68,21 @@ With multiple project windows open, if a background window is nearly out of cont
 
 Requires **Node.js 22 or newer** (no `npm install` needed).
 
-### Option 1: Let Antigravity install it
+### Option 1: One-line terminal install (no clone needed)
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/zou172866/agy-dart/main/install.ps1 | iex
+```
+
+**macOS / Linux:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zou172866/agy-dart/main/install.sh | sh
+```
+
+### Option 2: Let Antigravity install it
 
 Send this to Antigravity:
 
@@ -59,37 +90,29 @@ Send this to Antigravity:
 Clone https://github.com/zou172866/agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
 ```
 
-### Option 2: Install from terminal
-
-**Windows (PowerShell):**
+### Option 3: Clone & install with custom flags
 
 ```powershell
 git clone https://github.com/zou172866/agy-dart.git
 cd agy-dart
 
-.\install.ps1
-# Also auto-install ripgrep (rg) for faster search (recommended)
+# Windows PowerShell (optional -InstallRg auto-installs ripgrep)
 .\install.ps1 -InstallRg
-```
 
-**macOS / Linux:**
-
-```bash
-git clone https://github.com/zou172866/agy-dart.git
-cd agy-dart
+# macOS / Linux
 ./install.sh
 ```
 
 **Other commands:**
 
 ```bash
-node scripts/install.mjs install                        # Global install
+node scripts/install.mjs install                        # Global install (auto-syncs GEMINI_HOME & T3 ACP if present)
 node scripts/install.mjs install --project /repo/path   # Single-project install
 node scripts/install.mjs doctor                         # Check install health
 node scripts/install.mjs uninstall                      # Uninstall
 ```
 
-Restart or reload Antigravity after installing and open a new chat. If you previously installed standalone `agy-fast` or `antigravity-plugin-context-mode`, disable the old ones in your plugin list.
+Restart or reload Antigravity after installing and open a new chat. User-created `rules/*.local.md` files inside the plugin directory are preserved across upgrades. If you previously installed standalone `agy-fast` or `antigravity-plugin-context-mode`, disable the old ones in your plugin list.
 
 ---
 
@@ -97,23 +120,34 @@ Restart or reload Antigravity after installing and open a new chat. If you previ
 
 Nothing needs tuning day to day. Open the **agy-dart Context** panel in the right sidebar to toggle auto-keepalive, desktop alerts, protection pause, local cleanup, or file-size limits.
 
-Preset modes via CLI:
+Preset modes & tool-loading modes via CLI:
 
 ```bash
-node scripts/install.mjs mode host-45k      # Default: direct read up to 45 KB code / 128 KB patches, block >16 KB noisy logs
-node scripts/install.mjs mode balanced-16k  # Outline first above 16 KB
-node scripts/install.mjs mode fast-32k      # Raise normal file limit to 32 KB
-node scripts/install.mjs mode strict-8k     # Block above 8 KB
-node scripts/install.mjs mode no-read-hook  # Never block file reads, only trim noisy terminal output
+node scripts/install.mjs mode host-45k              # Default: direct read up to 45 KB code / 128 KB patches, block >16 KB noisy logs
+node scripts/install.mjs mode balanced-16k          # Outline first above 16 KB
+node scripts/install.mjs mode fast-32k              # Raise normal file limit to 32 KB
+node scripts/install.mjs mode strict-8k             # Block above 8 KB
+node scripts/install.mjs mode no-read-hook          # Never block file reads, only trim noisy terminal output
+
+node scripts/install.mjs tool-loading fast-eager    # Default: 4 fast tools eager, 8 context tools lazy
+node scripts/install.mjs tool-loading lazy          # All 12 tools lazy-loaded
+node scripts/install.mjs tool-loading eager         # All 12 tools eager-loaded
 ```
 
 ---
 
 ## Changelog
 
+### v1.6.0
+- **Cross-workspace hook loader & Desktop 2.0 `roots/list` guard**: Lifecycle hooks now resolve the plugin path reliably from any working directory on Windows/macOS/Linux; both MCP servers query `roots/list` on demand and block accidental writes/searches inside the installed plugin folder when `cwd` is omitted.
+- **Default `fast-eager` loading & `apply_edits` self-healing**: Eager-loads the 4 `agy-dart_fast` tools by default (`--tool-loading <fast-eager|lazy|eager>`), accepts JSON-stringified `edits`, and circuit-breaks host `call_mcp_tool` empty-array corruption.
+- **Flat `lineRanges` & dynamic water-filling quota**: `read_slices` supports `"path:10-50,80-120"` (including Windows drive letters like `E:\work\foo.mjs:1-60`); `run_checks` and multi-file outlines dynamically give short items' unused quota to long error traces and large files.
+- **Git sandbox, `170s` call budget & clean Windows exit**: Blocks untrusted `.git/config` external diff/GPG/textconv hooks and `status -v`, caps shared MCP call budgets at `170s` (below Antigravity's `180s` hard kill), handles Windows `SIGBREAK` / pipe flush cleanly, preserves `rules/*.local.md` on upgrade, and adds one-line clone-free installers plus T3 ACP / `GEMINI_HOME` sync.
+- **Per-window sticky keepalive & ghost-read tracking**: Isolated per-conversation keepalive controls in the sticky top bar with strict subagent/workflow suppression and localized UI polish.
+
 ### v1.5.4
 - **Click alerts to jump to that chat**: Clicking a desktop popup or cross-window panel alert brings the matching project window to the front and opens that conversation; added a multi-window session switcher bar in the panel.
-- **Automatic cache keepalive**: Sends a lightweight keepalive ping shortly before cache expiry, with per-chat toggle and count controls at the top of the panel (default cap 3, resets on your next message).
+- **Automatic cache keepalive**: Sends a lightweight keepalive ping for primary chats shortly before cache expiry (skipping background subagents and workflow workers), with per-chat toggle and count controls at the top of the panel (default cap 3, resets on your next message).
 - Moved current context usage, cache countdown, and blocked noise volume into a larger top card in the panel.
 
 ### v1.5.3

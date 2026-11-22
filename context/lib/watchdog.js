@@ -29,6 +29,8 @@ import {
   readTranscriptTail,
   resolveModelProfile
 } from "./cache-analyzer.js";
+import os from "node:os";
+import path from "node:path";
 import {
   HEADLESS_FINISH_PROMPT_RE,
   WATCHDOG_LEASE_PREFIX,
@@ -36,8 +38,12 @@ import {
   KNOWN_MCP_TOOL_RE,
   LONG_MCP_TOOL_RE,
   classifyToolExecutionKind,
+  classifyTranscriptGenesisFile,
+  classifyTranscriptGenesisSteps,
   decodeFileUriOrPath,
   deriveLlmSubphase,
+  detectSubagentFromTranscriptFile,
+  detectSubagentFromTranscriptSteps,
   extractBareToolName,
   formatWorkspaceWindowLabel,
   getToolTimeoutTier,
@@ -45,6 +51,8 @@ import {
   isHeadlessWorkerPrompt,
   isSameWorkspacePath,
   isSubagentLeasePayload,
+  isSummaryMetadataSubagent,
+  isTrajectoryMetadataSubagent,
   listWatchdogLeases,
   lookupConversationSummary,
   lookupConversationTitle,
@@ -52,6 +60,7 @@ import {
   parseMaybeJsonObj,
   readWatchdogLease,
   recordHookLeaseTransition,
+  resolveCandidateTranscriptPath,
   sanitizeConversationId,
   sanitizeWatchdogText,
   truncateUtf8Safe,
@@ -64,19 +73,26 @@ export {
   WATCHDOG_LEASE_PREFIX,
   WATCHDOG_PHASES,
   classifyToolExecutionKind,
+  classifyTranscriptGenesisFile,
+  classifyTranscriptGenesisSteps,
   decodeFileUriOrPath,
+  detectSubagentFromTranscriptFile,
+  detectSubagentFromTranscriptSteps,
   formatWorkspaceWindowLabel,
   getToolTimeoutTier,
   getWatchdogLeaseKey,
   isHeadlessWorkerPrompt,
   isSameWorkspacePath,
   isSubagentLeasePayload,
+  isSummaryMetadataSubagent,
+  isTrajectoryMetadataSubagent,
   listWatchdogLeases,
   lookupConversationSummary,
   lookupConversationTitle,
   normalizeWatchdogLease,
   readWatchdogLease,
   recordHookLeaseTransition,
+  resolveCandidateTranscriptPath,
   sanitizeConversationId,
   sanitizeWatchdogText,
   truncateUtf8Safe,
@@ -279,10 +295,11 @@ function countMediaInStep(s) {
  */
 export function inspectTranscriptTailForWatchdog(steps = [], options = {}) {
   const treatAsSubagent = Boolean(options?.isSubagent);
+  const genesisSubagent = !treatAsSubagent && detectSubagentFromTranscriptSteps(steps);
   const result = {
     hasSteps: false,
     hasAssistantSteps: false,
-    detectedSubagent: treatAsSubagent,
+    detectedSubagent: Boolean(treatAsSubagent || genesisSubagent),
     lastStepTs: null,
     lastStepType: "",
     isTerminal: false,
@@ -1183,12 +1200,14 @@ export class WatchdogMonitor {
     this.monoNsFn = options.monoNsFn || (() => process.hrtime.bigint());
     this.statFn = options.statFn || ((p) => fs.statSync(p));
     this.readTailFn = options.readTailFn || ((p, bytes) => readTranscriptTail(p, bytes, { minUsageSteps: 1 }));
+    this._hasCustomFindTranscript = typeof options.findTranscriptFn === "function";
     this.findTranscriptFn =
       options.findTranscriptFn || ((convId) => findTranscriptForConversation(convId, { exactOnly: true }));
     this.lookupTitleFn =
       options.lookupTitleFn ||
       ((convId, { transcriptPath } = {}) =>
         transcriptPath ? lookupConversationTitle(convId, { transcriptPath, allowDefaultDb: false }) : "");
+    this._hasCustomLookupSummary = typeof options.lookupSummaryFn === "function";
     this.lookupSummaryFn =
       options.lookupSummaryFn || ((convId, opts = {}) => lookupConversationSummary(convId, opts));
     this.notifyFn = options.notifyFn || sendDesktopNotification;
@@ -1221,6 +1240,7 @@ export class WatchdogMonitor {
     this._lastEvaluated = new Map();
     this._ttlNotifiedKeys = new Map();
     this._keepaliveInFlight = new Set();
+    this._subagentIdentityCache = new Map();
     this._lastTtlNotifyGlobalTs = 0;
     this._fallbackPendingJump = null;
     this.statSyncCount = 0;
@@ -1453,7 +1473,212 @@ export class WatchdogMonitor {
     return Boolean(cfg.ttlDesktopNotify);
   }
 
-  _resolveTtlKeepaliveEnabled(store, cfg) {
+  _isTtlKeepaliveForcedOffByEnv() {
+    const disableRaw = process.env.AGY_DART_DISABLE_TTL_KEEPALIVE;
+    if (typeof disableRaw === "string" && disableRaw.trim() !== "") {
+      const d = disableRaw.trim().toLowerCase();
+      if (d === "1" || d === "true" || d === "yes" || d === "on") return true;
+      if (d === "0" || d === "false" || d === "no" || d === "off") return false;
+    }
+    const envRaw = process.env.AGY_DART_TTL_KEEPALIVE;
+    if (typeof envRaw === "string" && envRaw.trim() !== "") {
+      const s = envRaw.trim().toLowerCase();
+      if (s === "0" || s === "false" || s === "no" || s === "off") return true;
+      if (s === "1" || s === "true" || s === "yes" || s === "on") return false;
+    }
+    return false;
+  }
+
+  _rememberSubagentIdentity(conversationId, isSubagent, { definitive = true, nowMs = this.nowFn() } = {}) {
+    if (!conversationId) return;
+    if (this._subagentIdentityCache.size >= 512 && !this._subagentIdentityCache.has(conversationId)) {
+      const oldest = this._subagentIdentityCache.keys().next().value;
+      if (oldest !== undefined) this._subagentIdentityCache.delete(oldest);
+    }
+    const boolVal = Boolean(isSubagent);
+    const isDefinitive = boolVal || Boolean(definitive);
+    const expiresTs = isDefinitive ? Number.POSITIVE_INFINITY : Number(nowMs || 0) + 15_000;
+    this._subagentIdentityCache.set(conversationId, {
+      isSubagent: boolVal,
+      definitive: isDefinitive,
+      expiresTs
+    });
+  }
+
+  _shouldAllowDefaultSummaryDb(store) {
+    if (typeof process.env.AGY_DART_SUMMARY_DB_PATH === "string" && process.env.AGY_DART_SUMMARY_DB_PATH.trim()) {
+      return true;
+    }
+    if (this._hasCustomLookupSummary) return true;
+    if (store && typeof store.dbPath === "string" && store.dbPath.trim()) {
+      const defaultDbPath = path.join(os.homedir(), ".agy-dart", "context.db");
+      return isSameWorkspacePath(store.dbPath, defaultDbPath);
+    }
+    return false;
+  }
+
+  _isConversationSubagent(store, conversationId, leaseInput = null, { requireDefinitive = false } = {}) {
+    const cleanId = sanitizeConversationId(conversationId);
+    if (!cleanId || cleanId === "__unbound__") return false;
+
+    const lease =
+      leaseInput && leaseInput.conversationId === cleanId
+        ? leaseInput
+        : store
+          ? readWatchdogLease(store, cleanId)
+          : null;
+
+    if (lease) {
+      if (
+        lease.isSubagent ||
+        (lease.parentConversationId && lease.parentConversationId !== cleanId) ||
+        (lease.rootSessionId && lease.rootSessionId !== cleanId) ||
+        (lease.lastUserInput && isHeadlessWorkerPrompt(lease.lastUserInput))
+      ) {
+        this._rememberSubagentIdentity(cleanId, true, { definitive: true });
+        return true;
+      }
+      if (lease.convTitle) {
+        this._rememberSubagentIdentity(cleanId, false, { definitive: true });
+        return false;
+      }
+    }
+
+    const nowMs = this.nowFn();
+    const cached = this._subagentIdentityCache.get(cleanId);
+    if (cached && nowMs < cached.expiresTs && (cached.definitive || !requireDefinitive)) {
+      return Boolean(cached.isSubagent);
+    }
+
+    let detected = false;
+    let definitive = false;
+    let discoveredParent = "";
+    let discoveredTitle = "";
+    const allowDefaultDb = this._shouldAllowDefaultSummaryDb(store);
+    let txPath = lease?.transcriptPath || "";
+    if (!txPath) {
+      txPath = resolveCandidateTranscriptPath(cleanId, { allowDefaultDb });
+      if (!txPath && this._hasCustomFindTranscript) {
+        try {
+          txPath = this.findTranscriptFn(cleanId) || "";
+        } catch {}
+      }
+    }
+
+    let summaryFound = false;
+    let summaryAgentName = "";
+    if (allowDefaultDb || txPath) {
+      try {
+        const summary = this.lookupSummaryFn?.(cleanId, {
+          transcriptPath: txPath,
+          allowDefaultDb,
+          checkSubagent: true
+        });
+        if (summary) {
+          summaryFound = Boolean(summary.found);
+          summaryAgentName = typeof summary.agentName === "string" ? summary.agentName.trim() : "";
+          if (summary.isSubagent) {
+            detected = true;
+            definitive = true;
+          }
+          if (summary.parentConversationId && summary.parentConversationId !== cleanId) {
+            discoveredParent = summary.parentConversationId;
+            detected = true;
+            definitive = true;
+          }
+          if (summary.title) {
+            discoveredTitle = summary.title;
+            if (!detected) definitive = true;
+          }
+        }
+      } catch {}
+    }
+
+    if (!detected && !discoveredTitle && txPath) {
+      try {
+        const genesisCls = classifyTranscriptGenesisFile(txPath);
+        if (genesisCls === "subagent") {
+          detected = true;
+          definitive = true;
+        } else if (genesisCls === "human") {
+          definitive = true;
+        }
+      } catch {}
+    }
+
+    if (!detected && !definitive && summaryFound && !summaryAgentName) {
+      definitive = true;
+    }
+
+    this._rememberSubagentIdentity(cleanId, detected, { definitive, nowMs });
+
+    if (detected && store) {
+      if (lease && !lease.isSubagent) {
+        try {
+          writeWatchdogLeaseIfUnchanged(store, lease.updatedTs, lease.phase, {
+            ...lease,
+            isSubagent: true,
+            parentConversationId: discoveredParent || lease.parentConversationId || "",
+            rootSessionId:
+              lease.rootSessionId && lease.rootSessionId !== cleanId
+                ? lease.rootSessionId
+                : discoveredParent || lease.rootSessionId || cleanId,
+            ...(txPath && !lease.transcriptPath ? { transcriptPath: txPath } : {})
+          });
+        } catch {}
+      }
+      try {
+        store.deleteMeta?.(`cache:ttl_keepalive_state:${cleanId}`);
+      } catch {}
+    }
+
+    return detected;
+  }
+
+  _isConversationKilled(store, conversationId, leaseInput = null) {
+    const cleanId = sanitizeConversationId(conversationId);
+    if (!cleanId || cleanId === "__unbound__") return false;
+    const lease =
+      leaseInput && leaseInput.conversationId === cleanId
+        ? leaseInput
+        : store
+          ? readWatchdogLease(store, cleanId)
+          : null;
+    const allowDefaultDb = this._shouldAllowDefaultSummaryDb(store);
+    const txPath = lease?.transcriptPath || "";
+    if (!allowDefaultDb && !txPath && !this._hasCustomLookupSummary) return false;
+    try {
+      const summary = this.lookupSummaryFn?.(cleanId, {
+        transcriptPath: txPath,
+        allowDefaultDb
+      });
+      if (summary && summary.killed === true) {
+        if (store) {
+          try {
+            const cur = lease || readWatchdogLease(store, cleanId);
+            if (cur && cur.stopReason !== "USER_CANCELED") {
+              writeWatchdogLeaseIfUnchanged(store, cur.updatedTs, cur.phase, {
+                ...cur,
+                stopReason: "USER_CANCELED"
+              });
+            }
+            store.deleteMeta?.(`cache:ttl_keepalive_state:${cleanId}`);
+          } catch {}
+        }
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  _resolveTtlKeepaliveEnabled(store, cfg, conversationId = "", lease = null) {
+    if (
+      conversationId &&
+      conversationId !== "__unbound__" &&
+      this._isConversationSubagent(store, conversationId, lease)
+    ) {
+      return false;
+    }
     const disableRaw = process.env.AGY_DART_DISABLE_TTL_KEEPALIVE;
     if (typeof disableRaw === "string" && disableRaw.trim() !== "") {
       const d = disableRaw.trim().toLowerCase();
@@ -1466,38 +1691,43 @@ export class WatchdogMonitor {
       if (s === "1" || s === "true" || s === "yes" || s === "on") return true;
       if (s === "0" || s === "false" || s === "no" || s === "off") return false;
     }
+    if (conversationId && store && typeof store.getTtlKeepaliveState === "function") {
+      try {
+        const kaState = store.getTtlKeepaliveState(conversationId);
+        if (kaState && typeof kaState.enabled === "boolean") {
+          return kaState.enabled;
+        }
+      } catch {}
+    }
     if (this._hasCustomConfig) {
-      if (store && typeof store.getMeta === "function") {
-        const raw = store.getMeta("cache:ttl_keepalive_enabled", null);
-        if (raw !== null) return raw !== "false" && raw !== "0";
-      }
       return cfg.ttlKeepalive !== undefined ? Boolean(cfg.ttlKeepalive) : true;
     }
     if (store && typeof store.isTtlKeepaliveEnabled === "function") {
-      return store.isTtlKeepaliveEnabled();
+      return store.isTtlKeepaliveEnabled(conversationId || null);
     }
     return cfg.ttlKeepalive !== undefined ? Boolean(cfg.ttlKeepalive) : true;
   }
 
-  _resolveTtlKeepaliveMaxCount(store, cfg) {
+  _resolveTtlKeepaliveMaxCount(store, cfg, conversationId = "") {
     const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 3)));
     const envRaw = process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT;
     if (typeof envRaw === "string" && envRaw.trim() !== "") {
       const n = Number(envRaw.trim());
       if (Number.isFinite(n) && n >= 1) return clampMax(n);
     }
-    if (this._hasCustomConfig) {
-      if (store && typeof store.getMeta === "function") {
-        const raw = store.getMeta("cache:ttl_keepalive_max_count", null);
-        if (raw !== null && raw !== "") {
-          const n = Number(raw);
-          if (Number.isFinite(n) && n >= 1) return clampMax(n);
+    if (conversationId && store && typeof store.getTtlKeepaliveState === "function") {
+      try {
+        const kaState = store.getTtlKeepaliveState(conversationId);
+        if (kaState && typeof kaState.maxCount === "number" && Number.isFinite(kaState.maxCount) && kaState.maxCount >= 1) {
+          return clampMax(kaState.maxCount);
         }
-      }
+      } catch {}
+    }
+    if (this._hasCustomConfig) {
       return clampMax(cfg.ttlKeepaliveMaxCount ?? 3);
     }
     if (store && typeof store.getTtlKeepaliveMaxCount === "function") {
-      return store.getTtlKeepaliveMaxCount();
+      return store.getTtlKeepaliveMaxCount(conversationId || null);
     }
     return clampMax(cfg.ttlKeepaliveMaxCount ?? 3);
   }
@@ -1586,13 +1816,13 @@ export class WatchdogMonitor {
   _evaluateIdleTtlKeepalive(
     store,
     leases,
-    { nowWallMs, cfg, ttlKeepaliveEnabled, ttlKeepaliveMaxCount = 3, uiLang = "en", sleepJumpMs }
+    { nowWallMs, cfg, uiLang = "en", sleepJumpMs }
   ) {
     const coveredConvIds = new Set();
     const exhaustedConvMap = new Map();
     if (
-      !ttlKeepaliveEnabled ||
       typeof this.keepaliveSendFn !== "function" ||
+      this._isTtlKeepaliveForcedOffByEnv() ||
       !store ||
       !Array.isArray(leases) ||
       leases.length === 0
@@ -1606,14 +1836,19 @@ export class WatchdogMonitor {
         ? Math.min(500000, Math.max(0, Math.floor(Number(rawMinTok))))
         : 0;
     const leadSec = Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30)));
-    const maxCount = Math.min(20, Math.max(1, Math.floor(Number(ttlKeepaliveMaxCount) || 3)));
 
     if (sleepJumpMs !== 0) {
       return { coveredConvIds, exhaustedConvMap };
     }
 
     for (const lease of leases) {
-      if (!lease || lease.phase !== WATCHDOG_PHASES.IDLE || lease.isSubagent) continue;
+      if (
+        !lease ||
+        lease.phase !== WATCHDOG_PHASES.IDLE ||
+        this._isConversationSubagent(store, lease.conversationId, lease)
+      ) {
+        continue;
+      }
       if (lease.subphase !== "stopped") continue;
       const stopReason = String(lease.stopReason || "").trim();
       if (
@@ -1624,6 +1859,8 @@ export class WatchdogMonitor {
         continue;
       }
       if (minTokens > 0 && Number(lease.contextTokens || 0) < minTokens) continue;
+      if (!this._resolveTtlKeepaliveEnabled(store, cfg, lease.conversationId, lease)) continue;
+      const maxCount = this._resolveTtlKeepaliveMaxCount(store, cfg, lease.conversationId);
 
       const effectiveTtlSec = this._resolveLeaseEffectiveTtlSec(store, lease, cfg, nowWallMs);
       const effectiveLeadSec = Math.min(leadSec, Math.max(5, Math.floor(effectiveTtlSec * 0.5)));
@@ -1662,27 +1899,89 @@ export class WatchdogMonitor {
       if (this._keepaliveInFlight.has(lease.conversationId)) continue;
       if (kaState.lastIdleAnchorTs === idleAnchorTs) continue;
       if (kaState.lastSentTs > 0 && nowWallMs - kaState.lastSentTs < 25_000) continue;
-
-      const nextUsed = kaState.usedCount + 1;
-      const isZh = uiLang === "zh";
-      const message = isZh
-        ? `[agy-dart TTL保活 ${nextUsed}/${maxCount}] 仅回复 OK 以保持上下文缓存热度，请勿调用任何工具或修改任何内容。`
-        : `[agy-dart TTL Keepalive ${nextUsed}/${maxCount}] Reply OK only to keep the prompt cache warm. Do not call any tools or modify any files.`;
+      if (
+        this._isConversationSubagent(store, lease.conversationId, lease, { requireDefinitive: true }) ||
+        this._isConversationKilled(store, lease.conversationId, lease)
+      ) {
+        coveredConvIds.delete(lease.conversationId);
+        exhaustedConvMap.delete(lease.conversationId);
+        continue;
+      }
 
       const convId = lease.conversationId;
-      const prevUsed = kaState.usedCount;
-      const prevAnchor = kaState.lastIdleAnchorTs;
-      this._keepaliveInFlight.add(convId);
-      try {
+      const runAtomicClaim = () => {
+        if (typeof store.getMeta === "function") {
+          const freshLease = readWatchdogLease(store, convId);
+          if (freshLease) {
+            const freshStop = String(freshLease.stopReason || "").trim();
+            if (
+              freshLease.phase !== WATCHDOG_PHASES.IDLE ||
+              freshLease.isSubagent ||
+              freshLease.subphase !== "stopped" ||
+              /^(?:EXECUTOR_TERMINATION_REASON_)?(?:USER_CANCELED|USER_CANCELLED|CANCELED|CANCELLED|ABORTED|ERROR|watchdog_disabled|stale_|orphan_)/i.test(
+                freshStop
+              )
+            ) {
+              return { claimed: false };
+            }
+          }
+        }
+        const freshKa =
+          typeof store.getTtlKeepaliveState === "function"
+            ? store.getTtlKeepaliveState(convId)
+            : kaState;
+        if (
+          freshKa.usedCount >= maxCount ||
+          freshKa.lastIdleAnchorTs === idleAnchorTs ||
+          Boolean(freshKa.pendingAck && freshKa.lastSentTs > 0 && nowWallMs - freshKa.lastSentTs < 60_000) ||
+          (freshKa.lastSentTs > 0 && nowWallMs - freshKa.lastSentTs < 25_000)
+        ) {
+          return { claimed: false };
+        }
+        const claimedNextUsed = freshKa.usedCount + 1;
         store.setTtlKeepaliveState?.(convId, {
-          usedCount: nextUsed,
+          usedCount: claimedNextUsed,
           lastIdleAnchorTs: idleAnchorTs,
           lastSentTs: nowWallMs,
           pendingAck: true,
           lastError: "",
           updatedTs: nowWallMs
         });
+        return {
+          claimed: true,
+          nextUsed: claimedNextUsed,
+          prevUsed: freshKa.usedCount,
+          prevAnchor: freshKa.lastIdleAnchorTs
+        };
+      };
+
+      let claimRes = {
+        claimed: true,
+        nextUsed: kaState.usedCount + 1,
+        prevUsed: kaState.usedCount,
+        prevAnchor: kaState.lastIdleAnchorTs
+      };
+      try {
+        if (typeof store._withWriteTx === "function") {
+          if (typeof store.open === "function") store.open();
+          claimRes = store._withWriteTx(runAtomicClaim);
+        } else {
+          claimRes = runAtomicClaim();
+        }
       } catch {}
+      if (!claimRes || !claimRes.claimed) {
+        continue;
+      }
+
+      const nextUsed = claimRes.nextUsed;
+      const prevUsed = claimRes.prevUsed;
+      const prevAnchor = claimRes.prevAnchor;
+      const isZh = uiLang === "zh";
+      const message = isZh
+        ? `[agy-dart TTL保活 ${nextUsed}/${maxCount}] 仅回复 OK 以保持上下文缓存热度，请勿调用任何工具或修改任何内容。`
+        : `[agy-dart TTL Keepalive ${nextUsed}/${maxCount}] Reply OK only to keep the prompt cache warm. Do not call any tools or modify any files.`;
+
+      this._keepaliveInFlight.add(convId);
 
       Promise.resolve()
         .then(() =>
@@ -1695,6 +1994,33 @@ export class WatchdogMonitor {
           })
         )
         .then((res) => {
+          if (res && res.skippedSubagent === true) {
+            this._rememberSubagentIdentity(convId, true, { definitive: true });
+            try {
+              const curLease = readWatchdogLease(store, convId);
+              if (curLease && !curLease.isSubagent) {
+                writeWatchdogLeaseIfUnchanged(store, curLease.updatedTs, curLease.phase, {
+                  ...curLease,
+                  isSubagent: true
+                });
+              }
+              store.deleteMeta?.(`cache:ttl_keepalive_state:${convId}`);
+            } catch {}
+            return;
+          }
+          if (res && res.skippedKilled === true) {
+            try {
+              const curLease = readWatchdogLease(store, convId);
+              if (curLease && curLease.stopReason !== "USER_CANCELED") {
+                writeWatchdogLeaseIfUnchanged(store, curLease.updatedTs, curLease.phase, {
+                  ...curLease,
+                  stopReason: "USER_CANCELED"
+                });
+              }
+              store.deleteMeta?.(`cache:ttl_keepalive_state:${convId}`);
+            } catch {}
+            return;
+          }
           if (res && res.ok === false) {
             throw new Error(res.error || "keepalive_send_failed");
           }
@@ -1764,7 +2090,13 @@ export class WatchdogMonitor {
     };
 
     for (const lease of leases) {
-      if (!lease || lease.phase !== WATCHDOG_PHASES.IDLE || lease.isSubagent) continue;
+      if (
+        !lease ||
+        lease.phase !== WATCHDOG_PHASES.IDLE ||
+        this._isConversationSubagent(store, lease.conversationId, lease)
+      ) {
+        continue;
+      }
       if (coveredConvIds && coveredConvIds.has(lease.conversationId)) continue;
       if (lease.subphase !== "stopped" && lease.subphase !== "stopped_bg_pending") continue;
       const stopReason = String(lease.stopReason || "").trim();
@@ -1790,6 +2122,34 @@ export class WatchdogMonitor {
       const dedupKey = `${lease.conversationId}:${idleAnchorTs}`;
       if (this._ttlNotifiedKeys.get(lease.conversationId) === dedupKey) continue;
       if (this._lastTtlNotifyGlobalTs > 0 && nowWallMs - this._lastTtlNotifyGlobalTs < 60_000) continue;
+      if (this._isConversationKilled(store, lease.conversationId, lease)) continue;
+
+      const ttlAlertMetaKey = `cache_alert:${lease.conversationId}:ttl_desktop`;
+      if (store && (typeof store.getTimedMeta === "function" || typeof store.getMeta === "function")) {
+        const claimTtlPopup = () => {
+          const prev =
+            typeof store.getTimedMeta === "function"
+              ? store.getTimedMeta(ttlAlertMetaKey, "")
+              : store.getMeta(ttlAlertMetaKey, "");
+          if (prev === dedupKey) return false;
+          if (typeof store.setTimedMeta === "function") store.setTimedMeta(ttlAlertMetaKey, dedupKey);
+          else if (typeof store.setMeta === "function") store.setMeta(ttlAlertMetaKey, dedupKey);
+          return true;
+        };
+        let claimedPopup = true;
+        try {
+          if (typeof store._withWriteTx === "function") {
+            if (typeof store.open === "function") store.open();
+            claimedPopup = store._withWriteTx(claimTtlPopup);
+          } else {
+            claimedPopup = claimTtlPopup();
+          }
+        } catch {}
+        if (!claimedPopup) {
+          this._ttlNotifiedKeys.set(lease.conversationId, dedupKey);
+          continue;
+        }
+      }
 
       const isZh = uiLang === "zh";
       const notifyLease = this._enrichNotificationLeaseIdentity(lease);
@@ -1871,7 +2231,7 @@ export class WatchdogMonitor {
     };
 
     for (const lease of leases) {
-      if (!lease || lease.isSubagent) continue;
+      if (!lease || this._isConversationSubagent(store, lease.conversationId, lease)) continue;
       const wmKey = `cache_alert:${lease.conversationId}:wm_desktop`;
       if (lease.watermark === "ok") {
         if (getWmMeta(wmKey)) {
@@ -1896,6 +2256,7 @@ export class WatchdogMonitor {
       }
 
       if (getWmMeta(wmKey) === "critical") continue;
+      if (this._isConversationKilled(store, lease.conversationId, lease)) continue;
       setWmMeta(wmKey, "critical");
 
       const isZh = uiLang === "zh";
@@ -1965,7 +2326,11 @@ export class WatchdogMonitor {
     const ttlDesktopNotifyEnabled = this._resolveTtlDesktopNotifyEnabled(store, cfg);
     const ttlKeepaliveEnabled = this._resolveTtlKeepaliveEnabled(store, cfg);
     const ttlKeepaliveMaxCount = this._resolveTtlKeepaliveMaxCount(store, cfg);
-    const ttlKeepaliveActive = Boolean(ttlKeepaliveEnabled && typeof this.keepaliveSendFn === "function");
+    const ttlKeepaliveActive = Boolean(
+      typeof this.keepaliveSendFn === "function" &&
+        !this._isTtlKeepaliveForcedOffByEnv() &&
+        (ttlKeepaliveEnabled || Boolean(store?.hasAnyExplicitTtlKeepaliveEnabled?.()))
+    );
     const watermarkDesktopNotifyEnabled = this._resolveWatermarkDesktopNotifyEnabled(store, cfg, {
       desktopNotifyEnabled: enabled && desktopNotifyEnabled,
       ttlDesktopNotifyEnabled
@@ -2040,7 +2405,13 @@ export class WatchdogMonitor {
 
     // Zero statSync fast path when ALL leases are IDLE (or none exist)
     if (activeLeases.length === 0) {
-      const evaluated = leases.map((lease) => this._buildIdleEvaluation(lease, nowWallMs));
+      const evaluated = leases.map((lease) => {
+        const effectiveLease =
+          !lease.isSubagent && this._isConversationSubagent(store, lease.conversationId, lease)
+            ? { ...lease, isSubagent: true }
+            : lease;
+        return this._buildIdleEvaluation(effectiveLease, nowWallMs);
+      });
       this._lastEvaluated.clear();
       for (const item of evaluated) this._lastEvaluated.set(item.conversationId, item);
       const liveIds = new Set(leases.map((l) => l.conversationId));
@@ -2107,7 +2478,11 @@ export class WatchdogMonitor {
           st.rescueBriefKey = "";
           st.rescueBrief = null;
         }
-        evaluated.push(this._buildIdleEvaluation(lease, nowWallMs));
+        const effectiveIdleLease =
+          !lease.isSubagent && this._isConversationSubagent(store, lease.conversationId, lease)
+            ? { ...lease, isSubagent: true }
+            : lease;
+        evaluated.push(this._buildIdleEvaluation(effectiveIdleLease, nowWallMs));
         continue;
       }
 
@@ -2276,6 +2651,9 @@ export class WatchdogMonitor {
 
   _evaluateActiveLease(store, leaseInput, { nowWallMs, cfg, desktopNotifyEnabled, uiLang = "en", sleepJumpMs, _retryDepth = 0 }) {
     let lease = { ...leaseInput };
+    if (!lease.isSubagent && this._isConversationSubagent(store, lease.conversationId, lease)) {
+      lease.isSubagent = true;
+    }
     const st = this._getOrCreateConvState(lease.conversationId);
 
     if (lease.updatedTs !== st.lastLeaseUpdatedTs) {
@@ -2724,11 +3102,74 @@ export class WatchdogMonitor {
       current = sessions.find((s) => s.phase !== WATCHDOG_PHASES.IDLE) || sessions[0] || null;
     }
 
-    const kaTargetConvId = safeConvId || current?.conversationId || "";
+    let kaTargetConvId = safeConvId;
+    if (!kaTargetConvId) {
+      const walkPrimaryAncestor = (seedObj) => {
+        if (!seedObj) return null;
+        const visited = new Set([seedObj.conversationId]);
+        let cursor = seedObj;
+        for (let hop = 0; hop < 6 && cursor; hop += 1) {
+          const nextParent =
+            cursor.parentConversationId ||
+            (cursor.rootSessionId && cursor.rootSessionId !== cursor.conversationId ? cursor.rootSessionId : "");
+          if (!nextParent || visited.has(nextParent)) break;
+          visited.add(nextParent);
+          const candEval = this._lastEvaluated.get(nextParent);
+          const candObj = candEval || (store ? readWatchdogLease(store, nextParent) : null);
+          if (!candObj) break;
+          if (!candObj.isSubagent && !this._isConversationSubagent(store, nextParent, candEval ? null : candObj)) {
+            return candObj;
+          }
+          cursor = candObj;
+        }
+        return null;
+      };
+
+      if (
+        current &&
+        !current.isSubagent &&
+        !this._isConversationSubagent(store, current.conversationId)
+      ) {
+        kaTargetConvId = current.conversationId;
+      } else {
+        let primaryMatch =
+          walkPrimaryAncestor(current) ||
+          sessions.find((s) => !s.isSubagent && !this._isConversationSubagent(store, s.conversationId)) ||
+          null;
+        if (!primaryMatch && store) {
+          const persistedLeases = listWatchdogLeases(store).sort(
+            (a, b) => (b.updatedTs || 0) - (a.updatedTs || 0)
+          );
+          if (persistedLeases.length > 0) {
+            primaryMatch =
+              walkPrimaryAncestor(persistedLeases[0]) ||
+              persistedLeases.find(
+                (l) => !l.isSubagent && !this._isConversationSubagent(store, l.conversationId, l)
+              ) ||
+              null;
+          }
+        }
+        kaTargetConvId = primaryMatch?.conversationId || "";
+      }
+    }
+
+    const isKaTargetSubagent = Boolean(
+      kaTargetConvId &&
+        kaTargetConvId !== "__unbound__" &&
+        this._isConversationSubagent(store, kaTargetConvId)
+    );
     const kaState =
-      kaTargetConvId && store && typeof store.getTtlKeepaliveState === "function"
+      !isKaTargetSubagent && kaTargetConvId && store && typeof store.getTtlKeepaliveState === "function"
         ? store.getTtlKeepaliveState(kaTargetConvId)
         : { usedCount: 0, lastSentTs: 0, lastError: "" };
+    const convKeepaliveEnabled = isKaTargetSubagent
+      ? false
+      : kaTargetConvId
+        ? this._resolveTtlKeepaliveEnabled(store, cfg, kaTargetConvId)
+        : ttlKeepaliveEnabled;
+    const convKeepaliveMaxCount = kaTargetConvId
+      ? this._resolveTtlKeepaliveMaxCount(store, cfg, kaTargetConvId)
+      : ttlKeepaliveMaxCount;
 
     const alertingSessions = sessions.filter((s) => s.severity === "stalled" || s.severity === "suspect");
     const activeCount = sessions.filter((s) => s.phase !== WATCHDOG_PHASES.IDLE).length;
@@ -2742,9 +3183,11 @@ export class WatchdogMonitor {
       desktopNotifyEnabled,
       ttlDesktopNotifyEnabled,
       ttlKeepalive: {
-        enabled: ttlKeepaliveEnabled,
-        supported: typeof this.keepaliveSendFn === "function",
-        maxCount: ttlKeepaliveMaxCount,
+        conversationId: kaTargetConvId,
+        enabled: convKeepaliveEnabled,
+        supported: typeof this.keepaliveSendFn === "function" && !isKaTargetSubagent,
+        isSubagent: isKaTargetSubagent,
+        maxCount: convKeepaliveMaxCount,
         usedCount: kaState.usedCount,
         leadSec: ttlKeepaliveLeadSec,
         lastSentTs: kaState.lastSentTs || 0,

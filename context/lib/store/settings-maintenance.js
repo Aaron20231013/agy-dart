@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { getConfigSnapshot, getEffectiveConfig, parseUiLang } from "../config.js";
 import {
   DEFAULT_ACTIVE_CATEGORIES,
@@ -6,6 +8,200 @@ import {
   DEFAULT_EXEMPT_EXTENSIONS,
   FILE_CATEGORIES
 } from "./schema.js";
+
+const STORE_HEADLESS_FINISH_RE = /\bWhen you are done,\s*call the finish tool with your result\./i;
+const STORE_PRIMARY_HOST_AGENT_RE = /^(?:antigravity|main|default|primary|chat|user|assistant|cascade)$/i;
+const STORE_SUBAGENT_ROLE_RE =
+  /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?|browser|image[-_]?generator)(?:$|[-_\s/])|^(?:DeepCoder|DeepInvestigator)[A-Za-z0-9_-]*$/i;
+const STORE_SUBAGENT_GENESIS_RE =
+  /\[Message\]\s+timestamp=\S+\s+sender=[0-9a-f-]{8,}|<original_task>|<subagent_reminder>|\brunning as a subagent,\s*invoked by a caller agent\b/i;
+
+function isSameStorePath(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const norm = (p) => p.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  const na = norm(a);
+  const nb = norm(b);
+  if (!na || !nb) return false;
+  return process.platform === "win32" || /^[a-zA-Z]:(?:\/|$)/.test(na)
+    ? na.toLowerCase() === nb.toLowerCase()
+    : na === nb;
+}
+
+function resolveStoreCandidateTranscriptPath(cid, { transcriptPath = "", allowDefaultDb = false } = {}) {
+  if (typeof transcriptPath === "string" && transcriptPath.trim()) {
+    const direct = transcriptPath.trim();
+    try {
+      if (fs.existsSync(direct)) return direct;
+    } catch {}
+  }
+  if (!cid || !/^[A-Za-z0-9._-]+$/.test(cid) || cid.includes("..")) return "";
+  const roots = [];
+  if (typeof process.env.AGY_DART_SUMMARY_DB_PATH === "string" && process.env.AGY_DART_SUMMARY_DB_PATH.trim()) {
+    roots.push(path.join(path.dirname(path.resolve(process.env.AGY_DART_SUMMARY_DB_PATH.trim())), "brain"));
+  }
+  if (allowDefaultDb) {
+    const home = os.homedir();
+    if (home) {
+      roots.push(path.join(home, ".gemini", "antigravity", "brain"));
+      roots.push(path.join(home, ".gemini", "antigravity-ide", "brain"));
+      roots.push(path.join(home, ".gemini", "antigravity-cli", "brain"));
+    }
+  }
+  for (const r of roots) {
+    const rootAbs = path.resolve(r);
+    for (const sub of [
+      path.join(cid, ".system_generated", "logs", "transcript_full.jsonl"),
+      path.join(cid, ".system_generated", "logs", "transcript.jsonl")
+    ]) {
+      const cand = path.resolve(rootAbs, sub);
+      try {
+        if (fs.existsSync(cand)) return cand;
+      } catch {}
+    }
+  }
+  return "";
+}
+
+function inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, { transcriptPath = "", allowDefaultDb = false } = {}) {
+  if (!DatabaseSyncCtor || !cid) return { isSubagent: false, killed: false, parentId: "", title: "" };
+  const candidates = [];
+  if (typeof process.env.AGY_DART_SUMMARY_DB_PATH === "string" && process.env.AGY_DART_SUMMARY_DB_PATH.trim()) {
+    candidates.push(path.resolve(process.env.AGY_DART_SUMMARY_DB_PATH.trim()));
+  }
+  if (typeof transcriptPath === "string" && transcriptPath.trim()) {
+    let cur = path.dirname(path.resolve(transcriptPath.trim()));
+    for (let depth = 0; depth < 7 && cur; depth += 1) {
+      if (path.basename(cur).toLowerCase() === "brain") {
+        const agRoot = path.dirname(cur);
+        if (agRoot && agRoot !== cur) candidates.push(path.join(agRoot, "conversation_summaries.db"));
+        break;
+      }
+      const next = path.dirname(cur);
+      if (!next || next === cur) break;
+      cur = next;
+    }
+  }
+  if (allowDefaultDb) {
+    const home = os.homedir();
+    if (home) {
+      candidates.push(path.join(home, ".gemini", "antigravity", "conversation_summaries.db"));
+      candidates.push(path.join(home, ".gemini", "antigravity-ide", "conversation_summaries.db"));
+    }
+  }
+  const seen = new Set();
+  for (const dbPath of candidates) {
+    const key = process.platform === "win32" ? dbPath.toLowerCase() : dbPath;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let sdb = null;
+    try {
+      if (!fs.existsSync(dbPath)) continue;
+      sdb = new DatabaseSyncCtor(dbPath, { readOnly: true });
+      let row = null;
+      try {
+        row = sdb
+          .prepare(
+            "SELECT title, parent_conversation_id, nesting_depth, agent_name, killed FROM conversation_summaries WHERE conversation_id = ? LIMIT 1"
+          )
+          .get(cid);
+      } catch {
+        try {
+          row = sdb
+            .prepare(
+              "SELECT title, parent_conversation_id, nesting_depth, agent_name FROM conversation_summaries WHERE conversation_id = ? LIMIT 1"
+            )
+            .get(cid);
+        } catch {
+          row = sdb.prepare("SELECT title FROM conversation_summaries WHERE conversation_id = ? LIMIT 1").get(cid);
+        }
+      }
+      if (!row) continue;
+      const title = typeof row.title === "string" ? row.title.trim() : "";
+      const rawParent = typeof row.parent_conversation_id === "string" ? row.parent_conversation_id.trim() : "";
+      const parentId =
+        rawParent && rawParent !== cid && /^[A-Za-z0-9._-]+$/.test(rawParent) ? rawParent.slice(0, 128) : "";
+      const depth = Number(row.nesting_depth);
+      const agent = typeof row.agent_name === "string" ? row.agent_name.trim() : "";
+      const killed = Boolean(row.killed === true || (Number.isFinite(Number(row.killed)) && Number(row.killed) > 0));
+      const isSubagent = Boolean(
+        parentId ||
+          (Number.isFinite(depth) && depth > 0) ||
+          (agent &&
+            !STORE_PRIMARY_HOST_AGENT_RE.test(agent) &&
+            (agent.toLowerCase() === "self" || STORE_SUBAGENT_ROLE_RE.test(agent) || !title))
+      );
+      return { isSubagent, killed, parentId, title };
+    } catch {
+      // Fail-open
+    } finally {
+      if (sdb) {
+        try {
+          sdb.close();
+        } catch {}
+      }
+    }
+  }
+  return { isSubagent: false, killed: false, parentId: "", title: "" };
+}
+
+function inspectTranscriptGenesisFileForSubagent(transcriptPath) {
+  if (typeof transcriptPath !== "string" || !transcriptPath.trim()) return false;
+  let fd = null;
+  try {
+    const cleanPath = transcriptPath.trim();
+    if (!fs.existsSync(cleanPath)) return false;
+    fd = fs.openSync(cleanPath, "r");
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size <= 0) return false;
+    const toRead = Math.min(262144, st.size);
+    const buf = Buffer.allocUnsafe(toRead);
+    const n = fs.readSync(fd, buf, 0, toRead, 0);
+    if (n <= 0) return false;
+    const rawLines = buf.subarray(0, n).toString("utf8").split(/\r?\n/);
+    let sawSysStep0 = false;
+    let sawSubagentSys = false;
+    for (let i = 0, seen = 0; i < rawLines.length && seen < 10; i++) {
+      const ln = rawLines[i].trim();
+      if (!ln) continue;
+      seen += 1;
+      try {
+        const o = JSON.parse(ln);
+        if (!o || typeof o !== "object") continue;
+        const t = String(o.type || "").toUpperCase();
+        const r = String(o.role || "").toLowerCase();
+        if (t === "PLANNER_RESPONSE" || r === "assistant" || r === "model") break;
+        const txt = typeof (o.user_input ?? o.content ?? o.text) === "string" ? String(o.user_input ?? o.content ?? o.text) : "";
+        if (txt && STORE_HEADLESS_FINISH_RE.test(txt)) return true;
+        if (t === "USER_INPUT" || r === "user") return false;
+        if (t === "SYSTEM_MESSAGE") {
+          if (o.step_index === 0 || seen === 1) sawSysStep0 = true;
+          if (o.source === "SYSTEM" || (txt && STORE_SUBAGENT_GENESIS_RE.test(txt))) sawSubagentSys = true;
+        }
+      } catch {
+        if (/^\{\s*(?:"[^"]+"\s*:\s*[^,]+,\s*){0,6}"type"\s*:\s*"USER_INPUT"/.test(ln)) {
+          return STORE_HEADLESS_FINISH_RE.test(ln);
+        }
+        if (
+          sawSysStep0 &&
+          /^\{\s*(?:"[^"]+"\s*:\s*[^,]+,\s*){0,6}"type"\s*:\s*"SYSTEM_MESSAGE"/.test(ln) &&
+          (/"source"\s*:\s*"SYSTEM"\b/.test(ln) || STORE_SUBAGENT_GENESIS_RE.test(ln))
+        ) {
+          return true;
+        }
+        break;
+      }
+    }
+    return Boolean(sawSysStep0 && sawSubagentSys);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
 
 const DEFAULT_PROFILE_COLD_FLOOR_SEC = 300;
 
@@ -1103,49 +1299,118 @@ export class SettingsMaintenanceMethods {
     return boolVal;
   }
 
-  /** Check if KV-cache TTL auto-keepalive is enabled (default ON; env > sqlite > config) */
-  isTtlKeepaliveEnabled() {
+  /** Check if KV-cache TTL auto-keepalive is enabled for a conversation (default ON; env > per-conv sqlite > config) */
+  isTtlKeepaliveEnabled(conversationId = null) {
     const snap = getConfigSnapshot();
     if (snap.sources.ttlKeepalive === "env") {
       return Boolean(snap.values.ttlKeepalive);
     }
-    this.open();
-    const raw = this.getMeta("cache:ttl_keepalive_enabled", null);
-    if (raw !== null) {
-      return raw !== "false" && raw !== "0";
+    const cleanId = this._sanitizeKeepaliveConvId(conversationId);
+    if (cleanId) {
+      const st = this.getTtlKeepaliveState(cleanId);
+      if (typeof st.enabled === "boolean") {
+        return st.enabled;
+      }
     }
     return Boolean(snap.values.ttlKeepalive);
   }
 
-  /** Enable or disable KV-cache TTL auto-keepalive in SQLite meta */
-  setTtlKeepaliveEnabled(enabled) {
+  /** Enable or disable KV-cache TTL auto-keepalive for a specific conversation in SQLite meta */
+  setTtlKeepaliveEnabled(enabled, conversationId = null) {
     this.open();
     const boolVal = Boolean(enabled && enabled !== "false" && enabled !== "0");
-    this.setMeta("cache:ttl_keepalive_enabled", boolVal ? "true" : "false");
+    const targetId = this._sanitizeKeepaliveConvId(conversationId) || "__unbound__";
+    this.setTtlKeepaliveState(targetId, { enabled: boolVal });
     return boolVal;
   }
 
-  /** Resolve max auto-keepalive activations per conversation before a fresh user message (1..20, default 3) */
-  getTtlKeepaliveMaxCount() {
+  /** True iff this specific conversation was explicitly toggled ON in SQLite meta */
+  hasExplicitTtlKeepaliveEnabled(conversationId) {
+    const cleanId = this._sanitizeKeepaliveConvId(conversationId);
+    if (!cleanId || cleanId === "__unbound__") return false;
+    const st = this.getTtlKeepaliveState(cleanId);
+    return st.enabled === true;
+  }
+
+  /** True iff ANY real conversation in SQLite meta has an explicit enabled=true keepalive override */
+  hasAnyExplicitTtlKeepaliveEnabled() {
+    this.open();
+    try {
+      const allowDefaultSummaryDb = Boolean(
+        (typeof process.env.AGY_DART_SUMMARY_DB_PATH === "string" && process.env.AGY_DART_SUMMARY_DB_PATH.trim()) ||
+          (typeof this.dbPath === "string" &&
+            isSameStorePath(this.dbPath, path.join(os.homedir(), ".agy-dart", "context.db")))
+      );
+      const DatabaseSyncCtor = this.db?.constructor || null;
+      const rows = this.db
+        .prepare("SELECT key, value FROM meta WHERE key LIKE 'cache:ttl_keepalive_state:%'")
+        .all();
+      for (const row of rows || []) {
+        if (!row || typeof row.key !== "string" || row.key.endsWith(":__unbound__")) continue;
+        if (typeof row.value !== "string") continue;
+        const cid = this._sanitizeKeepaliveConvId(row.key.slice("cache:ttl_keepalive_state:".length));
+        if (!cid) continue;
+        try {
+          const parsed = JSON.parse(row.value);
+          if (!parsed || parsed.enabled !== true) continue;
+          const leaseRaw = this.getMeta(`watchdog_lease:${cid}`, null);
+          let leaseObj = null;
+          if (leaseRaw && typeof leaseRaw === "string") {
+            leaseObj = JSON.parse(leaseRaw);
+            if (
+              leaseObj &&
+              (leaseObj.isSubagent === true ||
+                (leaseObj.parentConversationId && leaseObj.parentConversationId !== cid) ||
+                (leaseObj.rootSessionId && leaseObj.rootSessionId !== cid))
+            ) {
+              continue;
+            }
+          }
+          if (!leaseObj?.convTitle) {
+            const txPath = resolveStoreCandidateTranscriptPath(cid, {
+              transcriptPath: typeof leaseObj?.transcriptPath === "string" ? leaseObj.transcriptPath : "",
+              allowDefaultDb: allowDefaultSummaryDb
+            });
+            if ((allowDefaultSummaryDb || txPath) && DatabaseSyncCtor) {
+              const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
+                transcriptPath: txPath,
+                allowDefaultDb: allowDefaultSummaryDb
+              });
+              if (summary.isSubagent) continue;
+              if (!summary.title && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) continue;
+            } else if (txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
+              continue;
+            }
+          }
+          return true;
+        } catch {}
+      }
+    } catch {}
+    return false;
+  }
+
+  /** Resolve max auto-keepalive activations for a conversation before a fresh user message (1..20, default 3) */
+  getTtlKeepaliveMaxCount(conversationId = null) {
     const snap = getConfigSnapshot();
     const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 3)));
     if (snap.sources.ttlKeepaliveMaxCount === "env") {
       return clampMax(snap.values.ttlKeepaliveMaxCount);
     }
-    this.open();
-    const raw = this.getMeta("cache:ttl_keepalive_max_count", null);
-    if (raw !== null && raw !== "") {
-      const n = Number(raw);
-      if (Number.isFinite(n) && n >= 1) return clampMax(n);
+    const cleanId = this._sanitizeKeepaliveConvId(conversationId);
+    if (cleanId) {
+      const st = this.getTtlKeepaliveState(cleanId);
+      if (typeof st.maxCount === "number" && Number.isFinite(st.maxCount) && st.maxCount >= 1) {
+        return clampMax(st.maxCount);
+      }
     }
     return clampMax(snap.values.ttlKeepaliveMaxCount ?? 3);
   }
 
-  /** Persist max auto-keepalive count (1..20) in SQLite meta */
-  setTtlKeepaliveMaxCount(maxCount) {
+  /** Persist per-conversation max auto-keepalive count (1..20) in SQLite meta */
+  setTtlKeepaliveMaxCount(maxCount, conversationId = null) {
     const clamped = Math.min(20, Math.max(1, Math.floor(Number(maxCount) || 3)));
-    this.open();
-    this.setMeta("cache:ttl_keepalive_max_count", String(clamped));
+    const targetId = this._sanitizeKeepaliveConvId(conversationId) || "__unbound__";
+    this.setTtlKeepaliveState(targetId, { maxCount: clamped });
     return clamped;
   }
 
@@ -1160,9 +1425,11 @@ export class SettingsMaintenanceMethods {
     return trimmed;
   }
 
-  /** Read per-conversation TTL auto-keepalive activation state */
-  getTtlKeepaliveState(conversationId) {
+  /** Read per-conversation TTL auto-keepalive activation & toggle state */
+  getTtlKeepaliveState(conversationId, nowMs = Date.now()) {
     const empty = {
+      enabled: null,
+      maxCount: null,
       usedCount: 0,
       lastIdleAnchorTs: 0,
       lastSentTs: 0,
@@ -1173,21 +1440,125 @@ export class SettingsMaintenanceMethods {
     const cleanId = this._sanitizeKeepaliveConvId(conversationId);
     if (!cleanId) return empty;
     this.open();
-    const raw = this.getMeta(`cache:ttl_keepalive_state:${cleanId}`, null);
+    const metaKey = `cache:ttl_keepalive_state:${cleanId}`;
+    const raw = this.getMeta(metaKey, null);
     if (!raw || typeof raw !== "string") return empty;
     try {
       const parsed = JSON.parse(raw);
       if (!parsed || typeof parsed !== "object") return empty;
+      const updatedTs =
+        Number.isFinite(Number(parsed.updatedTs)) && Number(parsed.updatedTs) > 0
+          ? Math.floor(Number(parsed.updatedTs))
+          : 0;
+      if (cleanId === "__unbound__") {
+        const safeNow = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+        if (updatedTs <= 0 || safeNow - updatedTs > 30 * 60 * 1000) {
+          try {
+            this.deleteMeta(metaKey);
+          } catch {}
+          return empty;
+        }
+      }
+      const rawMax = parsed.maxCount;
+      const validMax =
+        rawMax !== null &&
+        rawMax !== undefined &&
+        rawMax !== "" &&
+        typeof rawMax !== "boolean" &&
+        Number.isFinite(Number(rawMax)) &&
+        Number(rawMax) >= 1
+          ? Math.min(20, Math.max(1, Math.floor(Number(rawMax))))
+          : null;
       return {
+        enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : null,
+        maxCount: validMax,
         usedCount: Number.isFinite(Number(parsed.usedCount)) && Number(parsed.usedCount) >= 0 ? Math.floor(Number(parsed.usedCount)) : 0,
         lastIdleAnchorTs: Number.isFinite(Number(parsed.lastIdleAnchorTs)) && Number(parsed.lastIdleAnchorTs) > 0 ? Math.floor(Number(parsed.lastIdleAnchorTs)) : 0,
         lastSentTs: Number.isFinite(Number(parsed.lastSentTs)) && Number(parsed.lastSentTs) > 0 ? Math.floor(Number(parsed.lastSentTs)) : 0,
         pendingAck: Boolean(parsed.pendingAck),
         lastError: typeof parsed.lastError === "string" ? parsed.lastError.slice(0, 180) : "",
-        updatedTs: Number.isFinite(Number(parsed.updatedTs)) && Number(parsed.updatedTs) > 0 ? Math.floor(Number(parsed.updatedTs)) : 0
+        updatedTs
       };
     } catch {
       return empty;
+    }
+  }
+
+  /**
+   * Atomically migrate a fresh empty-tab (`__unbound__`) keepalive preference onto a genuinely
+   * brand-new conversation's Turn 0, clearing `__unbound__` so other tabs stay isolated.
+   */
+  claimPendingUnboundTtlKeepalive(conversationId, { nowMs = Date.now(), maxAgeMs = 30 * 60 * 1000 } = {}) {
+    const cleanId = this._sanitizeKeepaliveConvId(conversationId);
+    if (!cleanId || cleanId === "__unbound__") return null;
+    this.open();
+    const safeNow = Number.isFinite(Number(nowMs)) ? Math.floor(Number(nowMs)) : Date.now();
+    const ttlMs = Number.isFinite(Number(maxAgeMs)) && Number(maxAgeMs) > 0 ? Number(maxAgeMs) : 30 * 60 * 1000;
+    try {
+      return this._withWriteTx(() => {
+        const unboundRow = this.db
+          .prepare("SELECT value FROM meta WHERE key = 'cache:ttl_keepalive_state:__unbound__'")
+          .get();
+        if (!unboundRow || typeof unboundRow.value !== "string") return null;
+
+        let parsed = null;
+        try {
+          parsed = JSON.parse(unboundRow.value);
+        } catch {
+          parsed = null;
+        }
+        const updatedTs =
+          parsed && Number.isFinite(Number(parsed.updatedTs)) && Number(parsed.updatedTs) > 0
+            ? Math.floor(Number(parsed.updatedTs))
+            : 0;
+        const rawMax = parsed?.maxCount;
+        const validMax =
+          rawMax !== null &&
+          rawMax !== undefined &&
+          rawMax !== "" &&
+          typeof rawMax !== "boolean" &&
+          Number.isFinite(Number(rawMax)) &&
+          Number(rawMax) >= 1
+            ? Math.min(20, Math.max(1, Math.floor(Number(rawMax))))
+            : null;
+        const validEnabled = typeof parsed?.enabled === "boolean" ? parsed.enabled : null;
+        if (!parsed || updatedTs <= 0 || safeNow - updatedTs > ttlMs || (validEnabled === null && validMax === null)) {
+          this.db.prepare("DELETE FROM meta WHERE key = 'cache:ttl_keepalive_state:__unbound__'").run();
+          return null;
+        }
+
+        const existingMeta = this.db
+          .prepare("SELECT 1 FROM meta WHERE key IN (?, ?) LIMIT 1")
+          .get(`cache:ttl_keepalive_state:${cleanId}`, `watchdog_lease:${cleanId}`);
+        if (existingMeta) return null;
+
+        const priorActivity = this.db
+          .prepare(
+            "SELECT 1 FROM events WHERE session_id = ? UNION ALL SELECT 1 FROM sources WHERE session_id = ? UNION ALL SELECT 1 FROM session_checkpoints WHERE session_id = ? LIMIT 1"
+          )
+          .get(cleanId, cleanId, cleanId);
+        if (priorActivity) return null;
+
+        const migrated = {
+          enabled: validEnabled,
+          maxCount: validMax,
+          usedCount: 0,
+          lastIdleAnchorTs: 0,
+          lastSentTs: 0,
+          pendingAck: false,
+          lastError: "",
+          updatedTs: safeNow
+        };
+        this.db
+          .prepare(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+          )
+          .run(`cache:ttl_keepalive_state:${cleanId}`, JSON.stringify(migrated));
+        this.db.prepare("DELETE FROM meta WHERE key = 'cache:ttl_keepalive_state:__unbound__'").run();
+        return migrated;
+      });
+    } catch {
+      return null;
     }
   }
 
@@ -1198,7 +1569,21 @@ export class SettingsMaintenanceMethods {
     this.open();
     const cur = this.getTtlKeepaliveState(cleanId);
     const safePatch = patch && typeof patch === "object" ? patch : {};
+    const nextEnabled =
+      safePatch.enabled === null
+        ? null
+        : safePatch.enabled !== undefined
+          ? Boolean(safePatch.enabled && safePatch.enabled !== "false" && safePatch.enabled !== "0")
+          : cur.enabled;
+    const nextMaxCount =
+      safePatch.maxCount === null
+        ? null
+        : safePatch.maxCount !== undefined
+          ? Math.min(20, Math.max(1, Math.floor(Number(safePatch.maxCount) || 3)))
+          : cur.maxCount;
     const next = {
+      enabled: nextEnabled,
+      maxCount: nextMaxCount,
       usedCount:
         safePatch.usedCount !== undefined
           ? Math.max(0, Math.floor(Number(safePatch.usedCount) || 0))
@@ -1460,19 +1845,152 @@ export class SettingsMaintenanceMethods {
     return { updatedProfiles };
   }
 
-  /** Scrub legacy sub-baseline (< profile.ttlSec) cold noise & empirical leases in SQLite meta */
+  /** Scrub legacy sub-baseline (< profile.ttlSec) cold noise, empirical leases, mislabeled subagent leases & obsolete global keepalive keys in SQLite meta */
   sanitizeModelTtlState() {
     this.open();
     let scrubbedCalibrations = 0;
     let clampedLeases = 0;
+    let healedSubagentLeases = 0;
+    let removedLegacyGlobalKeepalive = 0;
     try {
+      const allowDefaultSummaryDb = Boolean(
+        (typeof process.env.AGY_DART_SUMMARY_DB_PATH === "string" && process.env.AGY_DART_SUMMARY_DB_PATH.trim()) ||
+          (typeof this.dbPath === "string" &&
+            isSameStorePath(this.dbPath, path.join(os.homedir(), ".agy-dart", "context.db")))
+      );
+      const DatabaseSyncCtor = this.db?.constructor || null;
+      const preScanRows = this.db
+        .prepare("SELECT key, value FROM meta WHERE key LIKE 'watchdog_lease:%'")
+        .all();
+      const subagentRepairMap = new Map();
+      for (const row of preScanRows || []) {
+        if (!row || typeof row.key !== "string" || typeof row.value !== "string") continue;
+        const cid = this._sanitizeKeepaliveConvId(row.key.slice("watchdog_lease:".length));
+        if (!cid || cid === "__unbound__") continue;
+        try {
+          const lease = JSON.parse(row.value);
+          if (!lease || typeof lease !== "object") continue;
+          if (lease.isSubagent === true) {
+            subagentRepairMap.set(cid, { markSubagent: false, scrubKeepalive: true, parentId: "" });
+            continue;
+          }
+          const inlineSub = Boolean(
+            (lease.parentConversationId && lease.parentConversationId !== cid) ||
+              (lease.rootSessionId && lease.rootSessionId !== cid) ||
+              (typeof lease.lastUserInput === "string" && STORE_HEADLESS_FINISH_RE.test(lease.lastUserInput))
+          );
+          if (inlineSub) {
+            subagentRepairMap.set(cid, {
+              markSubagent: true,
+              scrubKeepalive: true,
+              parentId: lease.parentConversationId || ""
+            });
+            continue;
+          }
+          if (lease.convTitle) {
+            if (
+              lease.phase === "IDLE" &&
+              lease.stopReason !== "USER_CANCELED" &&
+              (allowDefaultSummaryDb || lease.transcriptPath) &&
+              DatabaseSyncCtor
+            ) {
+              const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
+                transcriptPath: typeof lease.transcriptPath === "string" ? lease.transcriptPath : "",
+                allowDefaultDb: allowDefaultSummaryDb
+              });
+              if (summary.killed) {
+                subagentRepairMap.set(cid, {
+                  markSubagent: false,
+                  markKilled: true,
+                  scrubKeepalive: true,
+                  parentId: ""
+                });
+              }
+            }
+            continue;
+          }
+
+          let detectedSub = false;
+          let detectedKilled = false;
+          let foundParent = "";
+          let foundTitle = "";
+          const txPath = resolveStoreCandidateTranscriptPath(cid, {
+            transcriptPath: typeof lease.transcriptPath === "string" ? lease.transcriptPath : "",
+            allowDefaultDb: allowDefaultSummaryDb
+          });
+          if ((allowDefaultSummaryDb || txPath) && DatabaseSyncCtor) {
+            const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
+              transcriptPath: txPath,
+              allowDefaultDb: allowDefaultSummaryDb
+            });
+            if (summary.isSubagent) detectedSub = true;
+            if (summary.killed) detectedKilled = true;
+            if (summary.parentId && summary.parentId !== cid) {
+              foundParent = summary.parentId;
+            }
+            if (summary.title) foundTitle = summary.title;
+          }
+          if (!detectedSub && !foundTitle && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
+            detectedSub = true;
+          }
+          if (detectedSub || detectedKilled) {
+            subagentRepairMap.set(cid, {
+              markSubagent: detectedSub,
+              markKilled: detectedKilled,
+              scrubKeepalive: true,
+              parentId: foundParent
+            });
+          }
+        } catch {}
+      }
+
+      const kaPreRows = this.db
+        .prepare("SELECT key FROM meta WHERE key LIKE 'cache:ttl_keepalive_state:%'")
+        .all();
+      const orphanSubagentKeepaliveIds = new Set();
+      for (const row of kaPreRows || []) {
+        if (!row || typeof row.key !== "string" || row.key.endsWith(":__unbound__")) continue;
+        const cid = this._sanitizeKeepaliveConvId(row.key.slice("cache:ttl_keepalive_state:".length));
+        if (!cid || subagentRepairMap.has(cid)) continue;
+        try {
+          const txPath = resolveStoreCandidateTranscriptPath(cid, { allowDefaultDb: allowDefaultSummaryDb });
+          let detectedSub = false;
+          let detectedKilled = false;
+          let foundTitle = "";
+          if ((allowDefaultSummaryDb || txPath) && DatabaseSyncCtor) {
+            const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
+              transcriptPath: txPath,
+              allowDefaultDb: allowDefaultSummaryDb
+            });
+            if (summary.isSubagent) detectedSub = true;
+            if (summary.killed) detectedKilled = true;
+            if (summary.title) foundTitle = summary.title;
+          }
+          if (!detectedSub && !foundTitle && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
+            detectedSub = true;
+          }
+          if (detectedSub || detectedKilled) {
+            orphanSubagentKeepaliveIds.add(cid);
+          }
+        } catch {}
+      }
+
       this._withWriteTx(() => {
+        const legacyRes = this.db
+          .prepare("DELETE FROM meta WHERE key IN ('cache:ttl_keepalive_enabled', 'cache:ttl_keepalive_max_count')")
+          .run();
+        removedLegacyGlobalKeepalive = Number(legacyRes?.changes || 0);
+
         const calRows = this.db
           .prepare("SELECT key, value FROM meta WHERE key LIKE 'ttl_calibration:v1:%'")
           .all();
         const upsertStmt = this.db.prepare(
           "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
         );
+        const delKeyStmt = this.db.prepare("DELETE FROM meta WHERE key = ?");
+        for (const orphanCid of orphanSubagentKeepaliveIds) {
+          delKeyStmt.run(`cache:ttl_keepalive_state:${orphanCid}`);
+        }
         for (const row of calRows || []) {
           if (!row || typeof row.key !== "string" || typeof row.value !== "string") continue;
           const pid = row.key.slice("ttl_calibration:v1:".length).trim();
@@ -1496,22 +2014,53 @@ export class SettingsMaintenanceMethods {
           .all();
         for (const row of leaseRows || []) {
           if (!row || typeof row.key !== "string" || typeof row.value !== "string") continue;
+          const cid = this._sanitizeKeepaliveConvId(row.key.slice("watchdog_lease:".length));
           try {
             const lease = JSON.parse(row.value);
             if (!lease || typeof lease !== "object") continue;
-            if (lease.ttlSource !== "empirical") continue;
-            const modelStr = typeof lease.model === "string" ? lease.model : "";
-            const floorSec = resolveModelColdFloorSec(modelStr);
-            if (Number.isFinite(Number(lease.cacheTtlSec)) && Number(lease.cacheTtlSec) > 0 && Number(lease.cacheTtlSec) < floorSec) {
-              lease.cacheTtlSec = floorSec;
+            let mutated = false;
+            if (lease.ttlSource === "empirical") {
+              const modelStr = typeof lease.model === "string" ? lease.model : "";
+              const floorSec = resolveModelColdFloorSec(modelStr);
+              if (
+                Number.isFinite(Number(lease.cacheTtlSec)) &&
+                Number(lease.cacheTtlSec) > 0 &&
+                Number(lease.cacheTtlSec) < floorSec
+              ) {
+                lease.cacheTtlSec = floorSec;
+                clampedLeases += 1;
+                mutated = true;
+              }
+            }
+            const repair = cid ? subagentRepairMap.get(cid) : null;
+            if (repair) {
+              if (repair.markSubagent && !lease.isSubagent) {
+                lease.isSubagent = true;
+                if (repair.parentId && !lease.parentConversationId) {
+                  lease.parentConversationId = repair.parentId;
+                  if (!lease.rootSessionId || lease.rootSessionId === cid) {
+                    lease.rootSessionId = repair.parentId;
+                  }
+                }
+                healedSubagentLeases += 1;
+                mutated = true;
+              }
+              if (repair.markKilled && lease.phase === "IDLE" && lease.stopReason !== "USER_CANCELED") {
+                lease.stopReason = "USER_CANCELED";
+                mutated = true;
+              }
+              if (repair.scrubKeepalive && cid) {
+                delKeyStmt.run(`cache:ttl_keepalive_state:${cid}`);
+              }
+            }
+            if (mutated) {
               upsertStmt.run(row.key, JSON.stringify(lease));
-              clampedLeases += 1;
             }
           } catch {}
         }
       });
     } catch {}
-    return { scrubbedCalibrations, clampedLeases };
+    return { scrubbedCalibrations, clampedLeases, healedSubagentLeases, removedLegacyGlobalKeepalive };
   }
 
   /** Read normalized one-time GitHub Star milestone prompt state from SQLite meta */
@@ -1706,24 +2255,72 @@ export class SettingsMaintenanceMethods {
           )
           .all();
         const delMetaStmt = this.db.prepare("DELETE FROM meta WHERE key = ?");
+        const upsertMetaStmt = this.db.prepare(
+          "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        );
+        const unboundCutoffTs = now - 30 * 60 * 1000;
         for (const row of metaRows) {
           let entryTs = 0;
+          let parsedObj = null;
           if (typeof row.value === "string" && row.value.startsWith("{")) {
             try {
               const p = JSON.parse(row.value);
-              if (p && Number.isFinite(p.updatedTs)) entryTs = p.updatedTs;
-              else if (p && Number.isFinite(p.ts)) entryTs = p.ts;
+              if (p && typeof p === "object") {
+                parsedObj = p;
+                if (Number.isFinite(p.updatedTs)) entryTs = p.updatedTs;
+                else if (Number.isFinite(p.ts)) entryTs = p.ts;
+              }
             } catch {}
           }
           const isShortConfirm =
             row.key.startsWith("large_read_confirm:") || row.key.startsWith("sensitive_read_confirm:");
-          const isWatchdogLease =
-            row.key.startsWith("watchdog_lease:") || row.key.startsWith("cache:ttl_keepalive_state:");
           if (isShortConfirm) {
             if (entryTs <= 0 || entryTs < confirmCutoffTs) {
               delMetaStmt.run(row.key);
             }
-          } else if (isWatchdogLease) {
+          } else if (row.key === "cache:ttl_keepalive_state:__unbound__") {
+            if (days === 0 || entryTs <= 0 || entryTs < unboundCutoffTs) {
+              delMetaStmt.run(row.key);
+            }
+          } else if (row.key.startsWith("cache:ttl_keepalive_state:")) {
+            if (!parsedObj) {
+              delMetaStmt.run(row.key);
+              continue;
+            }
+            const hasExplicitOverride =
+              typeof parsedObj.enabled === "boolean" ||
+              (typeof parsedObj.maxCount === "number" && Number.isFinite(parsedObj.maxCount) && parsedObj.maxCount >= 1);
+            const isStaleKa = entryTs <= 0 || entryTs < (days === 0 ? cutoffTs : leaseCutoffTs);
+            if (!hasExplicitOverride) {
+              if (isStaleKa) {
+                delMetaStmt.run(row.key);
+              }
+            } else if (
+              isStaleKa &&
+              (parsedObj.usedCount > 0 ||
+                parsedObj.lastIdleAnchorTs > 0 ||
+                parsedObj.lastSentTs > 0 ||
+                parsedObj.pendingAck ||
+                parsedObj.lastError)
+            ) {
+              upsertMetaStmt.run(
+                row.key,
+                JSON.stringify({
+                  enabled: typeof parsedObj.enabled === "boolean" ? parsedObj.enabled : null,
+                  maxCount:
+                    typeof parsedObj.maxCount === "number" && Number.isFinite(parsedObj.maxCount) && parsedObj.maxCount >= 1
+                      ? Math.min(20, Math.max(1, Math.floor(parsedObj.maxCount)))
+                      : null,
+                  usedCount: 0,
+                  lastIdleAnchorTs: 0,
+                  lastSentTs: 0,
+                  pendingAck: false,
+                  lastError: "",
+                  updatedTs: entryTs > 0 ? entryTs : now
+                })
+              );
+            }
+          } else if (row.key.startsWith("watchdog_lease:")) {
             if (entryTs <= 0 || entryTs < (days === 0 ? cutoffTs : leaseCutoffTs)) {
               delMetaStmt.run(row.key);
             }

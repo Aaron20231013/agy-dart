@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
@@ -70,22 +71,32 @@ function runHookRaw(relScript, payload, dbPath, extraEnv = {}) {
   });
 }
 
-async function httpJsonRequest(port, urlPath, { method = "GET", headers = {}, body = undefined } = {}) {
-  const init = {
-    method,
-    headers: { ...headers }
-  };
-  if (body !== undefined) {
-    init.headers["Content-Type"] = "application/json";
-    init.body = JSON.stringify(body);
-  }
-  const res = await fetch(`http://127.0.0.1:${port}${urlPath}`, init);
-  const text = await res.text();
-  let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {}
-  return { status: res.status, text, json };
+function httpJsonRequest(port, urlPath, { method = "GET", headers = {}, body = undefined } = {}) {
+  return new Promise((resolve, reject) => {
+    const payload = body !== undefined ? JSON.stringify(body) : "";
+    const reqHeaders = { ...headers };
+    if (body !== undefined) {
+      reqHeaders["Content-Type"] = "application/json";
+      reqHeaders["Content-Length"] = Buffer.byteLength(payload, "utf8");
+    }
+    const req = http.request({ hostname: "127.0.0.1", port, path: urlPath, method, headers: reqHeaders }, (res) => {
+      let text = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => {
+        text += c;
+      });
+      res.on("end", () => {
+        let json = null;
+        try {
+          json = JSON.parse(text);
+        } catch {}
+        resolve({ status: res.statusCode, text, json });
+      });
+    });
+    req.on("error", reject);
+    if (body !== undefined) req.write(payload);
+    req.end();
+  });
 }
 
 test("v1.5-1: Cross-session empirical TTL calibration (gemini-4-512k), interval bounds & downward convergence without SQLite coupling", () => {

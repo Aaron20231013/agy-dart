@@ -656,7 +656,8 @@ export function hasExplicitConversationId(payload = {}, env = process.env) {
 }
 
 const SUBAGENT_ROLE_GUARD_RE =
-  /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?)(?:$|[-_\s/])/i;
+  /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?|browser|image[-_]?generator)(?:$|[-_\s/])|^(?:DeepCoder|DeepInvestigator)[A-Za-z0-9_-]*$/i;
+const PRIMARY_HOST_ROLE_RE = /^(?:antigravity|main|default|primary|chat|user|assistant|cascade)$/i;
 
 export function isSubagentReadPayload(payload = {}, env = process.env) {
   if (env?.ANTIGRAVITY_PARENT_CONVERSATION_ID) return true;
@@ -670,7 +671,10 @@ export function isSubagentReadPayload(payload = {}, env = process.env) {
   ) {
     return true;
   }
+  const directDepth = Number(payload.nestingDepth ?? payload.nesting_depth);
+  if (Number.isFinite(directDepth) && directDepth > 0) return true;
   if (payload.metadata && typeof payload.metadata === "object") {
+    const metaDepth = Number(payload.metadata.nestingDepth ?? payload.metadata.nesting_depth);
     if (
       payload.metadata.subagent === true ||
       payload.metadata.isSubagent === true ||
@@ -680,7 +684,8 @@ export function isSubagentReadPayload(payload = {}, env = process.env) {
       payload.metadata.parentConversationId ||
       payload.metadata.parent_conversation_id ||
       payload.metadata.parentSessionId ||
-      payload.metadata.parent_session_id
+      payload.metadata.parent_session_id ||
+      (Number.isFinite(metaDepth) && metaDepth > 0)
     ) {
       return true;
     }
@@ -702,6 +707,8 @@ export function isSubagentReadPayload(payload = {}, env = process.env) {
     payload.agent_role,
     payload.agentType,
     payload.agent_type,
+    payload.agentName,
+    payload.agent_name,
     payload.sessionType,
     payload.session_type,
     payload.sessionKind,
@@ -710,11 +717,16 @@ export function isSubagentReadPayload(payload = {}, env = process.env) {
     payload.metadata?.agentRole,
     payload.metadata?.agent_role,
     payload.metadata?.agentType,
-    payload.metadata?.agent_type
+    payload.metadata?.agent_type,
+    payload.metadata?.agentName,
+    payload.metadata?.agent_name
   ];
   for (const candidate of roleCandidates) {
-    if (typeof candidate === "string" && candidate.trim() && SUBAGENT_ROLE_GUARD_RE.test(candidate.trim())) {
-      return true;
+    if (typeof candidate === "string" && candidate.trim()) {
+      const clean = candidate.trim();
+      if (!PRIMARY_HOST_ROLE_RE.test(clean) && (clean.toLowerCase() === "self" || SUBAGENT_ROLE_GUARD_RE.test(clean))) {
+        return true;
+      }
     }
   }
   return false;
@@ -1870,16 +1882,106 @@ async function main() {
     }
   }
 
+  let independentSubagentResolved = null;
+  let discoveredParentConvId = "";
+  const isIndependentSubagentRead = async () => {
+    if (independentSubagentResolved !== null) return independentSubagentResolved;
+    if (!directConvId || directConvId === "default") {
+      independentSubagentResolved = false;
+      return false;
+    }
+    const explicitDepth = Number(
+      payload.nestingDepth ?? payload.nesting_depth ?? payload.metadata?.nestingDepth ?? payload.metadata?.nesting_depth
+    );
+    if (
+      (sessionId && sessionId !== "default" && directConvId !== sessionId) ||
+      (Number.isFinite(explicitDepth) && explicitDepth > 0)
+    ) {
+      independentSubagentResolved = true;
+      return true;
+    }
+    // Inline subagent with explicit subagentId sharing parent conversationId (e.g. `{ conversationId: "p-main", subagent: true, subagentId: "sub-A" }`)
+    // shares the parent's context window and must keep 2-strike confirm isolation rather than bypassing read guards.
+    if (subagentId && directConvId === sessionId) {
+      independentSubagentResolved = false;
+      return false;
+    }
+    try {
+      const wl = await ensureWatchdogLease();
+      const st = getSharedStore();
+      const existingLease = typeof wl.readWatchdogLease === "function" ? wl.readWatchdogLease(st, directConvId) : null;
+      if (existingLease) {
+        if (
+          existingLease.isSubagent === true ||
+          (existingLease.parentConversationId && existingLease.parentConversationId !== directConvId) ||
+          (existingLease.rootSessionId && existingLease.rootSessionId !== directConvId)
+        ) {
+          discoveredParentConvId = existingLease.parentConversationId || "";
+          independentSubagentResolved = true;
+          return true;
+        }
+        if (existingLease.convTitle) {
+          independentSubagentResolved = false;
+          return false;
+        }
+      }
+      const allowDefaultSummaryDb =
+        Boolean(process.env.AGY_DART_SUMMARY_DB_PATH) || cfgSnapshot.sources.dbPath === "default";
+      const txPath =
+        (typeof payload.transcriptPath === "string" && payload.transcriptPath.trim()) ||
+        (typeof payload.transcript_path === "string" && payload.transcript_path.trim()) ||
+        existingLease?.transcriptPath ||
+        (typeof wl.resolveCandidateTranscriptPath === "function"
+          ? wl.resolveCandidateTranscriptPath(directConvId, { allowDefaultDb: allowDefaultSummaryDb })
+          : "");
+      if (allowDefaultSummaryDb || txPath) {
+        const summary = wl.lookupConversationSummary?.(directConvId, {
+          transcriptPath: txPath,
+          allowDefaultDb: allowDefaultSummaryDb,
+          checkSubagent: true,
+          allowUntitledCustomAgent: false
+        });
+        if (summary?.isSubagent) {
+          discoveredParentConvId = summary.parentConversationId || "";
+          independentSubagentResolved = true;
+          return true;
+        }
+        if (summary?.title) {
+          independentSubagentResolved = false;
+          return false;
+        }
+      }
+      if (txPath && wl.detectSubagentFromTranscriptFile?.(txPath)) {
+        independentSubagentResolved = true;
+        return true;
+      }
+    } catch {}
+    independentSubagentResolved = false;
+    return false;
+  };
+
   const touchWatchdogPreTool = async (decision = "allow") => {
     if (!effectiveCfg.stallWatchdog || !directConvId || directConvId === "default") return;
     try {
       const st = getSharedStore();
       if (typeof st.isWatchdogEnabled === "function" && !st.isWatchdogEnabled()) return;
       const wl = await ensureWatchdogLease();
+      if (isSubagentCall && directConvId === sessionId && !subagentId && independentSubagentResolved === null) {
+        await isIndependentSubagentRead();
+      }
+      const sharesParentLease = Boolean(
+        isSubagentCall && directConvId === sessionId && independentSubagentResolved !== true
+      );
+      const effectiveSubagent = Boolean(!sharesParentLease && (isSubagentCall || independentSubagentResolved === true));
       wl.recordHookLeaseTransition(st, "PreToolUse", payload, {
         directConvId,
-        rootSessionId: sessionId,
-        isSubagent: isSubagentCall,
+        rootSessionId:
+          sessionId && sessionId !== directConvId
+            ? sessionId
+            : discoveredParentConvId || sessionId,
+        ...(discoveredParentConvId ? { parentConversationId: discoveredParentConvId } : {}),
+        isSubagent: effectiveSubagent,
+        suppressPayloadSubagent: sharesParentLease,
         cwd,
         toolName,
         toolArgs: args,
@@ -2309,33 +2411,37 @@ async function main() {
               }
 
               if (dup && Number(dup.bypass_armed) === 0) {
-                store.armReadBypass({
-                  sessionId: directConvId,
-                  filePath: absPath,
-                  startLine: dup.start_line,
-                  endLine: dup.end_line
-                });
-                const rangeLabel = effectiveEndLine !== null ? `lines ${startLine}-${effectiveEndLine}` : "full file";
-                const dedupReason =
-                  `[agy-dart read-dedup] '${filePath}' (${rangeLabel}, ~${formatBytes(estBytes)}) was already read unchanged earlier in this session ` +
-                  `(mtime & size identical). Reuse the copy already in context to save tokens; if context was compacted and you truly need a fresh copy, call ${toolName} once more to bypass.`;
+                if (readGuardMode !== "strict" && (await isIndependentSubagentRead())) {
+                  dup = null;
+                } else {
+                  store.armReadBypass({
+                    sessionId: directConvId,
+                    filePath: absPath,
+                    startLine: dup.start_line,
+                    endLine: dup.end_line
+                  });
+                  const rangeLabel = effectiveEndLine !== null ? `lines ${startLine}-${effectiveEndLine}` : "full file";
+                  const dedupReason =
+                    `[agy-dart read-dedup] '${filePath}' (${rangeLabel}, ~${formatBytes(estBytes)}) was already read unchanged earlier in this session ` +
+                    `(mtime & size identical). Reuse the copy already in context to save tokens; if context was compacted and you truly need a fresh copy, call ${toolName} once more to bypass.`;
 
-                recordInterception({
-                  sessionId,
-                  agent: agentName,
-                  cwd,
-                  toolName,
-                  path: filePath,
-                  size: estBytes,
-                  reason: dedupReason,
-                  kind: "dedup",
-                  key: "unchanged_reread"
-                });
+                  recordInterception({
+                    sessionId,
+                    agent: agentName,
+                    cwd,
+                    toolName,
+                    path: filePath,
+                    size: estBytes,
+                    reason: dedupReason,
+                    kind: "dedup",
+                    key: "unchanged_reread"
+                  });
 
-                await touchWatchdogPreTool("deny");
-                closeSharedStore();
-                process.stdout.write(JSON.stringify({ decision: "deny", reason: dedupReason }) + "\n");
-                process.exit(0);
+                  await touchWatchdogPreTool("deny");
+                  closeSharedStore();
+                  process.stdout.write(JSON.stringify({ decision: "deny", reason: dedupReason }) + "\n");
+                  process.exit(0);
+                }
               }
 
               if (dup && Number(dup.bypass_armed) === 1) {
@@ -2411,7 +2517,10 @@ async function main() {
                         diff.diffBytes < currentRangeBytes * MAX_DIFF_READ_RATIO
                       ) {
                         const compCheck = await checkLazyCompactionOnSlowPath({ snapshotRow: snapshot });
-                        if (!compCheck?.invalidated) {
+                        if (
+                          !compCheck?.invalidated &&
+                          !(readGuardMode !== "strict" && (await isIndependentSubagentRead()))
+                        ) {
                           store.saveFileSnapshot({
                             sessionId: directConvId,
                             filePath: absPath,
@@ -2598,9 +2707,12 @@ async function main() {
                 !isMinifiedDenseSlice && slicedRangeBytes > maxPagedSliceBytes;
 
               if (isLargeFile && (isWideRange || isMinifiedDenseSlice || isOversizedMultiLineSlice)) {
+                const independentSubagent =
+                  readGuardMode !== "strict" ? await isIndependentSubagentRead() : false;
+                const effectiveSubagentCall = Boolean(isSubagentCall || independentSubagent);
                 const isHardDeny =
                   readGuardMode === "strict" ||
-                  (!isSubagentCall && (tier === "noise" || isMinifiedDenseSlice));
+                  (!effectiveSubagentCall && (tier === "noise" || isMinifiedDenseSlice));
 
                 const modeSig = isMinifiedDenseSlice
                   ? "dense"
@@ -2609,8 +2721,8 @@ async function main() {
                     : "full";
                 const confirmKey = `large_read_confirm:${confirmScope.scopeKey}:${normKey}:${modeSig}`;
 
-                let softBypassAllowed = false;
-                if (!isHardDeny) {
+                let softBypassAllowed = independentSubagent;
+                if (!isHardDeny && !softBypassAllowed) {
                   try {
                     const st = getSharedStore();
                     const prevSig = st.getTimedMeta(confirmKey, "", confirmScope.ttlMs);

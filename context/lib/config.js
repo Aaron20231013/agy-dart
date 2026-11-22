@@ -65,6 +65,7 @@ export const CONFIG_DEFAULTS = Object.freeze({
   ttlKeepaliveLeadSec: 30,
   ttlKeepaliveMinTokens: 0,
   watermarkDesktopNotify: null,
+  toolLoading: "fast-eager",
   uiLang: "en"
 });
 
@@ -144,6 +145,18 @@ export function parseUiLang(raw) {
   if (!s) return undefined;
   if (s === "zh" || s === "cn" || s.startsWith("zh-") || s.startsWith("zh_")) return "zh";
   if (s === "en" || s.startsWith("en-") || s.startsWith("en_")) return "en";
+  return undefined;
+}
+
+export function parseToolLoading(raw) {
+  if (raw === undefined || raw === null) return undefined;
+  const s = String(raw).trim().toLowerCase();
+  if (!s) return undefined;
+  if (s === "fast-eager" || s === "fast_eager" || s === "fasteager" || s === "hybrid" || s === "default") {
+    return "fast-eager";
+  }
+  if (s === "lazy" || s === "on-demand" || s === "ondemand") return "lazy";
+  if (s === "eager" || s === "all-eager" || s === "alleager" || s === "all") return "eager";
   return undefined;
 }
 
@@ -530,6 +543,7 @@ export function getConfigSnapshot(options = {}) {
     parseEnvBool(env?.AGY_DART_WATERMARK_DESKTOP_NOTIFY),
     cfgBool("watermarkDesktopNotify")
   );
+  pick("toolLoading", parseToolLoading(env?.AGY_DART_TOOL_LOADING), parseToolLoading(cfg.toolLoading));
   pick("uiLang", parseUiLang(env?.AGY_DART_LANG), parseUiLang(cfg.uiLang));
 
   return {
@@ -564,6 +578,7 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra
     "stallWatchdog",
     "stablePrefixOnly",
     "outlineDb",
+    "toolLoading",
     "secretRedaction",
     "sensitiveFileGuard",
     "allowPrivateUrls"

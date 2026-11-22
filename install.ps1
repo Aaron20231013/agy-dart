@@ -1,19 +1,20 @@
 <#
 .SYNOPSIS
-  One-command Windows installer for agy-dart (Antigravity all-in-one latency & context guard plugin).
+  One-command Windows installer for agy-dart (supports both clone-free `irm ... | iex` and local repo runs).
 .EXAMPLE
-  .\install.ps1
+  irm https://raw.githubusercontent.com/zou172866/agy-dart/main/install.ps1 | iex
   .\install.ps1 -InstallRg
+  .\install.ps1 -ToolLoading fast-eager
   .\install.ps1 -WithDevtools
-  .\install.ps1 -Mode host-45k
-  .\install.ps1 -Mode balanced-16k
   .\install.ps1 -Command doctor
 #>
 param(
-  [ValidateSet("install", "doctor", "uninstall", "mode")]
+  [ValidateSet("install", "doctor", "uninstall", "mode", "tool-loading")]
   [string]$Command = "install",
   [ValidateSet("host-45k", "balanced-16k", "fast-32k", "strict-8k", "no-read-hook")]
   [string]$Mode = "host-45k",
+  [ValidateSet("fast-eager", "lazy", "eager")]
+  [string]$ToolLoading = "fast-eager",
   [switch]$InstallRg,
   [switch]$WithDevtools,
   [switch]$Json,
@@ -21,29 +22,63 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Installer = Join-Path $ScriptDir "scripts\install.mjs"
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
   Write-Error "Node.js >= 22 is required. Install Node.js first: https://nodejs.org/"
   exit 1
 }
 
-$nodeArgs = @($Installer, $Command)
-if ($Command -eq "install") {
-  if ($PSBoundParameters.ContainsKey("Mode")) {
-    $nodeArgs += @("--mode", $Mode)
-  }
-  if ($InstallRg) { $nodeArgs += "--install-rg" }
-  if ($WithDevtools) { $nodeArgs += "--with-devtools" }
-} elseif ($Command -eq "mode") {
-  $nodeArgs += $Mode
-} elseif ($Command -eq "doctor") {
-  if ($Json) { $nodeArgs += "--json" }
-}
-if ($Project) {
-  $nodeArgs += @("--project", $Project)
-}
+$ScriptPath = $MyInvocation.MyCommand.Path
+$ScriptDir = if ($ScriptPath) { Split-Path -Parent $ScriptPath } else { "" }
+$Installer = if ($ScriptDir) { Join-Path $ScriptDir "scripts\install.mjs" } else { "" }
+$TempWorkDir = ""
 
-& node @nodeArgs
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+try {
+  if (-not $Installer -or -not (Test-Path -LiteralPath $Installer)) {
+    $TempWorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("agy-dart-bootstrap-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $TempWorkDir | Out-Null
+    $RepoDir = Join-Path $TempWorkDir "repo"
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+      Write-Host "[agy-dart] Fetching latest release from GitHub..."
+      & git clone --depth 1 --quiet "https://github.com/zou172866/agy-dart.git" $RepoDir
+      if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE" }
+    } else {
+      Write-Host "[agy-dart] Downloading archive from GitHub..."
+      $ZipFile = Join-Path $TempWorkDir "agy-dart.zip"
+      Invoke-WebRequest -Uri "https://github.com/zou172866/agy-dart/archive/refs/heads/main.zip" -OutFile $ZipFile -UseBasicParsing
+      Expand-Archive -Path $ZipFile -DestinationPath $TempWorkDir -Force
+      $Extracted = Get-ChildItem -Path $TempWorkDir -Directory -Filter "agy-dart-*" | Select-Object -First 1
+      if (-not $Extracted) { throw "Failed to unpack agy-dart archive." }
+      $RepoDir = $Extracted.FullName
+    }
+    $Installer = Join-Path $RepoDir "scripts\install.mjs"
+  }
+
+  $nodeArgs = @($Installer, $Command)
+  if ($Command -eq "install") {
+    if ($PSBoundParameters.ContainsKey("Mode")) {
+      $nodeArgs += @("--mode", $Mode)
+    }
+    if ($PSBoundParameters.ContainsKey("ToolLoading")) {
+      $nodeArgs += @("--tool-loading", $ToolLoading)
+    }
+    if ($InstallRg) { $nodeArgs += "--install-rg" }
+    if ($WithDevtools) { $nodeArgs += "--with-devtools" }
+  } elseif ($Command -eq "mode") {
+    $nodeArgs += $Mode
+  } elseif ($Command -eq "tool-loading") {
+    $nodeArgs += $ToolLoading
+  } elseif ($Command -eq "doctor") {
+    if ($Json) { $nodeArgs += "--json" }
+  }
+  if ($Project) {
+    $nodeArgs += @("--project", $Project)
+  }
+
+  & node @nodeArgs
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} finally {
+  if ($TempWorkDir -and (Test-Path -LiteralPath $TempWorkDir)) {
+    Remove-Item -LiteralPath $TempWorkDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}

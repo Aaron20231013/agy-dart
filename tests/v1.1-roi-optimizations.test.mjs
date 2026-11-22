@@ -147,9 +147,10 @@ test("Opt 1: fast/mcp-server.mjs schema slimming cuts Turn-0 budget while preser
 
     // read_slices
     const rs = byName.get("read_slices").inputSchema;
-    assert.deepEqual(Object.keys(rs.properties).sort(), ["cwd", "maxChars", "outlines", "slices"]);
+    assert.deepEqual(Object.keys(rs.properties).sort(), ["cwd", "lineRanges", "maxChars", "outlines", "slices"]);
     assert.equal(rs.properties.outlines.maxItems, 40);
     assert.equal(rs.properties.slices.maxItems, 30);
+    assert.equal(rs.properties.lineRanges.maxItems, 30);
 
     // run_checks
     const rc = byName.get("run_checks").inputSchema;

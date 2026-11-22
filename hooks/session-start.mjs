@@ -64,7 +64,8 @@ function nonEmptyString(val) {
 }
 
 const SUBAGENT_ROLE_RE =
-  /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?)(?:$|[-_\s/])/i;
+  /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?|browser|image[-_]?generator)(?:$|[-_\s/])|^(?:DeepCoder|DeepInvestigator)[A-Za-z0-9_-]*$/i;
+const PRIMARY_HOST_AGENT_NAME_RE = /^(?:antigravity|main|default|primary|chat|user|assistant|cascade)$/i;
 
 /**
  * Detect whether a SessionStart hook payload / environment belongs to a subagent or swarm worker.
@@ -77,51 +78,47 @@ export function isSubagentPayload(payload, env = process.env) {
 
   const p = parseHookPayload(payload);
   if (!p) return false;
+  const common = p.common && typeof p.common === "object" && !Array.isArray(p.common) ? p.common : null;
+  const meta = p.metadata && typeof p.metadata === "object" && !Array.isArray(p.metadata) ? p.metadata : null;
 
-  if (p.subagent === true || p.isSubagent === true || p.is_subagent === true) {
-    return true;
-  }
-
-  if (nonEmptyString(p.subagentId) || nonEmptyString(p.subagent_id)) {
-    return true;
-  }
-
-  if (p.metadata && typeof p.metadata === "object") {
+  for (const bag of [p, common, meta]) {
+    if (!bag) continue;
+    if (bag.subagent === true || bag.isSubagent === true || bag.is_subagent === true) return true;
+    if (nonEmptyString(bag.subagentId) || nonEmptyString(bag.subagent_id)) return true;
+    const spec = bag.subagentSpec ?? bag.subagent_spec ?? null;
+    if (spec && typeof spec === "object" && !Array.isArray(spec) && Object.keys(spec).length > 0) return true;
+    const depth = Number(bag.nestingDepth ?? bag.nesting_depth);
+    if (Number.isFinite(depth) && depth > 0) return true;
     if (
-      p.metadata.subagent === true ||
-      p.metadata.isSubagent === true ||
-      p.metadata.is_subagent === true ||
-      nonEmptyString(p.metadata.subagentId) ||
-      nonEmptyString(p.metadata.subagent_id) ||
-      nonEmptyString(p.metadata.parentConversationId) ||
-      nonEmptyString(p.metadata.parent_conversation_id) ||
-      nonEmptyString(p.metadata.parentSessionId) ||
-      nonEmptyString(p.metadata.parent_session_id)
+      nonEmptyString(bag.parentConversationId) ||
+      nonEmptyString(bag.parent_conversation_id) ||
+      nonEmptyString(bag.parentSessionId) ||
+      nonEmptyString(bag.parent_session_id)
     ) {
       return true;
     }
   }
 
-  if (
-    nonEmptyString(p.parentConversationId) ||
-    nonEmptyString(p.parent_conversation_id) ||
-    nonEmptyString(p.parentSessionId) ||
-    nonEmptyString(p.parent_session_id)
-  ) {
-    return true;
-  }
-
+  const isBattle = Boolean(
+    p.isBattleMode || p.is_battle_mode || common?.isBattleMode || common?.is_battle_mode || meta?.isBattleModeFork
+  );
   const rootId =
     nonEmptyString(p.rootConversationId) ||
     nonEmptyString(p.root_conversation_id) ||
-    nonEmptyString(p.metadata?.rootConversationId) ||
-    nonEmptyString(p.metadata?.root_conversation_id);
+    nonEmptyString(common?.rootConversationId) ||
+    nonEmptyString(common?.root_conversation_id) ||
+    nonEmptyString(meta?.rootConversationId) ||
+    nonEmptyString(meta?.root_conversation_id) ||
+    nonEmptyString(e.ANTIGRAVITY_ROOT_CONVERSATION_ID);
   const convId =
     nonEmptyString(p.conversationId) ||
     nonEmptyString(p.conversation_id) ||
+    nonEmptyString(common?.conversationId) ||
+    nonEmptyString(common?.conversation_id) ||
     nonEmptyString(p.sessionId) ||
-    nonEmptyString(p.session_id);
-  if (rootId && convId && rootId !== convId) {
+    nonEmptyString(p.session_id) ||
+    nonEmptyString(e.ANTIGRAVITY_CONVERSATION_ID);
+  if (!isBattle && rootId && convId && rootId !== convId) {
     return true;
   }
 
@@ -131,19 +128,26 @@ export function isSubagentPayload(payload, env = process.env) {
     p.agent_role,
     p.agentType,
     p.agent_type,
+    p.agentName,
+    p.agent_name,
     p.sessionType,
     p.session_type,
     p.sessionKind,
     p.session_kind,
-    p.metadata?.role,
-    p.metadata?.agentRole,
-    p.metadata?.agent_role,
-    p.metadata?.agentType,
-    p.metadata?.agent_type
+    common?.agentName,
+    common?.agent_name,
+    common?.role,
+    meta?.role,
+    meta?.agentRole,
+    meta?.agent_role,
+    meta?.agentType,
+    meta?.agent_type,
+    meta?.agentName,
+    meta?.agent_name
   ];
   for (const candidate of roleCandidates) {
     const text = nonEmptyString(candidate);
-    if (text && SUBAGENT_ROLE_RE.test(text)) {
+    if (text && !PRIMARY_HOST_AGENT_NAME_RE.test(text) && (text.toLowerCase() === "self" || SUBAGENT_ROLE_RE.test(text))) {
       return true;
     }
   }
