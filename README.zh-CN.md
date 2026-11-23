@@ -205,3 +205,12 @@ npm run cache:simulate
 ## 致谢与开源协议
 
 [MIT 协议](LICENSE) 开源。部分代码整合改造自同为 MIT 协议的 [INK-Q/agy-fast](https://github.com/INK-Q/agy-fast) 与 [Domush/antigravity-plugin-context-mode](https://github.com/Domush/antigravity-plugin-context-mode)，完整第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## v1.7 CLI
+
+默认安装到 Antigravity。显式使用 `--target claude` 或 `--target codex` 选择其他宿主。`outline <文件>` 输出签名与行号，`session <ID>` 和 `compare <前> <后>` 分析会话账单。
+
+```sh
+npx agy-dart install
+npx agy-dart doctor
+```

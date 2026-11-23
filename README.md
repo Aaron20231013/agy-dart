@@ -205,3 +205,12 @@ npm run cache:simulate
 ## Credits & License
 
 [MIT License](LICENSE). Incorporates and adapts MIT-licensed code from [INK-Q/agy-fast](https://github.com/INK-Q/agy-fast) and [Domush/antigravity-plugin-context-mode](https://github.com/Domush/antigravity-plugin-context-mode); full third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## v1.7 CLI
+
+Install for Antigravity by default. Select Claude Code or Codex explicitly with `--target claude|codex`. Use `outline <file>` for a compact signature map and `session <id>` or `compare <before> <after>` for transcript usage.
+
+```sh
+npx agy-dart install
+npx agy-dart doctor
+```

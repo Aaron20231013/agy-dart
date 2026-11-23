@@ -5,6 +5,7 @@
  * Uses Antigravity's zero-prefix-pollution UI-only `metadata.user_markdown`
  * (with empty `systemMessage: ""`) so alerts never mutate the model prompt prefix.
  */
+import { executionReceiptsFromSteps } from "../context/lib/execution-receipts.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -585,6 +586,11 @@ async function main() {
 
       const steps = readTranscriptTail(transcriptPath, 131072, { minUsageSteps: 2 });
       loadedSteps = steps;
+      if (dbExists) {
+        try {
+          store.claimExecutionReceipts(targetConvId, executionReceiptsFromSteps(steps));
+        } catch {} // A busy database can be retried on the next invocation.
+      }
       if (steps.length > 0) {
         const diagOpts = {
           conversationId: targetConvId && targetConvId !== "default" ? targetConvId : ""

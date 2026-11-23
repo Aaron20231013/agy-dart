@@ -533,6 +533,7 @@ test("Fix 4: prefix-budget.mjs estimateTokens is CJK/UTF-8 aware with numeric fa
       "fast/mcp-server.mjs",
       "fast/session-start.mjs",
       "context/server.js",
+      "context/lib/code-outline.js",
       "context/lib/config.js",
       "context/lib/store.js",
       "context/lib/store/schema.js",

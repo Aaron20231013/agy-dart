@@ -1167,7 +1167,9 @@ export function verifyPackageManifest(rootDir = REPO_ROOT) {
   const overlap = RUNTIME_FILES.filter((rel) => devtoolsSet.has(rel));
 
   const runtimeEntries = discoverRuntimeEntrypoints(rootDir);
-  const runtimeGraph = collectImportGraph(runtimeEntries, rootDir);
+  const runtimeAssets = ["agents/dart-coder.md", "agents/dart-reviewer.md"];
+  const targetModules = ["shared", "antigravity", "claude-code", "codex", "index"].map(name => "scripts/targets/" + name + ".mjs");
+  const runtimeGraph = collectImportGraph([...runtimeEntries, ...runtimeAssets, ...targetModules], rootDir);
   const missingFromRuntimeManifest = runtimeGraph.reachable.filter((rel) => !runtimeSet.has(rel));
   const devtoolsLeakedIntoRuntime = runtimeGraph.reachable.filter((rel) => devtoolsSet.has(rel));
 
@@ -1177,8 +1179,12 @@ export function verifyPackageManifest(rootDir = REPO_ROOT) {
     new Set([...runtimeGraph.unresolvedSpecifiers, ...devtoolsGraph.unresolvedSpecifiers])
   ).sort();
 
+  let binEntry;
+  try {
+    binEntry = JSON.parse(fs.readFileSync(path.join(rootDir, "package.json"), "utf8")).bin?.["agy-dart"]?.replace(/^\.\//, "");
+  } catch { /* An incomplete package fails verification below. */ }
   const ok =
-    missingOnDisk.length === 0 &&
+    devtoolsSet.has(binEntry) && missingOnDisk.length === 0 &&
     overlap.length === 0 &&
     missingFromRuntimeManifest.length === 0 &&
     devtoolsLeakedIntoRuntime.length === 0 &&

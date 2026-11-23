@@ -17,6 +17,7 @@
 2. **No blind dumps & long commands**: Never run bare `cat`/`Get-Content`/`type` or stdout `curl`/`wget`. Short `run_command` dev calls (`git`, tests, builds) are compacted <=8.8 KB (indexed in FTS5); >60s or async (`WaitMsBeforeAsync <= 2000`, `IsDaemon: true`) run natively via `run_command`.
 3. **KV-Cache & TTFT hygiene**: Use `SessionStart` snapshot + Core hubs before `ls`/`git status`. Delegate screenshots/images in >150k-token sessions to a text-only subagent. Avoid re-reading unchanged files. Never pause mid-task to ask for `/compact`; keep long tasks continuous and call `ctx_resume` only after user compaction.
 4. **One MCP call/turn & brief subagents**: Pack searches into one `batch_search`, edits + `verify` into one `apply_edits`, and tell subagents to use `agy-dart_fast` or ranged `read_file`.
+5. **Compact `ctx_execute` cards**: Put a short `intent` first; keep inline `code` <=5 lines (~400 chars) — for longer scripts, write to OS temp dir (`/tmp` or `$TEMP`, not the repo) and pass `file` + `args`.
 
 ## Inline Schemas (<=8.8 KB)
 **`agy-dart_fast`**:
@@ -26,7 +27,7 @@
 - `run_checks`: `{ cwd?, commands: [{ name?, command, cwd?, timeoutSec? }], concurrency?: 1..8, timeoutSec?, outputMode?: "compact"|"full", maxChars?: 500..8800 }`
 
 **`agy-dart_context`**:
-- `ctx_execute`: `{ cwd?, language?: "javascript"|"nodejs"|"python"|"shell"|"powershell"|"cmd", code?, file?, args?: string[], intent?, timeoutSec?: 1..300 }`
+- `ctx_execute`: `{ intent?, cwd?, language?: "javascript"|"nodejs"|"python"|"shell"|"powershell"|"cmd", code?, file?, args?: string[], timeoutSec?: 1..300 }`
 - `ctx_index`: `{ cwd?, path?, url?, content?, label? }` · `ctx_batch`: `{ cwd?, commands: string[], queries?: string[] }`
 - `ctx_search`: `{ cwd?, queries: string[], sourceId?, scope?: "session"|"worktree"|"all", limit?: int, offset?: int }`
 - `ctx_resume`: `{ seq?: int, sessionId?: string }` · `ctx_stats`: `{ reset?: boolean, sessionId?: string }` · `ctx_doctor`: `{ cwd? }` · `ctx_purge`: `{ cwd?, scope?: "session"|"worktree"|"all"|"stale", sessionId?: string, olderThanDays?: int, vacuum?: boolean }` *(pass Conversation ID as `sessionId` in shared hosts)*

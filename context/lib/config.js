@@ -26,6 +26,7 @@ export const CONFIG_DEFAULTS = Object.freeze({
   diffReadMaxTurns: 12,
   diffReadMaxAgeMs: 15 * 60 * 1000,
   maxReadBytes: null,
+  inlineOutlineMaxBytes: 524288,
   noiseMaxReadBytes: 16384,
   reviewMaxReadBytes: 131072,
   shellDumpMaxBytes: 16384,
@@ -363,6 +364,7 @@ export function getConfigSnapshot(options = {}) {
     parseNonNegativeInt(env?.AGY_DART_MAX_READ_BYTES) ?? parseNonNegativeInt(env?.CONTEXT_MODE_MAX_READ_BYTES),
     parseNonNegativeInt(cfg.maxReadBytes)
   );
+  pick("inlineOutlineMaxBytes", parseNonNegativeInt(env?.AGY_DART_INLINE_OUTLINE_MAX_BYTES), parseNonNegativeInt(cfg.inlineOutlineMaxBytes));
   pick(
     "noiseMaxReadBytes",
     parseNonNegativeInt(env?.AGY_DART_NOISE_MAX_READ_BYTES),
@@ -629,7 +631,7 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra
     .join(", ");
   lines.push(
     `  - Read guard    : mode=${values.readGuardMode} (${sources.readGuardMode}), source=${fmtKb(effSourceCutoff)} (${effSourceProv}), ` +
-      `noise=${fmtKb(values.noiseMaxReadBytes)}, review=${fmtKb(values.reviewMaxReadBytes)}, shellDump=${fmtKb(values.shellDumpMaxBytes)}` +
+      `inlineOutlineMaxBytes=${values.inlineOutlineMaxBytes}, noise=${fmtKb(values.noiseMaxReadBytes)}, review=${fmtKb(values.reviewMaxReadBytes)}, shellDump=${fmtKb(values.shellDumpMaxBytes)}` +
       (exemptSummary ? `, ${exemptSummary}` : "")
   );
   lines.push(

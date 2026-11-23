@@ -538,14 +538,15 @@ export class FtsMethods {
     body = "",
     turn = 0,
     sandboxBytes = 0,
-    returnedBytes = 0
+    returnedBytes = 0,
+    executionReceipt = null
   }) {
     this.open();
     const now = new Date().toISOString();
     const insert = this.db.prepare(`
       INSERT INTO events (
-        session_id, worktree, agent, kind, tool, key, path, ok, exit_code, bytes, body, turn, sandbox_bytes, returned_bytes, created_at, accessed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        session_id, worktree, agent, kind, tool, key, path, ok, exit_code, bytes, body, turn, sandbox_bytes, returned_bytes, execution_receipt, created_at, accessed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const result = this._withBusyRetry(() =>
@@ -564,12 +565,30 @@ export class FtsMethods {
         turn,
         sandboxBytes,
         returnedBytes,
+        executionReceipt,
         now,
         now
       )
     );
 
     return { seq: result.lastInsertRowid };
+  }
+
+  claimExecutionReceipts(sessionId, receipts) {
+    const owner = typeof sessionId === "string" ? sessionId.trim() : "";
+    if (!receipts.length || !owner || owner.length > 128 || /[\x00-\x1f\x7f\\/]/.test(owner) ||
+        /^(?:default|all|app|lifetime)$/i.test(owner)) {
+      return;
+    }
+    this.open();
+    const pending = this.db.prepare("SELECT 1 FROM events WHERE execution_receipt = ?");
+    const claim = this.db.prepare(
+      "UPDATE events SET session_id = ?, execution_receipt = NULL WHERE execution_receipt = ? " +
+      "AND session_id = 'default' AND tool = 'ctx_execute' AND kind = 'execution'"
+    );
+    for (const receipt of receipts) {
+      if (pending.get(receipt)) this._withBusyRetry(() => claim.run(owner, receipt));
+    }
   }
 
   /** Retrieve compaction / state resume block */

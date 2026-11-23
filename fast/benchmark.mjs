@@ -9,6 +9,7 @@ import path2 from "node:path";
 import { fileURLToPath as __fileURLToPath } from "node:url";
 // [agy-dart KV-cache extension]
 import {
+  BUST_DROP_RATIO,
   analyzeMultipleSessionsCache,
   DEFAULT_CACHE_TTL_SEC,
   extractStepTokenUsage,
@@ -667,7 +668,11 @@ function filterStepsByTime(steps, sinceMs, untilMs) {
   }
   return out;
 }
+const billingFields = ["totalInputTokens", "totalCacheReadTokens", "totalCacheCreationTokens", "totalTokenThroughput", "peakContextTokens", "readFileCalls", "blindReadFileCalls", "compactionCount", "suspectedTruncationCount"];
 function analyzeTranscriptSessions(sessions) {
+  const billing = Object.fromEntries(billingFields.map(key => [key, 0]));
+  const compactionSteps = [], topContextGrowth = [];
+  let elapsedSec = 0;
   let validSessions = 0;
   let sessionsWithAgyFast = 0;
   let sessionsWithSnapshot = 0;
@@ -707,6 +712,7 @@ function analyzeTranscriptSessions(sessions) {
   let turnGapsOver60s = 0;
   for (const steps of sessions) {
     if (steps.length === 0) continue;
+    let previousContext = null, checkpointSincePlanner = false, firstTime = null, lastTime = null;
     let hasPlanner = false;
     let sessionFastCalls = 0;
     let sessionMediaCount = 0;
@@ -716,6 +722,16 @@ function analyzeTranscriptSessions(sessions) {
     let prevTurnHadCalls = false;
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
+      const stamp = parseTimeMs(step.created_at);
+      if (stamp !== null) {
+        firstTime = firstTime === null ? stamp : Math.min(firstTime, stamp);
+        lastTime = lastTime === null ? stamp : Math.max(lastTime, stamp);
+      }
+      if (step.type !== "PLANNER_RESPONSE" && /^CHECKPOINT:\s*# Resuming from a compaction/im.test(typeof step.content === "string" ? step.content : "")) {
+        billing.compactionCount++;
+        compactionSteps.push(step.step_index ?? i);
+        checkpointSincePlanner = true;
+      }
       if (Array.isArray(step.media) && step.media.length > 0) {
         sessionMediaCount += step.media.length;
         mediaLoadedCount += step.media.length;
@@ -749,6 +765,26 @@ function analyzeTranscriptSessions(sessions) {
       const stepUsage = extractStepTokenUsage(step);
       if (stepUsage.outputTokens > 0) {
         totalOutputTokens += stepUsage.outputTokens;
+      }
+      billing.totalInputTokens += stepUsage.inputTokens;
+      billing.totalCacheReadTokens += stepUsage.cacheReadTokens;
+      billing.totalCacheCreationTokens += stepUsage.cacheCreationTokens;
+      billing.totalTokenThroughput += stepUsage.contextTokens + stepUsage.outputTokens;
+      billing.peakContextTokens = Math.max(billing.peakContextTokens, stepUsage.contextTokens);
+      if (stepUsage.contextTokens > 0) {
+        if (previousContext !== null) {
+          const growth = stepUsage.contextTokens - previousContext;
+          if (!checkpointSincePlanner && stepUsage.contextTokens < previousContext * BUST_DROP_RATIO) billing.suspectedTruncationCount++;
+          if (growth > 0) {
+            const call = step.tool_calls?.[0];
+            topContextGrowth.push({ step: step.step_index ?? i, growth, tool: call?.name ?? null,
+              parameters: call ? Object.keys(getCallArgs(call)).slice(0, 8).join(", ") : "" });
+            topContextGrowth.sort((a, b) => b.growth - a.growth);
+            topContextGrowth.length = Math.min(5, topContextGrowth.length);
+          }
+        }
+        previousContext = stepUsage.contextTokens;
+        checkpointSincePlanner = false;
       }
       const cacheTok = stepUsage.cacheReadTokens;
       const ctxTok = stepUsage.contextTokens;
@@ -789,6 +825,10 @@ function analyzeTranscriptSessions(sessions) {
           const call = calls[callIdx];
           const name = call.name ?? "";
           const callArgs = getCallArgs(call);
+          if (name === "read_file" || name === "view_file") {
+            billing.readFileCalls++;
+            if (["StartLine", "EndLine", "ByteOffset"].every(key => callArgs[key] == null)) billing.blindReadFileCalls++;
+          }
           if (name === "edit_file") {
             editFileCalls += 1;
             const p = getTargetPath(callArgs);
@@ -886,6 +926,7 @@ function analyzeTranscriptSessions(sessions) {
         }
       }
     }
+    if (firstTime !== null) elapsedSec += (lastTime - firstTime) / 1000;
     if (hasPlanner) {
       validSessions += 1;
       if (sessionFastCalls > 0) sessionsWithAgyFast += 1;
@@ -894,6 +935,7 @@ function analyzeTranscriptSessions(sessions) {
   }
   const cacheAttribution = analyzeMultipleSessionsCache(sessions);
   return {
+    ...billing, compactionSteps, topContextGrowth, elapsedSec,
     sessions: validSessions,
     sessionsWithAgyFast,
     sessionsWithSnapshot,
@@ -1200,6 +1242,7 @@ function formatCompareMarkdown(before, after) {
     "",
     "| Metric | Before | After | Change |",
     "| :--- | ---: | ---: | ---: |",
+    ...billingFields.map(key => `| ${key} | ${before[key]} | ${after[key]} | ${formatDelta(before[key], after[key])} |`),
     `| Sessions | ${before.sessions} | ${after.sessions} | - |`,
     `| LLM turns | ${before.llmTurns} | ${after.llmTurns} | ${formatDelta(before.llmTurns, after.llmTurns)} |`,
     `| Tool calls | ${before.totalToolCalls} | ${after.totalToolCalls} | ${formatDelta(before.totalToolCalls, after.totalToolCalls)} |`,
@@ -1246,6 +1289,28 @@ function formatUsageSplitMarkdown(split) {
 }
 
 // src/benchmark.ts
+export async function resolveSessionOrPathInput(raw, { searchRoots = ["antigravity", "antigravity-ide", "antigravity-cli"].map(host => path2.join(os.homedir(), ".gemini", host, "brain")) } = {}) {
+  try { await fs2.access(raw); return raw; } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (!/^[0-9a-f-]{6,64}$/i.test(raw)) return raw;
+  const matches = [];
+  for (const root of searchRoots) {
+    let entries;
+    try { entries = await fs2.readdir(root, { withFileTypes: true }); } catch (e) { if (e.code === "ENOENT") continue; throw e; }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.toLowerCase().startsWith(raw.toLowerCase())) continue;
+      for (const filename of ["transcript_full.jsonl", "transcript.jsonl"]) {
+        const file = path2.join(root, entry.name, ".system_generated", "logs", filename);
+        try { await fs2.access(file); } catch (e) { if (e.code === "ENOENT") continue; throw e; }
+        matches.push({ name: entry.name, file });
+        break;
+      }
+    }
+  }
+  const exact = matches.filter(x => x.name.toLowerCase() === raw.toLowerCase());
+  const candidates = exact.length ? exact : matches;
+  if (candidates.length === 1) return candidates[0].file;
+  throw new Error(candidates.length ? "Ambiguous session: " + candidates.slice(0,5).map(x => x.name).join(", ") : "Unknown session: " + raw);
+}
 async function assertPathsExist(paths) {
   for (const p of paths) {
     try {
@@ -1285,6 +1350,8 @@ function printUsage() {
       "  node fast/benchmark.mjs analyze --local [--recent <N>] [--since <ISO>] [--until <ISO>] [--split-usage] [--json]",
       "  node fast/benchmark.mjs cache [--local | <path...>] [--recent <N>] [--since <ISO>] [--until <ISO>] [--ttl <sec>] [--json]",
       "  node fast/benchmark.mjs cache simulate [--local | <path...>] [--recent <N>] [--since <ISO>] [--until <ISO>] [--ttl <sec>] [--keepalive-tail <sec>] [--json]",
+      "  node fast/benchmark.mjs session <idOrPath> [--json]",
+      "  node fast/benchmark.mjs compare <before> <after> [--json]",
       "  node fast/benchmark.mjs compare --before <path> --after <path> [--json]",
       "",
       "Options:",
@@ -1525,6 +1592,15 @@ async function main(argv) {
     );
     return;
   }
+  if (cmd === "session") {
+    const inputs = args.slice(1).filter(arg => arg !== "--json");
+    if (inputs.length !== 1) throw new Error("session <idOrPath> [--json]");
+    const m = await analyzePaths([await resolveSessionOrPathInput(inputs[0])]);
+    console.log(args.includes("--json") ? JSON.stringify(m, null, 2) :
+      [formatMetricsMarkdown(m), "Elapsed seconds: " + m.elapsedSec, ...billingFields.map(key => key + ": " + m[key]),
+       "Compaction steps: " + m.compactionSteps.join(", "), "Top context growth:", ...m.topContextGrowth.map(x => JSON.stringify(x))].join("\n"));
+    return;
+  }
   if (cmd === "compare") {
     let beforePath = "";
     let afterPath = "";
@@ -1549,6 +1625,10 @@ async function main(argv) {
           return;
         }
         afterPath = val;
+      } else if (!a.startsWith("-") && !beforePath) {
+        beforePath = a;
+      } else if (!a.startsWith("-") && !afterPath) {
+        afterPath = a;
       } else {
         process.stderr.write(`Error: unknown option: ${a}
 `);
@@ -1561,6 +1641,7 @@ async function main(argv) {
       process.exitCode = 1;
       return;
     }
+    [beforePath, afterPath] = await Promise.all([beforePath, afterPath].map(input => resolveSessionOrPathInput(input)));
     if (!await assertPathsExist([beforePath, afterPath])) {
       process.exitCode = 1;
       return;
@@ -1589,5 +1670,5 @@ const __isDirectBenchmarkRun = Boolean(
       : path2.resolve(process.argv[1]) === __selfBenchmarkPath)
 );
 if (__isDirectBenchmarkRun) {
-  void main(process.argv);
+  main(process.argv).catch(error => { process.stderr.write(error.message + "\n"); process.exitCode = 1; });
 }

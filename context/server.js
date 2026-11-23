@@ -192,13 +192,14 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_execute",
-    description: "Run JS/Python/Shell/PowerShell in sandbox to filter >16 KB logs or giant JSON/CSV/API data (<=8.8 KB inline + FTS5 index).",
+    description: "Run JS/Python/Shell/PowerShell in sandbox to filter >16 KB logs or giant JSON/CSV/API data (<=8.8 KB inline + FTS5). Pass short intent first; for >5-line scripts, write to OS temp dir and pass file + args.",
     inputSchema: {
       type: "object",
       properties: {
         language: { type: "string", enum: ["javascript", "nodejs", "python", "shell", "powershell", "cmd"] },
         code: { type: "string" },
         file: { type: "string" },
+        sessionId: { type: "string" },
         args: { type: "array", items: { type: "string" } },
         cwd: { type: "string" },
         intent: { type: "string" },
@@ -511,17 +512,11 @@ rl.on("line", async (line) => {
         }
         // Strictly per-call session isolation via AsyncLocalStorage: never mutate process-global
         // session state across concurrent conversations sharing one long-lived MCP stdio server.
-        const callSessionId =
-          [
-            toolArgs.sessionId,
-            toolArgs.conversationId,
-            params?._meta?.rootConversationId,
-            params?._meta?.conversationId,
-            params?._meta?.sessionId,
-            params?.sessionId
-          ]
-            .map(normalizeCallSessionId)
-            .find(Boolean) ?? null;
+        const hostIds = [params?._meta?.rootConversationId, params?._meta?.conversationId, params?._meta?.sessionId, params?.sessionId];
+        const argumentIds = [toolArgs.sessionId, toolArgs.conversationId];
+        // The host owns execution attribution. Other tools support explicit cross-session queries.
+        const candidates = toolName === "ctx_execute" ? [...hostIds, ...argumentIds] : [...argumentIds, ...hostIds];
+        const callSessionId = candidates.map(normalizeCallSessionId).find(Boolean) ?? null;
         const callDirectConvId =
           [
             toolArgs.conversationId,

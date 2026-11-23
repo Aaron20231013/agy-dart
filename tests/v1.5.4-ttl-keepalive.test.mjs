@@ -4027,6 +4027,17 @@ test("v1.5.4-ka-12: Adversarial hardening — PreToolUse agentName/isSubagent wi
         probeSrv.close(() => resolve(p));
       });
     });
+    // Supply the SidecarApp lifecycle contract even on CI machines without Antigravity.
+    const sdkHome = path.join(tmpDir, "reload-home");
+    const sdkDir = path.join(sdkHome, ".gemini/config/node_modules/sidecar_sdk");
+    fs.mkdirSync(sdkDir, { recursive: true });
+    fs.writeFileSync(path.join(sdkDir, "index.mjs"), `export class SidecarApp {
+      config = {};
+      api() {}
+      page() {}
+      async run() { this.timer = setInterval(() => {}, 1000); }
+      async close() { clearInterval(this.timer); }
+    }`);
     const reloadChild = spawn(process.execPath, [path.join(ROOT, "sidecars", "dashboard", "server.mjs")], {
       cwd: ROOT,
       windowsHide: true,
@@ -4037,6 +4048,7 @@ test("v1.5.4-ka-12: Adversarial hardening — PreToolUse agentName/isSubagent wi
         ANTIGRAVITY_CSRF_TOKEN: "csrf-reload-test",
         ANTIGRAVITY_SIDECAR_WEB_PORT: String(reloadPort),
         ANTIGRAVITY_SIDECAR_UI_TOKEN: "ui-tok-reload-test",
+        HOME: sdkHome, USERPROFILE: sdkHome,
         AGY_DART_SIDECAR_WATCH_FILE: watchSentinel,
         AGY_DART_SIDECAR_RELOAD_POLL_MS: "180",
         AGY_DART_DISABLE_COMPILE_CACHE: "1"

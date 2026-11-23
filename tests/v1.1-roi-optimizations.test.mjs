@@ -742,6 +742,77 @@ test("Opt 5: Enhanced ctx_resume structured sessionCheckpoint (0 new MCP tools, 
   }
 });
 
+test("Shared ctx_execute savings follow the host conversation exactly once", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-execution-receipts-"));
+  const dbPath = path.join(dir, "context.db");
+  const env = {
+    AGY_DART_DB_PATH: dbPath, ANTIGRAVITY_CONVERSATION_ID: "", ANTIGRAVITY_PARENT_CONVERSATION_ID: "",
+    ANTIGRAVITY_ROOT_CONVERSATION_ID: "", CONVERSATION_ID: ""
+  };
+  const client = createPersistentMcpClient(path.join(ROOT, "context/server.js"), env);
+  const store = new ContextModeStore({ dbPath });
+  try {
+    store.recordEvent({ sessionId: "default", kind: "execution", tool: "ctx_execute", sandboxBytes: 25, returnedBytes: 5 });
+    // Exercise an upgrade with an existing anonymous event in the v152 schema.
+    store.db.exec("DROP INDEX idx_events_receipt; ALTER TABLE events DROP COLUMN execution_receipt; PRAGMA user_version = 152;");
+    store.close();
+    const execute = (code, metadata = {}) => client.request("tools/call", {
+      name: "ctx_execute", arguments: { language: "nodejs", cwd: dir, code }, ...metadata
+    }).then(response => JSON.parse(response.result.content[0].text));
+    const code = 'console.log("abcdef".repeat(4000))';
+    const [a, b, scoped] = await Promise.all([
+      execute(code), execute(code), execute(code, {
+        arguments: { language: "nodejs", cwd: dir, code, sessionId: "wrong" },
+        _meta: { conversationId: "already-bound" }
+      })
+    ]);
+    assert.ok(a.ok && a.rawBytes > a.returnedBytes);
+    assert.ok(a.executionReceipt);
+    assert.notEqual(a.executionReceipt, b.executionReceipt);
+    assert.equal(scoped.executionReceipt, undefined);
+    const allBefore = store.getStats("all");
+    const toolCall = { name: "call_mcp_tool", args: { ServerName: "agy-dart_context", ToolName: "ctx_execute" } };
+    const post = (id, result, call = toolCall) => runHook("hooks/post-tool-use.mjs", {
+      common: { conversationId: id }, toolCall: call, toolResponse: { content: [{ text: JSON.stringify(result) }] }
+    }, dbPath, env);
+    post("wrong", a, { name: "call_mcp_tool", args: { ServerName: "other", ToolName: "ctx_execute" } });
+    post("conv-a", a);
+    post("conv-a", a);
+    assert.equal(store.getStats("conv-a").keptOutBytes, a.rawBytes - a.returnedBytes);
+    assert.equal(store.getStats("conv-b").calls, 0);
+    assert.equal(store.getStats("wrong").calls, 0);
+
+    // Hosts that omit the response in PostToolUse persist it in the next invocation's transcript.
+    const tx = path.join(dir, "transcript.jsonl");
+    const planner = { step_index: 10, type: "PLANNER_RESPONSE", tool_calls: [
+      { name: "read_file" },
+      { name: "call_mcp_tool", args: { ServerName: '"agy-dart_context"', ToolName: '"ctx_execute"' } }
+    ] };
+    const steps = [
+      planner, { type: "GENERIC", step_index: 11, content: JSON.stringify(b) },
+      { type: "GENERIC", step_index: 12, content: "Created At: 2026-11-23T06:00:00Z\n" + JSON.stringify(b, null, 2).slice(0, 4000) }
+    ];
+    const invocation = () => runHook("hooks/pre-invocation.mjs", {
+      common: { conversationId: "conv-b", transcriptPath: tx }
+    }, dbPath, env);
+    fs.writeFileSync(tx, steps.slice(0, 2).map(s => JSON.stringify(s)).join("\n"));
+    invocation();
+    assert.equal(store.getStats("conv-b").calls, 0);
+    fs.writeFileSync(tx, steps.map(s => JSON.stringify(s)).join("\n"));
+    invocation();
+    invocation();
+    assert.equal(store.getStats("conv-b").keptOutBytes, b.rawBytes - b.returnedBytes);
+    assert.equal(store.getStats("already-bound").calls, 1);
+    assert.equal(store.getStats("default").calls, 1);
+    assert.equal(store.getStats("default").keptOutBytes, 20);
+    assert.deepEqual(store.getStats("all"), allBefore);
+  } finally {
+    await client.close();
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
 test("Shared MCP server per-call sessionId isolation (AsyncLocalStorage prevents cross-tab leak, recovers checkpoint & scopes purge)", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-shared-mcp-"));
   const tmpDb = path.join(tmpDir, "context.db");

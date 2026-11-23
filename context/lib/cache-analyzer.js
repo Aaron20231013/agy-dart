@@ -836,7 +836,10 @@ export function describeToolCall(call) {
     const s = Array.isArray(args.slices) ? args.slices.length : 0;
     target = [o ? `${o} outlines` : "", s ? `${s} slices` : ""].filter(Boolean).join(", ");
   } else if (bareTool === "ctx_execute") {
-    target = shortTargetLabel(args.intent || args.file || args.language || "shell", 36);
+    const intentLabel = [args.intent, args.summary, args.description].find(
+      (v) => typeof v === "string" && v.trim()
+    );
+    target = shortTargetLabel(intentLabel || args.file || args.language || "shell", 36);
   } else if (bareTool === "ctx_index") {
     target = shortTargetLabel(args.url || args.path || args.label || "text", 36);
   } else if (bareTool === "ctx_search") {

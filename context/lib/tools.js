@@ -1,11 +1,12 @@
 import fs from "node:fs";
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import { fileURLToPath } from "node:url";
 import { getConfigSnapshot } from "./config.js";
-import { executeCode, resolveExecTimeoutMs, runProcess, OUTPUT_CAP } from "./executor.js";
+import { executeCode, inferLanguageFromFile, resolveExecTimeoutMs, runProcess, OUTPUT_CAP } from "./executor.js";
 import { SNIPPET_MAX_BYTES } from "./store.js";
 import {
   detectSensitiveFile,
@@ -47,8 +48,28 @@ function expandArgPath(raw) {
     s = os.homedir();
   } else if (s.startsWith("~/") || s.startsWith("~\\")) {
     s = path.join(os.homedir(), s.slice(2));
+  } else {
+    const tmpMatch = s.match(
+      /^(?:\$\{(?:TMPDIR|TEMP|TMP)\}|\$(?:TMPDIR|TEMP|TMP)|%(?:TEMP|TMP)%|\$env:(?:TEMP|TMP))(?=$|[\\/])(.*)$/i
+    );
+    if (tmpMatch) {
+      const tail = (tmpMatch[1] || "").replace(/^[\\/]+/, "");
+      s = tail ? path.join(os.tmpdir(), tail) : os.tmpdir();
+    }
   }
   return s;
+}
+
+const MAX_INTENT_LABEL_BYTES = 240;
+
+function resolveIntentText(...candidates) {
+  for (const candidate of candidates) {
+    if (typeof candidate === "string") {
+      const collapsed = candidate.replace(/\s+/g, " ").trim();
+      if (collapsed) return truncateUtf8(collapsed, MAX_INTENT_LABEL_BYTES);
+    }
+  }
+  return "";
 }
 
 function resolveCallCwd(
@@ -355,16 +376,24 @@ export function createTools({
   return {
     // 1. ctx_execute
     async ctx_execute({
-      language = "shell",
+      language = undefined,
       code = "",
       file = "",
       args = [],
       intent = "",
+      summary = "",
+      description = "",
       cwd: argCwd = "",
       timeoutSec = undefined,
       timeoutMs: argTimeoutMs = undefined
     } = {}) {
       const startTime = Date.now();
+      const resolvedIntent = resolveIntentText(intent, summary, description);
+      const expandedFile = typeof file === "string" && file.trim() ? expandArgPath(file) : "";
+      const effectiveCode = expandedFile && typeof code === "string" && !code.trim() ? "" : code;
+      const rawLang = typeof language === "string" ? language.trim() : "";
+      const effectiveLanguage =
+        rawLang || (!effectiveCode && expandedFile ? inferLanguageFromFile(expandedFile) : "") || "shell";
       const ws = resolveWs();
       const cwd = resolveCallCwd(argCwd, ws.cwd, {
         requireConfirmedWorkspace: true,
@@ -372,8 +401,10 @@ export function createTools({
       });
       const sessionId = getSessionId();
 
-      if (file) {
-        const absFile = path.isAbsolute(file) ? file : path.resolve(cwd, file);
+      if (expandedFile) {
+        const absFile = path.isAbsolute(expandedFile)
+          ? path.normalize(expandedFile)
+          : path.resolve(cwd, expandedFile);
         let realAbsFile = absFile;
         try {
           realAbsFile = fs.realpathSync(absFile);
@@ -397,9 +428,9 @@ export function createTools({
       const effTimeoutMs = resolveExecTimeoutMs(requestedTimeoutMs, cfgTimeoutMs);
 
       const result = await executeCode({
-        language,
-        code,
-        file,
+        language: effectiveLanguage,
+        code: effectiveCode,
+        file: expandedFile,
         args,
         cwd,
         timeoutMs: effTimeoutMs
@@ -416,6 +447,7 @@ export function createTools({
       const redacted = redactSecrets(rawCombined);
       const fullOutput = redacted.text;
       const fullBytes = Buffer.byteLength(fullOutput, "utf8");
+      const executionReceipt = sessionId === "default" ? randomBytes(16).toString("hex") : null;
 
       let sourceId = null;
       let deduplicated = false;
@@ -425,7 +457,7 @@ export function createTools({
           worktree: cwd,
           agent: "antigravity",
           kind: "execution",
-          label: intent || `${language} script (${elapsedMs}ms)`,
+          label: resolvedIntent || `${effectiveLanguage} script (${elapsedMs}ms)`,
           content: fullOutput,
           dedup: true
         });
@@ -454,12 +486,13 @@ export function createTools({
           if (crushed.crushed) {
             // Check JSON-in-JSON escaping overhead so capSerializedJsonField doesn't chop valid crushed JSON
             const probeObj = {
+              ...(executionReceipt ? { executionReceipt } : {}),
               ok: result.ok,
               exitCode: result.exitCode,
               ...(result.timedOut ? { timedOut: true } : {}),
               elapsedMs,
-              language,
-              intent: intent || null,
+              language: effectiveLanguage,
+              intent: resolvedIntent || null,
               sourceId,
               deduplicated,
               crushedJson: true,
@@ -495,12 +528,13 @@ export function createTools({
         : "\n\n... [truncated to protect context window]";
 
       const responseObj = {
+        ...(executionReceipt ? { executionReceipt } : {}),
         ok: result.ok,
         exitCode: result.exitCode,
         ...(result.timedOut ? { timedOut: true } : {}),
         elapsedMs,
-        language,
-        intent: intent || null,
+        language: effectiveLanguage,
+        intent: resolvedIntent || null,
         sourceId,
         deduplicated,
         ...(crushedJson ? { crushedJson: true } : {}),
@@ -540,8 +574,9 @@ export function createTools({
         agent: "antigravity",
         kind: "execution",
         tool: "ctx_execute",
-        key: language,
-        path: file || null,
+        executionReceipt,
+        key: effectiveLanguage,
+        path: expandedFile || null,
         ok: result.ok ? 1 : 0,
         exitCode: result.exitCode,
         bytes: fullBytes,

@@ -1812,9 +1812,27 @@ export function inspectCommand({ commandLine, cwd, sessionId, sensitiveGuardMode
   });
 }
 
+let claudeInput;
+let outlineModule;
+function ensureCodeOutlineModule() {
+  return outlineModule ??= import("../context/lib/code-outline.js");
+}
+function writeHookVerdict(verdict) {
+  let output = verdict;
+  if (claudeInput !== undefined) {
+    output = {};
+    if (verdict.decision === "deny") {
+      output.hookSpecificOutput = { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: verdict.reason };
+    } else if (verdict.overwrite) {
+      output.hookSpecificOutput = { hookEventName: "PreToolUse", updatedInput: { ...claudeInput, ...verdict.overwrite } };
+    }
+  }
+  process.stdout.write(JSON.stringify(output) + "\n");
+}
+
 function finishAllow() {
   closeSharedStore();
-  process.stdout.write(JSON.stringify({ decision: "allow" }) + "\n");
+  writeHookVerdict({ decision: "allow" });
   process.exit(0);
 }
 
@@ -1831,6 +1849,18 @@ async function main() {
     return finishAllow();
   }
 
+  if (!payload.toolCall && (payload.hook_event_name === "PreToolUse" || typeof payload.tool_name === "string")) {
+    claudeInput = payload.tool_input || {};
+    const start = Math.max(1, Number(claudeInput.offset) || 1);
+    if (payload.tool_name === "Read") {
+      payload.toolCall = { name: "read_file", args: { Path: claudeInput.file_path,
+        ...(claudeInput.offset || claudeInput.limit ? { StartLine: start } : {}),
+        ...(claudeInput.limit > 0 ? { EndLine: start + claudeInput.limit - 1 } : {}) } };
+    } else if (payload.tool_name === "Bash") {
+      payload.toolCall = { name: "run_command", args: claudeInput };
+    }
+  }
+  if (payload.common?.conversationId && !payload.conversationId) payload.conversationId = payload.common.conversationId;
   const toolCall = payload.toolCall || {};
   const toolName = toolCall.name || "";
   const args = toolCall.args || {};
@@ -2065,7 +2095,7 @@ async function main() {
                 });
                 await touchWatchdogPreTool("deny");
                 closeSharedStore();
-                process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
+                writeHookVerdict({ decision: "deny", reason });
                 process.exit(0);
               }
               const sensTtlMs =
@@ -2089,7 +2119,7 @@ async function main() {
                 });
                 await touchWatchdogPreTool("deny");
                 closeSharedStore();
-                process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
+                writeHookVerdict({ decision: "deny", reason });
                 process.exit(0);
               } else if (confirmScope.consumeOnAllow) {
                 try {
@@ -2439,7 +2469,7 @@ async function main() {
 
                   await touchWatchdogPreTool("deny");
                   closeSharedStore();
-                  process.stdout.write(JSON.stringify({ decision: "deny", reason: dedupReason }) + "\n");
+                  writeHookVerdict({ decision: "deny", reason: dedupReason });
                   process.exit(0);
                 }
               }
@@ -2562,7 +2592,7 @@ async function main() {
 
                           await touchWatchdogPreTool("deny");
                           closeSharedStore();
-                          process.stdout.write(JSON.stringify({ decision: "deny", reason: diffReason }) + "\n");
+                          writeHookVerdict({ decision: "deny", reason: diffReason });
                           process.exit(0);
                         }
                       }
@@ -2800,6 +2830,29 @@ async function main() {
                       `For logs/docs/data use call_mcp_tool(ServerName:"${CTX_SERVER}", ToolName:"ctx_index" or "ctx_execute", path:"${filePath}")${lineInstruction}${softRetryHint}`;
                   }
 
+                  let outlineBlock = "";
+                  if ((tier === "source" || tier === "review") && !isMinifiedDenseSlice && !isOversizedMultiLineSlice &&
+                      stat.size <= Math.min(524288, effectiveCfg.inlineOutlineMaxBytes) && effectiveCfg.inlineOutlineMaxBytes > 0) {
+                    try {
+                      const source = readUtf8TextSafe(absPath, readCtx);
+                      if (source) {
+                        const { extractSymbolsFromLines, renderOutlineWithinBudget } = await ensureCodeOutlineModule();
+                        const lines = source.split(/\r?\n/);
+                        const symbols = extractSymbolsFromLines(absPath, lines);
+                        if (symbols.length) {
+                          const next = claudeInput ? "Read(file_path, offset, limit)" : "read_file(Path, StartLine, EndLine)";
+                          const hint = "Use " + next + " for up to " + tierMaxLineRange + " lines." +
+                            (isHardDeny ? "" : " Repeat this read once if necessary.");
+                          const block = renderOutlineWithinBudget(path.basename(absPath), lines.length, symbols, 3400, 1, { bracketLines: true });
+                          if (Buffer.byteLength(block) <= 3400) {
+                            outlineBlock = block;
+                            const prefix = claudeInput ? "" : reason + "\n";
+                            reason = (Buffer.byteLength(prefix + hint + "\n" + block) <= 4500 ? prefix : "") + hint + "\n" + block;
+                          }
+                        }
+                      }
+                    } catch { /* Preserve the original guard when outlining is unavailable. */ }
+                  }
                   recordInterception({
                     sessionId,
                     agent: agentName,
@@ -2807,6 +2860,7 @@ async function main() {
                     toolName,
                     path: filePath,
                     size: stat.size,
+                    returnedBytes: Buffer.byteLength(outlineBlock),
                     reason
                   });
 
@@ -2821,7 +2875,7 @@ async function main() {
 
                   await touchWatchdogPreTool("deny");
                   closeSharedStore();
-                  process.stdout.write(JSON.stringify({ decision: "deny", reason }) + "\n");
+                  writeHookVerdict({ decision: "deny", reason });
                   process.exit(0);
                 }
               } else if (
@@ -2957,15 +3011,13 @@ async function main() {
       if (builtinRewrite) {
         await touchWatchdogPreTool("allow");
         closeSharedStore();
-        process.stdout.write(
-          JSON.stringify({
+        writeHookVerdict({
             decision: "allow",
             overwrite: {
               [cmdKey]: builtinRewrite.rewrittenCommand
             },
             ...(sandboxReadOverride ? { permissionOverrides: sandboxReadOverride } : {})
-          }) + "\n"
-        );
+          });
         process.exit(0);
       }
     }
@@ -3003,7 +3055,7 @@ async function main() {
 
       await touchWatchdogPreTool("deny");
       closeSharedStore();
-      process.stdout.write(JSON.stringify({ decision: "deny", reason: inspection.reason }) + "\n");
+      writeHookVerdict({ decision: "deny", reason: inspection.reason });
       process.exit(0);
     }
 
@@ -3013,15 +3065,13 @@ async function main() {
       if (customRewrite) {
         await touchWatchdogPreTool("allow");
         closeSharedStore();
-        process.stdout.write(
-          JSON.stringify({
+        writeHookVerdict({
             decision: "allow",
             overwrite: {
               [cmdKey]: customRewrite.rewrittenCommand
             },
             ...(sandboxReadOverride ? { permissionOverrides: sandboxReadOverride } : {})
-          }) + "\n"
-        );
+          });
         process.exit(0);
       }
     }

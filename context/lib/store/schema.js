@@ -12,7 +12,7 @@ export const MAX_OUTLINE_CACHE_DB_ENTRIES = 512;
 export const MAX_OUTLINE_JSON_BYTES = 128 * 1024;
 export const DEFAULT_FILE_READ_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_CUTOFF_BYTES = 46080; // 45 KiB — aligns with Antigravity read_file host return cap
-export const CURRENT_SCHEMA_USER_VERSION = 152;
+export const CURRENT_SCHEMA_USER_VERSION = 153;
 const REQUIRED_CORE_TABLES = Object.freeze([
   "meta",
   "sources",
@@ -139,7 +139,8 @@ export class SchemaMethods {
             FROM sqlite_master
             WHERE type = 'table'
               AND (
-                name IN ('meta', 'events', 'repo_cache', 'session_checkpoints', 'outline_cache', 'chunks', 'chunks_tri')
+                name IN ('meta', 'repo_cache', 'session_checkpoints', 'outline_cache', 'chunks', 'chunks_tri')
+                OR (name = 'events' AND sql LIKE '%execution_receipt%')
                 OR (name = 'sources' AND sql LIKE '%content_hash%')
                 OR (name = 'file_reads' AND sql LIKE '%ctime_ms%' AND sql LIKE '%ino%' AND sql LIKE '%read_step%' AND sql LIKE '%read_turn_seq%')
                 OR (name = 'file_snapshots' AND sql LIKE '%full_read_ts%' AND sql LIKE '%full_read_seq%' AND sql LIKE '%ino%' AND sql LIKE '%read_step%')
@@ -197,6 +198,7 @@ export class SchemaMethods {
         turn INTEGER NOT NULL DEFAULT 0,
         sandbox_bytes INTEGER NOT NULL DEFAULT 0,
         returned_bytes INTEGER NOT NULL DEFAULT 0,
+        execution_receipt TEXT,
         created_at TEXT NOT NULL,
         accessed_at TEXT
       );
@@ -302,6 +304,16 @@ export class SchemaMethods {
         }
       }
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_sources_session_hash ON sources(session_id, content_hash);");
+
+      const eventCols = this.db.prepare("PRAGMA table_info(events)").all();
+      if (!eventCols.some((c) => c.name === "execution_receipt")) {
+        try {
+          this.db.exec("ALTER TABLE events ADD COLUMN execution_receipt TEXT");
+        } catch (err) {
+          if (!/duplicate column name/i.test(String(err?.message || ""))) throw err;
+        }
+      }
+      this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_receipt ON events(execution_receipt) WHERE execution_receipt IS NOT NULL");
 
       // Idempotent schema upgrade: ensure file_reads tracks ctime_ms & ino to catch atomic replace / preserved-mtime edits
       const readCols = this.db.prepare("PRAGMA table_info(file_reads)").all();

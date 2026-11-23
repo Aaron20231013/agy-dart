@@ -1608,8 +1608,14 @@ export function classifyToolExecutionKind(toolName, rawArgs = {}, options = {}) 
   }
 
   if (LONG_MCP_TOOL_RE.test(bare)) {
+    const aliasIntent =
+      bare === "ctx_execute"
+        ? [effectiveArgs.intent, effectiveArgs.summary, effectiveArgs.description].find(
+            (v) => typeof v === "string" && v.trim()
+          ) || ""
+        : effectiveArgs.intent;
     const desc =
-      effectiveArgs.intent ||
+      aliasIntent ||
       effectiveArgs.file ||
       (Array.isArray(effectiveArgs.commands)
         ? effectiveArgs.commands

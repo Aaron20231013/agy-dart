@@ -16,14 +16,25 @@ description: >-
 
 For logs, test dumps, CSV/JSON files, or API responses larger than 16 KB, extract only the computed facts in the sandbox (`timeoutSec`: 1–300, default 120s; pass `cwd` when targeting a specific workspace directory; supports both CommonJS `require` and top-level ESM `import`):
 
-```json
-{
-  "language": "javascript",
-  "code": "const fs = require('fs'); const lines = fs.readFileSync('build.log', 'utf8').split(/\\r?\\n/); const errs = lines.filter(l => /error|exception/i.test(l)); console.log(JSON.stringify({ totalLines: lines.length, errorCount: errs.length, sample: errs.slice(0, 20) }, null, 2));",
-  "intent": "Count and sample errors from build.log",
-  "timeoutSec": 120
-}
-```
+- **Keep MCP tool cards compact**: Always put a short `intent` first so the tool card header and FTS5 index carry a clear summary immediately.
+- **Short one-liners (`<= 5 lines` / `<= ~400 chars`)**: Pass inline `code`:
+  ```json
+  {
+    "intent": "Count and sample errors from build.log",
+    "language": "javascript",
+    "code": "const fs = require('fs'); const lines = fs.readFileSync('build.log', 'utf8').split(/\\r?\\n/); const errs = lines.filter(l => /error|exception/i.test(l)); console.log(JSON.stringify({ totalLines: lines.length, errorCount: errs.length, sample: errs.slice(0, 20) }, null, 2));",
+    "timeoutSec": 120
+  }
+  ```
+- **Multi-line scripts (`> 5 lines` / `> ~400 chars`)**: Write the script to an OS temp file first (e.g. `/tmp/agy_ctx_trace.py` or `$TEMP/agy_ctx_trace.py`, outside the repo so `git status` stays clean) and pass `file` + `args` instead of embedding a large `code` block in MCP arguments:
+  ```json
+  {
+    "intent": "Analyze slow queries in trace.json",
+    "language": "python",
+    "file": "/tmp/agy_ctx_trace.py",
+    "args": ["trace.json"]
+  }
+  ```
 
 ## 2. Heading-Aware Docs & URLs (`ctx_index` + `ctx_search`)
 

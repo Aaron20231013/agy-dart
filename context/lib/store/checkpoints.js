@@ -268,7 +268,7 @@ export class CheckpointMethods {
    * Look up persistent L2 outline symbols for a file by normalized path, mtimeMs (±1 ms tolerance), and exact fileSize.
    * Touches updated_ts for LRU recency on hit and returns `{ lineCount, symbols }` or `null`.
    */
-  getOutlineCache(filePath, mtimeMs, fileSize) {
+  getOutlineCache(filePath, mtimeMs, fileSize, version = null) {
     this.open();
     const norm = this._normalizeTrackPath(filePath);
     if (!norm) return null;
@@ -286,7 +286,9 @@ export class CheckpointMethods {
 
     let symbols;
     try {
-      symbols = JSON.parse(row.symbols_json);
+      const entry = JSON.parse(row.symbols_json);
+      if (version !== null && entry.version !== version) return null;
+      symbols = Array.isArray(entry) ? entry : entry.symbols;
     } catch {
       return null;
     }
@@ -320,7 +322,7 @@ export class CheckpointMethods {
     const lines = Math.max(0, Math.trunc(Number(lineCount) || 0));
     if (!Number.isFinite(mtime) || !Number.isFinite(size) || size < 0) return false;
 
-    const symbolsJson = JSON.stringify(symbols);
+    const symbolsJson = JSON.stringify(options.version ? { version: options.version, symbols } : symbols);
     if (Buffer.byteLength(symbolsJson, "utf8") > MAX_OUTLINE_JSON_BYTES) {
       return false;
     }

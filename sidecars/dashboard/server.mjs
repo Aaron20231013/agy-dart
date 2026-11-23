@@ -7,6 +7,7 @@ import os from "node:os";
 import { execFile, execSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { getEffectiveConfig } from "../../context/lib/config.js";
+import { executionReceiptsFromSteps } from "../../context/lib/execution-receipts.js";
 import { buildHandoffBrief, inferWorkspaceFromStore } from "../../context/lib/handoff.js";
 import {
   DEFAULT_STALE_LEASE_MS,
@@ -964,6 +965,12 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
           ? parseTranscriptLines(fs.readFileSync(transcriptPath, "utf8"))
           : readTranscriptTail(transcriptPath, 524288);
       parsedSteps = steps;
+      const transcriptOwner = inferConvIdFromTranscriptPath(transcriptPath);
+      if (transcriptOwner && transcriptOwner === resolvedObsConvId) {
+        try {
+          store.claimExecutionReceipts(transcriptOwner, executionReceiptsFromSteps(steps));
+        } catch {} // The hook and the next transcript refresh can also settle the same receipts.
+      }
       const nowMs = Date.now();
       const obsConvId = resolvedObsConvId;
       const diagOpts = {

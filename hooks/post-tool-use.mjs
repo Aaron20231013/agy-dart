@@ -13,6 +13,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
 import { getEffectiveConfig } from "../context/lib/config.js";
+import { executionReceiptFromText, isContextExecution } from "../context/lib/execution-receipts.js";
 
 function readStdin(timeoutMs = 1500) {
   return new Promise((resolve) => {
@@ -51,6 +52,8 @@ function resolveSessionId(payload = {}) {
     payload.parent_conversation_id ||
     payload.conversationId ||
     payload.conversation_id ||
+    payload.common?.conversationId ||
+    payload.common?.conversation_id ||
     payload.sessionId ||
     payload.session_id ||
     process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
@@ -64,6 +67,8 @@ function resolveDirectConversationId(payload = {}) {
   return (
     payload.conversationId ||
     payload.conversation_id ||
+    payload.common?.conversationId ||
+    payload.common?.conversation_id ||
     payload.sessionId ||
     payload.session_id ||
     process.env.ANTIGRAVITY_CONVERSATION_ID ||
@@ -346,6 +351,7 @@ async function main() {
 
   const { paths, clearAllSession } = extractInvalidationTargets(toolName, args, cwd);
   const responseText = extractToolResponseText(payload);
+  const receipt = isContextExecution(toolCall) && executionReceiptFromText(responseText);
   const responseIsError = extractResponseIsError(payload);
   const verifySignal = extractVerificationSignal(toolName, args, responseText);
 
@@ -356,7 +362,7 @@ async function main() {
     Boolean(directConvId && directConvId !== "default") &&
     (clearAllSession || paths.length > 0 || Boolean(verifySignal) || fs.existsSync(resolvedDbPath));
 
-  if (clearAllSession || paths.length > 0 || verifySignal || shouldTouchWatchdog) {
+  if (clearAllSession || paths.length > 0 || verifySignal || shouldTouchWatchdog || receipt) {
     let store = null;
     try {
       const [{ ContextModeStore }, { redactSecrets }, watchdogLeaseMod] = await Promise.all([
@@ -365,6 +371,7 @@ async function main() {
         shouldTouchWatchdog ? import("../context/lib/watchdog-lease.js") : Promise.resolve(null)
       ]);
       store = new ContextModeStore({ hookMode: true, maxBusyRetries: 4, maxRetryDeadlineMs: 800 });
+      if (receipt) store.claimExecutionReceipts(directConvId, [receipt]);
       if (clearAllSession) {
         store.invalidateFileReads(sessionId, null);
         if (directConvId && directConvId !== sessionId) {

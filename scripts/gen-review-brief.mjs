@@ -197,6 +197,8 @@ function countTests(rootDir) {
 }
 
 const CORE_LIB_ENTRIES = [
+  ["context/lib/code-outline.js", "共享语言符号提取、紧凑签名和按字节预算的大纲"],
+  ["context/lib/execution-receipts.js", "从当前对话的 ctx_execute 工具回执识别执行记录，用于归属节省统计"],
   ["context/lib/store.js", "`ContextModeStore` 门面类：统一导出与原型聚合（下拆 `context/lib/store/` 5 个职责子模块）"],
   ["context/lib/store/schema.js", "SQLite WAL + FTS5 DDL、幂等列迁移（`content_hash`/`full_read_ts`/`full_read_seq`）、常量与路径解析"],
   ["context/lib/store/fts.js", "标题感知 Markdown 分块、SHA-256 去重索引、Porter BM25 + Trigram RRF 检索与事件流"],

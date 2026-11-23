@@ -428,9 +428,21 @@ export function runProcess({
   });
 }
 
+/** Infer execution runtime from script file extension when language is omitted */
+export function inferLanguageFromFile(filePath) {
+  if (!filePath || typeof filePath !== "string") return "";
+  const ext = path.extname(filePath.trim()).toLowerCase();
+  if (ext === ".py" || ext === ".pyw") return "python";
+  if (ext === ".js" || ext === ".mjs" || ext === ".cjs") return "javascript";
+  if (ext === ".ps1") return "powershell";
+  if (ext === ".bat" || ext === ".cmd") return process.platform === "win32" ? "cmd" : "shell";
+  if (ext === ".sh" || ext === ".bash") return "shell";
+  return "";
+}
+
 /** Execute code in specified runtime (nodejs, python, shell, pwsh, cmd) */
 export async function executeCode({
-  language = "shell",
+  language = undefined,
   code = "",
   file = "",
   args = [],
@@ -438,7 +450,10 @@ export async function executeCode({
   timeoutMs = DEFAULT_TIMEOUT_MS,
   env = {}
 }) {
-  const normLang = String(language || "shell").toLowerCase().trim();
+  const rawLang = typeof language === "string" ? language.trim() : "";
+  const effectiveCode = file && typeof code === "string" && !code.trim() ? "" : code;
+  const inferredLang = !rawLang && !effectiveCode && file ? inferLanguageFromFile(file) : "";
+  const normLang = (rawLang || inferredLang || "shell").toLowerCase();
   const workdir = cwd || process.cwd();
   const safeArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
 
@@ -454,7 +469,7 @@ export async function executeCode({
         env
       });
     }
-    const nodeFlags = isLikelyEsmCode(code) ? ["--input-type=module", "-e", code, "--", ...safeArgs] : ["-e", code, "--", ...safeArgs];
+    const nodeFlags = isLikelyEsmCode(effectiveCode) ? ["--input-type=module", "-e", effectiveCode, "--", ...safeArgs] : ["-e", effectiveCode, "--", ...safeArgs];
     return runProcess({
       cmd: process.execPath,
       args: nodeFlags,
@@ -603,13 +618,13 @@ export async function executeCode({
 
   // 4. Windows CMD
   if (normLang === "cmd" || normLang === "bat") {
-    if (!code && file) {
+    if (!effectiveCode && file) {
       const scriptPath = path.isAbsolute(file) ? file : path.resolve(workdir, file);
       return runCmdBatchFile(scriptPath);
     }
     return runProcess({
       cmd: "cmd.exe",
-      args: ["/d", "/s", "/c", code || ""],
+      args: ["/d", "/s", "/c", effectiveCode || ""],
       cwd: workdir,
       timeoutMs,
       env
@@ -618,7 +633,7 @@ export async function executeCode({
 
   // 5. Default Shell
   if (process.platform === "win32") {
-    if (!code && file) {
+    if (!effectiveCode && file) {
       const scriptPath = path.isAbsolute(file) ? file : path.resolve(workdir, file);
       if (/\.(?:bat|cmd)$/i.test(scriptPath)) {
         return runCmdBatchFile(scriptPath);
@@ -631,10 +646,10 @@ export async function executeCode({
         env
       });
     }
-    return runPowerShellCommand("powershell.exe", code || "");
+    return runPowerShellCommand("powershell.exe", effectiveCode || "");
   } else {
     const shell = process.env.SHELL || "/bin/sh";
-    if (!code && file) {
+    if (!effectiveCode && file) {
       const scriptPath = path.isAbsolute(file) ? file : path.resolve(workdir, file);
       return runProcess({
         cmd: shell,
@@ -646,7 +661,7 @@ export async function executeCode({
     }
     return runProcess({
       cmd: shell,
-      args: safeArgs.length > 0 ? ["-c", code || "", "--", ...safeArgs] : ["-c", code || ""],
+      args: safeArgs.length > 0 ? ["-c", effectiveCode || "", "--", ...safeArgs] : ["-c", effectiveCode || ""],
       cwd: workdir,
       timeoutMs,
       env
