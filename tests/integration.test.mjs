@@ -161,6 +161,16 @@ test("SessionStart unified hook merges workspace snapshot and agy-dart status in
     const msg = parsed?.injectSteps?.[0]?.systemMessage?.systemMessage || "";
     assert.ok(msg.includes("agy-dart active:"));
     assert.ok(msg.includes("package.json") || msg.includes("Project") || msg.length > 150);
+    assert.doesNotMatch(msg.split("\n")[0], /agy-dart_fast|apply_edits/, "the startup header should not select the coding workflow");
+
+    const empty = spawnSync(process.execPath, [path.join(ROOT, "hooks", "session-start.mjs")], {
+      input: JSON.stringify({ hookEventName: "SessionStart", workspacePaths: [] }),
+      encoding: "utf8",
+      windowsHide: true,
+      env: { ...process.env, AGY_DART_DB_PATH: tmpDb }
+    });
+    assert.equal(empty.status, 0, empty.stderr);
+    assert.deepEqual(JSON.parse(empty.stdout), {}, "no standalone tool recommendation without workspace context");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

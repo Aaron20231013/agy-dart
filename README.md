@@ -9,7 +9,7 @@
 No extra dependencies · Works automatically in the background · Built-in side panel
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-10b981.svg)](LICENSE)
-[![Node.js >= 22](https://img.shields.io/badge/Node.js-%3E%3D22-38bdf8.svg)](package.json)
+[![Node.js 22.16+ (22.x) or 24+](https://img.shields.io/badge/Node.js-22.16%2B_(22.x)_or_24%2B-38bdf8.svg)](package.json)
 [![Security Policy](https://img.shields.io/badge/Security-Policy-818cf8.svg)](SECURITY.md)
 [![Glama MCP](https://glama.ai/mcp/servers/zou172866/agy-dart/badges/score.svg)](https://glama.ai/mcp/servers/zou172866/agy-dart)
 
@@ -33,7 +33,7 @@ No extra dependencies · Works automatically in the background · Built-in side 
 
 ## What does this plugin do?
 
-Saves tokens, improves cache hit rates, automatically keeps your cache warm, protects context quota, and rescues sessions when context overflows or freezes.
+Reduces repeated reads and large tool results, shows prompt-cache usage, and helps you resume work in a new chat when a session fills up or stalls.
 
 Once installed, it runs automatically in the background — no new commands to learn, just chat and code as usual:
 
@@ -43,8 +43,8 @@ When the AI needs to search several terms, it runs them in one batch; when it ed
 ### 2. Block noise
 If a test run prints 3,000 lines of logs, the plugin passes only the lines that matter to the AI (e.g., line 42 failed, the other 199 passed) and stores the full log locally for lookup. On multi-thousand-line code files, it pulls the outline first and reads only the target lines.
 
-### 3. Improve cache hits, keep cache warm automatically
-Keeps prompt headers steady for higher cache hit rates, and stops the AI from re-reading unchanged files repeatedly within short spans. When you step away and your cache is close to expiring, it can pop up a desktop alert or send a lightweight ping right before expiry to keep the cache warm (up to 3 times per chat by default, resetting to 0 on your next message).
+### 3. Cache monitoring and optional keepalive
+The plugin keeps prompt headers steady and avoids repeated reads of unchanged files. Automatic keepalive and desktop expiry alerts start off. If you enable keepalive, the initial limit is one ping per chat until your next message. You can change the limit in the panel.
 
 ### 4. Side panel & crash/hang rescue
 The right-sidebar panel shows: remaining context space, minutes until cache expiry, and total noise blocked.
@@ -66,20 +66,20 @@ With multiple project windows open, if a background window is nearly out of cont
 
 ## How to Install
 
-Requires **Node.js 22 or newer** (no `npm install` needed).
+Use **Node.js 22.16.0 or later in the 22.x line, or Node.js 24 or later**. The installer checks that the built-in SQLite supports FTS5 with the trigram tokenizer. The plugin uses only built-in modules.
 
 ### Option 1: One-line terminal install (no clone needed)
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/agy-dart/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/agy-dart/v1.7.0/install.ps1 | iex
 ```
 
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/agy-dart/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/agy-dart/v1.7.0/install.sh | sh
 ```
 
 ### Option 2: Let Antigravity install it
@@ -87,13 +87,13 @@ curl -fsSL https://raw.githubusercontent.com/zou172866/agy-dart/main/install.sh 
 Send this to Antigravity:
 
 ```text
-Clone https://github.com/zou172866/agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
+Clone tag v1.7.0 of https://github.com/zou172866/agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
 ```
 
 ### Option 3: Clone & install with custom flags
 
 ```powershell
-git clone https://github.com/zou172866/agy-dart.git
+git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/agy-dart.git
 cd agy-dart
 
 # Windows PowerShell (optional -InstallRg auto-installs ripgrep)
@@ -113,6 +113,10 @@ node scripts/install.mjs uninstall                      # Uninstall
 ```
 
 Restart or reload Antigravity after installing and open a new chat. User-created `rules/*.local.md` files inside the plugin directory are preserved across upgrades. If you previously installed standalone `agy-fast` or `antigravity-plugin-context-mode`, disable the old ones in your plugin list.
+
+Indexed content and usage history are stored locally in `~/.agy-dart/context.db` by default and survive uninstall. Before uninstalling, `ctx_purge` can clear the current chat's index. When the host omits a session ID, this covers anonymous data for the confirmed workspace. To clear indexed data and history across all projects, call `ctx_purge` with `scope: "all"`.
+
+Global uninstall also removes the Gemini/T3 copies recorded by the installer. If an older copy has no ownership record, the installer prints its location and a command for removing that copy explicitly.
 
 ---
 
@@ -147,7 +151,7 @@ node scripts/install.mjs tool-loading eager         # All 12 tools eager-loaded
 
 ### v1.5.4
 - **Click alerts to jump to that chat**: Clicking a desktop popup or cross-window panel alert brings the matching project window to the front and opens that conversation; added a multi-window session switcher bar in the panel.
-- **Automatic cache keepalive**: Sends a lightweight keepalive ping for primary chats shortly before cache expiry (skipping background subagents and workflow workers), with per-chat toggle and count controls at the top of the panel (default cap 3, resets on your next message).
+- **Optional cache keepalive** sends a ping for primary chats shortly before expiry. The panel controls the per-chat limit. Your next message resets the count.
 - Moved current context usage, cache countdown, and blocked noise volume into a larger top card in the panel.
 
 ### v1.5.3
@@ -210,7 +214,11 @@ npm run cache:simulate
 
 Install for Antigravity by default. Select Claude Code or Codex explicitly with `--target claude|codex`. Use `outline <file>` for a compact signature map and `session <id>` or `compare <before> <after>` for transcript usage.
 
+For Claude Code and Codex, the installer keeps hashes and undo metadata in `~/.agy-dart/<host>-install.json` to restore the plugin's configuration changes. Reinstalling replaces an older full-config record. Uninstalling removes that host's record.
+
 ```sh
-npx agy-dart install
-npx agy-dart doctor
+git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/agy-dart.git
+cd agy-dart
+node bin/agy-dart.mjs install
+node bin/agy-dart.mjs doctor
 ```

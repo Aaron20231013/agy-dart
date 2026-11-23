@@ -9,10 +9,7 @@
     "url": "https://github.com/zou172866"
   },
   "homepage": "https://github.com/zou172866/agy-dart",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/zou172866/agy-dart.git"
-  },
+  "repository": "https://github.com/zou172866/agy-dart",
   "suggestedPrompts": [
     "Search symbols across the codebase, outline large files, and apply multi-file edits with inline verification",
     "Analyze a large build or server log in the sandbox and summarize only the root causes",

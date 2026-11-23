@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { resetConfigCache } from "../context/lib/config.js";
+import { ContextModeStore } from "../context/lib/store.js";
 import {
   SAFE_GIT_CONFIG_ARGS,
   computeWaterFillBudgets,
@@ -299,6 +300,88 @@ test("v1.6-1: Cross-workspace hooks.json polyglot bootstrapper runs all 5 hooks 
   }
 });
 
+test("anonymous MCP sessions isolate new and legacy data by workspace", async () => {
+  const dir = makeTmpDir();
+  const db = path.join(dir, "contexts.db");
+  const editorCwd = path.join(dir, "editor-launch");
+  const projects = ["alpha", "beta"].map(name => path.join(dir, name));
+  const seed = new ContextModeStore({ dbPath: db });
+  let roots = [];
+  let client;
+  try {
+    fs.mkdirSync(editorCwd);
+    fs.writeFileSync(path.join(editorCwd, "editor-note.txt"), "editor launch marker");
+    for (const worktree of projects) {
+      fs.mkdirSync(worktree);
+      seed.indexContent({ sessionId: "default", worktree, content: "legacytoken " + path.basename(worktree) });
+      seed.recordEvent({ sessionId: "default", worktree, kind: "index", body: path.basename(worktree) });
+    }
+    seed.close();
+    client = createBidirectionalMcpClient(path.join(ROOT, "context/server.js"), {
+      cwd: dir,
+      onServerRequest: req => ({ jsonrpc: "2.0", id: req.id, result: { roots: roots.map(uri => ({ uri })) } }),
+      env: {
+        AGY_DART_DB_PATH: db, AGY_DART_CONFIG_PATH: path.join(dir, "config.json"),
+        ANTIGRAVITY_CONVERSATION_ID: "", ANTIGRAVITY_ROOT_CONVERSATION_ID: "",
+        ANTIGRAVITY_PARENT_CONVERSATION_ID: "", CONVERSATION_ID: "", ANTIGRAVITY_WORKSPACE_ROOT: "", VSCODE_CWD: editorCwd
+      }
+    });
+    await client.request("initialize", { capabilities: { roots: { listChanged: true } } });
+    const call = async (name, args) => {
+      const { result } = await client.request("tools/call", { name, arguments: args });
+      assert.equal(result.isError, false, result.content[0].text);
+      return JSON.parse(result.content[0].text);
+    };
+    for (const name of ["ctx_search", "ctx_purge", "ctx_resume", "ctx_stats"]) {
+      const { result } = await client.request("tools/call", { name, arguments: { sessionId: "default" } });
+      assert.equal(result.isError, true, name);
+      assert.match(result.content[0].text, /Workspace root could not be determined/);
+    }
+    const named = await client.request("tools/call", {
+      name: "ctx_index", arguments: { path: "editor-note.txt" }, _meta: { conversationId: "editor-session" }
+    });
+    assert.equal(named.result.isError, false, named.result.content[0].text);
+    const [a, b] = projects;
+    const [indexedA] = await Promise.all(projects.map(cwd =>
+      call("ctx_index", { cwd, content: "newtoken " + path.basename(cwd) })));
+    for (const cwd of projects) {
+      for (const query of ["newtoken", "legacytoken"]) {
+        const { hits } = await call("ctx_search", { cwd, queries: [query] });
+        assert.equal(hits.length, 1);
+        assert.ok(hits[0].snippet.includes(path.basename(cwd)), hits[0].snippet);
+      }
+      const resumed = await call("ctx_resume", { cwd });
+      assert.equal(resumed.recentEvents.length, 2);
+      assert.equal(resumed.recentSources.length, 2);
+    }
+    const foreign = await call("ctx_search", { cwd: b, queries: ["newtoken"], sourceId: indexedA.sourceId });
+    assert.equal(foreign.totalMatches, 0);
+    const setRoots = dirs => {
+      roots = dirs.map(dir => pathToFileURL(dir).href);
+      client.sendRaw({ jsonrpc: "2.0", method: "notifications/roots/list_changed" });
+    };
+    setRoots([a, b]);
+    assert.equal((await client.request("tools/call", { name: "ctx_purge" })).result.isError, true);
+    for (const cwd of projects) {
+      setRoots([cwd]);
+      const { hits } = await call("ctx_search", { queries: ["legacytoken"] });
+      assert.equal(hits.length, 1);
+      assert.ok(hits[0].snippet.includes(path.basename(cwd)));
+    }
+    await call("ctx_index", { cwd: a, content: "namedtoken", sessionId: "ordinary-session" });
+    await call("ctx_purge", { cwd: a });
+    assert.equal((await call("ctx_resume", { cwd: a })).recentSources.length, 0);
+    assert.equal((await call("ctx_resume", { cwd: b })).recentSources.length, 2);
+    assert.equal((await call("ctx_search", { sessionId: "ordinary-session", queries: ["namedtoken"] })).totalMatches, 1);
+    await call("ctx_stats", { cwd: b, reset: true });
+    assert.equal((await call("ctx_resume", { cwd: b })).recentEvents.length, 0);
+  } finally {
+    if (client) await client.close();
+    seed.close();
+    cleanTmpDir(dir);
+  }
+});
+
 test("v1.6-2: Dual MCP servers (fast + context) lazy roots/list, list_changed invalidation, zero-latency explicit cwd & PLUGIN_ROOT Fail-Fast guard", async () => {
   const tmpDir = makeTmpDir("agy-v16-roots-");
   try {
@@ -517,12 +600,13 @@ test("v1.6-2: Dual MCP servers (fast + context) lazy roots/list, list_changed in
       assert.equal(fileUriIdx.result.isError, false, fileUriIdx.result.content[0].text);
       assert.match(fileUriIdx.result.content[0].text, /Indexed/);
 
-      // Raw text indexing without workspace dependency still works
+      // Anonymous raw text requires a workspace to own the stored content.
       const rawIdx = await ctxClient.request("tools/call", {
         name: "ctx_index",
         arguments: { content: "# Heading\nPure text content", label: "mem-doc" }
       });
-      assert.equal(rawIdx.result.isError, false);
+      assert.equal(rawIdx.result.isError, true);
+      assert.match(rawIdx.result.content[0].text, /Workspace root could not be determined/);
 
       // Now enable roots/list and trigger list_changed -> relative ctx_index resolves wsA/alpha.txt!
       ctxProvideRoot = true;
@@ -1016,6 +1100,87 @@ test("v1.6-5: Phase 3 installer --tool-loading persistence, rules/*.local.md pre
     resetConfigCache();
     cleanTmpDir(tmpDir);
   }
+});
+
+test("global uninstall removes owned secondary hosts after environment changes and keeps independent copies", t => {
+  const home = makeTmpDir("agy-synced-hosts-");
+  t.after(() => cleanTmpDir(home));
+  const gemini = path.join(home, "custom-gemini");
+  const t3 = path.join(home, ".t3", "userdata", "providers", "antigravity");
+  const primary = path.join(home, ".gemini", "config", "plugins", "agy-dart");
+  const secondary = path.join(gemini, ".gemini", "config", "plugins", "agy-dart");
+  const managedT3 = path.join(t3, "managed", "plugins", "agy-dart");
+  const standalone = path.join(t3, "independent", "plugins", "agy-dart");
+  fs.mkdirSync(gemini);
+  fs.mkdirSync(path.dirname(managedT3), { recursive: true });
+  // An older synced copy and an independent install have identical, unmarked manifests.
+  fs.mkdirSync(standalone, { recursive: true });
+  fs.writeFileSync(path.join(standalone, "plugin.json"), '{"name":"agy-dart"}');
+  fs.writeFileSync(path.join(standalone, "hooks.json"), "independently configured");
+  const env = { ...process.env, HOME: home, USERPROFILE: home, GEMINI_HOME: gemini,
+    AGY_DART_DB_PATH: path.join(home, "ctx.db"), AGY_DART_CONFIG_PATH: path.join(home, "config.json") };
+  const run = (...args) => spawnSync(process.execPath, [path.join(ROOT, "scripts/install.mjs"), ...args],
+    { env, encoding: "utf8", windowsHide: true });
+  const cli = (...args) => {
+    const r = run(...args);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    return r.stdout;
+  };
+  assert.match(cli("install", "--with-devtools"), /Kept untracked secondary host/);
+  for (const dst of [secondary, managedT3]) assert.ok(fs.existsSync(path.join(dst, "hooks.json")));
+  // Two primary roots can use the same home when a configuration link is switched.
+  const globalDir = path.join(home, ".gemini");
+  const savedGlobal = path.join(home, "original-gemini-profile");
+  const otherGlobal = path.join(home, "alternate-gemini-profile");
+  const receipts = path.join(home, ".agy-dart", "synced-hosts");
+  const originalReceipts = fs.readdirSync(receipts).sort();
+  assert.equal(originalReceipts.length, 2);
+  fs.mkdirSync(otherGlobal);
+  fs.renameSync(globalDir, savedGlobal);
+  fs.symlinkSync(otherGlobal, globalDir, process.platform === "win32" ? "junction" : "dir");
+  cli("uninstall");
+  assert.ok(fs.existsSync(path.join(secondary, "hooks.json")), "other primary leaves this owner's copies installed");
+  assert.deepEqual(fs.readdirSync(receipts).sort(), originalReceipts, "other primary retains the original receipts");
+  fs.unlinkSync(globalDir);
+  fs.renameSync(savedGlobal, globalDir);
+  const localRule = path.join(secondary, "rules", "user.local.md");
+  fs.writeFileSync(localRule, "# user's rule");
+  fs.writeFileSync(path.join(secondary, "local-notes.txt"), "user content");
+  cli("install");
+  assert.ok(!fs.existsSync(path.join(secondary, "fast", "benchmark.mjs")), "obsolete devtools removed on upgrade");
+  assert.equal(fs.readFileSync(path.join(secondary, "local-notes.txt"), "utf8"), "user content");
+  const project = path.join(home, "workspace");
+  const projectTarget = path.join(project, ".agents", "plugins", "agy-dart");
+  fs.mkdirSync(projectTarget, { recursive: true });
+  fs.writeFileSync(path.join(projectTarget, "plugin.json"), '{"name":"agy-dart"}');
+  cli("uninstall", "--project", project);
+  assert.ok(!fs.existsSync(projectTarget));
+  assert.ok(fs.existsSync(path.join(primary, "hooks.json")));
+  assert.ok(fs.existsSync(path.join(secondary, "hooks.json")));
+  cli("uninstall", "--no-sync-hosts");
+  assert.ok(!fs.existsSync(primary));
+  assert.ok(fs.existsSync(path.join(secondary, "hooks.json")));
+  delete env.GEMINI_HOME;
+  const busyFile = path.join(secondary, "fast", "session-start.mjs");
+  fs.unlinkSync(busyFile);
+  fs.mkdirSync(busyFile);
+  assert.notEqual(run("uninstall").status, 0, "incomplete removal must report failure");
+  fs.rmdirSync(busyFile);
+  assert.match(cli("uninstall"), /Kept untracked secondary host/);
+  assert.ok(!fs.existsSync(path.join(secondary, "hooks.json")));
+  assert.ok(!fs.existsSync(path.join(secondary, "plugin.json")));
+  assert.ok(!fs.existsSync(managedT3));
+  assert.equal(fs.readFileSync(localRule, "utf8"), "# user's rule");
+  assert.equal(fs.readFileSync(path.join(standalone, "hooks.json"), "utf8"), "independently configured");
+  assert.ok(fs.existsSync(env.AGY_DART_DB_PATH), "uninstall preserves the user database");
+  env.GEMINI_HOME = gemini;
+  cli("install");
+  assert.ok(fs.existsSync(path.join(secondary, "hooks.json")), "reinstall restores managed runtime alongside user files");
+  cli("install", "--target", managedT3);
+  cli("uninstall");
+  assert.ok(fs.existsSync(path.join(managedT3, "hooks.json")), "explicit reinstall transfers ownership to standalone");
+  cli("uninstall", "--target", managedT3);
+  assert.ok(!fs.existsSync(managedT3));
 });
 
 test("batch_search keeps late Unicode matches visible on long lines across both backends", async t => {

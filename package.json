@@ -14,7 +14,7 @@
     "url": "https://github.com/zou172866/agy-dart/issues"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": "^22.16.0 || >=24.0.0"
   },
   "scripts": {
     "install:plugin": "node scripts/install.mjs install",

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export function isEphemeralNpxSource(dir) {
   return /(?:^|[/\\])(?:_npx|npm-cache|node_modules|bunx|pnpm[/\\]dlx)(?:[/\\]|$)/i.test(dir);
@@ -33,54 +33,100 @@ export function syncSharedRuntime(srcRoot, homeDir, manifest) {
   for (const [rel, bytes] of files) writeFileAtomicSync(path.join(dir, rel), bytes);
   return dir;
 }
-export function serverCommands(runtime) {
+export function serverCommands(runtime, executable = process.execPath) {
   return Object.fromEntries([["fast","fast/mcp-server.mjs"],["context","context/server.js"]].map(([name, file]) =>
-    [name, { command: process.execPath, args: [path.join(runtime, file)] }]));
+    [name, { command: executable, args: [path.join(runtime, file)] }]));
 }
-export function jsonConfig(original, edit) {
-  const data = JSON.parse(original ?? "{}");
-  if (!data || Array.isArray(data) || typeof data !== "object") throw Error("Expected a JSON configuration object");
-  edit(data);
-  return JSON.stringify(data, null, 2) + "\n";
+
+export function insertConfig(text, offset, addition, details = {}, replaced = "") {
+  return {
+    text: text.slice(0, offset) + addition + text.slice(offset + replaced.length),
+    undo: { offset, length: addition.length, ...details, ...(replaced && { replaced }) }
+  };
 }
+
+const digest = text => text === null ? null : createHash("sha256").update(text).digest("hex");
+
+function beforeInstall(spec, current, previous) {
+  if (!previous) return current;
+  if (Object.hasOwn(previous, "installed")) {
+    // Pre-v2 installers saved complete configurations. Consume the old snapshot only in memory.
+    if (current === previous.original || current === previous.installed) return previous.original;
+    if (current === null) return null;
+    const migrated = spec.install(previous.original);
+    if (migrated.text === current) return previous.original;
+    let undo = spec.legacyUndo?.(previous.original, previous.installed);
+    // An interrupted migration may have already switched the live block to this executable.
+    try { if (spec.verify(current)) undo = migrated.undo; } catch {}
+    return spec.remove(current, undo);
+  }
+  const currentHash = digest(current);
+  if (currentHash === previous.before || current === null) return current;
+  if (currentHash === previous.after) {
+    if (previous.before === null) return null;
+    const { offset, length, replaced = "" } = previous.undo;
+    const restored = current.slice(0, offset) + replaced + current.slice(offset + length);
+    if (digest(restored) !== previous.before) throw Error("Invalid install record: " + spec.file);
+    return restored;
+  }
+  return spec.remove(current, previous.undo);
+}
+
 export function manageFiles(home, host, specs, action) {
   const stateFile = path.join(home, ".agy-dart", host + "-install.json");
-  const state = JSON.parse(read(stateFile) ?? "{}");
+  const oldState = JSON.parse(read(stateFile) ?? "{}");
+  const records = oldState.version === 2 ? oldState.files : oldState;
+  const files = {};
+  const pending = {};
   const changes = [];
-  for (const { file, install, remove } of specs) {
-    const current = read(file), previous = state[file];
+  for (const spec of specs) {
+    const file = spec.file;
+    const current = read(file);
+    let previous = records[file];
+    const currentHash = digest(current);
+    if (previous?.transition?.from === currentHash) previous = previous.transition.record;
     if (action === "uninstall" && !previous) continue;
-    const original = previous ? previous.original : current;
-    let next;
+    const original = beforeInstall(spec, current, previous);
+    let next = original;
+    const legacy = previous && Object.hasOwn(previous, "installed");
     if (action === "install") {
-      if (previous && current === previous.installed) next = install(original);
-      else next = install(current, Boolean(previous));
-      state[file] = { original, installed: next };
-      // Restore the original bytes only when all unrelated content is still identical.
-      if (previous && current !== previous.installed && current !== original) state[file].original = remove(current);
-    } else next = current === previous.installed ? original : current === null ? null : remove(current);
-    changes.push({ file, next, current });
+      const edit = spec.install(original);
+      next = edit.text;
+      files[file] = { before: digest(original), after: digest(next), undo: edit.undo };
+      if (previous && !legacy && currentHash !== files[file].before && currentHash !== files[file].after) {
+        const {before, after, undo} = previous;
+        pending[file] = { ...files[file], transition: { from: currentHash, record: {before, after, undo} } };
+      }
+    }
+    if (next !== current) changes.push({ file, next, current, legacy });
   }
-  if (action === "install") writeFileAtomicSync(stateFile, JSON.stringify(state));
-  for (const {file,next,current} of changes) {
-    if (next === current) continue;
+  function apply({file, next, current}) {
+    if (read(file) !== current) throw Error("Configuration changed during installation: " + file);
     if (next === null) {
       fs.unlinkSync(file);
       if (file.endsWith(path.join("skills","agy-dart","SKILL.md")) && !fs.readdirSync(path.dirname(file)).length)
         fs.rmdirSync(path.dirname(file));
-    }
-    else writeFileAtomicSync(file, next);
+    } else writeFileAtomicSync(file, next);
   }
-  if (action === "uninstall" && read(stateFile) !== null) fs.unlinkSync(stateFile);
+  if (action === "install") {
+    // Keep legacy originals on disk until their live files contain the original formatting.
+    for (const change of changes) if (change.legacy) apply(change);
+    writeFileAtomicSync(stateFile, JSON.stringify({ version: 2, files: { ...files, ...pending } }));
+    for (const change of changes) if (!change.legacy) apply(change);
+    if (Object.keys(pending).length) writeFileAtomicSync(stateFile, JSON.stringify({ version: 2, files }));
+  } else {
+    for (const change of changes) apply(change);
+    if (read(stateFile) !== null) fs.unlinkSync(stateFile);
+  }
 }
 export function skillSpec(home, dir, src) {
   const body = fs.readFileSync(path.join(src,"skills/agy-dart/SKILL.md"),"utf8");
   return { file:path.join(home,dir,"skills/agy-dart/SKILL.md"),
-    install(current, owned) {
-      if (current !== null && !owned) throw Error("Skill already exists: " + dir);
-      if (owned && current !== body) throw Error("Local skill has edits: " + dir);
-      return body;
-    }, remove(current) { if (current !== body) throw Error("Locally modified skill: " + dir); return null; } };
+    install(current) {
+      if (current !== null) throw Error("Skill already exists: " + dir);
+      return insertConfig("", 0, body);
+    }, verify(current) { return current === body; },
+    remove() { throw Error("Locally modified skill: " + dir); } };
 }
 export function cleanupRuntime(home) {
   const base = path.join(home,".agy-dart");

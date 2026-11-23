@@ -3,7 +3,7 @@
  * agy-dart unified SessionStart hook:
  * - Resets transient session overrides & runs lightweight daily DB TTL maintenance
  * - Produces a strictly deterministic, KV-cache prefix-stable systemMessage:
- *   1. Static invariant routing line first
+ *   1. Stable workspace context header
  *   2. Semi-static workspace structure + git-HEAD-cached import hotspot hubs
  *   3. Volatile git branch / working-tree status last
  */
@@ -16,8 +16,7 @@ import { buildWorkspaceSnapshot } from "../fast/session-start.mjs";
 
 const __selfPath = path.resolve(fileURLToPath(import.meta.url));
 
-export const STATIC_COOP_NOTE =
-  "agy-dart active: agy-dart_fast for code; agy-dart_context for large output.";
+export const STATIC_COOP_NOTE = "agy-dart active: workspace context";
 
 function readStdin(timeoutMs = 1500) {
   return new Promise((resolve) => {
@@ -178,7 +177,7 @@ function resolveWorkspaceDir(rawOrPayload) {
  */
 export function assemblePrefixStableStartup(snapshotText, hotspotsLine = "", options = {}) {
   if (!snapshotText) {
-    return hotspotsLine ? `${STATIC_COOP_NOTE}\n${hotspotsLine}` : STATIC_COOP_NOTE;
+    return hotspotsLine ? `${STATIC_COOP_NOTE}\n${hotspotsLine}` : "";
   }
 
   const omitVolatileGit = Boolean(options?.omitVolatileGit);
@@ -290,6 +289,10 @@ async function main() {
     omitVolatileGit: stablePrefixOnly
   });
 
+  if (!mergedText) {
+    process.stdout.write("{}\n");
+    return;
+  }
   process.stdout.write(
     JSON.stringify({
       injectSteps: [

@@ -40,6 +40,25 @@ function parseMarkdownHeadingLinear(line) {
 }
 
 export class FtsMethods {
+  // Older MCP clients stored anonymous data under one shared ID. Only these rows
+  // carry a per-operation worktree; the shared checkpoint and caches can be mixed.
+  adoptLegacyWorkspaceData(worktree, sessionId) {
+    this.open();
+    const match = "session_id = 'default' AND worktree = ?";
+    const sources = "SELECT id FROM sources WHERE " + match;
+    const hasSources = this.db.prepare(sources + " LIMIT 1").get(worktree);
+    const hasEvents = this.db.prepare("SELECT 1 FROM events WHERE " + match + " LIMIT 1").get(worktree);
+    if (!hasSources && !hasEvents) return;
+    this._withWriteTx(() => {
+      if (hasSources) {
+        this.db.prepare("UPDATE chunks SET session_id = ? WHERE " + match).run(sessionId, worktree);
+        this.db.prepare("UPDATE chunks_tri SET session_id = ? WHERE session_id = 'default' AND source_id IN (" + sources + ")").run(sessionId, worktree);
+        this.db.prepare("UPDATE sources SET session_id = ? WHERE " + match).run(sessionId, worktree);
+      }
+      this.db.prepare("UPDATE events SET session_id = ? WHERE " + match).run(sessionId, worktree);
+    });
+  }
+
   /** Safely split an oversized single line into <= maxBytes UTF-8 slices */
   _splitOversizedLine(line, maxBytes) {
     const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 1;
@@ -584,7 +603,7 @@ export class FtsMethods {
     const pending = this.db.prepare("SELECT 1 FROM events WHERE execution_receipt = ?");
     const claim = this.db.prepare(
       "UPDATE events SET session_id = ?, execution_receipt = NULL WHERE execution_receipt = ? " +
-      "AND session_id = 'default' AND tool = 'ctx_execute' AND kind = 'execution'"
+      "AND (session_id = 'default' OR session_id GLOB 'workspace:*') AND tool = 'ctx_execute' AND kind = 'execution'"
     );
     for (const receipt of receipts) {
       if (pending.get(receipt)) this._withBusyRetry(() => claim.run(owner, receipt));

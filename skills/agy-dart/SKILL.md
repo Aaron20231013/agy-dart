@@ -7,7 +7,7 @@ description: Batch code work, filter logs, search indexed docs and diagnose cont
 
 ## Search, read, edit and verify
 
-Call exposed tools directly. In Antigravity's `call_mcp_tool`, set `ServerName` to `agy-dart_fast` for these operations.
+Use these tools within the selected workflow. During plan review, use search and reads for discovery. In Antigravity's `call_mcp_tool`, set `ServerName` to `agy-dart_fast` for these operations.
 
 | Tool | Arguments for common tasks |
 | --- | --- |

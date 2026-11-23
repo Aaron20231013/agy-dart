@@ -596,7 +596,7 @@ test("Audit P1/P2/P3 (H-4, H-5, H-8, H-15, M-18, M-19, M-20, P3-8, P3-9): contex
           method: "tools/call",
           params: {
             name: "ctx_search",
-            arguments: { queries: ["ALPHA_META_99"], scope: "session", sessionId: "default" }
+            arguments: { queries: ["ALPHA_META_99"], scope: "session", sessionId: "default", cwd: tmpDir }
           }
         }
       ],

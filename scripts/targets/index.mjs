@@ -5,7 +5,7 @@ import * as claude from "./claude-code.mjs";
 import * as codex from "./codex.mjs";
 import * as agy from "./antigravity.mjs";
 import { cleanupRuntime, guardPath, manageFiles, read, serverCommands, syncSharedRuntime } from "./shared.mjs";
-import { RUNTIME_FILES, FILES_TO_COPY, verifyMcpServer } from "../install.mjs";
+import { RUNTIME_FILES, FILES_TO_COPY, checkNodeAndSqlite, verifyMcpServer } from "../install.mjs";
 export async function runTargets(src, argv, home=os.homedir()) {
   const args=[...argv], at=args.indexOf("--target");
   const names=at<0?["agy"]:String(args.splice(at,2)[1]).split(",");
@@ -16,6 +16,7 @@ export async function runTargets(src, argv, home=os.homedir()) {
     if(name!=="agy" && !Object.hasOwn(adapters,name)) throw Error("Unknown host: "+name);
     if(name!=="agy" && !["install","uninstall","doctor","status"].includes(action)) throw Error("Unsupported "+action+" for "+name);
   }
+  if (action !== "uninstall" && [...targets].some(name => name !== "agy")) await checkNodeAndSqlite();
   const modifyingShared = [...targets].some(name => name !== "agy") && ["install","uninstall"].includes(action);
   const lock = path.join(home,".agy-dart","targets.lock");
   let fd;
@@ -39,8 +40,7 @@ export async function runTargets(src, argv, home=os.homedir()) {
     } else {
       for(const spec of specs) {
         const raw=read(spec.file);
-        if(raw===null || (!spec.file.endsWith("SKILL.md") && spec.install(raw,true)!==raw && !spec.file.endsWith(".json"))) throw Error("Invalid installation: "+spec.file);
-        if(spec.file.endsWith(".json") && JSON.stringify(JSON.parse(spec.install(raw,true)))!==JSON.stringify(JSON.parse(raw))) throw Error("Missing host configuration: "+spec.file);
+        if(raw === null || !spec.verify(raw)) throw Error("Invalid installation: " + spec.file);
       }
       const tmp=fs.mkdtempSync(path.join(os.tmpdir(),"agy-doctor-"));
       try {

@@ -1,6 +1,8 @@
 # agy-dart tool routing
 
-Use the startup snapshot before listing the workspace. Call tools directly when exposed, or use `call_mcp_tool` with the server name below. The agy-dart skill has optional arguments and examples.
+Follow workspace and workflow routing first. After read-only discovery, if the workspace or `agy-cmd` calls for `/plan`, submit the plan and wait for approval before editing project files.
+
+Use the startup snapshot for discovery. Call exposed tools or use `call_mcp_tool` with the server name below.
 
 - `agy-dart_fast`: batch queries with `batch_search`. In `apply_edits` + `verify`, group independent hunks by path. Use `run_checks` for short checks, native `run_command` for >60s or async (`WaitMsBeforeAsync <= 2000`).
 - For unfamiliar large source or patches, outline with `read_slices({ outlines })`, then parallelize targeted `read_file` ranges (45 KiB/800 lines). Reuse unchanged reads. Give subagents the same routing.

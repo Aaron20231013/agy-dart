@@ -9,7 +9,7 @@
 不用额外装依赖 · 装好自动在后台工作 · 自带右侧面板
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-10b981.svg)](LICENSE)
-[![Node.js >= 22](https://img.shields.io/badge/Node.js-%3E%3D22-38bdf8.svg)](package.json)
+[![Node.js 22.16+ (22.x) 或 24+](https://img.shields.io/badge/Node.js-22.16%2B_(22.x)_or_24%2B-38bdf8.svg)](package.json)
 [![Security Policy](https://img.shields.io/badge/Security-Policy-818cf8.svg)](SECURITY.md)
 [![Glama MCP](https://glama.ai/mcp/servers/zou172866/agy-dart/badges/score.svg)](https://glama.ai/mcp/servers/zou172866/agy-dart)
 
@@ -33,7 +33,7 @@
 
 ## 这个插件是干什么的？
 
-省 token，优化缓存命中，自动保持缓存温度，优化上下文额度，必要时可以救因为爆上下文崩掉等原因的会话。
+减少重复读取和过长的工具输出，查看缓存用量。会话占满上下文或卡住时，可以把进度带到新对话。
 
 装好之后在后台自动生效，不用记新命令，平时照常打字聊天就行：
 
@@ -43,8 +43,8 @@ AI 要搜好几个词时一次同时搜完，要改多个文件时一次改完�
 ### 2. 挡住废话
 跑一次测试吐出 3000 行日志，插件只挑关键那几句给 AI（比如第 42 行报错，其余 199 个通过），完整原文存进本地备查。遇到几千行的大代码文件，先拉目录再读要改的那几十行。
 
-### 3. 优化缓存命中，自动保持缓存温度
-稳住对话开头结构提高缓存命中率；同一个文件没改过，短时间内不让 AI 重复重读。你临时离开、缓存快过期时，可以弹窗提醒，或者在到期前自动发个极轻的信号延长缓存时间（默认每段对话最多自动续 3 次，发新消息归零）。
+### 3. 缓存监测与按需续温
+插件保持提示前缀稳定，减少短时间内重复读取未修改的文件。自动续温和缓存到期桌面提醒默认关闭。首次开启续温时，每段对话最多自动请求 1 次，发新消息后重新计数。次数可在面板里调整。
 
 ### 4. 右侧面板与崩溃/卡死抢救
 右侧边栏面板直接显示：上下文还有多少、缓存还剩几分钟过期、挡掉了多少废话。
@@ -66,20 +66,20 @@ AI 要搜好几个词时一次同时搜完，要改多个文件时一次改完�
 
 ## 怎么安装
 
-需要 **Node.js 22 或更高版本**（不用跑 `npm install`）。
+使用 **Node.js 22.x 的 22.16.0 及以上版本，或 Node.js 24 及以上版本**。安装器会检查内置 SQLite 是否支持 FTS5 及其 trigram 分词器。插件只使用内置模块。
 
 ### 方法一：终端一行命令直装（免手动克隆）
 
 **Windows（PowerShell）：**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/agy-dart/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/agy-dart/v1.7.0/install.ps1 | iex
 ```
 
 **macOS / Linux：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/agy-dart/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/agy-dart/v1.7.0/install.sh | sh
 ```
 
 ### 方法二：直接发给 Antigravity 装
@@ -87,13 +87,13 @@ curl -fsSL https://raw.githubusercontent.com/zou172866/agy-dart/main/install.sh 
 复制这句发给 Antigravity：
 
 ```text
-请将 https://github.com/zou172866/agy-dart.git 克隆到临时目录，运行其中的 scripts/install.mjs install 完成全局安装并跑 doctor 自检（Windows 如未安装 rg 请同时传 --install-rg）。
+请将 https://github.com/zou172866/agy-dart.git 的 v1.7.0 标签克隆到临时目录，运行其中的 scripts/install.mjs install 完成全局安装并跑 doctor 自检（Windows 如未安装 rg 请同时传 --install-rg）。
 ```
 
 ### 方法三：克隆仓库自定义安装
 
 ```powershell
-git clone https://github.com/zou172866/agy-dart.git
+git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/agy-dart.git
 cd agy-dart
 
 # Windows PowerShell（加 -InstallRg 可顺手自动安装快速搜索工具 rg）
@@ -113,6 +113,10 @@ node scripts/install.mjs uninstall                   # 卸载
 ```
 
 装完重启或刷新一下 Antigravity 窗口，新开对话生效。升级重装时会自动保留插件目录下你自建的 `rules/*.local.md`。以前单独装过 `agy-fast` 或 `antigravity-plugin-context-mode` 的话，去插件列表关掉旧的。
+
+索引内容和用量记录默认保存在本机 `~/.agy-dart/context.db`，卸载后会保留。卸载前可调用 `ctx_purge` 清理当前对话的索引。宿主未提供会话 ID 时，此操作会清理已确认工作区的匿名数据。如需清理所有项目的索引和历史记录，可用 `scope: "all"` 调用 `ctx_purge`。
+
+全局卸载也会移除安装器有记录的 Gemini/T3 同步副本。遇到无法确认归属的旧副本时，安装器会列出路径和单独卸载该副本的命令。
 
 ---
 
@@ -147,7 +151,7 @@ node scripts/install.mjs tool-loading eager         # 12 个工具全部预载
 
 ### v1.5.4
 - **点击提醒直达对应会话**：点右下角弹窗或右侧面板里的跨窗口告警，自动切出对应项目窗口并跳进那段对话；面板新增多窗口会话切换栏。
-- **缓存自动续期**：主对话缓存快到期前自动发轻量信号延长热度（自动跳过后台子智能体与批处理任务），面板顶部可按对话独立开关、调次数（默认最多 3 次，发新消息归零）。
+- **按需续温**。开启后，主对话会在缓存快到期前发送续温请求。面板可调整每段对话的次数，发新消息后重新计数。
 - 把当前上下文用量、缓存倒计时和已拦废话量放大移到面板第一栏。
 
 ### v1.5.3
@@ -214,7 +218,11 @@ npm run cache:simulate
 
 默认安装到 Antigravity。显式使用 `--target claude` 或 `--target codex` 选择其他宿主。`outline <文件>` 输出签名与行号，`session <ID>` 和 `compare <前> <后>` 分析会话账单。
 
+Claude Code 和 Codex 的安装器会在 `~/.agy-dart/<host>-install.json` 中保存哈希及撤销插件改动所需的信息。重装会替换旧版的整份配置备份，卸载会移除该宿主的安装记录。
+
 ```sh
-npx agy-dart install
-npx agy-dart doctor
+git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/agy-dart.git
+cd agy-dart
+node bin/agy-dart.mjs install
+node bin/agy-dart.mjs doctor
 ```

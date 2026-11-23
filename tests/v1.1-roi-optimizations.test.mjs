@@ -858,11 +858,11 @@ test("Shared MCP server per-call sessionId isolation (AsyncLocalStorage prevents
       assert.deepEqual(resA.sessionCheckpoint.modifiedFiles, ["alpha.js"]);
       assert.equal(resA.hint, undefined);
 
-      // 2. Subsequent call WITHOUT sessionId MUST revert to 'default' (zero global currentSessionId leak!) and include hint
+      // 2. Subsequent call without an ID uses its workspace, never the previous named session.
       const resDefault = JSON.parse(
-        (await client.request("tools/call", { name: "ctx_resume", arguments: {} })).result.content[0].text
+        (await client.request("tools/call", { name: "ctx_resume", arguments: { cwd: tmpDir } })).result.content[0].text
       );
-      assert.equal(resDefault.sessionId, "default", "Previous per-call sessionId must NOT leak into subsequent calls");
+      assert.match(resDefault.sessionId, /^workspace:[a-f\d]{64}$/);
       assert.equal(resDefault.sessionCheckpoint.modifiedFileCount, 0);
       assert.ok(typeof resDefault.hint === "string" && resDefault.hint.includes("sessionId"), "Empty default resume must provide actionable hint when UUID checkpoints exist");
 

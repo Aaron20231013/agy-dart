@@ -23,9 +23,13 @@ const MAX_MCP_JSON_BYTES = 8700;
 const MAX_FETCH_REDIRECTS = 5;
 const MAX_FETCH_BODY_BYTES = 10 * 1024 * 1024;
 const MAX_INDEX_FILE_BYTES = 32 * 1024 * 1024;
-const RESERVED_SESSION_SENTINELS = new Set(["all", "lifetime", "app"]);
+const RESERVED_SESSION_SENTINELS = new Set(["all", "lifetime", "app", "default"]);
 
-function normalizeExplicitSessionId(raw) {
+function isAnonymousSession(id) {
+  return id === "default" || /^workspace:[a-f0-9]{64}$/.test(id);
+}
+
+export function normalizeSessionId(raw) {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   if (!trimmed || trimmed.length > 128) return null;
@@ -110,14 +114,14 @@ function resolveCallCwd(
   if (!cleanedArg) {
     if (requireConfirmedWorkspace && !workspaceConfirmed) {
       throw new Error(
-        `Workspace root could not be determined (server cwd is inside plugin directory '${base}'). Pass the active workspace absolute path in 'cwd'.`
+        `Workspace root could not be determined from server cwd '${base}'. Pass the active workspace absolute path in 'cwd'.`
       );
     }
     return base;
   }
   if (!path.isAbsolute(cleanedArg) && requireConfirmedWorkspace && !workspaceConfirmed) {
     throw new Error(
-      `Workspace root could not be determined (server cwd is inside plugin directory '${base}'). Pass the active workspace absolute path in 'cwd'.`
+      `Workspace root could not be determined from server cwd '${base}'. Pass the active workspace absolute path in 'cwd'.`
     );
   }
   const resolved = path.resolve(base, cleanedArg);
@@ -427,7 +431,7 @@ export function createTools({
         requireConfirmedWorkspace: true,
         workspaceConfirmed: ws.confirmed
       });
-      const sessionId = getSessionId();
+      const sessionId = getSessionId(cwd);
 
       if (expandedFile) {
         const absFile = path.isAbsolute(expandedFile)
@@ -475,7 +479,7 @@ export function createTools({
       const redacted = redactSecrets(rawCombined);
       const fullOutput = redacted.text;
       const fullBytes = Buffer.byteLength(fullOutput, "utf8");
-      const executionReceipt = sessionId === "default" ? randomBytes(16).toString("hex") : null;
+      const executionReceipt = isAnonymousSession(sessionId) ? randomBytes(16).toString("hex") : null;
 
       let sourceId = null;
       let deduplicated = false;
@@ -623,7 +627,7 @@ export function createTools({
         requireConfirmedWorkspace: true,
         workspaceConfirmed: ws.confirmed
       });
-      const sessionId = getSessionId();
+      const sessionId = getSessionId(cwd);
       const cmdList = Array.isArray(commands) ? commands : [commands];
       const outputs = [];
       let totalRawBytes = 0;
@@ -725,11 +729,12 @@ export function createTools({
       const ws = resolveWs();
       const expandedFilePath = filePath ? expandArgPath(filePath) : "";
       const needsWorkspaceForRelativeFile = Boolean(expandedFilePath && !path.isAbsolute(expandedFilePath));
-      const cwd = resolveCallCwd(argCwd, ws.cwd, {
+      const fileDir = !ws.confirmed && !argCwd && path.isAbsolute(expandedFilePath) ? path.dirname(expandedFilePath) : ws.cwd;
+      const cwd = resolveCallCwd(argCwd, fileDir, {
         requireConfirmedWorkspace: needsWorkspaceForRelativeFile,
         workspaceConfirmed: ws.confirmed
       });
-      const sessionId = getSessionId();
+      const sessionId = getSessionId(cwd);
       let rawText = content || "";
       let resolvedLabel = label;
       let sensitiveFileWarning = null;
@@ -843,7 +848,7 @@ export function createTools({
         requireConfirmedWorkspace: scope === "worktree",
         workspaceConfirmed: ws.confirmed
       });
-      const sessionId = getSessionId();
+      const sessionId = scope === "all" || scope === "worktree" ? null : getSessionId(cwd);
 
       const res = store.search({
         queries,
@@ -910,9 +915,9 @@ export function createTools({
     },
 
     // 5. ctx_resume
-    async ctx_resume({ seq = null, sessionId: argSessionId = null } = {}) {
-      const explicitSid = normalizeExplicitSessionId(argSessionId);
-      const sessionId = explicitSid || getSessionId();
+    async ctx_resume({ seq = null, sessionId: argSessionId = null, cwd: argCwd = "" } = {}) {
+      const explicitSid = normalizeSessionId(argSessionId);
+      const sessionId = explicitSid || getSessionId(resolveCallCwd(argCwd, resolveWs().cwd));
       if (seq !== null && seq !== undefined) {
         const ev = store.getEventBySeq(seq, sessionId);
         if (!ev) throw new Error(`Event sequence #${seq} not found`);
@@ -975,13 +980,13 @@ export function createTools({
       };
 
       if (
-        sessionId === "default" &&
+        isAnonymousSession(sessionId) &&
         isCheckpointEmpty &&
         typeof store.hasNonDefaultCheckpoints === "function" &&
         store.hasNonDefaultCheckpoints()
       ) {
         resumePayload.hint =
-          "Shared MCP server resolved sessionId='default' (no host conversationId env). Pass sessionId: '<your Conversation ID>' to recover this conversation's PostToolUse checkpoint & isolated stats.";
+          "No host conversation ID was provided. Pass sessionId: '<your Conversation ID>' to recover this conversation's PostToolUse checkpoint and stats.";
       }
 
       // Strictly guarantee <= 8.8 KB UTF-8 inline cap even with adversarial CJK paths/commands
@@ -1034,9 +1039,9 @@ export function createTools({
     },
 
     // 6. ctx_stats
-    async ctx_stats({ reset = false, sessionId: argSessionId = null } = {}) {
-      const explicitSid = normalizeExplicitSessionId(argSessionId);
-      const sessionId = explicitSid || getSessionId();
+    async ctx_stats({ reset = false, sessionId: argSessionId = null, cwd: argCwd = "" } = {}) {
+      const explicitSid = normalizeSessionId(argSessionId);
+      const sessionId = explicitSid || getSessionId(resolveCallCwd(argCwd, resolveWs().cwd));
       if (reset) {
         store.purge({ scope: "session", sessionId });
       }
@@ -1095,12 +1100,13 @@ export function createTools({
           rejected: diag.rejected
         };
       } catch {}
-      const cutoffInfo = store.getCutoffInfo(getSessionId());
+      const sessionId = getSessionId(cwd, { optional: true });
+      const cutoffInfo = store.getCutoffInfo(sessionId);
       const out = {
         doctor: doc,
         features: {
-          cliFilterEnabled: store.isCliFilterEnabled(getSessionId()),
-          readDedupEnabled: store.isReadDedupEnabled(getSessionId()),
+          cliFilterEnabled: store.isCliFilterEnabled(sessionId),
+          readDedupEnabled: store.isReadDedupEnabled(sessionId),
           diffReadEnabled: cfgSnap.values.diffRead,
           headingAwareMarkdownChunking: true,
           secretRedactionEnabled: isSecretRedactionEnabled(),
@@ -1119,7 +1125,7 @@ export function createTools({
           exemptExtensionsCount: Array.isArray(cfgSnap.values.exemptExtensions) ? cfgSnap.values.exemptExtensions.length : 0
         },
         readDedup: {
-          enabled: store.isReadDedupEnabled(getSessionId()),
+          enabled: store.isReadDedupEnabled(sessionId),
           minBytes: cfgSnap.values.readDedupMinBytes,
           maxSteps: cfgSnap.values.readDedupMaxSteps,
           maxTurns: cfgSnap.values.readDedupMaxTurns
@@ -1174,13 +1180,13 @@ export function createTools({
       sessionId: argSessionId = null,
       cwd: argCwd = ""
     } = {}) {
-      const explicitSid = normalizeExplicitSessionId(argSessionId);
-      const sessionId = explicitSid || getSessionId();
+      const explicitSid = normalizeSessionId(argSessionId);
       const ws = resolveWs();
       const cwd = resolveCallCwd(argCwd, ws.cwd, {
         requireConfirmedWorkspace: scope === "worktree",
         workspaceConfirmed: ws.confirmed
       });
+      const sessionId = scope === "session" || scope === "conversation" ? explicitSid || getSessionId(cwd) : null;
       return store.purge({ scope, sessionId, worktree: cwd, olderThanDays, vacuum });
     }
   };

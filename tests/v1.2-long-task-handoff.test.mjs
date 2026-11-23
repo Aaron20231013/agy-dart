@@ -279,7 +279,7 @@ test("Long-Task 2: ctx_execute 120s default, timeoutSec 1..300 clamping, timedOu
           method: "tools/call",
           params: {
             name: "ctx_execute",
-            arguments: { language: "nodejs", code: "setTimeout(() => console.log('EOF_DRAIN_OK'), 60);" }
+            arguments: { cwd: workspaceDir, language: "nodejs", code: "setTimeout(() => console.log('EOF_DRAIN_OK'), 60);" }
           }
         }) + "\n"
       );

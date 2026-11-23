@@ -275,7 +275,12 @@ test("ctx_execute executes OS temp-dir scripts via file + args ($TMPDIR/%TEMP%/f
     });
     assert.equal(resTsFile.ok, true, resTsFile.output);
     assert.equal(resTsFile.language, "javascript");
-    assert.deepEqual(JSON.parse(resTsFile.output.trim()), { typedSum: 42 });
+    // ctx_execute includes child stderr. Early Node 22 builds warn about type stripping.
+    const typedOutput = resTsFile.output.trim().replace(
+      /\s*\(node:\d+\) ExperimentalWarning: Type Stripping is an experimental feature and might change at any time(?:\r?\n\(Use `node --trace-warnings \.\.\.` to show where the warning was created\))?$/,
+      ""
+    );
+    assert.deepEqual(JSON.parse(typedOutput), { typedSum: 42 });
 
     const wsFileFallback = await executeCode({
       language: "javascript",
