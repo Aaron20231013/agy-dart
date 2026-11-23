@@ -4770,7 +4770,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "apply_edits",
-      description: "Apply atomic edits. bestEffort skips invalid files. verify runs after writing.",
+      description: "Atomic edits. Group hunks by path. bestEffort skips invalid files. verify runs after writing.",
       inputSchema: {
         type: "object",
         properties: {

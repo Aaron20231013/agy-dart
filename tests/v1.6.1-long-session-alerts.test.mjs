@@ -1014,6 +1014,18 @@ test("v1.6.1-4: Suppress false-idle TTL alerts during stopped_bg_pending, active
         }
       });
 
+      // The sidecar can open mid-turn without access to the host process clock.
+      const previousPath = process.env.PATH;
+      try {
+        process.env.PATH = tmpDir;
+        const status = routes.get("/api/watchdog")({ scope: "conversation", conversationId: "conv-sidecar-live" });
+        assert.equal(status.current?.phase, WATCHDOG_PHASES.LLM_INFLIGHT,
+          "Opening the dashboard must preserve a fresh lease when the host start time is unknown");
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+      }
+
       const liveDiag = routes.get("/api/cache-diag")({
         scope: "conversation",
         conversationId: "conv-sidecar-live",

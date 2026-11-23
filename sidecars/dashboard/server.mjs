@@ -56,6 +56,7 @@ const SIDECAR_CSRF_TOKEN = crypto.randomBytes(24).toString("hex");
 
 let _runtimeStore = null;
 let _appStartTime = null;
+let _hostStartTime = null;
 let _runtimeInitialized = false;
 let _watchdogMonitor = null;
 const _convProjectIdCache = new Map();
@@ -224,9 +225,9 @@ export async function sendSidecarKeepaliveMessage(
   }
 }
 
-function getAppStartTime() {
-  if (_appStartTime !== null) return _appStartTime;
-  let ts = null;
+function getHostStartTime() {
+  if (_hostStartTime !== null) return _hostStartTime;
+  _hostStartTime = 0;
   if (process.platform === "win32") {
     try {
       const out = execSync(
@@ -234,11 +235,14 @@ function getAppStartTime() {
         { encoding: "utf8", timeout: 3000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }
       );
       const parsed = new Date(out.trim()).getTime();
-      if (!Number.isNaN(parsed) && parsed > 0) ts = parsed;
+      if (Number.isFinite(parsed) && parsed > 0) _hostStartTime = parsed;
     } catch {}
   }
-  _appStartTime = ts || (Date.now() - Math.round(process.uptime() * 1000));
-  return _appStartTime;
+  return _hostStartTime;
+}
+
+function getAppStartTime() {
+  return _appStartTime ??= getHostStartTime() || (Date.now() - Math.round(process.uptime() * 1000));
 }
 
 export function stopWatchdogMonitor() {
@@ -254,7 +258,8 @@ export function getWatchdogMonitor(options = {}) {
   if (!_watchdogMonitor) {
     _watchdogMonitor = new WatchdogMonitor({
       getStore: () => getRuntimeStore(),
-      getAppStartTime: () => getAppStartTime(),
+      // Only a known host restart can invalidate a lease that predates the dashboard.
+      getAppStartTime: getHostStartTime,
       ...options
     });
   }
