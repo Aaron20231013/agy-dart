@@ -13,13 +13,18 @@ import {
   WatchdogMonitor,
   collectChildSubagentActivity,
   detectSubagentFromTranscriptFile,
+  inspectLatestTurnInSteps,
   isHeadlessWorkerPrompt,
+  isKeepaliveTurnFlushedForRound,
   isSameWorkspacePath,
   isTrajectoryMetadataSubagent,
   listWatchdogLeases,
   lookupConversationSummary,
   readWatchdogLease,
-  resolveCandidateTranscriptPath
+  readWatchdogTranscriptTail,
+  resolveCandidateTranscriptPath,
+  WATCHDOG_PHASES,
+  writeWatchdogLeaseIfUnchanged
 } from "../../context/lib/watchdog.js";
 import {
   analyzeTranscriptCache,
@@ -739,6 +744,8 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
   const ttlDesktopNotifyEnabled = store.isTtlDesktopNotifyEnabled();
   const globalTtlKeepaliveMaxCount = store.getGlobalTtlKeepaliveMaxCount();
   const fallbackTtlKeepaliveMaxCount = store.getFallbackNonZeroKeepaliveMaxCount();
+  const globalTtlKeepaliveMinContextPct = store.getGlobalTtlKeepaliveMinContextPct();
+  const deliveryLatencyMs = store.getTtlKeepaliveDeliveryMs();
   const isSpecificConvForKa = Boolean(
     convId && convId !== "default" && convId !== "all" && convId !== "app"
   );
@@ -751,7 +758,11 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
   const kaState =
     !isExplicitSubagentForKa && kaConvId
       ? store.getTtlKeepaliveState(kaConvId)
-      : { usedCount: 0, lastSentTs: 0, lastError: "" };
+      : { usedCount: 0, coldMissTripped: false, lastSentTs: 0, lastError: "" };
+  const initialCustomOverride = Boolean(
+    !isExplicitSubagentForKa && kaConvId && store.hasCustomTtlKeepaliveOverride(kaConvId)
+  );
+  const defaultWindowTokens = resolveModelProfile(null).windowTokens;
   const ttlKeepalive = {
     conversationId: kaConvId,
     enabled: isExplicitSubagentForKa ? false : store.isTtlKeepaliveEnabled(kaConvId || null),
@@ -760,11 +771,16 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     maxCount: store.getTtlKeepaliveMaxCount(kaConvId || null),
     globalMaxCount: globalTtlKeepaliveMaxCount,
     fallbackMaxCount: fallbackTtlKeepaliveMaxCount,
-    isCustomOverride: Boolean(
-      !isExplicitSubagentForKa && kaConvId && store.hasCustomTtlKeepaliveOverride(kaConvId)
-    ),
+    minContextPct: globalTtlKeepaliveMinContextPct,
+    minContextTokens: initialCustomOverride
+      ? 0
+      : Math.round((defaultWindowTokens * globalTtlKeepaliveMinContextPct) / 100),
+    windowTokens: defaultWindowTokens,
+    isCustomOverride: initialCustomOverride,
     usedCount: kaState.usedCount,
-    leadSec: Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30))),
+    coldMissTripped: Boolean(kaState.coldMissTripped),
+    deliveryLatencyMs,
+    leadSec: Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 60))),
     lastSentTs: kaState.lastSentTs || 0,
     lastError: kaState.lastError || ""
   };
@@ -803,6 +819,13 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     const ttlSource = explicitTtlSec !== undefined ? "explicit" : "profile";
     const effTtl = explicitTtlSec ?? defProfile.ttlSec;
     const conversationActive = isSpecificConv ? isSidecarConversationActive(convId, store) : false;
+    const noTxKeepalive = {
+      ...ttlKeepalive,
+      windowTokens: effectiveWindow,
+      minContextTokens: ttlKeepalive.isCustomOverride
+        ? 0
+        : Math.round((effectiveWindow * globalTtlKeepaliveMinContextPct) / 100)
+    };
     return {
       ok: true,
       transcriptFound: false,
@@ -813,7 +836,8 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       ttlDesktopNotifyEnabled,
       globalTtlKeepaliveMaxCount,
       fallbackTtlKeepaliveMaxCount,
-      ttlKeepalive,
+      globalTtlKeepaliveMinContextPct,
+      ttlKeepalive: noTxKeepalive,
       cacheTtlSec: effTtl,
       ttlSource,
       ttlCalibration: {
@@ -895,7 +919,9 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
           supported: false,
           isSubagent: true,
           isCustomOverride: false,
+          minContextTokens: 0,
           usedCount: 0,
+          coldMissTripped: false,
           lastSentTs: 0,
           lastError: ""
         };
@@ -907,6 +933,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
         : resolvedObsConvId;
       if (fallbackPrimaryConvId) {
         const resolvedKa = store.getTtlKeepaliveState(fallbackPrimaryConvId);
+        const resolvedCustom = store.hasCustomTtlKeepaliveOverride(fallbackPrimaryConvId);
         effectiveTtlKeepalive = {
           ...ttlKeepalive,
           conversationId: fallbackPrimaryConvId,
@@ -914,8 +941,9 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
           supported: true,
           isSubagent: false,
           maxCount: store.getTtlKeepaliveMaxCount(fallbackPrimaryConvId),
-          isCustomOverride: store.hasCustomTtlKeepaliveOverride(fallbackPrimaryConvId),
+          isCustomOverride: resolvedCustom,
           usedCount: resolvedKa.usedCount,
+          coldMissTripped: Boolean(resolvedKa.coldMissTripped),
           lastSentTs: resolvedKa.lastSentTs || 0,
           lastError: resolvedKa.lastError || ""
         };
@@ -927,6 +955,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     const cacheKey = `${baseKeyPrefix}:${calStamp}`;
     const cached = parsedDiagCache.get(cacheKey);
     let diag;
+    let parsedSteps = null;
     if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
       diag = refreshWallClockTtl(cached.diag, explicitTtlSec);
     } else {
@@ -934,6 +963,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
         st.size <= 2 * 1024 * 1024
           ? parseTranscriptLines(fs.readFileSync(transcriptPath, "utf8"))
           : readTranscriptTail(transcriptPath, 524288);
+      parsedSteps = steps;
       const nowMs = Date.now();
       const obsConvId = resolvedObsConvId;
       const diagOpts = {
@@ -962,6 +992,78 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       });
       diag = { ...diag, serverNowMs: nowMs };
     }
+
+    // Layer-2 post-flush cold-miss circuit breaker & live window-token threshold sync
+    const kaTargetForDiag = effectiveTtlKeepalive.conversationId;
+    if (
+      kaTargetForDiag &&
+      kaTargetForDiag !== "__unbound__" &&
+      !effectiveTtlKeepalive.isSubagent &&
+      kaTargetForDiag === resolvedObsConvId
+    ) {
+      const liveKa = store.getTtlKeepaliveState(kaTargetForDiag);
+      if (
+        liveKa.usedCount >= 1 &&
+        !liveKa.pendingAck &&
+        !liveKa.inKeepaliveTurn &&
+        (liveKa.lastColdCheckUsed || 0) < liveKa.usedCount
+      ) {
+        const tailToCheck = parsedSteps || readWatchdogTranscriptTail(transcriptPath, 32768).steps;
+        const info = inspectLatestTurnInSteps(tailToCheck);
+        if (isKeepaliveTurnFlushedForRound(info, liveKa)) {
+          const nextColdTripped = Boolean(liveKa.coldMissTripped || info.cacheReadTokens === 0);
+          store.setTtlKeepaliveState(kaTargetForDiag, {
+            coldMissTripped: nextColdTripped,
+            lastColdCheckUsed: liveKa.usedCount,
+            updatedTs: Date.now()
+          });
+          effectiveTtlKeepalive = { ...effectiveTtlKeepalive, coldMissTripped: nextColdTripped };
+        }
+      }
+      if (diag?.currentContextTokens > 0) {
+        try {
+          const idleLease = readWatchdogLease(store, kaTargetForDiag);
+          if (
+            idleLease &&
+            idleLease.phase === WATCHDOG_PHASES.IDLE &&
+            !idleLease.isSubagent &&
+            Number(idleLease.contextTokens || 0) === 0
+          ) {
+            const parsedLastPlannerMs = diag.lastPlannerAt ? Date.parse(diag.lastPlannerAt) : NaN;
+            const anchorTs = idleLease.idleAnchorTs || idleLease.updatedTs || 0;
+            const syncedOriginTs =
+              Number.isFinite(parsedLastPlannerMs) &&
+              parsedLastPlannerMs > 0 &&
+              anchorTs > 0 &&
+              parsedLastPlannerMs <= anchorTs &&
+              anchorTs - parsedLastPlannerMs <= 30 * 60 * 1000
+                ? Math.floor(parsedLastPlannerMs)
+                : idleLease.cacheOriginTs;
+            writeWatchdogLeaseIfUnchanged(store, idleLease.updatedTs, idleLease.phase, {
+              ...idleLease,
+              contextTokens: Math.floor(Number(diag.currentContextTokens)),
+              ...(Number(diag.modelProfile?.windowTokens) > 0
+                ? { windowTokens: Math.floor(Number(diag.modelProfile.windowTokens)) }
+                : {}),
+              ...(diag.currentModel ? { model: diag.currentModel } : {}),
+              ...(syncedOriginTs > 0 ? { cacheOriginTs: syncedOriginTs } : {})
+            });
+          }
+        } catch {}
+      }
+    }
+    const resolvedWinTokens =
+      Number(diag?.modelProfile?.windowTokens) > 0
+        ? Math.floor(Number(diag.modelProfile.windowTokens))
+        : defaultWindowTokens;
+    effectiveTtlKeepalive = {
+      ...effectiveTtlKeepalive,
+      windowTokens: resolvedWinTokens,
+      minContextTokens: effectiveTtlKeepalive.isCustomOverride
+        ? 0
+        : Math.round((resolvedWinTokens * globalTtlKeepaliveMinContextPct) / 100)
+    };
+
     const activeTargetConvId = resolvedObsConvId || (isSpecificConv ? convId : "");
     const conversationActive = isSidecarConversationActive(activeTargetConvId, store);
     if (
@@ -981,6 +1083,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       ttlDesktopNotifyEnabled,
       globalTtlKeepaliveMaxCount,
       fallbackTtlKeepaliveMaxCount,
+      globalTtlKeepaliveMinContextPct,
       ttlKeepalive: effectiveTtlKeepalive,
       ...diag,
       contextComposition: diag.contextComposition ?? createEmptyContextComposition(),
@@ -1342,6 +1445,30 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
     };
   }
+  if (action === "setTtlKeepaliveMinContextPct") {
+    const rawPct = data.minContextPct !== undefined ? data.minContextPct : data.pct;
+    const invalidType =
+      rawPct === undefined ||
+      rawPct === null ||
+      typeof rawPct === "boolean" ||
+      typeof rawPct === "object" ||
+      (typeof rawPct === "string" && rawPct.trim() === "");
+    const parsedPct = invalidType ? NaN : Number(rawPct);
+    if (!Number.isFinite(parsedPct) || !Number.isInteger(parsedPct) || parsedPct < 0 || parsedPct > 100) {
+      return {
+        ok: false,
+        status: 400,
+        error: "Invalid 'minContextPct' value: expected integer between 0 and 100"
+      };
+    }
+    store.setGlobalTtlKeepaliveMinContextPct(parsedPct);
+    const effectivePct = store.getGlobalTtlKeepaliveMinContextPct();
+    return {
+      ok: true,
+      globalTtlKeepaliveMinContextPct: effectivePct,
+      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
+    };
+  }
   if (
     action === "setTtlKeepalive" ||
     action === "resetTtlKeepalive" ||
@@ -1481,7 +1608,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     ok: false,
     status: 400,
     error:
-      "Invalid watchdog action: expected 'ack', 'snooze', 'clear', 'markIdle', 'setEnabled', 'setDesktopNotify', 'setTtlDesktopNotify', 'setTtlKeepalive', 'setGlobalTtlKeepalive', 'resetTtlKeepalive', 'resetTtlKeepaliveOverride', 'setUiLang', 'focusConversation', 'ackJump', or 'tick'"
+      "Invalid watchdog action: expected 'ack', 'snooze', 'clear', 'markIdle', 'setEnabled', 'setDesktopNotify', 'setTtlDesktopNotify', 'setTtlKeepalive', 'setGlobalTtlKeepalive', 'setTtlKeepaliveMinContextPct', 'resetTtlKeepalive', 'resetTtlKeepaliveOverride', 'setUiLang', 'focusConversation', 'ackJump', or 'tick'"
   };
 }
 

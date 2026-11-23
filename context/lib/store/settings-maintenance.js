@@ -1299,7 +1299,7 @@ export class SettingsMaintenanceMethods {
     return boolVal;
   }
 
-  /** Return last remembered non-zero global keepalive max count (1..20, fallback 3) */
+  /** Return last remembered non-zero global keepalive max count (1..20, fallback 1) */
   getFallbackNonZeroKeepaliveMaxCount() {
     this.open();
     const raw = this.getMeta("cache:ttl_keepalive_last_nonzero_max", null);
@@ -1314,7 +1314,7 @@ export class SettingsMaintenanceMethods {
     if (Number.isFinite(cfgMax) && cfgMax >= 1) {
       return Math.min(20, Math.max(1, Math.floor(cfgMax)));
     }
-    return 3;
+    return 1;
   }
 
   /** True iff global keepalive max count (0..20) has been explicitly persisted in SQLite meta */
@@ -1334,7 +1334,7 @@ export class SettingsMaintenanceMethods {
       return 0;
     }
     if (snap.sources.ttlKeepaliveMaxCount === "env") {
-      return clampGlobal(snap.values.ttlKeepaliveMaxCount ?? 3);
+      return clampGlobal(snap.values.ttlKeepaliveMaxCount ?? 1);
     }
     const envForcedOn = snap.sources.ttlKeepalive === "env" && snap.values.ttlKeepalive === true;
     this.open();
@@ -1349,7 +1349,7 @@ export class SettingsMaintenanceMethods {
     if (snap.values.ttlKeepalive === false) {
       return 0;
     }
-    const cfgVal = clampGlobal(snap.values.ttlKeepaliveMaxCount ?? 3);
+    const cfgVal = clampGlobal(snap.values.ttlKeepaliveMaxCount ?? 1);
     return cfgVal === 0 && envForcedOn ? this.getFallbackNonZeroKeepaliveMaxCount() : cfgVal;
   }
 
@@ -1363,12 +1363,77 @@ export class SettingsMaintenanceMethods {
       typeof maxCount === "object" ||
       (typeof maxCount === "string" && maxCount.trim() === "");
     const n = isBlankOrInvalid ? NaN : Number(maxCount);
-    const clamped = Number.isFinite(n) ? Math.min(20, Math.max(0, Math.floor(n))) : 3;
+    const clamped = Number.isFinite(n) ? Math.min(20, Math.max(0, Math.floor(n))) : 1;
     this.setMeta("cache:ttl_keepalive_global_max_count", String(clamped));
     if (clamped >= 1) {
       this.setMeta("cache:ttl_keepalive_last_nonzero_max", String(clamped));
     }
     return clamped;
+  }
+
+  /** True iff global keepalive min context % (0..100) has been explicitly persisted in SQLite meta */
+  hasExplicitGlobalTtlKeepaliveMinContextPct() {
+    this.open();
+    const raw = this.getMeta("cache:ttl_keepalive_min_context_pct", null);
+    if (raw === null || raw === "") return false;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 && n <= 100;
+  }
+
+  /** Resolve global default keepalive min context window % (0..100, default 15%; env > sqlite > config) */
+  getGlobalTtlKeepaliveMinContextPct() {
+    const snap = getConfigSnapshot();
+    const clampPct = (v) => Math.min(100, Math.max(0, Math.floor(Number(v))));
+    if (snap.sources.ttlKeepaliveMinContextPct === "env") {
+      return clampPct(snap.values.ttlKeepaliveMinContextPct ?? 15);
+    }
+    this.open();
+    const raw = this.getMeta("cache:ttl_keepalive_min_context_pct", null);
+    if (raw !== null && raw !== "") {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n >= 0 && n <= 100) {
+        return clampPct(n);
+      }
+    }
+    return clampPct(snap.values.ttlKeepaliveMinContextPct ?? 15);
+  }
+
+  /** Persist global default keepalive min context window % (0..100; 0 means no threshold) in SQLite meta */
+  setGlobalTtlKeepaliveMinContextPct(pct) {
+    this.open();
+    const isBlankOrInvalid =
+      pct === null ||
+      pct === undefined ||
+      typeof pct === "boolean" ||
+      typeof pct === "object" ||
+      (typeof pct === "string" && pct.trim() === "");
+    const n = isBlankOrInvalid ? NaN : Number(pct);
+    const clamped = Number.isFinite(n) ? Math.min(100, Math.max(0, Math.floor(n))) : 15;
+    this.setMeta("cache:ttl_keepalive_min_context_pct", String(clamped));
+    return clamped;
+  }
+
+  /** Read smoothed keepalive send->PreInvocation delivery latency in ms (0..20000; 0 = uncalibrated) */
+  getTtlKeepaliveDeliveryMs() {
+    this.open();
+    const raw = this.getMeta("cache:ttl_keepalive_delivery_ms", null);
+    if (raw === null || raw === "") return 0;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.min(20000, Math.max(0, Math.round(n))) : 0;
+  }
+
+  /** Record a measured keepalive send->PreInvocation ack latency sample (EMA smoothed, clamped 50..20000 ms) */
+  recordTtlKeepaliveDeliveryMs(sampleMs) {
+    const s = Number(sampleMs);
+    if (!Number.isFinite(s) || s <= 0 || s > 30000) {
+      return this.getTtlKeepaliveDeliveryMs();
+    }
+    this.open();
+    const clampedSample = Math.min(20000, Math.max(50, Math.round(s)));
+    const prev = this.getTtlKeepaliveDeliveryMs();
+    const next = prev > 0 ? Math.round(prev * 0.6 + clampedSample * 0.4) : clampedSample;
+    this.setMeta("cache:ttl_keepalive_delivery_ms", String(next));
+    return next;
   }
 
   /** Check if KV-cache TTL auto-keepalive is enabled for a conversation (default ON; env kill-switch > per-conv sqlite > env max/on > global sqlite > config) */
@@ -1486,7 +1551,7 @@ export class SettingsMaintenanceMethods {
   /** Resolve max auto-keepalive activations for a conversation before a fresh user message (1..20, fallback to last non-zero when global is 0) */
   getTtlKeepaliveMaxCount(conversationId = null) {
     const snap = getConfigSnapshot();
-    const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 3)));
+    const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 1)));
     const cleanId = this._sanitizeKeepaliveConvId(conversationId);
     if (cleanId) {
       const st = this.getTtlKeepaliveState(cleanId);
@@ -1507,7 +1572,7 @@ export class SettingsMaintenanceMethods {
 
   /** Persist per-conversation max auto-keepalive count (1..20) in SQLite meta */
   setTtlKeepaliveMaxCount(maxCount, conversationId = null) {
-    const clamped = Math.min(20, Math.max(1, Math.floor(Number(maxCount) || 3)));
+    const clamped = Math.min(20, Math.max(1, Math.floor(Number(maxCount) || 1)));
     const targetId = this._sanitizeKeepaliveConvId(conversationId) || "__unbound__";
     const cur = this.getTtlKeepaliveState(targetId);
     const shouldAutoEnable = cur.enabled === null && this.getGlobalTtlKeepaliveMaxCount() === 0;
@@ -1542,6 +1607,8 @@ export class SettingsMaintenanceMethods {
       !cur.lastIdleAnchorTs &&
       !cur.lastSentTs &&
       !cur.pendingAck &&
+      !cur.coldMissTripped &&
+      !cur.inKeepaliveTurn &&
       !cur.lastError
     ) {
       this.deleteMeta(metaKey);
@@ -1574,6 +1641,9 @@ export class SettingsMaintenanceMethods {
       lastIdleAnchorTs: 0,
       lastSentTs: 0,
       pendingAck: false,
+      coldMissTripped: false,
+      inKeepaliveTurn: false,
+      lastColdCheckUsed: 0,
       lastError: "",
       updatedTs: 0
     };
@@ -1616,6 +1686,12 @@ export class SettingsMaintenanceMethods {
         lastIdleAnchorTs: Number.isFinite(Number(parsed.lastIdleAnchorTs)) && Number(parsed.lastIdleAnchorTs) > 0 ? Math.floor(Number(parsed.lastIdleAnchorTs)) : 0,
         lastSentTs: Number.isFinite(Number(parsed.lastSentTs)) && Number(parsed.lastSentTs) > 0 ? Math.floor(Number(parsed.lastSentTs)) : 0,
         pendingAck: Boolean(parsed.pendingAck),
+        coldMissTripped: Boolean(parsed.coldMissTripped),
+        inKeepaliveTurn: Boolean(parsed.inKeepaliveTurn),
+        lastColdCheckUsed:
+          Number.isFinite(Number(parsed.lastColdCheckUsed)) && Number(parsed.lastColdCheckUsed) >= 0
+            ? Math.floor(Number(parsed.lastColdCheckUsed))
+            : 0,
         lastError: typeof parsed.lastError === "string" ? parsed.lastError.slice(0, 180) : "",
         updatedTs
       };
@@ -1686,6 +1762,9 @@ export class SettingsMaintenanceMethods {
           lastIdleAnchorTs: 0,
           lastSentTs: 0,
           pendingAck: false,
+          coldMissTripped: false,
+          inKeepaliveTurn: false,
+          lastColdCheckUsed: 0,
           lastError: "",
           updatedTs: safeNow
         };
@@ -1719,7 +1798,7 @@ export class SettingsMaintenanceMethods {
       safePatch.maxCount === null
         ? null
         : safePatch.maxCount !== undefined
-          ? Math.min(20, Math.max(1, Math.floor(Number(safePatch.maxCount) || 3)))
+          ? Math.min(20, Math.max(1, Math.floor(Number(safePatch.maxCount) || 1)))
           : cur.maxCount;
     const next = {
       enabled: nextEnabled,
@@ -1737,6 +1816,14 @@ export class SettingsMaintenanceMethods {
           ? Math.max(0, Math.floor(Number(safePatch.lastSentTs) || 0))
           : cur.lastSentTs,
       pendingAck: safePatch.pendingAck !== undefined ? Boolean(safePatch.pendingAck) : cur.pendingAck,
+      coldMissTripped:
+        safePatch.coldMissTripped !== undefined ? Boolean(safePatch.coldMissTripped) : cur.coldMissTripped,
+      inKeepaliveTurn:
+        safePatch.inKeepaliveTurn !== undefined ? Boolean(safePatch.inKeepaliveTurn) : cur.inKeepaliveTurn,
+      lastColdCheckUsed:
+        safePatch.lastColdCheckUsed !== undefined
+          ? Math.max(0, Math.floor(Number(safePatch.lastColdCheckUsed) || 0))
+          : cur.lastColdCheckUsed,
       lastError:
         safePatch.lastError !== undefined ? String(safePatch.lastError || "").slice(0, 180) : cur.lastError,
       updatedTs:
@@ -1748,13 +1835,16 @@ export class SettingsMaintenanceMethods {
     return next;
   }
 
-  /** Reset per-conversation TTL auto-keepalive counter back to 0 */
+  /** Reset per-conversation TTL auto-keepalive counter & cold-miss breaker back to 0 */
   resetTtlKeepaliveState(conversationId, nowMs = Date.now()) {
     return this.setTtlKeepaliveState(conversationId, {
       usedCount: 0,
       lastIdleAnchorTs: 0,
       lastSentTs: 0,
       pendingAck: false,
+      coldMissTripped: false,
+      inKeepaliveTurn: false,
+      lastColdCheckUsed: 0,
       lastError: "",
       updatedTs: nowMs
     });
@@ -2441,6 +2531,8 @@ export class SettingsMaintenanceMethods {
                 parsedObj.lastIdleAnchorTs > 0 ||
                 parsedObj.lastSentTs > 0 ||
                 parsedObj.pendingAck ||
+                parsedObj.coldMissTripped ||
+                parsedObj.inKeepaliveTurn ||
                 parsedObj.lastError)
             ) {
               upsertMetaStmt.run(
@@ -2455,6 +2547,9 @@ export class SettingsMaintenanceMethods {
                   lastIdleAnchorTs: 0,
                   lastSentTs: 0,
                   pendingAck: false,
+                  coldMissTripped: false,
+                  inKeepaliveTurn: false,
+                  lastColdCheckUsed: 0,
                   lastError: "",
                   updatedTs: entryTs > 0 ? entryTs : now
                 })

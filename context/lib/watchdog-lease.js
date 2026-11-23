@@ -330,6 +330,416 @@ export function detectSubagentFromTranscriptFile(transcriptPath, maxBytes = 2621
   return classifyTranscriptGenesisFile(transcriptPath, maxBytes) === "subagent";
 }
 
+function toLeaseNonNegNum(val) {
+  if (val === undefined || val === null || val === "" || typeof val === "boolean") return null;
+  const n = Number(val);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+}
+
+function firstLeasePosOrNonNeg(...vals) {
+  let sawZero = false;
+  for (const v of vals) {
+    const n = toLeaseNonNegNum(v);
+    if (n !== null) {
+      if (n > 0) return n;
+      sawZero = true;
+    }
+  }
+  return sawZero ? 0 : null;
+}
+
+export function parseStepPrefillTimestampMs(step) {
+  if (!step || typeof step !== "object") return 0;
+  for (const field of ["created_at", "timestamp", "ts", "completed_at", "updated_at"]) {
+    const v = step[field];
+    if (typeof v === "number" && Number.isFinite(v) && v > 1e11) return Math.floor(v);
+    if (typeof v === "string" && v.trim()) {
+      const ms = Date.parse(v);
+      if (Number.isFinite(ms) && ms > 0) return Math.floor(ms);
+    }
+  }
+  return 0;
+}
+
+function extractLightweightStepUsage(step) {
+  if (!step || typeof step !== "object") {
+    return { contextTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, maxTokens: 0, model: "" };
+  }
+  const usage =
+    (step.usage && typeof step.usage === "object" ? step.usage : null) ||
+    (step.usageMetadata && typeof step.usageMetadata === "object" ? step.usageMetadata : null) ||
+    (step.usage_metadata && typeof step.usage_metadata === "object" ? step.usage_metadata : null) ||
+    {};
+  const hasAnthropicCacheFields =
+    toLeaseNonNegNum(step.cache_read_input_tokens) !== null ||
+    toLeaseNonNegNum(usage.cache_read_input_tokens) !== null ||
+    toLeaseNonNegNum(step.cache_creation_input_tokens) !== null ||
+    toLeaseNonNegNum(usage.cache_creation_input_tokens) !== null ||
+    Boolean(usage.cache_creation && typeof usage.cache_creation === "object");
+  const hasInclusiveGateway =
+    !hasAnthropicCacheFields &&
+    (toLeaseNonNegNum(usage.input_tokens_details?.cached_tokens) !== null ||
+      toLeaseNonNegNum(usage.prompt_tokens_details?.cached_tokens) !== null ||
+      toLeaseNonNegNum(usage.cachedContentTokenCount) !== null ||
+      toLeaseNonNegNum(usage.cached_content_token_count) !== null ||
+      toLeaseNonNegNum(usage.prompt_cache_hit_tokens) !== null);
+  const cacheReadTokens =
+    firstLeasePosOrNonNeg(
+      step.cache_read_tokens,
+      step.cache_read_input_tokens,
+      usage.cache_read_tokens,
+      usage.cache_read_input_tokens,
+      usage.cachedContentTokenCount,
+      usage.cached_content_token_count,
+      usage.prompt_tokens_details?.cached_tokens,
+      usage.input_tokens_details?.cached_tokens,
+      usage.prompt_cache_hit_tokens
+    ) ?? 0;
+  const cacheCreate1h =
+    firstLeasePosOrNonNeg(step.cache_creation_1h_tokens, usage.cache_creation?.ephemeral_1h_input_tokens) ?? 0;
+  const cacheCreate5m = firstLeasePosOrNonNeg(usage.cache_creation?.ephemeral_5m_input_tokens) ?? 0;
+  const rawCreate = firstLeasePosOrNonNeg(
+    step.cache_creation_tokens,
+    step.cache_creation_input_tokens,
+    usage.cache_creation_tokens,
+    usage.cache_creation_input_tokens
+  );
+  const cacheCreationTokens = rawCreate !== null ? rawCreate : cacheCreate5m + cacheCreate1h;
+  const disjointIn = hasInclusiveGateway
+    ? firstLeasePosOrNonNeg(step.input_tokens)
+    : firstLeasePosOrNonNeg(step.input_tokens, usage.input_tokens);
+  const inclusivePrompt = firstLeasePosOrNonNeg(
+    step.prompt_tokens,
+    step.promptTokenCount,
+    usage.prompt_tokens,
+    hasInclusiveGateway ? usage.input_tokens : null,
+    usage.promptTokenCount,
+    usage.prompt_token_count
+  );
+  let inputTokens = 0;
+  if (disjointIn !== null && (disjointIn > 0 || inclusivePrompt === null)) {
+    inputTokens = disjointIn;
+  } else if (inclusivePrompt !== null) {
+    inputTokens = Math.max(0, inclusivePrompt - cacheReadTokens - cacheCreationTokens);
+  }
+  const contextTokens = inputTokens + cacheReadTokens + cacheCreationTokens;
+
+  let maxTokens = 0;
+  for (const cand of [
+    step.max_token_limit,
+    step.maxTokenLimit,
+    step.model_config?.max_token_limit,
+    step.model_config?.maxTokenLimit,
+    step.modelConfig?.max_token_limit,
+    step.modelConfig?.maxTokenLimit,
+    step.metadata?.maxTokenLimit,
+    step.metadata?.max_token_limit,
+    step.config?.maxTokenLimit,
+    step.config?.max_token_limit
+  ]) {
+    const parsedLim = toLeaseNonNegNum(cand);
+    if (parsedLim !== null && parsedLim >= 8000 && parsedLim <= 10_000_000) {
+      maxTokens = parsedLim;
+      break;
+    }
+  }
+  const model = typeof step.model === "string" && step.model.trim() ? step.model.trim().slice(0, 96) : "";
+  return { contextTokens, cacheReadTokens, cacheCreationTokens, maxTokens, model };
+}
+
+const TTL_KEEPALIVE_ROUND_RE = /\[agy-dart TTL(?:保活| Keepalive)\s+(\d+)\/\d+\]/i;
+
+function isEmbeddedSubagentStepLite(step) {
+  if (!step || typeof step !== "object") return false;
+  if (step.is_subagent === true || step.isSubagent === true) return true;
+  if (typeof step.parent_conversation_id === "string" && step.parent_conversation_id.trim()) return true;
+  if (typeof step.parentConversationId === "string" && step.parentConversationId.trim()) return true;
+  return false;
+}
+
+function stepHasActiveNonFinishCallsLite(step) {
+  if (!step || typeof step !== "object") return false;
+  const checkCallObj = (c) => {
+    if (!c || typeof c !== "object") return false;
+    const rawName = c.name || c.tool || c.function?.name || "";
+    const bare = extractBareToolName(rawName);
+    return Boolean(bare && bare !== "finish");
+  };
+  for (const arr of [step.tool_calls, step.toolCalls, step.function_calls, step.functionCalls]) {
+    if (Array.isArray(arr) && arr.some(checkCallObj)) return true;
+  }
+  for (const single of [step.tool_call, step.toolCall, step.function_call, step.functionCall]) {
+    if (checkCallObj(single)) return true;
+  }
+  if (Array.isArray(step.content)) {
+    for (const part of step.content) {
+      if (
+        part &&
+        typeof part === "object" &&
+        (part.type === "tool_use" || part.type === "tool_call" || part.type === "function_call") &&
+        checkCallObj(part)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Zero-dependency tail step inspector shared by Stop hook, Sidecar cache-diag, and Watchdog:
+ * extracts latest primary PLANNER_RESPONSE prefill origin (`created_at`), token usage (`cacheReadTokens`,
+ * `contextTokens`), window limit, tool-continuation state, and keepalive round provenance.
+ */
+export function inspectLatestTurnInSteps(steps = []) {
+  const empty = {
+    hasPlanner: false,
+    prefillTs: 0,
+    contextTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    maxTokens: 0,
+    model: "",
+    hasPromptAfterLastPlanner: false,
+    hasToolContinuationAfterLastPlanner: false,
+    precededByKeepalivePrompt: false,
+    keepaliveRound: null
+  };
+  if (!Array.isArray(steps) || steps.length === 0) return empty;
+
+  let lastPlannerIdx = -1;
+  let lastPlannerUsage = null;
+  let lastPlannerPrefillTs = 0;
+  let latestMaxTokens = 0;
+  let latestModel = "";
+
+  for (let i = 0; i < steps.length; i++) {
+    const s = steps[i];
+    if (!s || typeof s !== "object" || isEmbeddedSubagentStepLite(s)) continue;
+    const sysObj = s.systemMessage || s.system_message;
+    if (sysObj && typeof sysObj === "object" && sysObj.systemMessage === "" && sysObj.metadata?.user_markdown) {
+      continue;
+    }
+    const usage = extractLightweightStepUsage(s);
+    if (usage.maxTokens > 0) latestMaxTokens = usage.maxTokens;
+    if (usage.model) latestModel = usage.model;
+    const tUpper = String(s.type || "").toUpperCase();
+    const rLower = String(s.role || "").toLowerCase();
+    if (tUpper === "PLANNER_RESPONSE" || ((rLower === "assistant" || rLower === "model") && usage.contextTokens > 0)) {
+      lastPlannerIdx = i;
+      lastPlannerUsage = usage;
+      lastPlannerPrefillTs = parseStepPrefillTimestampMs(s);
+    }
+  }
+
+  if (lastPlannerIdx < 0 || !lastPlannerUsage) return empty;
+
+  const lastPlannerHasActiveToolCalls = stepHasActiveNonFinishCallsLite(steps[lastPlannerIdx]);
+  let hasPromptAfterLastPlanner = false;
+  let sawToolResultAfterLastPlanner = false;
+  for (let i = lastPlannerIdx + 1; i < steps.length; i++) {
+    const s = steps[i];
+    if (!s || typeof s !== "object" || isEmbeddedSubagentStepLite(s)) continue;
+    const sysObj = s.systemMessage || s.system_message;
+    if (sysObj && typeof sysObj === "object" && sysObj.systemMessage === "" && sysObj.metadata?.user_markdown) {
+      continue;
+    }
+    const tUpper = String(s.type || "").toUpperCase();
+    const rLower = String(s.role || "").toLowerCase();
+    if (
+      tUpper === "GENERIC" ||
+      tUpper === "TOOL_OUTPUT" ||
+      tUpper === "TOOL_RESULT" ||
+      rLower === "tool" ||
+      s.tool_result !== undefined ||
+      s.tool_call_id !== undefined ||
+      s.toolCallId !== undefined ||
+      s.call_id !== undefined
+    ) {
+      sawToolResultAfterLastPlanner = true;
+      continue;
+    }
+    if (tUpper === "USER_INPUT" || rLower === "user" || tUpper === "SYSTEM_MESSAGE") {
+      const txt = extractGenesisStepText(s).trim();
+      if (txt) {
+        hasPromptAfterLastPlanner = true;
+        break;
+      }
+    }
+  }
+
+  let sawKeepaliveBeforePlanner = false;
+  let sawGenuineUserBeforePlanner = false;
+  let keepaliveRound = null;
+  for (let i = lastPlannerIdx - 1; i >= 0; i--) {
+    const s = steps[i];
+    if (!s || typeof s !== "object" || isEmbeddedSubagentStepLite(s)) continue;
+    const sysObj = s.systemMessage || s.system_message;
+    if (sysObj && typeof sysObj === "object" && sysObj.systemMessage === "" && sysObj.metadata?.user_markdown) {
+      continue;
+    }
+    const tUpper = String(s.type || "").toUpperCase();
+    const rLower = String(s.role || "").toLowerCase();
+    if (tUpper === "PLANNER_RESPONSE" || rLower === "assistant" || rLower === "model") {
+      const prevUsage = extractLightweightStepUsage(s);
+      const hasToolCalls =
+        Array.isArray(s.tool_calls) ||
+        Array.isArray(s.toolCalls) ||
+        Array.isArray(s.function_calls) ||
+        Array.isArray(s.functionCalls);
+      if (tUpper === "PLANNER_RESPONSE" || (prevUsage.contextTokens > 0 && !hasToolCalls)) {
+        break;
+      }
+      continue;
+    }
+    if (tUpper === "USER_INPUT" || rLower === "user" || tUpper === "SYSTEM_MESSAGE") {
+      const txt = extractGenesisStepText(s).trim();
+      if (!txt) continue;
+      if (isTtlKeepalivePrompt(txt)) {
+        sawKeepaliveBeforePlanner = true;
+        if (keepaliveRound === null) {
+          const roundMatch = txt.match(TTL_KEEPALIVE_ROUND_RE);
+          if (roundMatch && Number.isFinite(Number(roundMatch[1])) && Number(roundMatch[1]) >= 1) {
+            keepaliveRound = Math.floor(Number(roundMatch[1]));
+          }
+        }
+      } else if (tUpper === "USER_INPUT" || rLower === "user") {
+        sawGenuineUserBeforePlanner = true;
+      }
+    }
+  }
+
+  const precededByKeepalivePrompt = sawKeepaliveBeforePlanner && !sawGenuineUserBeforePlanner;
+  return {
+    hasPlanner: true,
+    prefillTs: lastPlannerPrefillTs,
+    contextTokens: lastPlannerUsage.contextTokens,
+    cacheReadTokens: lastPlannerUsage.cacheReadTokens,
+    cacheCreationTokens: lastPlannerUsage.cacheCreationTokens,
+    maxTokens: lastPlannerUsage.maxTokens || latestMaxTokens,
+    model: lastPlannerUsage.model || latestModel,
+    hasPromptAfterLastPlanner,
+    hasToolContinuationAfterLastPlanner: Boolean(lastPlannerHasActiveToolCalls || sawToolResultAfterLastPlanner),
+    precededByKeepalivePrompt,
+    keepaliveRound: precededByKeepalivePrompt ? keepaliveRound : null
+  };
+}
+
+export function isKeepaliveTurnFlushedForRound(info, kaState) {
+  if (
+    !info ||
+    !info.hasPlanner ||
+    info.hasPromptAfterLastPlanner ||
+    info.hasToolContinuationAfterLastPlanner ||
+    !(info.contextTokens > 0)
+  ) {
+    return false;
+  }
+  const usedCount = Number.isFinite(Number(kaState?.usedCount)) ? Math.floor(Number(kaState.usedCount)) : 0;
+  const lastSentTs = Number.isFinite(Number(kaState?.lastSentTs)) ? Math.floor(Number(kaState.lastSentTs)) : 0;
+  if (info.prefillTs > 0 && lastSentTs > 0 && info.prefillTs < lastSentTs - 5_000) {
+    return false;
+  }
+  if (info.keepaliveRound !== null && usedCount > 0 && info.keepaliveRound !== usedCount) {
+    return false;
+  }
+  return Boolean(
+    info.precededByKeepalivePrompt ||
+      (info.prefillTs > 0 && lastSentTs > 0 && info.prefillTs >= lastSentTs - 5_000)
+  );
+}
+
+export function computeCausalTurnLlmFloorTs(lease, nowMs) {
+  if (!lease || typeof lease !== "object") return 0;
+  const now = Number.isFinite(nowMs) && nowMs > 0 ? Math.floor(nowMs) : Date.now();
+  const turnFloorTs = lease.startedTs > 0 && lease.startedTs <= now ? lease.startedTs : 0;
+  const maxAgeMs = 30 * 60 * 1000;
+  let floor = 0;
+  const consider = (ts) => {
+    if (
+      Number.isFinite(ts) &&
+      ts > 0 &&
+      ts <= now &&
+      (turnFloorTs === 0 || ts >= turnFloorTs - 1_000) &&
+      now - ts <= maxAgeMs
+    ) {
+      floor = Math.max(floor, Math.floor(ts));
+    }
+  };
+  consider(lease.lastLlmStartTs);
+  consider(lease.lastCompletedToolTs);
+  if (lease.phase === WATCHDOG_PHASES.TOOL_RUNNING || lease.phase === WATCHDOG_PHASES.SUBAGENT_BG) {
+    consider(lease.phaseChangedTs);
+  }
+  return floor;
+}
+
+export function readWatchdogTranscriptTail(transcriptPath, maxBytes = 32768) {
+  if (typeof transcriptPath !== "string" || !transcriptPath.trim()) {
+    return { steps: [], mtimeMs: 0, size: 0 };
+  }
+  let fd = null;
+  try {
+    const cleanPath = transcriptPath.trim();
+    if (cleanPath.includes("\0") || /^[\\/]{2}/.test(cleanPath) || !fs.existsSync(cleanPath)) {
+      return { steps: [], mtimeMs: 0, size: 0 };
+    }
+    const HARD_CAP_BYTES = 524288;
+    const initialCap = Math.min(HARD_CAP_BYTES, Math.max(4096, Math.floor(Number(maxBytes) || 32768)));
+    fd = fs.openSync(cleanPath, "r");
+    const fstat = fs.fstatSync(fd);
+    if (!fstat.isFile() || fstat.size <= 0) {
+      return { steps: [], mtimeMs: fstat.mtimeMs || 0, size: 0 };
+    }
+
+    let windowBytes = Math.min(initialCap, fstat.size);
+    while (true) {
+      const offset = Math.max(0, fstat.size - windowBytes);
+      const buf = Buffer.allocUnsafe(windowBytes);
+      const bytesRead = fs.readSync(fd, buf, 0, windowBytes, offset);
+      if (bytesRead <= 0) {
+        return { steps: [], mtimeMs: fstat.mtimeMs || 0, size: fstat.size };
+      }
+      let slice = buf.subarray(0, bytesRead).toString("utf8");
+      if (offset > 0) {
+        const nlIdx = slice.indexOf("\n");
+        slice = nlIdx >= 0 ? slice.slice(nlIdx + 1) : "";
+      }
+      const steps = [];
+      let hasPlannerStep = false;
+      if (slice) {
+        for (const rawLine of slice.split(/\r?\n/)) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          try {
+            const parsed = JSON.parse(line);
+            if (parsed && typeof parsed === "object") {
+              steps.push(parsed);
+              const tUpper = String(parsed.type || "").toUpperCase();
+              const rLower = String(parsed.role || "").toLowerCase();
+              if (tUpper === "PLANNER_RESPONSE" || rLower === "assistant" || rLower === "model") {
+                hasPlannerStep = true;
+              }
+            }
+          } catch {}
+        }
+      }
+      if ((hasPlannerStep && steps.length >= 2) || offset === 0 || windowBytes >= HARD_CAP_BYTES || windowBytes >= fstat.size) {
+        return { steps, mtimeMs: fstat.mtimeMs || 0, size: fstat.size };
+      }
+      windowBytes = Math.min(fstat.size, Math.min(HARD_CAP_BYTES, windowBytes * 4));
+    }
+  } catch {
+    return { steps: [], mtimeMs: 0, size: 0 };
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
 export function isSubagentLeasePayload(payload = {}, env = process.env) {
   const envSub = String(env?.ANTIGRAVITY_SUBAGENT || "").trim().toLowerCase();
   if (envSub === "1" || envSub === "true") return true;
@@ -1383,6 +1793,15 @@ export function normalizeWatchdogLease(raw, fallbackConvId = "") {
         ? raw.ttlSource
         : "",
     idleAnchorTs: toFiniteTs(raw.idleAnchorTs, 0),
+    cacheOriginTs: (() => {
+      const rawIdle = toFiniteTs(raw.idleAnchorTs, 0);
+      const rawOrigin = toFiniteTs(raw.cacheOriginTs, 0);
+      if (phase === WATCHDOG_PHASES.IDLE && rawIdle > 0 && rawOrigin > rawIdle) {
+        return rawIdle;
+      }
+      return rawOrigin;
+    })(),
+    lastLlmStartTs: toFiniteTs(raw.lastLlmStartTs, 0),
     stopReason: raw.stopReason ? sanitizeWatchdogText(raw.stopReason, 120) : "",
     ackedUntilTs: toFiniteTs(raw.ackedUntilTs, 0)
   };
@@ -1558,6 +1977,8 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
     cacheTtlSec: 0,
     ttlSource: "",
     idleAnchorTs: 0,
+    cacheOriginTs: 0,
+    lastLlmStartTs: 0,
     stopReason: "",
     ackedUntilTs: 0
   };
@@ -1719,6 +2140,11 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
     }
     next.phaseChangedTs = now;
     next.idleAnchorTs = now;
+    next.lastLlmStartTs = now;
+    next.cacheOriginTs =
+      Number.isFinite(safeOptions.cacheOriginTs) && safeOptions.cacheOriginTs > 0
+        ? Math.floor(safeOptions.cacheOriginTs)
+        : now;
     next.activeTool = "";
     next.activeToolKind = "";
     next.activeToolSummary = "";
@@ -1799,6 +2225,8 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
       next.activeToolCallId = "";
       next.pendingSlowCalls = [];
       next.phaseChangedTs = now;
+      next.lastLlmStartTs = now;
+      next.cacheOriginTs = now;
       next.stopReason = "";
     } else {
       if (cls.isBackground) {
@@ -1930,6 +2358,8 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
       next.activeToolCallId = "";
       next.pendingSlowCalls = [];
       next.phaseChangedTs = now;
+      next.lastLlmStartTs = now;
+      next.cacheOriginTs = now;
     }
     if (!existing || existing.phase === WATCHDOG_PHASES.IDLE) {
       next.startedTs = now;
@@ -1970,6 +2400,25 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
         ? `${normalizedUpperReason}: ${rawError}`
         : rawReason;
 
+    const turnFloorTs = base.startedTs > 0 && base.startedTs <= now ? base.startedTs : 0;
+    const causalLlmFloorTs = computeCausalTurnLlmFloorTs(base, now);
+    const optOriginTs =
+      Number.isFinite(safeOptions.cacheOriginTs) && safeOptions.cacheOriginTs > 0
+        ? Math.floor(safeOptions.cacheOriginTs)
+        : 0;
+    let resolvedCacheOriginTs = now;
+    if (
+      optOriginTs > 0 &&
+      optOriginTs <= now + 5_000 &&
+      (turnFloorTs === 0 || optOriginTs >= turnFloorTs - 5_000) &&
+      (causalLlmFloorTs === 0 || optOriginTs >= causalLlmFloorTs - 5_000) &&
+      now - optOriginTs <= 30 * 60 * 1000
+    ) {
+      resolvedCacheOriginTs = Math.min(now, optOriginTs);
+    } else if (causalLlmFloorTs > 0) {
+      resolvedCacheOriginTs = causalLlmFloorTs;
+    }
+
     next.phase = WATCHDOG_PHASES.IDLE;
     next.subphase = rawFullyIdle === false && !isAbortOrError ? "stopped_bg_pending" : "stopped";
     next.activeTool = "";
@@ -1981,6 +2430,8 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
     next.transcriptMtimeMs = 0;
     next.phaseChangedTs = now;
     next.idleAnchorTs = now;
+    next.cacheOriginTs = resolvedCacheOriginTs;
+    next.lastLlmStartTs = 0;
     next.stopReason = sanitizeWatchdogText(formattedReason, 120);
   }
 

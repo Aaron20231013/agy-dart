@@ -416,7 +416,7 @@ async function main() {
         : (cfgSnapshot.sources.ttlKeepalive !== "default" ||
             cfgSnapshot.sources.ttlKeepaliveMaxCount !== "default") &&
           Boolean(effectiveCfg.ttlKeepalive) &&
-          Number(effectiveCfg.ttlKeepaliveMaxCount ?? 3) >= 1);
+          Number(effectiveCfg.ttlKeepaliveMaxCount ?? 1) >= 1);
   const watermarkNotifyExplicit =
     effectiveCfg.watermarkDesktopNotify === true && cfgSnapshot.sources.watermarkDesktopNotify !== "default";
   const dbExists = fs.existsSync(resolvedDbPath);
@@ -808,7 +808,7 @@ async function main() {
           cfgSnapshot.sources.ttlKeepaliveMaxCount !== "default"
         ) {
           ttlKeepaliveExplicit =
-            Boolean(effectiveCfg.ttlKeepalive) && Number(effectiveCfg.ttlKeepaliveMaxCount ?? 3) >= 1;
+            Boolean(effectiveCfg.ttlKeepalive) && Number(effectiveCfg.ttlKeepaliveMaxCount ?? 1) >= 1;
         }
       }
     }
@@ -894,8 +894,24 @@ async function main() {
 
         if (matchedDirectKeepalive || (matchedKeepaliveInTrailingSteps && !sawUserStepAfterPlanner)) {
           isKeepaliveTurn = true;
-          if (!isMidTurnContinuation && kaState?.pendingAck && typeof store.setTtlKeepaliveState === "function") {
-            store.setTtlKeepaliveState(targetConvId, { pendingAck: false, updatedTs: Date.now() });
+          if (!isMidTurnContinuation && typeof store.setTtlKeepaliveState === "function") {
+            const nowAckMs = Date.now();
+            const ackDelayMs = kaState?.lastSentTs > 0 ? nowAckMs - kaState.lastSentTs : 0;
+            if (
+              kaState?.pendingAck &&
+              ackDelayMs > 0 &&
+              ackDelayMs <= 30_000 &&
+              typeof store.recordTtlKeepaliveDeliveryMs === "function"
+            ) {
+              store.recordTtlKeepaliveDeliveryMs(ackDelayMs);
+            }
+            if (kaState?.pendingAck || !kaState?.inKeepaliveTurn) {
+              store.setTtlKeepaliveState(targetConvId, {
+                pendingAck: false,
+                inKeepaliveTurn: true,
+                updatedTs: nowAckMs
+              });
+            }
           }
         } else if (
           !isMidTurnContinuation &&
@@ -906,7 +922,16 @@ async function main() {
         ) {
           isKeepaliveTurn = true;
           if (typeof store.setTtlKeepaliveState === "function") {
-            store.setTtlKeepaliveState(targetConvId, { pendingAck: false, updatedTs: Date.now() });
+            const nowAckMs = Date.now();
+            const ackDelayMs = kaState.lastSentTs > 0 ? nowAckMs - kaState.lastSentTs : 0;
+            if (ackDelayMs > 0 && ackDelayMs <= 30_000 && typeof store.recordTtlKeepaliveDeliveryMs === "function") {
+              store.recordTtlKeepaliveDeliveryMs(ackDelayMs);
+            }
+            store.setTtlKeepaliveState(targetConvId, {
+              pendingAck: false,
+              inKeepaliveTurn: true,
+              updatedTs: nowAckMs
+            });
           }
         }
 
@@ -922,10 +947,18 @@ async function main() {
 
         if (
           !isKeepaliveTurn &&
+          !isMidTurnContinuation &&
+          isBackgroundWakeup &&
+          kaState?.inKeepaliveTurn &&
+          typeof store.setTtlKeepaliveState === "function"
+        ) {
+          store.setTtlKeepaliveState(targetConvId, { inKeepaliveTurn: false, updatedTs: Date.now() });
+        } else if (
+          !isKeepaliveTurn &&
           !isBackgroundWakeup &&
           !isMidTurnContinuation &&
           kaState &&
-          (kaState.usedCount > 0 || kaState.pendingAck) &&
+          (kaState.usedCount > 0 || kaState.pendingAck || kaState.coldMissTripped || kaState.inKeepaliveTurn) &&
           typeof store.resetTtlKeepaliveState === "function"
         ) {
           store.resetTtlKeepaliveState(targetConvId);

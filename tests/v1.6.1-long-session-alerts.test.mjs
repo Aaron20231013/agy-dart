@@ -1279,8 +1279,8 @@ test("v1.6.1-4: Suppress false-idle TTL alerts during stopped_bg_pending, active
         vmCtx.window.sidecar.fetch = origVmFetch;
         assert.equal(getEl("wd-severity-badge").textContent, "已关闭", "Failed overlapping keepalive edit must NOT corrupt cachedWatchdog.enabled");
         assert.equal(getEl("kv-ttl-bar-fill").className, "ttl-fill is-expired", "Failed overlapping keepalive edit must NOT re-freeze #kv-ttl-bar-fill");
-        assert.equal(getEl("kv-keepalive-btn").innerText, "自动续温：0/3", "Overlapping failed keepalive edit must reconcile back to server 0/3");
-        assert.equal(getEl("kv-keepalive-max").value, "3");
+        assert.equal(getEl("kv-keepalive-btn").innerText, "自动续温：0/1", "Overlapping failed keepalive edit must reconcile back to server 0/1");
+        assert.equal(getEl("kv-keepalive-max").value, "1");
       }
 
       // Re-enable Watchdog & re-seed active turn before testing Stop hook restoration

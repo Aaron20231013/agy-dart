@@ -49,8 +49,10 @@ import {
   formatWorkspaceWindowLabel,
   getToolTimeoutTier,
   getWatchdogLeaseKey,
+  inspectLatestTurnInSteps,
   isHeadlessWorkerPrompt,
   isHighReasoningModel,
+  isKeepaliveTurnFlushedForRound,
   isSameWorkspacePath,
   isSubagentLeasePayload,
   isSummaryMetadataSubagent,
@@ -60,7 +62,9 @@ import {
   lookupConversationTitle,
   normalizeWatchdogLease,
   parseMaybeJsonObj,
+  parseStepPrefillTimestampMs,
   readWatchdogLease,
+  readWatchdogTranscriptTail,
   recordHookLeaseTransition,
   resolveCandidateTranscriptPath,
   sanitizeConversationId,
@@ -73,6 +77,10 @@ import {
 export {
   HEADLESS_FINISH_PROMPT_RE,
   WATCHDOG_LEASE_PREFIX,
+  inspectLatestTurnInSteps,
+  isKeepaliveTurnFlushedForRound,
+  parseStepPrefillTimestampMs,
+  readWatchdogTranscriptTail,
   WATCHDOG_PHASES,
   classifyToolExecutionKind,
   classifyTranscriptGenesisFile,
@@ -466,6 +474,7 @@ export function inspectTranscriptTailForWatchdog(steps = [], options = {}) {
     hasAssistantSteps: false,
     detectedSubagent: Boolean(treatAsSubagent || genesisSubagent),
     lastStepTs: null,
+    lastPlannerPrefillTs: 0,
     lastStepType: "",
     isTerminal: false,
     terminalReason: "",
@@ -578,6 +587,8 @@ export function inspectTranscriptTailForWatchdog(steps = [], options = {}) {
       lastPlannerActiveCalls = activeCalls;
       lastPlannerOnlyFinish = allFinish;
       onlyToolResultsAfterPlanner = true;
+      const pTs = parseStepPrefillTimestampMs(step);
+      if (pTs > 0) result.lastPlannerPrefillTs = pTs;
       completedCallIds.clear();
       completedResultsAfterPlanner = 0;
     } else {
@@ -1437,6 +1448,7 @@ export class WatchdogMonitor {
     this.nowFn = options.nowFn || (() => Date.now());
     this.monoNsFn = options.monoNsFn || (() => process.hrtime.bigint());
     this.statFn = options.statFn || ((p) => fs.statSync(p));
+    this._hasCustomReadTail = typeof options.readTailFn === "function";
     this.readTailFn = options.readTailFn || ((p, bytes) => readTranscriptTail(p, bytes, { minUsageSteps: 1 }));
     this._hasCustomFindTranscript = typeof options.findTranscriptFn === "function";
     this.findTranscriptFn =
@@ -1477,6 +1489,7 @@ export class WatchdogMonitor {
     this._convState = new Map();
     this._lastEvaluated = new Map();
     this._ttlNotifiedKeys = new Map();
+    this._turn0BackfillChecked = new Map();
     this._keepaliveInFlight = new Set();
     this._subagentIdentityCache = new Map();
     this._lastTtlNotifyGlobalTs = 0;
@@ -1956,13 +1969,13 @@ export class WatchdogMonitor {
         const clampedCfg = clampGlobal(rawCfgMax);
         return clampedCfg === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : clampedCfg;
       }
-      return 3;
+      return 1;
     }
     if (store && typeof store.getGlobalTtlKeepaliveMaxCount === "function") {
       return store.getGlobalTtlKeepaliveMaxCount();
     }
     if (cfg.ttlKeepalive === false && !kaEnvOn) return 0;
-    const clampedDefault = clampGlobal(cfg.ttlKeepaliveMaxCount ?? 3);
+    const clampedDefault = clampGlobal(cfg.ttlKeepaliveMaxCount ?? 1);
     return clampedDefault === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : clampedDefault;
   }
 
@@ -1982,7 +1995,54 @@ export class WatchdogMonitor {
     ) {
       return Math.min(20, Math.max(1, Math.floor(Number(rawCfgMax))));
     }
-    return 3;
+    return 1;
+  }
+
+  _resolveGlobalTtlKeepaliveMinContextPct(store, cfg) {
+    const clampPct = (v) => Math.min(100, Math.max(0, Math.floor(Number(v))));
+    const envRaw = process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT;
+    if (typeof envRaw === "string" && envRaw.trim() !== "") {
+      const n = Number(envRaw.trim());
+      if (Number.isFinite(n) && n >= 0) return clampPct(n);
+    }
+    if (
+      store &&
+      typeof store.hasExplicitGlobalTtlKeepaliveMinContextPct === "function" &&
+      store.hasExplicitGlobalTtlKeepaliveMinContextPct()
+    ) {
+      return store.getGlobalTtlKeepaliveMinContextPct();
+    }
+    if (this._hasCustomConfig) {
+      const rawCfgPct = cfg?.ttlKeepaliveMinContextPct;
+      if (
+        rawCfgPct !== undefined &&
+        rawCfgPct !== null &&
+        Number.isFinite(Number(rawCfgPct)) &&
+        Number(rawCfgPct) >= 0
+      ) {
+        return clampPct(rawCfgPct);
+      }
+      if (store && typeof store.getGlobalTtlKeepaliveMinContextPct === "function") {
+        return store.getGlobalTtlKeepaliveMinContextPct();
+      }
+      return 15;
+    }
+    if (store && typeof store.getGlobalTtlKeepaliveMinContextPct === "function") {
+      return store.getGlobalTtlKeepaliveMinContextPct();
+    }
+    return clampPct(cfg?.ttlKeepaliveMinContextPct ?? 15);
+  }
+
+  _resolveLeaseKeepaliveMinContext(store, cfg, lease = null, { isCustomOverride = false } = {}) {
+    const globalPct = this._resolveGlobalTtlKeepaliveMinContextPct(store, cfg);
+    const profile = resolveModelProfile(lease?.model || null);
+    const windowTokens =
+      Number.isFinite(Number(lease?.windowTokens)) && Number(lease.windowTokens) > 0
+        ? Math.floor(Number(lease.windowTokens))
+        : profile?.windowTokens || 200_000;
+    const effectivePct = isCustomOverride ? 0 : globalPct;
+    const pctMinTokens = effectivePct > 0 ? Math.round((windowTokens * effectivePct) / 100) : 0;
+    return { globalPct, effectivePct, windowTokens, pctMinTokens };
   }
 
   _resolveTtlKeepaliveEnabled(store, cfg, conversationId = "", lease = null) {
@@ -2027,7 +2087,7 @@ export class WatchdogMonitor {
   }
 
   _resolveTtlKeepaliveMaxCount(store, cfg, conversationId = "") {
-    const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 3)));
+    const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 1)));
     if (conversationId && store && typeof store.getTtlKeepaliveState === "function") {
       try {
         const kaState = store.getTtlKeepaliveState(conversationId);
@@ -2152,7 +2212,10 @@ export class WatchdogMonitor {
       rawMinTok !== undefined && rawMinTok !== null && Number.isFinite(Number(rawMinTok))
         ? Math.min(500000, Math.max(0, Math.floor(Number(rawMinTok))))
         : 0;
-    const leadSec = Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30)));
+    const leadSec = Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 60)));
+    const deliveryMs =
+      typeof store.getTtlKeepaliveDeliveryMs === "function" ? store.getTtlKeepaliveDeliveryMs() : 0;
+    const deliveryCompSec = deliveryMs > 0 ? Math.min(20, Math.ceil(deliveryMs / 1000)) : 0;
 
     if (sleepJumpMs !== 0) {
       return { coveredConvIds, exhaustedConvMap };
@@ -2175,24 +2238,94 @@ export class WatchdogMonitor {
       ) {
         continue;
       }
-      if (minTokens > 0 && Number(lease.contextTokens || 0) < minTokens) continue;
       if (!this._resolveTtlKeepaliveEnabled(store, cfg, lease.conversationId, lease)) continue;
+      const isCustomOverride = Boolean(store.hasCustomTtlKeepaliveOverride?.(lease.conversationId));
+      let { pctMinTokens } = this._resolveLeaseKeepaliveMinContext(store, cfg, lease, { isCustomOverride });
+      let effectiveMinTokens = isCustomOverride ? 0 : Math.max(minTokens, pctMinTokens);
+      let leaseContextTokens = Number(lease.contextTokens || 0);
+      if (effectiveMinTokens > 0 && leaseContextTokens > 0 && leaseContextTokens < effectiveMinTokens) continue;
+      if (effectiveMinTokens > 0 && leaseContextTokens === 0 && !lease.transcriptPath) continue;
       const maxCount = this._resolveTtlKeepaliveMaxCount(store, cfg, lease.conversationId);
 
       const effectiveTtlSec = this._resolveLeaseEffectiveTtlSec(store, lease, cfg, nowWallMs);
       const effectiveLeadSec = Math.min(leadSec, Math.max(5, Math.floor(effectiveTtlSec * 0.5)));
       if (!(effectiveTtlSec > effectiveLeadSec)) continue;
+      const effectiveTriggerLeadSec = Math.min(
+        Math.max(5, Math.floor(effectiveTtlSec * 0.75)),
+        effectiveLeadSec + deliveryCompSec
+      );
 
       const idleAnchorTs = lease.idleAnchorTs || lease.phaseChangedTs || lease.updatedTs || 0;
       if (idleAnchorTs <= 0 || nowWallMs < idleAnchorTs) continue;
-      const idleSec = Math.floor((nowWallMs - idleAnchorTs) / 1000);
-      const remSec = effectiveTtlSec - idleSec;
+      let originTs =
+        lease.cacheOriginTs > 0 &&
+        lease.cacheOriginTs <= idleAnchorTs &&
+        idleAnchorTs - lease.cacheOriginTs <= 30 * 60 * 1000
+          ? lease.cacheOriginTs
+          : idleAnchorTs;
+      let idleSec = Math.floor((nowWallMs - originTs) / 1000);
+      let remSec = effectiveTtlSec - idleSec;
       if (remSec <= 0) continue;
 
       const kaState =
         typeof store.getTtlKeepaliveState === "function"
           ? store.getTtlKeepaliveState(lease.conversationId)
-          : { usedCount: 0, lastIdleAnchorTs: 0, lastSentTs: 0, pendingAck: false };
+          : {
+              usedCount: 0,
+              lastIdleAnchorTs: 0,
+              lastSentTs: 0,
+              pendingAck: false,
+              coldMissTripped: false,
+              lastColdCheckUsed: 0
+            };
+
+      if (kaState.coldMissTripped) continue;
+
+      // Lazy Turn-0 post-Stop flush backfill (0 fs.statSync): if Stop ran before the first
+      // PLANNER_RESPONSE flushed to disk, inspect the tail once when entering the trigger window.
+      if (
+        effectiveMinTokens > 0 &&
+        leaseContextTokens === 0 &&
+        lease.transcriptPath &&
+        kaState.usedCount < maxCount &&
+        remSec <= effectiveTriggerLeadSec &&
+        this._turn0BackfillChecked.get(lease.conversationId) !== idleAnchorTs
+      ) {
+        this._turn0BackfillChecked.set(lease.conversationId, idleAnchorTs);
+        try {
+          this.tailReadCount += 1;
+          const tailSteps = this._hasCustomReadTail
+            ? this.readTailFn(lease.transcriptPath, 32768)
+            : readWatchdogTranscriptTail(lease.transcriptPath, 32768).steps;
+          const info = inspectLatestTurnInSteps(tailSteps);
+          if (info.hasPlanner && !info.hasPromptAfterLastPlanner && info.contextTokens > 0) {
+            leaseContextTokens = info.contextTokens;
+            const nextBackfilledOrigin =
+              info.prefillTs > 0 &&
+              info.prefillTs <= idleAnchorTs &&
+              idleAnchorTs - info.prefillTs <= 30 * 60 * 1000
+                ? info.prefillTs
+                : lease.cacheOriginTs || idleAnchorTs;
+            const enrichedLease = {
+              ...lease,
+              contextTokens: info.contextTokens,
+              ...(info.maxTokens > 0 ? { windowTokens: info.maxTokens } : {}),
+              ...(info.model ? { model: info.model } : {}),
+              cacheOriginTs: nextBackfilledOrigin
+            };
+            writeWatchdogLeaseIfUnchanged(store, lease.updatedTs, lease.phase, enrichedLease);
+            ({ pctMinTokens } = this._resolveLeaseKeepaliveMinContext(store, cfg, enrichedLease, {
+              isCustomOverride
+            }));
+            effectiveMinTokens = isCustomOverride ? 0 : Math.max(minTokens, pctMinTokens);
+            originTs = nextBackfilledOrigin;
+            idleSec = Math.floor((nowWallMs - originTs) / 1000);
+            remSec = effectiveTtlSec - idleSec;
+          }
+        } catch {}
+      }
+      if (remSec <= 0) continue;
+      if (effectiveMinTokens > 0 && leaseContextTokens < effectiveMinTokens) continue;
 
       const sentOnCurrentIdleCycle =
         kaState.lastIdleAnchorTs === idleAnchorTs ||
@@ -2211,11 +2344,42 @@ export class WatchdogMonitor {
       }
 
       if (kaState.usedCount >= maxCount) continue;
-      if (remSec > effectiveLeadSec) continue;
+      if (remSec > effectiveTriggerLeadSec) continue;
 
       if (this._keepaliveInFlight.has(lease.conversationId)) continue;
       if (kaState.lastIdleAnchorTs === idleAnchorTs) continue;
       if (kaState.lastSentTs > 0 && nowWallMs - kaState.lastSentTs < 25_000) continue;
+
+      // Layer-3 cold-miss circuit breaker (0 fs.statSync): if a prior keepalive round's transcript
+      // flushed AFTER Stop hook ran, verify its cache_read_tokens before firing round 2+.
+      if (
+        kaState.usedCount >= 1 &&
+        (kaState.lastColdCheckUsed || 0) < kaState.usedCount &&
+        lease.transcriptPath &&
+        typeof this.readTailFn === "function"
+      ) {
+        let coldTrippedNow = false;
+        try {
+          this.tailReadCount += 1;
+          const tailSteps = this._hasCustomReadTail
+            ? this.readTailFn(lease.transcriptPath, 32768)
+            : readWatchdogTranscriptTail(lease.transcriptPath, 32768).steps;
+          const info = inspectLatestTurnInSteps(tailSteps);
+          if (isKeepaliveTurnFlushedForRound(info, kaState)) {
+            coldTrippedNow = info.cacheReadTokens === 0;
+            store.setTtlKeepaliveState?.(lease.conversationId, {
+              coldMissTripped: coldTrippedNow,
+              lastColdCheckUsed: kaState.usedCount,
+              updatedTs: nowWallMs
+            });
+          }
+        } catch {}
+        if (coldTrippedNow) {
+          coveredConvIds.delete(lease.conversationId);
+          continue;
+        }
+      }
+
       if (
         this._isConversationSubagent(store, lease.conversationId, lease, { requireDefinitive: true }) ||
         this._isConversationKilled(store, lease.conversationId, lease)
@@ -2248,6 +2412,7 @@ export class WatchdogMonitor {
             ? store.getTtlKeepaliveState(convId)
             : kaState;
         if (
+          freshKa.coldMissTripped ||
           freshKa.usedCount >= maxCount ||
           freshKa.lastIdleAnchorTs === idleAnchorTs ||
           Boolean(freshKa.pendingAck && freshKa.lastSentTs > 0 && nowWallMs - freshKa.lastSentTs < 60_000) ||
@@ -2645,6 +2810,7 @@ export class WatchdogMonitor {
     const ttlDesktopNotifyEnabled = this._resolveTtlDesktopNotifyEnabled(store, cfg);
     const globalTtlKeepaliveMaxCount = this._resolveGlobalTtlKeepaliveMaxCount(store, cfg);
     const fallbackTtlKeepaliveMaxCount = this._resolveFallbackTtlKeepaliveMaxCount(store, cfg);
+    const globalTtlKeepaliveMinContextPct = this._resolveGlobalTtlKeepaliveMinContextPct(store, cfg);
     const ttlKeepaliveEnabled = this._resolveTtlKeepaliveEnabled(store, cfg);
     const ttlKeepaliveMaxCount = this._resolveTtlKeepaliveMaxCount(store, cfg);
     const ttlKeepaliveActive = Boolean(
@@ -2671,6 +2837,7 @@ export class WatchdogMonitor {
         ttlKeepaliveMaxCount,
         globalTtlKeepaliveMaxCount,
         fallbackTtlKeepaliveMaxCount,
+        globalTtlKeepaliveMinContextPct,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -2715,6 +2882,9 @@ export class WatchdogMonitor {
       for (const id of this._ttlNotifiedKeys.keys()) {
         if (!liveIds.has(id)) this._ttlNotifiedKeys.delete(id);
       }
+      for (const id of this._turn0BackfillChecked.keys()) {
+        if (!liveIds.has(id)) this._turn0BackfillChecked.delete(id);
+      }
       const { coveredConvIds, exhaustedConvMap } = this._evaluateIdleTtlKeepalive(store, leases, {
         nowWallMs,
         cfg,
@@ -2747,6 +2917,7 @@ export class WatchdogMonitor {
         ttlKeepaliveMaxCount,
         globalTtlKeepaliveMaxCount,
         fallbackTtlKeepaliveMaxCount,
+        globalTtlKeepaliveMinContextPct,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -2785,6 +2956,9 @@ export class WatchdogMonitor {
       for (const id of this._ttlNotifiedKeys.keys()) {
         if (!liveIds.has(id)) this._ttlNotifiedKeys.delete(id);
       }
+      for (const id of this._turn0BackfillChecked.keys()) {
+        if (!liveIds.has(id)) this._turn0BackfillChecked.delete(id);
+      }
       const { coveredConvIds, exhaustedConvMap } = this._evaluateIdleTtlKeepalive(store, leases, {
         nowWallMs,
         cfg,
@@ -2817,6 +2991,7 @@ export class WatchdogMonitor {
         ttlKeepaliveMaxCount,
         globalTtlKeepaliveMaxCount,
         fallbackTtlKeepaliveMaxCount,
+        globalTtlKeepaliveMinContextPct,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -2935,6 +3110,9 @@ export class WatchdogMonitor {
     for (const id of this._ttlNotifiedKeys.keys()) {
       if (!seenIds.has(id)) this._ttlNotifiedKeys.delete(id);
     }
+    for (const id of this._turn0BackfillChecked.keys()) {
+      if (!seenIds.has(id)) this._turn0BackfillChecked.delete(id);
+    }
 
     const idleLeases = leases.filter((l) => l.phase === WATCHDOG_PHASES.IDLE);
     const { coveredConvIds, exhaustedConvMap } = this._evaluateIdleTtlKeepalive(store, idleLeases, {
@@ -2975,6 +3153,7 @@ export class WatchdogMonitor {
       ttlKeepaliveMaxCount,
       globalTtlKeepaliveMaxCount,
       fallbackTtlKeepaliveMaxCount,
+      globalTtlKeepaliveMinContextPct,
       watermarkDesktopNotifyEnabled,
       uiLang,
       uiLangSource: langInfo.source,
@@ -3269,6 +3448,12 @@ export class WatchdogMonitor {
         this._applyTailEnrichment(lease, tailInfo, tailIsFreshForEnrich);
 
         if (tailInfo.isTerminal && tailIsFreshForHeal) {
+          const healedOriginTs =
+            tailInfo.lastPlannerPrefillTs > 0 && tailInfo.lastPlannerPrefillTs <= nowWallMs + 5_000
+              ? Math.min(nowWallMs, tailInfo.lastPlannerPrefillTs)
+              : lease.lastLlmStartTs > 0 && lease.lastLlmStartTs <= nowWallMs
+                ? lease.lastLlmStartTs
+                : nowWallMs;
           const healedLease = {
             ...lease,
             phase: WATCHDOG_PHASES.IDLE,
@@ -3283,6 +3468,9 @@ export class WatchdogMonitor {
             transcriptMtimeMs: curMtimeMs,
             transcriptSize: curSize,
             phaseChangedTs: nowWallMs,
+            idleAnchorTs: nowWallMs,
+            cacheOriginTs: healedOriginTs,
+            lastLlmStartTs: 0,
             updatedTs: nowWallMs,
             lastHeartbeatTs: nowWallMs,
             hookEvent: "SidecarHeal",
@@ -3579,6 +3767,9 @@ export class WatchdogMonitor {
     const fallbackTtlKeepaliveMaxCount = tickRes
       ? tickRes.fallbackTtlKeepaliveMaxCount
       : this._resolveFallbackTtlKeepaliveMaxCount(store, cfg);
+    const globalTtlKeepaliveMinContextPct = tickRes
+      ? tickRes.globalTtlKeepaliveMinContextPct
+      : this._resolveGlobalTtlKeepaliveMinContextPct(store, cfg);
     const ttlKeepaliveEnabled = tickRes
       ? tickRes.ttlKeepaliveEnabled
       : this._resolveTtlKeepaliveEnabled(store, cfg);
@@ -3596,7 +3787,7 @@ export class WatchdogMonitor {
       : this._resolveUiLangInfo(store, cfg);
     const ttlNotifyLeadSec = Math.min(300, Math.max(15, Math.floor(Number(cfg.ttlNotifyLeadSec) || 60)));
     const ttlNotifyMinTokens = Math.min(500000, Math.max(4000, Math.floor(Number(cfg.ttlNotifyMinTokens) || 60000)));
-    const ttlKeepaliveLeadSec = Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30)));
+    const ttlKeepaliveLeadSec = Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 60)));
 
     const sessions = Array.from(this._lastEvaluated.values()).sort((a, b) => {
       const rankDiff = severityRank(b.severity) - severityRank(a.severity);
@@ -3673,7 +3864,7 @@ export class WatchdogMonitor {
     const kaState =
       !isKaTargetSubagent && kaTargetConvId && store && typeof store.getTtlKeepaliveState === "function"
         ? store.getTtlKeepaliveState(kaTargetConvId)
-        : { usedCount: 0, lastSentTs: 0, lastError: "" };
+        : { usedCount: 0, coldMissTripped: false, lastSentTs: 0, lastError: "" };
     const convKeepaliveEnabled = isKaTargetSubagent
       ? false
       : kaTargetConvId
@@ -3689,6 +3880,18 @@ export class WatchdogMonitor {
         typeof store.hasCustomTtlKeepaliveOverride === "function" &&
         store.hasCustomTtlKeepaliveOverride(kaTargetConvId)
     );
+    const targetLeaseForCtx =
+      (kaTargetConvId && this._lastEvaluated.get(kaTargetConvId)) ||
+      (kaTargetConvId && store ? readWatchdogLease(store, kaTargetConvId) : null) ||
+      current ||
+      null;
+    const minCtxInfo = this._resolveLeaseKeepaliveMinContext(store, cfg, targetLeaseForCtx, {
+      isCustomOverride
+    });
+    const deliveryLatencyMs =
+      store && typeof store.getTtlKeepaliveDeliveryMs === "function"
+        ? store.getTtlKeepaliveDeliveryMs()
+        : 0;
 
     const alertingSessions = sessions.filter((s) => s.severity === "stalled" || s.severity === "suspect");
     const activeCount = sessions.filter((s) => s.phase !== WATCHDOG_PHASES.IDLE).length;
@@ -3703,6 +3906,7 @@ export class WatchdogMonitor {
       ttlDesktopNotifyEnabled,
       globalTtlKeepaliveMaxCount,
       fallbackTtlKeepaliveMaxCount,
+      globalTtlKeepaliveMinContextPct,
       ttlKeepalive: {
         conversationId: kaTargetConvId,
         enabled: convKeepaliveEnabled,
@@ -3711,8 +3915,13 @@ export class WatchdogMonitor {
         maxCount: convKeepaliveMaxCount,
         globalMaxCount: globalTtlKeepaliveMaxCount,
         fallbackMaxCount: fallbackTtlKeepaliveMaxCount,
+        minContextPct: globalTtlKeepaliveMinContextPct,
+        minContextTokens: minCtxInfo.pctMinTokens,
+        windowTokens: minCtxInfo.windowTokens,
         isCustomOverride,
         usedCount: kaState.usedCount,
+        coldMissTripped: Boolean(kaState.coldMissTripped),
+        deliveryLatencyMs,
         leadSec: ttlKeepaliveLeadSec,
         lastSentTs: kaState.lastSentTs || 0,
         lastError: kaState.lastError || ""

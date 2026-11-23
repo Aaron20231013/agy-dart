@@ -63,8 +63,9 @@ export const CONFIG_DEFAULTS = Object.freeze({
   ttlNotifyLeadSec: 60,
   ttlNotifyMinTokens: 60000,
   ttlKeepalive: true,
-  ttlKeepaliveMaxCount: 3,
-  ttlKeepaliveLeadSec: 30,
+  ttlKeepaliveMaxCount: 1,
+  ttlKeepaliveLeadSec: 60,
+  ttlKeepaliveMinContextPct: 15,
   ttlKeepaliveMinTokens: 0,
   watermarkDesktopNotify: null,
   toolLoading: "fast-eager",
@@ -546,6 +547,11 @@ export function getConfigSnapshot(options = {}) {
     clampInt(parsePositiveInt(cfg.ttlKeepaliveLeadSec), 10, 180)
   );
   pick(
+    "ttlKeepaliveMinContextPct",
+    clampInt(parseNonNegativeInt(env?.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT), 0, 100),
+    clampInt(parseNonNegativeInt(cfg.ttlKeepaliveMinContextPct), 0, 100)
+  );
+  pick(
     "ttlKeepaliveMinTokens",
     clampInt(parseNonNegativeInt(env?.AGY_DART_TTL_KEEPALIVE_MIN_TOKENS), 0, 500000),
     clampInt(parseNonNegativeInt(cfg.ttlKeepaliveMinTokens), 0, 500000)
@@ -642,7 +648,7 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra
   lines.push(
     `  - TTL alert     : desktopNotify=${values.ttlDesktopNotify} (${sources.ttlDesktopNotify}), ` +
       `watermarkNotify=${wmNotifyDisplay} (${sources.watermarkDesktopNotify}), ` +
-      `keepalive=${values.ttlKeepalive} (${sources.ttlKeepalive}, max=${values.ttlKeepaliveMaxCount}, lead=${values.ttlKeepaliveLeadSec}s), ` +
+      `keepalive=${values.ttlKeepalive} (${sources.ttlKeepalive}, max=${values.ttlKeepaliveMaxCount}, lead=${values.ttlKeepaliveLeadSec}s, minCtx=${values.ttlKeepaliveMinContextPct}%), ` +
       `lead=${values.ttlNotifyLeadSec}s, minTokens=${values.ttlNotifyMinTokens}, lang=${values.uiLang} (${sources.uiLang})`
   );
 
