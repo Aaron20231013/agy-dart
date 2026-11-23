@@ -73,17 +73,23 @@ export function truncateTailUtf8Safe(text, maxBytes) {
 }
 
 /** Preserve both head context (~35%) and failure tail/summary (~65%) within <= maxBytes UTF-8 */
-export function truncateHeadTailUtf8Safe(text, maxBytes) {
-  if (!text) return "";
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  const marker = "\n... [middle omitted to stay <=8.8KB; tail failure/summary preserved] ...\n";
+export function truncateHeadTailUtf8Safe(
+  text, maxBytes,
+  marker = "\n... [middle omitted to stay <=8.8KB; tail failure/summary preserved] ...\n",
+  maxChars = Number.MAX_SAFE_INTEGER
+) {
+  if (!text || maxBytes <= 0 || maxChars <= 0) return "";
+  if (text.length <= maxChars && Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   const markerBytes = Buffer.byteLength(marker, "utf8");
   const avail = maxBytes - markerBytes;
-  if (avail < 200) return truncateTailUtf8Safe(text, maxBytes);
+  const availChars = maxChars - marker.length;
+  const tailWithin = (bytes, chars) => truncateTailUtf8Safe(text.slice(-chars).replace(/^[\uDC00-\uDFFF]/, ""), bytes);
+  if (avail < 200 || availChars < 64) return tailWithin(maxBytes, maxChars);
   const headBudget = Math.floor(avail * 0.35);
   const tailBudget = avail - headBudget;
-  const head = truncateUtf8Safe(text, headBudget).replace(/\s+$/, "");
-  const tail = truncateTailUtf8Safe(text, tailBudget).replace(/^\s+/, "");
+  const headChars = Math.floor(availChars * 0.35);
+  const head = truncateUtf8Safe(text.slice(0, headChars).replace(/[\uD800-\uDBFF]$/, ""), headBudget).trimEnd();
+  const tail = tailWithin(tailBudget, availChars - headChars).trimStart();
   return `${head}${marker}${tail}`;
 }
 
@@ -2162,36 +2168,92 @@ function filterGitLog(combined, exitCode) {
   return shownLines.join("\n");
 }
 
-/** Rule 4: test runners (node --test, npm/pnpm/yarn test, vitest, jest, pytest, go test, cargo test) */
-function filterTestRunner(combined, exitCode) {
-  const lines = combined.split("\n").map((l) => l.trimEnd());
-  const nonEmpty = lines.filter((l) => l.trim().length > 0);
-
-  const summaryRe =
-    /(?:^|\s)(?:tests?\s+\d+|suites?\s+\d+|pass(?:ed)?\s*[:=]?\s*\d+|fail(?:ed|ures?)?\s*[:=]?\s*\d+|skipped?\s*[:=]?\s*\d+|duration_ms|test result:|passed in \d|failed in \d|ran \d+ tests?|total:\s*\d+|Tests:\s+|Test Suites:\s+|FAIL\s+|PASS\s+|ok\s+\S+\s+\d|---\s+FAIL:|errors?\b)/i;
-
-  if (exitCode === 0) {
-    // Passing run: keep summary lines, warnings, and test count totals; collapse passing checklists
-    const kept = [];
-    for (const line of nonEmpty) {
-      if (
-        summaryRe.test(line) ||
-        /\bwarn(?:ing)?\b/i.test(line) ||
-        /^ℹ\s+(?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)\b/i.test(line.trim())
-      ) {
-        kept.push(line);
-      }
-    }
-    if (kept.length > 0) {
-      const unique = [];
-      for (const l of kept) {
-        if (unique[unique.length - 1] !== l) unique.push(l);
-      }
-      return `PASS (exit 0) — ${nonEmpty.length} raw lines compacted:\n${unique.slice(-40).join("\n")}`;
-    }
-    // Fallback: last 20 lines
-    return `PASS (exit 0) — tail:\n${nonEmpty.slice(-20).join("\n")}`;
+// Find a run of identical lines, or lines with one consecutive numeric counter.
+// Any other value change ends the run so that the exceptional line remains visible.
+function repeatedRunEnd(lines, start) {
+  const first = lines[start];
+  const second = lines[start + 1];
+  let end = start + 1;
+  if (second === undefined) return end;
+  if (first === second) {
+    while (lines[end] === first) end++;
+    return end;
   }
+  const left = first.split(/(\d+)/);
+  const right = second.split(/(\d+)/);
+  if (left.length !== right.length) return end;
+  const counter = left.findIndex((part, i) => part !== right[i]);
+  if (counter < 0 || counter % 2 === 0) return end;
+  const initial = Number(left[counter]);
+  if (!Number.isSafeInteger(initial)) return end;
+  const prefix = left.slice(0, counter).join("");
+  const suffix = left.slice(counter + 1).join("");
+  const width = left[counter].length;
+  while (end < lines.length) {
+    const value = String(initial + (end - start)).padStart(width, "0");
+    if (lines[end] !== prefix + value + suffix) break;
+    end++;
+  }
+  return end;
+}
+
+const PASS_REPORTER_LINE = /^\s*(?:TAP version \d+$|# Subtest: |ok \d+(?:\s+-\s|$)|[✔✓]\s+.*\([\d.]+\s*(?:ms|s)\)\s*$|--- PASS: |PASS\s+\S+\.(?:[cm]?[jt]sx?|py)\b|test \S+ \.\.\. ok$|---$|\.\.\.$|\d+\.\.\d+$)/;
+const TAP_TEST_METADATA = /^\s+(?:duration_ms:\s+[\d.]+|type:\s+['"]?(?:test|suite)['"]?)\s*$/;
+const TEST_TOTAL_LINE = /^\s*(?:[#ℹ]\s*)?(?:(?:tests?|suites?|pass|fail|cancelled|skipped|todo|duration_ms)\s+\d|(?:Tests|Test Suites|test result):|\d+ passed\b|Ran \d+ tests?\b)/i;
+
+export function compactPassingTestOutput(text, maxBytes, maxChars = maxBytes) {
+  const fits = value => value.length <= maxChars && Buffer.byteLength(value, "utf8") <= maxBytes;
+  if (fits(text)) return text;
+  const lines = text.split(/\r?\n/).filter(line => line.trim());
+  const header = `PASS (exit 0) — ${lines.length} raw lines compacted:\n`;
+  if (!fits(header)) return truncateUtf8Safe(header.slice(0, maxChars), maxBytes);
+  const withoutReporter = lines.filter(line =>
+    !(PASS_REPORTER_LINE.test(line) || TAP_TEST_METADATA.test(line)) ||
+    /\bwarn(?:ing)?\b/i.test(line) || isFailureAnchorLine(line)
+  );
+  const diagnostics = withoutReporter.length ? withoutReporter : lines;
+  let body = diagnostics.join("\n");
+  if (fits(header + body)) return header + body;
+
+  const kept = [];
+  for (let start = 0; start < diagnostics.length;) {
+    const end = repeatedRunEnd(diagnostics, start);
+    if (end - start >= 4) {
+      kept.push(diagnostics[start], `... [${end - start - 2} repeated lines omitted] ...`, diagnostics[end - 1]);
+    } else {
+      kept.push(...diagnostics.slice(start, end));
+    }
+    start = end;
+  }
+  body = kept.join("\n");
+  if (fits(header + body)) return header + body;
+
+  // Keep warnings and the final counts visible even when unique diagnostics overflow.
+  const summaries = [];
+  const other = [];
+  for (const line of kept) {
+    if (TEST_TOTAL_LINE.test(line) || /\bwarn(?:ing)?\b/i.test(line) || isFailureAnchorLine(line)) summaries.push(line);
+    else other.push(line);
+  }
+  const marker = "\n... [middle output omitted] ...\n";
+  const availableBytes = maxBytes - Buffer.byteLength(header, "utf8");
+  const availableChars = maxChars - header.length;
+  const otherText = other.join("\n");
+  const summary = truncateHeadTailUtf8Safe(
+    summaries.join("\n"),
+    Math.max(Math.floor(availableBytes / 2), availableBytes - Buffer.byteLength(otherText, "utf8") - (other.length ? 1 : 0)),
+    marker,
+    Math.max(Math.floor(availableChars / 2), availableChars - otherText.length - (other.length ? 1 : 0))
+  );
+  const tail = summary && other.length ? "\n" + summary : summary;
+  body = truncateHeadTailUtf8Safe(otherText, availableBytes - Buffer.byteLength(tail, "utf8"), marker, availableChars - tail.length);
+  return header + body + tail;
+}
+
+/** Rule 4: test runners (node --test, npm/pnpm/yarn test, vitest, jest, pytest, go test, cargo test) */
+function filterTestRunner(combined, exitCode, ctx) {
+  if (exitCode === 0) return compactPassingTestOutput(combined, ctx.maxBytes);
+  const lines = combined.split("\n").map((l) => l.trimEnd());
 
   // Failing run: strip pure passing check lines, keep all failure blocks, assertions, stacks & summary
   const passNoiseRe = /^\s*(?:✔|✓|ok\s+\d+|PASS\s+|test\s+\S+\s+\.\.\.\s+ok\s*$|---\s+PASS:|passed\b.*\[100%\]|\.\s*$)/i;
@@ -2363,24 +2425,12 @@ function filterTerraform(combined, exitCode) {
 }
 
 /** Rule 11: Playwright test runner */
-function filterPlaywright(combined, exitCode) {
+function filterPlaywright(combined, exitCode, ctx) {
   const lines = combined.split("\n").map((l) => l.trimEnd());
-  const nonEmpty = lines.filter((l) => l.trim().length > 0);
-
-  if (exitCode === 0) {
-    const keepRe =
-      /(?:Running\s+\d+\s+tests?|\b\d+\s+(?:passed|failed|flaky|skipped|interrupted)\b|Slow test file|\bwarn(?:ing)?\b)/i;
-    const kept = nonEmpty.filter((l) => keepRe.test(l));
-    if (kept.length > 0) {
-      return `PASS (exit 0) — ${nonEmpty.length} raw lines compacted:\n${kept.slice(-35).join("\n")}`;
-    }
-    return `PASS (exit 0) — tail:\n${nonEmpty.slice(-20).join("\n")}`;
-  }
-
-  // On failure: strip passing test lines, keep all failure blocks, locators, call logs & summary
   const passLineRe = /^\s*(?:✓|✔|ok\s+\d+)\s+\d+\s+\[[^\]]+\]/i;
-  const kept = lines.filter((l) => !passLineRe.test(l));
+  const kept = lines.filter((line) => !passLineRe.test(line));
   const collapsed = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (exitCode === 0) return compactPassingTestOutput(collapsed || combined, ctx.maxBytes);
   return collapsed || combined;
 }
 
@@ -2915,6 +2965,17 @@ export function applyFilterRule(ruleId, rawStdout, rawStderr, exitCode = 0, opti
     (rawStderr ? (rawStdout && !rawStdout.endsWith("\n") ? "\n" : "") + rawStderr : "");
   const rawBytes = Buffer.byteLength(rawCombined, "utf8");
   const cleaned = stripAnsiAndProgress(rawCombined);
+  // A complete passing log needs no footer. Don't withhold its last few hundred bytes to reserve one.
+  if (ruleId === "test-runner" && exitCode === 0 && !options.note && rawBytes <= maxBytes && !isJsonLikeFn?.(cleaned)) {
+    return {
+      filteredText: cleaned,
+      rawBytes,
+      filteredBytes: Buffer.byteLength(cleaned, "utf8"),
+      wasFiltered: false,
+      truncated: false,
+      crushedJson: false
+    };
+  }
 
   let rule = FILTER_RULES.find((r) => r.id === ruleId);
   if (!rule && typeof ruleId === "string" && ruleId.startsWith("custom:")) {
@@ -2955,8 +3016,10 @@ export function applyFilterRule(ruleId, rawStdout, rawStderr, exitCode = 0, opti
 
   const noteParts = [];
   if (options.note) noteParts.push(options.note);
+  const passingTest = exitCode === 0 && (ruleId === "test-runner" || ruleId === "playwright");
+  const queryHint = passingTest ? "use ctx_search for details missing from this preview" : "query via agy-dart_context ctx_search";
   const sourceHint = options.sourceId
-    ? ` full output indexed as ${options.sourceId} (query via agy-dart_context ctx_search)`
+    ? ` full output indexed as ${options.sourceId} (${queryHint})`
     : "";
 
   const reserveFooter = Math.max(

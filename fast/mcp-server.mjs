@@ -71,8 +71,9 @@ function resolveDirectoryCandidateFast(raw) {
   return null;
 }
 let isSafeRegex = (pattern) => typeof pattern === "string" && pattern.length <= 512;
+let filterRulesMod;
 try {
-  const filterRulesMod = await import("../hooks/filter-rules.mjs");
+  filterRulesMod = await import("../hooks/filter-rules.mjs");
   if (typeof filterRulesMod?.isSafeRegex === "function") {
     isSafeRegex = filterRulesMod.isSafeRegex;
   }
@@ -1222,6 +1223,11 @@ function isFailureNoiseLine(line) {
   return false;
 }
 var SUMMARY_LINE_PATTERN = /\b(passed|tests?|specs?|suites?|ok|warnings?|errors?|built in|compiled|done in|finished)\b/i;
+function isRecognizedTestCheck(command, cwd) {
+  if (typeof filterRulesMod?.compactPassingTestOutput !== "function") return false;
+  const id = filterRulesMod.matchFilterRule(command, { cwd, builtinOnly: true })?.rule.id;
+  return id === "test-runner" || id === "playwright";
+}
 function formatCompactCommandOutput(params) {
   const out = normalizeTerminalOutput(params.stdout);
   const err = normalizeTerminalOutput(params.stderr);
@@ -1239,6 +1245,7 @@ ${tail}` : "TIMED OUT (no output)",
   }
   if (params.exitCode === 0) {
     if (!combined) return "OK";
+    if (params.passingTest) return filterRulesMod.compactPassingTestOutput(combined, params.maxBytes, params.maxChars);
     const lines2 = combined.split("\n").map((l) => l.trim()).filter(Boolean);
     const summaryLines = lines2.filter((l) => SUMMARY_LINE_PATTERN.test(l));
     const picked = summaryLines.length > 0 ? summaryLines.slice(-2) : lines2.length <= 2 ? lines2 : [lines2[lines2.length - 1]];
@@ -1972,19 +1979,19 @@ ${summaryLines.join("\n")}`];
         });
         BATCH_SEARCH_CACHE.clear();
         const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
+        const verifyHeader = `\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n`;
+        const verifyBytes = DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(parts.join("\n")) - 1 - Buffer.byteLength(verifyHeader);
         const formatted = formatCompactCommandOutput({
           stdout: res.stdout,
           stderr: res.stderr,
           exitCode: res.exitCode,
           timedOut: res.timedOut,
           error: res.error,
-          maxChars: maxVerifyChars
+          maxChars: maxVerifyChars,
+          maxBytes: Math.max(0, verifyBytes),
+          passingTest: res.exitCode === 0 && isRecognizedTestCheck(verifySpec.command, verifyCwd)
         });
-        parts.push(
-          `
-Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
-${formatted}`
-        );
+        parts.push(verifyHeader + formatted);
       }
     }
   }
@@ -3860,14 +3867,17 @@ async function runChecks(input, options = {}) {
         naturalLen: headerPrefix.length + rawBody.length
       };
     }
-    const maxProbe = passed ? 300 : usableChars;
+    const passingTest = passed && isRecognizedTestCheck(spec.command, spec.cwd);
+    const maxProbe = passed && !passingTest ? 300 : usableChars;
     const rawCompact = formatCompactCommandOutput({
       stdout: result.stdout,
       stderr: result.stderr,
       exitCode: result.exitCode,
       timedOut: result.timedOut,
       error: result.error,
-      maxChars: maxProbe
+      maxChars: maxProbe,
+      maxBytes,
+      passingTest
     });
     const headerPrefix = passed
       ? `- [PASS ${result.durationMs}ms] ${spec.name} (\`${spec.command}\`): `
@@ -3878,17 +3888,34 @@ async function runChecks(input, options = {}) {
       badge,
       headerPrefix,
       rawBody: rawCompact,
+      passingTest,
       naturalLen: headerPrefix.length + rawCompact.length
     };
   });
+  const hasPassingTests = preFormatted.some((pre) => pre.passingTest);
+  const separators = 2 * outcomes.length;
   const itemBudgets = computeWaterFillBudgets(
     preFormatted.map((p) => p.naturalLen),
-    usableChars,
+    hasPassingTests ? maxChars - summaryHeader.length - separators : usableChars,
     160
   );
+  const itemByteBudgets = hasPassingTests ? computeWaterFillBudgets(
+    preFormatted.map((pre) => Buffer.byteLength(pre.fixedBlock ?? pre.headerPrefix + pre.rawBody)),
+    maxBytes - Buffer.byteLength(summaryHeader) - separators
+  ) : [];
   const blocks = outcomes.map(({ result }, idx) => {
     const pre = preFormatted[idx];
     if (pre.skippedForBudget) return pre.fixedBlock;
+    if (pre.passingTest) {
+      const charLimit = Math.max(0, itemBudgets[idx] - pre.headerPrefix.length);
+      const byteLimit = Math.max(0, itemByteBudgets[idx] - Buffer.byteLength(pre.headerPrefix));
+      if (pre.rawBody.length <= charLimit && Buffer.byteLength(pre.rawBody) <= byteLimit) {
+        return pre.headerPrefix + pre.rawBody;
+      }
+      return pre.headerPrefix + formatCompactCommandOutput({
+        ...result, passingTest: true, maxChars: charLimit, maxBytes: byteLimit
+      });
+    }
     const bodyAvail = Math.max(160, itemBudgets[idx] - pre.headerPrefix.length);
     if (outputMode === "full") {
       const body2 = pre.rawBody.length <= bodyAvail ? pre.rawBody : truncateWithNotice(pre.rawBody, bodyAvail);
@@ -4094,7 +4121,7 @@ function createAgyFastServer() {
           outputMode: {
             type: "string",
             enum: ["compact", "full"],
-            description: "compact hides pass logs (default)"
+            description: "compact retains test diagnostics and shortens noisy check logs (default)"
           },
           maxChars: { type: "integer", minimum: 500, maximum: 8800 }
         },

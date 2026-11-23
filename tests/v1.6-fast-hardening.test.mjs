@@ -846,6 +846,70 @@ test("v1.6-4: 170s shared monotonic call budget, stringified arguments/edits sel
   }
 });
 
+test("successful compact test checks retain diagnostics within their batch budget", async () => {
+  const cwd = makeTmpDir();
+  const nestedTestContext = process.env.NODE_TEST_CONTEXT;
+  delete process.env.NODE_TEST_CONTEXT;
+  try {
+    const note = "The regional warehouse handles this shipment.";
+    const small = "node --test --test-reporter=tap small.test.cjs";
+    const large = "node --test --test-reporter=tap large.test.cjs";
+    fs.writeFileSync(path.join(cwd, "small.test.cjs"), [
+      'console.log("x".repeat(360));',
+      `console.log(${JSON.stringify(note)});`
+    ].join("\n"));
+    fs.writeFileSync(path.join(cwd, "large.test.cjs"), [
+      'for (let n = 1; n <= 600; n++) {',
+      '  console.log("Processing parcel " + n + " of 600");',
+      '  if (n === 317) console.log("承运仓库：青岛");',
+      '}'
+    ].join("\n"));
+    fs.writeFileSync(path.join(cwd, "other.cjs"), 'console.log("other-hidden\\nother-middle\\nother-last")');
+
+    const single = await runChecks({ cwd, commands: [small] });
+    assert.match(single.text, /Checks: 1\/1 passed/);
+    assert.ok(single.text.includes("x".repeat(360)));
+    assert.ok(single.text.includes(note));
+
+    const batch = await runChecks({ cwd, commands: [small, large, "node other.cjs"], maxChars: 2000 });
+    assert.match(batch.text, /Checks: 3\/3 passed/);
+    assert.ok(batch.text.includes(note));
+    assert.ok(batch.text.includes("承运仓库：青岛"));
+    assert.match(batch.text, /omitted|compacted/);
+    assert.match(batch.text, /other-last/);
+    assert.doesNotMatch(batch.text, /other-hidden/);
+    assert.ok(batch.text.length <= 2000);
+    assert.ok(Buffer.byteLength(batch.text) <= 8800);
+
+    const edit = await runApplyEdits({ cwd, edits: [{ path: "edited.txt", create: "ok" }], verify: small });
+    assert.match(edit.text, /Verify \[PASS/);
+    assert.ok(edit.text.includes(note));
+
+    const cities = ["青岛", "天津", "武汉", "沈阳", "广州", "厦门", "昆明", "成都", "太原", "长春"];
+    const records = cities.map(city => `${city}仓库今日只接收已登记的包裹，请先核对收货人。`);
+    fs.writeFileSync(path.join(cwd, "cities.test.cjs"), [
+      'const test = require("node:test");',
+      `for (const city of ${JSON.stringify(records)}) console.log(city);`,
+      'for (let i = 0; i < 15; i++) test("reporter noise " + i, () => {});'
+    ].join("\n"));
+    const cityCheck = "node --test --test-reporter=tap cities.test.cjs";
+    const cityBatch = await runChecks({ cwd, commands: [cityCheck, "node other.cjs"], maxChars: 640 });
+    const cityEdit = await runApplyEdits({
+      cwd, edits: [{ path: "cities.txt", create: "ok" }], verify: cityCheck, maxVerifyChars: 480
+    });
+    assert.match(cityBatch.text, /Checks: 2\/2 passed/);
+    assert.ok(cityBatch.text.length <= 640);
+    assert.match(cityEdit.text, /Verify \[PASS/);
+    for (const record of records) {
+      assert.ok(cityBatch.text.includes(record), `Missing from checks: ${record}`);
+      assert.ok(cityEdit.text.includes(record), `Missing from verification: ${record}`);
+    }
+  } finally {
+    if (nestedTestContext !== undefined) process.env.NODE_TEST_CONTEXT = nestedTestContext;
+    cleanTmpDir(cwd);
+  }
+});
+
 test("v1.6-5: Phase 3 installer --tool-loading persistence, rules/*.local.md preservation, GEMINI_HOME & T3 ACP multi-host sync, and OSS metadata", () => {
   const tmpDir = makeTmpDir("agy-v16-p3-");
   try {

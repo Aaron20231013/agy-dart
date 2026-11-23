@@ -275,11 +275,13 @@ test("filter-rules: new built-in rules (gh, kubectl, terraform, playwright) + au
   const pwPassRaw = [
     "Running 80 tests using 4 workers",
     ...Array.from({ length: 80 }, (_, i) => `  ✓  ${i + 1} [chromium] › auth.spec.ts:10:5 › case #${i} (120ms)`),
+    "INFO freightlane=ZEPHYR",
     "  80 passed (9.2s)"
   ].join("\n");
   const pwPassRes = applyFilterRule("playwright", pwPassRaw, "", 0);
   assert.equal(pwPassRes.wasFiltered, true);
   assert.ok(pwPassRes.filteredText.includes("80 passed"));
+  assert.ok(pwPassRes.filteredText.includes("INFO freightlane=ZEPHYR"));
   assert.ok(!pwPassRes.filteredText.includes("case #40"));
 
   // 5. applyFilterRule automatically runs SmartCrusher on large JSON/JSONL output instead of mid-JSON truncation
@@ -399,6 +401,37 @@ test("filter-rules: project .agy-dart/filters.json declarative rules (match/keep
   }
 });
 
+test("filter-rules: a passing test keeps all business diagnostics that fit", () => {
+  const diagnostics = [
+    "INFO freightlane=ZEPHYR",
+    "The regional warehouse handles this shipment.",
+    ...Array.from({ length: 32 }, (_, i) => `The manifest includes parcel ${i}.`)
+  ];
+  const raw = ["TAP version 13", ...diagnostics, "ok 1 - routing", "# pass 1"].join("\n");
+  const result = applyFilterRule("test-runner", raw, "", 0);
+  for (const line of diagnostics) {
+    assert.ok(result.filteredText.includes(line), `Missing diagnostic: ${line}`);
+  }
+  const nearLimit = raw.padEnd(7800, "x");
+  assert.equal(applyFilterRule("test-runner", nearLimit, "", 0).filteredText, nearLimit);
+});
+
+test("filter-rules: a passing test keeps uncommon middle diagnostics among repetitive progress", () => {
+  const progress = Array.from({ length: 600 }, (_, i) => `# Processing parcel ${i + 1} of 600`);
+  const diagnostics = ["# INFO freightlane=ZEPHYR", "# The regional warehouse handles this shipment."];
+  progress.splice(317, 0, ...diagnostics);
+  const raw = ["TAP version 13", ...progress, "ok 1 - routing", "# pass 1"].join("\n");
+  const maxBytes = 2000;
+  const result = applyFilterRule("test-runner", raw, "", 0, { maxBytes });
+  assert.ok(Buffer.byteLength(raw) > maxBytes);
+  assert.ok(Buffer.byteLength(result.filteredText) <= maxBytes);
+  for (const line of diagnostics) {
+    assert.ok(result.filteredText.includes(line), `Missing middle diagnostic: ${line}`);
+  }
+  assert.ok(result.filteredText.includes("# pass 1"));
+  assert.match(result.filteredText, /omitted|compacted|truncated|collapsed|hidden|filtered/i);
+});
+
 test("cli-filter.mjs live execution: cd <tmpSubdir> && node --test ... 2>&1 preserves exact pass/fail exit codes and project custom rules", () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-v12-clilive-"));
   const subDir = path.join(tmpDir, "pkg sub");
@@ -411,7 +444,11 @@ test("cli-filter.mjs live execution: cd <tmpSubdir> && node --test ... 2>&1 pres
 import assert from "node:assert/strict";
 for (let i = 0; i < 50; i++) {
   test("sub pass #" + i + " " + "y".repeat(160), () => {
-    if (i === 25) console.error("STDERR_MARKER_SUB_25");
+    if (i === 25) {
+      console.error("STDERR_MARKER_SUB_25");
+      console.log("INFO freightlane=ZEPHYR");
+      console.log("The regional warehouse handles this shipment.");
+    }
     assert.equal(2 + 2, 4);
   });
 }\n`
@@ -491,6 +528,8 @@ test("sub broken", () => {
     assert.equal(rPass.status, 0, `Expected exit 0, got ${rPass.status}: ${rPass.stderr}`);
     assert.ok(Buffer.byteLength(rPass.stdout, "utf8") <= 8000);
     assert.ok(rPass.stdout.includes("PASS (exit 0)"));
+    assert.ok(rPass.stdout.includes("INFO freightlane=ZEPHYR"), "Missing business diagnostic in CLI stdout");
+    assert.ok(rPass.stdout.includes("The regional warehouse handles this shipment."), "Missing prose in CLI stdout");
 
     // Raw merged stderr marker is searchable in FTS5
     const store = new ContextModeStore({ dbPath: tmpDb });
