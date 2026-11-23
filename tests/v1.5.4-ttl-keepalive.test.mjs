@@ -4284,8 +4284,10 @@ test("v1.5.4-ka-13: Global keepalive maxCount (0..20), per-window override vs fo
 
       let statCalls = 0;
       const sentZero = [];
+      const notificationsWhileOff = [];
       const monZero = new WatchdogMonitor({
         getStore: () => st,
+        notifyFn: (notification) => notificationsWhileOff.push(notification),
         getConfig: () => ({
           stallWatchdog: true,
           ttlKeepalive: true,
@@ -4306,6 +4308,7 @@ test("v1.5.4-ka-13: Global keepalive maxCount (0..20), per-window override vs fo
       monZero.tick();
       await flushMicrotasks();
       assert.equal(sentZero.length, 0, "Global maxCount=0 must suppress auto-keepalive on uncustomized windows");
+      assert.deepEqual(notificationsWhileOff, [], "Global maxCount=0 must silence TTL notifications");
       assert.equal(monZero.statSyncCount, 0, "IDLE WatchdogMonitor.tick() with global maxCount=0 must maintain statSyncCount === 0");
       assert.equal(statCalls, 0, "IDLE WatchdogMonitor.tick() with global maxCount=0 must perform 0 transcript statSync calls");
 
@@ -4340,7 +4343,8 @@ test("v1.5.4-ka-13: Global keepalive maxCount (0..20), per-window override vs fo
 
     // 2. HTTP `/api/watchdog/action` boundary validation (`0..20` valid; out-of-range/non-int -> 400) + auto-enable + resetTtlKeepaliveOverride
     const token = "csrf-global-ka-test-token-012345";
-    srv = createStandaloneServer({ csrfToken: token });
+    // The panel toggles live notification settings while simulated leases are still in the test DB.
+    srv = createStandaloneServer({ csrfToken: token, watchdogOptions: { notifyFn: () => ({ dispatched: true }) } });
     await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
     const port = srv.address().port;
     const headers = {
