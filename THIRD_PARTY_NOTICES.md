@@ -10,6 +10,7 @@
 
 - **Repository**: https://github.com/INK-Q/agy-fast
 - **License**: MIT License
+- Windows shell routing and console decoding, extended batch searches, and the HTML/Vue/Svelte tag-stack outliner were adapted from [upstream commit 841c396](https://github.com/INK-Q/agy-fast/commit/841c3962c75f284efae2108746f26d82387d1ff5).
 - **What is reused / adapted**:
   - Zero-dependency bundled ESM artifacts (`fast/mcp-server.mjs`, `fast/session-start.mjs`, `fast/benchmark.mjs`) implementing the 4 batched latency-acceleration tools (`batch_search`, `apply_edits`, `read_slices`, `run_checks`), workspace `SessionStart` snapshot generator, and offline transcript benchmark CLI (extended in `agy-dart` with KV-cache attribution metrics and `cache` subcommand).
   - Tool-routing latency hygiene principles (inline schemas, `<= 8.8 KB` UTF-8 MCP inline budget, parallel ranged `read_file` after outlining, multimodal high-context TTFT isolation).

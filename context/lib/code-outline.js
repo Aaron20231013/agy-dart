@@ -1,6 +1,6 @@
 import path from "node:path";
 import { redactSecrets } from "./security.js";
-export const OUTLINE_SCHEMA_VERSION = 2;
+export const OUTLINE_SCHEMA_VERSION = 3;
 function isRegexStartContext(line, slashIdx) {
   let j = slashIdx - 1;
   while (j >= 0 && /\s/.test(line[j])) j--;
@@ -1191,184 +1191,754 @@ function extractCssSymbols(lines, compactOnly = false) {
   }
   return symbols;
 }
-function dedentBlockLines(blockLines) {
-  let baseIndent = 0;
-  for (const ln of blockLines) {
-    if (!ln || !ln.trim()) continue;
-    const expanded = ln.replace(/\t/g, "  ");
-    baseIndent = expanded.length - expanded.trimStart().length;
-    break;
+var HTML_VOID_ELEMENTS = /* @__PURE__ */ new Set([
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "param",
+  "source",
+  "track",
+  "wbr"
+]);
+var HTML_RAW_SKIP_TAGS = /* @__PURE__ */ new Set([
+  "textarea",
+  "title",
+  "xmp",
+  "noembed",
+  "noframes"
+]);
+var HTML_SEMANTIC_TAGS = /* @__PURE__ */ new Set([
+  "head",
+  "body",
+  "header",
+  "nav",
+  "main",
+  "aside",
+  "section",
+  "article",
+  "footer",
+  "form",
+  "dialog",
+  "template"
+]);
+var HTML_CONTAINER_TAGS = /* @__PURE__ */ new Set([
+  "div",
+  "ul",
+  "ol",
+  "table",
+  "fieldset",
+  "details"
+]);
+var COMPONENT_LANDMARK_RE = /^(?:[A-Z][A-Za-z0-9]*\.)?(?:[A-Z][A-Za-z0-9]*)?(?:Modal|Drawer|Dialog|Panel|Tabs?|View|Page|Form)$/;
+var MAX_HTML_DEPTH = 2;
+var MAX_TAG_HEADER_SCAN = 8192;
+function leadingWhitespaceCols(line, tabWidth = 4) {
+  let cols = 0;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === " ") cols += 1;
+    else if (ch === "	") cols += tabWidth;
+    else break;
   }
-  if (baseIndent <= 0) return blockLines;
-  return blockLines.map((ln) => {
-    if (!ln || !ln.trim()) return "";
-    const expanded = ln.replace(/\t/g, "  ");
-    const lead = expanded.length - expanded.trimStart().length;
-    return expanded.slice(Math.min(lead, baseIndent));
+  return cols;
+}
+function stripLeadingCols(line, colsToStrip, tabWidth = 4) {
+  if (colsToStrip <= 0) return line;
+  let cols = 0;
+  let idx = 0;
+  while (idx < line.length && cols < colsToStrip) {
+    const ch = line[idx];
+    if (ch === " ") {
+      cols += 1;
+      idx++;
+    } else if (ch === "	") {
+      cols += tabWidth;
+      idx++;
+    } else {
+      break;
+    }
+  }
+  if (cols > colsToStrip) {
+    return " ".repeat(cols - colsToStrip) + line.slice(idx);
+  }
+  return line.slice(idx);
+}
+function dedentBlockLines(lines, skipFirstLineForIndent = false) {
+  const startIdx = skipFirstLineForIndent ? 1 : 0;
+  let firstNonEmptyIndent = -1;
+  let minPosCols = Infinity;
+  for (let i = startIdx; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    const cols = leadingWhitespaceCols(line);
+    if (firstNonEmptyIndent === -1) firstNonEmptyIndent = cols;
+    if (cols > 0 && cols < minPosCols) minPosCols = cols;
+  }
+  if (firstNonEmptyIndent <= 0 || !Number.isFinite(minPosCols) || minPosCols <= 0) {
+    return lines;
+  }
+  return lines.map((line, idx) => {
+    if (idx < startIdx || !line.trim()) return line;
+    return stripLeadingCols(line, minPosCols);
   });
 }
-function extractHtmlCommentLandmark(text) {
-  if (text.length < 10 || text.length > 200) return null;
-  if (!text.startsWith("<!--") || !text.endsWith("-->")) return null;
-  const inner = text.slice(4, -3);
-  if (inner.includes("<!--") || inner.includes("-->") || inner.includes(">")) return null;
-  const cleaned = inner.replace(/^[\s=\-*#]+/, "").replace(/[\s=\-*#]+$/, "");
-  if (cleaned.length < 3 || cleaned.length > 61) return null;
-  if (cleaned.startsWith("-")) return null;
+function findMatchingBrace2(text, start, maxLookahead = 2e3) {
+  const limit = Math.min(text.length, start + maxLookahead);
+  let depth = 0;
+  let quote = null;
+  let escape = false;
+  for (let i = start; i < limit; i++) {
+    const ch = text[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (quote) {
+      if (ch === "\\") {
+        escape = true;
+      } else if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+    } else if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+function findClosingMustache(text, start, maxLookahead = 2e3) {
+  const limit = Math.min(text.length, start + maxLookahead);
+  let quote = null;
+  let escape = false;
+  for (let i = start + 2; i + 1 < limit; i++) {
+    const ch = text[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (quote) {
+      if (ch === "\\") {
+        escape = true;
+      } else if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+    } else if (ch === "}" && text[i + 1] === "}") {
+      return i;
+    }
+  }
+  return -1;
+}
+function parseHtmlAttrs(attrText) {
+  const attrs = /* @__PURE__ */ new Map();
+  let vueSlot;
+  let i = 0;
+  const len = attrText.length;
+  while (i < len) {
+    while (i < len && /[\s/]/.test(attrText[i])) i++;
+    if (i >= len) break;
+    const nameStart = i;
+    while (i < len && !/[\s=/>"'`]/.test(attrText[i])) i++;
+    const rawName = attrText.slice(nameStart, i);
+    if (!rawName) {
+      i++;
+      continue;
+    }
+    const lowerName = rawName.toLowerCase();
+    if (!vueSlot && rawName.startsWith("#") && rawName.length > 1) {
+      vueSlot = rawName.slice(1);
+    } else if (!vueSlot && lowerName.startsWith("v-slot:") && rawName.length > 7) {
+      vueSlot = rawName.slice(7);
+    }
+    while (i < len && /\s/.test(attrText[i])) i++;
+    let value = "";
+    if (i < len && attrText[i] === "=") {
+      i++;
+      while (i < len && /\s/.test(attrText[i])) i++;
+      if (i < len) {
+        const ch = attrText[i];
+        if (ch === '"' || ch === "'") {
+          const quote = ch;
+          i++;
+          const valStart = i;
+          while (i < len && attrText[i] !== quote) i++;
+          value = attrText.slice(valStart, i);
+          if (i < len) i++;
+        } else if (ch === "{") {
+          const endBrace = findMatchingBrace2(attrText, i);
+          if (endBrace >= 0) {
+            value = attrText.slice(i, endBrace + 1);
+            i = endBrace + 1;
+          } else {
+            const valStart = i;
+            while (i < len && !/[\s/>]/.test(attrText[i])) i++;
+            value = attrText.slice(valStart, i);
+          }
+        } else {
+          const valStart = i;
+          while (i < len && !/[\s/>]/.test(attrText[i])) i++;
+          value = attrText.slice(valStart, i);
+        }
+      }
+    }
+    if (!attrs.has(lowerName)) {
+      attrs.set(lowerName, value);
+    }
+  }
+  return { attrs, vueSlot };
+}
+function normalizeInlineAttr(value, maxChars) {
+  if (!value) return "";
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.slice(0, maxChars).replace(/[\uD800-\uDBFF]$/, "");
+}
+function formatHtmlTagLabel(displayTag, lowerTag, rawAttrs, parsed) {
+  if (lowerTag === "script" || lowerTag === "style") {
+    const compact = normalizeInlineAttr(rawAttrs, 40);
+    return compact ? `<${lowerTag} ${compact}>` : `<${lowerTag}>`;
+  }
+  const idVal = normalizeInlineAttr(parsed.attrs.get("id"), 36);
+  if (idVal) {
+    return `<${displayTag} #${idVal}>`;
+  }
+  const testIdVal = normalizeInlineAttr(parsed.attrs.get("data-testid"), 36);
+  if (testIdVal) {
+    return `<${displayTag} data-testid="${testIdVal}">`;
+  }
+  const roleVal = normalizeInlineAttr(parsed.attrs.get("role"), 36);
+  if (roleVal) {
+    return `<${displayTag} role="${roleVal}">`;
+  }
+  const slotVal = normalizeInlineAttr(parsed.vueSlot, 36);
+  if (lowerTag === "template" && slotVal) {
+    return `<template #${slotVal}>`;
+  }
+  return `<${displayTag}>`;
+}
+function isJsScriptType(typeAttr) {
+  if (typeAttr === void 0) return true;
+  const mime = typeAttr.trim().toLowerCase().split(";")[0]?.trim() ?? "";
+  return !mime || mime === "module" || mime === "text/javascript" || mime === "application/javascript" || mime === "text/ecmascript" || mime === "application/ecmascript" || mime === "text/typescript" || mime === "ts" || mime === "tsx" || mime === "jsx";
+}
+function isCommentDecorChar(ch) {
+  return ch === "=" || ch === "-" || ch === "*" || ch === "#" || ch === "~" || ch === ":" || ch === " " || ch === "	" || ch === "\r" || ch === "\n";
+}
+function extractCommentLandmark(inner) {
+  let start = 0;
+  let end = inner.length;
+  while (start < end && isCommentDecorChar(inner[start])) start++;
+  while (end > start && isCommentDecorChar(inner[end - 1])) end--;
+  const cleaned = inner.slice(start, end);
+  if (cleaned.length < 2 || cleaned.length > 60) return null;
+  if (/[<>]/.test(cleaned)) return null;
+  if (/^(?:eslint|prettier|istanbul|c8|v8|@ts-)/i.test(cleaned)) return null;
+  if (!/[A-Za-z0-9\u4e00-\u9fff]/.test(cleaned)) return null;
   return cleaned;
 }
-function extractSfcSymbols(lines, isHtmlDoc = false) {
+function extractTemplateSymbols(rawLines, mode = "html") {
+  if (rawLines.length === 0) return [];
+  const lines = rawLines[0].startsWith("\uFEFF") ? [rawLines[0].slice(1), ...rawLines.slice(1)] : rawLines;
+  const text = lines.join("\n");
+  const lineStarts = new Array(lines.length);
+  let acc = 0;
+  for (let idx = 0; idx < lines.length; idx++) {
+    lineStarts[idx] = acc;
+    acc += lines[idx].length + 1;
+  }
+  const offsetToLineIdx = (pos) => {
+    let lo = 0;
+    let hi = lineStarts.length - 1;
+    while (lo < hi) {
+      const mid = lo + hi + 1 >> 1;
+      if (lineStarts[mid] <= pos) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  };
   const symbols = [];
-  const blockOpenRe = /^<(script|template|style)\b([^>]*)>/i;
-  const semanticTagRe = /^<(header|nav|main|aside|section|footer|dialog|form|[A-Z][A-Za-z0-9]*(?:Modal|Drawer|Dialog|Panel))\b([^>]*)>/;
-  let htmlLandmarks = 0;
+  const stack = [];
+  const stackTagCounts = /* @__PURE__ */ new Map();
+  const pushFrame = (frame) => {
+    stack.push(frame);
+    stackTagCounts.set(frame.lowerTag, (stackTagCounts.get(frame.lowerTag) ?? 0) + 1);
+  };
+  const popFrame = () => {
+    const frame = stack.pop();
+    const prev = stackTagCounts.get(frame.lowerTag) ?? 0;
+    if (prev <= 1) stackTagCounts.delete(frame.lowerTag);
+    else stackTagCounts.set(frame.lowerTag, prev - 1);
+    return frame;
+  };
+  let emittedCount = 0;
+  let noCloseSingle = false;
+  let noCloseDouble = false;
+  let noCloseScript = false;
+  let noCloseStyle = false;
+  let noCloseBodyBrace = false;
+  let noCloseMustache = false;
+  const noCloseRawSkip = /* @__PURE__ */ new Set();
+  let nextRightBrace = text.indexOf("}");
+  let nextCloseMustache = mode === "vue" ? text.indexOf("}}") : -1;
   let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    const expanded = line.replace(/\t/g, "  ");
-    const indent = expanded.length - expanded.trimStart().length;
-    const trimmed = line.trim();
-    const m = indent <= 8 ? blockOpenRe.exec(trimmed) : null;
-    if (!m || !m[1]) {
-      if (isHtmlDoc && indent <= 10 && htmlLandmarks < 16 && trimmed) {
-        if (/^<body\b/i.test(trimmed)) {
-          symbols.push({
-            kind: "body",
-            name: "<body>",
-            startLine: i + 1,
-            endLine: i + 1,
-            depth: 0
-          });
-          htmlLandmarks++;
-        } else {
-          const landmarkName = extractHtmlCommentLandmark(trimmed);
-          if (landmarkName) {
+  const len = text.length;
+  while (i < len) {
+    const lt = text.indexOf("<", i);
+    if (lt < 0) break;
+    if (mode === "svelte" && !noCloseBodyBrace) {
+      const bracePos = text.indexOf("{", i);
+      if (bracePos >= 0 && bracePos < lt) {
+        if (nextRightBrace !== -1 && nextRightBrace < bracePos) {
+          nextRightBrace = text.indexOf("}", bracePos);
+        }
+        if (nextRightBrace === -1) {
+          noCloseBodyBrace = true;
+        } else if (nextRightBrace < bracePos + 2e3) {
+          const endBrace = findMatchingBrace2(text, bracePos);
+          if (endBrace >= 0) {
+            i = endBrace + 1;
+            continue;
+          }
+          i = bracePos + 1;
+          continue;
+        } else if (nextRightBrace < lt) {
+          i = nextRightBrace + 1;
+          continue;
+        }
+      }
+    } else if (mode === "vue" && !noCloseMustache) {
+      const mustachePos = text.indexOf("{{", i);
+      if (mustachePos >= 0 && mustachePos < lt) {
+        if (nextCloseMustache !== -1 && nextCloseMustache < mustachePos + 2) {
+          nextCloseMustache = text.indexOf("}}", mustachePos + 2);
+        }
+        if (nextCloseMustache === -1) {
+          noCloseMustache = true;
+        } else if (nextCloseMustache < mustachePos + 2e3) {
+          const endMustache = findClosingMustache(text, mustachePos);
+          if (endMustache >= 0) {
+            i = endMustache + 2;
+            continue;
+          }
+          i = mustachePos + 2;
+          continue;
+        } else if (nextCloseMustache < lt) {
+          i = nextCloseMustache + 2;
+          continue;
+        }
+      }
+    }
+    i = lt;
+    if (text.startsWith("<!--", i)) {
+      if (text.startsWith("<!-->", i)) {
+        i += 5;
+        continue;
+      }
+      if (text.startsWith("<!--->", i)) {
+        i += 6;
+        continue;
+      }
+      const startLineIdx2 = offsetToLineIdx(i);
+      const stdClose = text.indexOf("-->", i + 4);
+      const bangClose = text.indexOf("--!>", i + 4);
+      let closePos = -1;
+      let closeLen = 3;
+      if (stdClose >= 0 && (bangClose < 0 || stdClose <= bangClose)) {
+        closePos = stdClose;
+        closeLen = 3;
+      } else if (bangClose >= 0) {
+        closePos = bangClose;
+        closeLen = 4;
+      }
+      if (closePos < 0) {
+        break;
+      }
+      const endLineIdx = offsetToLineIdx(closePos + closeLen - 1);
+      if (startLineIdx2 === endLineIdx && closeLen === 3) {
+        const lineTrim = lines[startLineIdx2].trim();
+        if (lineTrim.startsWith("<!--") && lineTrim.endsWith("-->") && lineTrim.indexOf("-->", 4) === lineTrim.length - 3) {
+          const landmark = extractCommentLandmark(text.slice(i + 4, closePos));
+          if (landmark) {
+            const ln = startLineIdx2 + 1;
             symbols.push({
               kind: "section",
-              name: landmarkName,
-              startLine: i + 1,
-              endLine: i + 1,
-              depth: 1
+              name: landmark,
+              startLine: ln,
+              endLine: ln,
+              depth: Math.min(MAX_HTML_DEPTH, emittedCount)
             });
-            htmlLandmarks++;
-          } else {
-            const sm = semanticTagRe.exec(trimmed);
-            if (sm && sm[1]) {
-              const attrStr = sm[2] ?? "";
-              const idMatch = /(?:data-testid|id|class)=["']([^"']+)["']/.exec(attrStr);
-              const tagDesc = idMatch && idMatch[1] ? `<${sm[1]} ${idMatch[1].slice(0, 36)}>` : `<${sm[1]}>`;
-              symbols.push({
-                kind: "block",
-                name: tagDesc,
-                startLine: i + 1,
-                endLine: i + 1,
-                depth: 1
-              });
-              htmlLandmarks++;
+          }
+        }
+      }
+      i = closePos + closeLen;
+      continue;
+    }
+    if (text.startsWith("<![CDATA[", i)) {
+      const closePos = text.indexOf("]]>", i + 9);
+      i = closePos < 0 ? len : closePos + 3;
+      continue;
+    }
+    const nextCh = text[i + 1];
+    if (nextCh === "?") {
+      const closePi = text.indexOf("?>", i + 2);
+      if (closePi >= 0) {
+        i = closePi + 2;
+      } else {
+        const closeGt = text.indexOf(">", i + 2);
+        i = closeGt >= 0 ? closeGt + 1 : len;
+      }
+      continue;
+    }
+    if (nextCh === "!") {
+      let quote2 = null;
+      let j2 = i + 2;
+      while (j2 < len) {
+        const c = text[j2];
+        if (quote2) {
+          if (c === quote2 || c === "\n") quote2 = null;
+        } else if (c === '"' || c === "'") {
+          quote2 = c;
+        } else if (c === ">") {
+          j2++;
+          break;
+        }
+        j2++;
+      }
+      i = j2;
+      continue;
+    }
+    if (nextCh === "/") {
+      const nameStart = i + 2;
+      if (nameStart >= len || !/[A-Za-z]/.test(text[nameStart])) {
+        i += 2;
+        continue;
+      }
+      let j2 = nameStart + 1;
+      while (j2 < len && /[A-Za-z0-9:._-]/.test(text[j2])) j2++;
+      const closeLowerTag = text.slice(nameStart, j2).toLowerCase();
+      while (j2 < len && text[j2] !== ">") j2++;
+      if (j2 < len && text[j2] === ">") j2++;
+      const closeLine = offsetToLineIdx(Math.max(i, j2 - 1)) + 1;
+      if ((stackTagCounts.get(closeLowerTag) ?? 0) > 0) {
+        let matchIdx = -1;
+        for (let s = stack.length - 1; s >= 0; s--) {
+          if (stack[s].lowerTag === closeLowerTag) {
+            matchIdx = s;
+            break;
+          }
+        }
+        if (matchIdx >= 0) {
+          for (let s = stack.length - 1; s > matchIdx; s--) {
+            const unclosed = popFrame();
+            if (unclosed.emitted) {
+              emittedCount = Math.max(0, emittedCount - 1);
+              if (unclosed.symbol) {
+                unclosed.symbol.endLine = Math.max(
+                  unclosed.symbol.endLine,
+                  closeLine > unclosed.startLine ? closeLine - 1 : unclosed.startLine
+                );
+              }
+            }
+          }
+          const matched = popFrame();
+          if (matched.emitted) {
+            emittedCount = Math.max(0, emittedCount - 1);
+            if (matched.symbol) {
+              matched.symbol.endLine = Math.max(matched.symbol.endLine, closeLine);
             }
           }
         }
       }
+      i = j2;
+      continue;
+    }
+    if (!nextCh || !/[A-Za-z]/.test(nextCh)) {
       i++;
       continue;
     }
-    const tag = m[1].toLowerCase();
-    const attrs = (m[2] ?? "").trim();
-    const startIdx = i;
-    let endIdx = i;
-    if (tag === "template") {
-      let depth = 0;
-      const openTemplateRe = /<template\b[^>]*>/gi;
-      const closeTemplateRe = /<\/template\s*>/gi;
-      for (let j = i; j < lines.length; j++) {
-        const ln = lines[j];
-        const opens = ln.match(openTemplateRe)?.length ?? 0;
-        const closes = ln.match(closeTemplateRe)?.length ?? 0;
-        depth += opens - closes;
-        if (depth <= 0) {
-          endIdx = j;
+    const tagStart = i;
+    let nameEnd = i + 1;
+    while (nameEnd < len && /[A-Za-z0-9:._-]/.test(text[nameEnd])) nameEnd++;
+    const afterNameCh = text[nameEnd];
+    if (afterNameCh !== void 0 && !/[\s/>]/.test(afterNameCh)) {
+      i = nameEnd;
+      continue;
+    }
+    const rawTag = text.slice(i + 1, nameEnd);
+    const lowerTag = rawTag.toLowerCase();
+    const headerLimit = Math.min(len, nameEnd + MAX_TAG_HEADER_SCAN);
+    let j = nameEnd;
+    let quote = null;
+    let braceDepth = 0;
+    let braceQuote = null;
+    let braceEscape = false;
+    let lastUnquotedNonWs = "";
+    let foundGt = false;
+    while (j < headerLimit) {
+      const c = text[j];
+      if (braceDepth > 0) {
+        if (braceEscape) {
+          braceEscape = false;
+        } else if (braceQuote) {
+          if (c === "\\") braceEscape = true;
+          else if (c === braceQuote) braceQuote = null;
+        } else if (c === '"' || c === "'" || c === "`") {
+          braceQuote = c;
+        } else if (c === "{") {
+          braceDepth++;
+        } else if (c === "}") {
+          braceDepth--;
+          if (braceDepth === 0) lastUnquotedNonWs = "}";
+        }
+        j++;
+        continue;
+      }
+      if (quote) {
+        if (c === quote) quote = null;
+        j++;
+        continue;
+      }
+      if ((c === '"' || c === "'") && lastUnquotedNonWs === "=") {
+        if (c === '"' && !noCloseDouble || c === "'" && !noCloseSingle) {
+          quote = c;
+        }
+        lastUnquotedNonWs = c;
+        j++;
+        continue;
+      }
+      if (c === "{") {
+        if (nextRightBrace !== -1 && nextRightBrace < j) {
+          nextRightBrace = text.indexOf("}", j);
+        }
+        if (nextRightBrace === -1 || nextRightBrace >= headerLimit) {
+          foundGt = false;
           break;
         }
-        endIdx = j;
+        braceDepth = 1;
+        braceQuote = null;
+        braceEscape = false;
+        j++;
+        continue;
       }
-    } else {
-      const closeRe = new RegExp(`</${tag}\\s*>`, "i");
-      for (let j = i; j < lines.length; j++) {
-        endIdx = j;
-        if (j > i && closeRe.test(lines[j])) break;
-        if (j === i && closeRe.test(trimmed.slice(m[0].length))) break;
+      if (c === "<") {
+        foundGt = false;
+        break;
+      }
+      if (c === "&" && text[j + 1] === "&" || c === "|" && text[j + 1] === "|" || c === "=" && text[j + 1] === ">") {
+        foundGt = false;
+        break;
+      }
+      if (c === ">") {
+        foundGt = true;
+        break;
+      }
+      if (!/\s/.test(c)) {
+        lastUnquotedNonWs = c;
+      }
+      j++;
+    }
+    if (!foundGt) {
+      if (j === len) {
+        if (quote === '"') noCloseDouble = true;
+        else if (quote === "'") noCloseSingle = true;
+      }
+      i = tagStart + 1;
+      continue;
+    }
+    const gtPos = j;
+    const selfClosing = lastUnquotedNonWs === "/";
+    const rawAttrSlice = text.slice(
+      nameEnd,
+      selfClosing ? text.lastIndexOf("/", gtPos) : gtPos
+    );
+    const startLineIdx = offsetToLineIdx(tagStart);
+    const openEndLineIdx = offsetToLineIdx(gtPos);
+    const startLine = startLineIdx + 1;
+    const openEndLine = openEndLineIdx + 1;
+    if (HTML_RAW_SKIP_TAGS.has(lowerTag)) {
+      if (selfClosing || noCloseRawSkip.has(lowerTag)) {
+        i = gtPos + 1;
+        continue;
+      }
+      const closeRe = new RegExp(`</${lowerTag}\\s*>`, "gi");
+      closeRe.lastIndex = gtPos + 1;
+      const closeMatch = closeRe.exec(text);
+      if (closeMatch) {
+        i = closeMatch.index + closeMatch[0].length;
+      } else {
+        noCloseRawSkip.add(lowerTag);
+        i = gtPos + 1;
+      }
+      continue;
+    }
+    if (lowerTag === "script" || lowerTag === "style") {
+      const parsed = parseHtmlAttrs(rawAttrSlice);
+      const tagDepth = Math.min(MAX_HTML_DEPTH, emittedCount);
+      const label = formatHtmlTagLabel(lowerTag, lowerTag, rawAttrSlice, parsed);
+      if (selfClosing) {
+        symbols.push({
+          kind: lowerTag,
+          name: label,
+          startLine,
+          endLine: openEndLine,
+          depth: tagDepth
+        });
+        i = gtPos + 1;
+        continue;
+      }
+      const noCloseLatch = lowerTag === "script" ? noCloseScript : noCloseStyle;
+      let closeMatch = null;
+      if (!noCloseLatch) {
+        const closeRe = new RegExp(`</${lowerTag}\\s*>`, "gi");
+        closeRe.lastIndex = gtPos + 1;
+        closeMatch = closeRe.exec(text);
+        if (!closeMatch) {
+          if (lowerTag === "script") noCloseScript = true;
+          else noCloseStyle = true;
+        }
+      }
+      let closeStart;
+      let endLine;
+      let nextPos;
+      if (closeMatch) {
+        closeStart = closeMatch.index;
+        const closeEndPos = closeMatch.index + closeMatch[0].length;
+        endLine = Math.max(startLine, offsetToLineIdx(closeEndPos - 1) + 1);
+        nextPos = closeEndPos;
+      } else if (lowerTag === "script" && parsed.attrs.has("src")) {
+        closeStart = gtPos + 1;
+        endLine = openEndLine;
+        nextPos = gtPos + 1;
+      } else {
+        closeStart = len;
+        endLine = Math.max(startLine, lines.length);
+        nextPos = len;
+      }
+      symbols.push({
+        kind: lowerTag,
+        name: label,
+        startLine,
+        endLine,
+        depth: tagDepth
+      });
+      const shouldRecurse = closeStart > gtPos + 1 && (lowerTag === "style" || !parsed.attrs.has("src") && isJsScriptType(parsed.attrs.get("type")));
+      if (shouldRecurse) {
+        const closeLineIdx = offsetToLineIdx(
+          closeStart < len ? closeStart : Math.max(0, len - 1)
+        );
+        const innerLines = [];
+        let innerBaseLineIdx;
+        let hasFirstRest = false;
+        if (openEndLineIdx === closeLineIdx) {
+          innerBaseLineIdx = openEndLineIdx;
+          const singleInner = text.slice(gtPos + 1, closeStart);
+          if (singleInner.trim()) {
+            innerLines.push(singleInner);
+          }
+        } else {
+          const openLineEnd = openEndLineIdx + 1 < lineStarts.length ? lineStarts[openEndLineIdx + 1] - 1 : len;
+          const firstRest = text.slice(gtPos + 1, openLineEnd);
+          if (firstRest.trim()) {
+            innerBaseLineIdx = openEndLineIdx;
+            innerLines.push(firstRest.trimStart());
+            hasFirstRest = true;
+          } else {
+            innerBaseLineIdx = openEndLineIdx + 1;
+          }
+          for (let li = openEndLineIdx + 1; li < closeLineIdx; li++) {
+            innerLines.push(lines[li]);
+          }
+          if (closeStart < len) {
+            const lastPrefix = text.slice(lineStarts[closeLineIdx], closeStart);
+            if (lastPrefix.trim()) {
+              innerLines.push(lastPrefix);
+            }
+          } else if (closeLineIdx >= openEndLineIdx + 1) {
+            innerLines.push(lines[closeLineIdx]);
+          }
+        }
+        if (innerLines.some((l) => l.trim().length > 0)) {
+          const dedented = dedentBlockLines(innerLines, hasFirstRest);
+          const innerSyms = lowerTag === "script" ? extractTsJsSymbols(dedented) : extractCssSymbols(dedented, true);
+          for (const s of innerSyms) {
+            const childStart = s.startLine + innerBaseLineIdx;
+            const childEnd = Math.max(childStart, s.endLine + innerBaseLineIdx);
+            symbols.push({
+              kind: s.kind,
+              name: s.name,
+              startLine: childStart,
+              endLine: childEnd,
+              depth: Math.min(MAX_HTML_DEPTH, tagDepth + 1 + s.depth)
+            });
+          }
+        }
+      }
+      i = nextPos;
+      continue;
+    }
+    const isVoid = HTML_VOID_ELEMENTS.has(lowerTag);
+    const isComponent = COMPONENT_LANDMARK_RE.test(rawTag);
+    const isSemantic = HTML_SEMANTIC_TAGS.has(lowerTag);
+    const isContainer = HTML_CONTAINER_TAGS.has(lowerTag);
+    let shouldEmit = false;
+    let emittedSymbol;
+    if (isComponent || isSemantic || isContainer) {
+      const parsed = parseHtmlAttrs(rawAttrSlice);
+      const hasIdentityAttr = Boolean(parsed.attrs.get("id")?.trim()) || Boolean(parsed.attrs.get("data-testid")?.trim()) || Boolean(parsed.attrs.get("role")?.trim());
+      const keepTemplate = lowerTag !== "template" || emittedCount === 0 || Boolean(parsed.vueSlot) || hasIdentityAttr;
+      if (keepTemplate && (isComponent || isSemantic || isContainer && hasIdentityAttr)) {
+        shouldEmit = true;
+        const displayTag = isComponent ? rawTag : lowerTag;
+        const kind = lowerTag === "body" ? "body" : lowerTag === "template" ? "template" : isComponent ? "component" : "block";
+        emittedSymbol = {
+          kind,
+          name: formatHtmlTagLabel(displayTag, lowerTag, rawAttrSlice, parsed),
+          startLine,
+          endLine: openEndLine,
+          depth: Math.min(MAX_HTML_DEPTH, emittedCount)
+        };
+        symbols.push(emittedSymbol);
       }
     }
-    const headerLabel = attrs ? `<${tag} ${attrs.slice(0, 40)}>` : `<${tag}>`;
-    symbols.push({
-      kind: tag,
-      name: headerLabel,
-      startLine: startIdx + 1,
-      endLine: endIdx + 1,
-      depth: 0
-    });
-    const innerStart = startIdx + 1;
-    const innerLines = lines.slice(innerStart, endIdx);
-    if (tag === "script" && innerLines.length > 0) {
-      const innerSyms = extractTsJsSymbols(dedentBlockLines(innerLines));
-      for (const s of innerSyms) {
-        symbols.push({
-          kind: s.kind,
-          name: s.name,
-          startLine: s.startLine + innerStart,
-          endLine: s.endLine + innerStart,
-          depth: s.depth + 1
-        });
-      }
-    } else if (tag === "template" && innerLines.length >= 30) {
-      let landmarks = 0;
-      for (let k = 0; k < innerLines.length && landmarks < 14; k++) {
-        const raw = innerLines[k];
-        const kIndent = raw.length - raw.trimStart().length;
-        if (kIndent > 8) continue;
-        const kTrimmed = raw.trim();
-        const landmarkName = extractHtmlCommentLandmark(kTrimmed);
-        if (landmarkName) {
-          symbols.push({
-            kind: "section",
-            name: landmarkName,
-            startLine: innerStart + k + 1,
-            endLine: innerStart + k + 1,
-            depth: 1
-          });
-          landmarks++;
-          continue;
-        }
-        const sm = semanticTagRe.exec(kTrimmed);
-        if (sm && sm[1]) {
-          const attrStr = sm[2] ?? "";
-          const idMatch = /(?:data-testid|id|class)=["']([^"']+)["']/.exec(attrStr);
-          const tagDesc = idMatch && idMatch[1] ? `<${sm[1]} ${idMatch[1].slice(0, 36)}>` : `<${sm[1]}>`;
-          symbols.push({
-            kind: "block",
-            name: tagDesc,
-            startLine: innerStart + k + 1,
-            endLine: innerStart + k + 1,
-            depth: 1
-          });
-          landmarks++;
-        }
-      }
-    } else if (tag === "style" && innerLines.length > 0) {
-      const cssSyms = extractCssSymbols(dedentBlockLines(innerLines), true).slice(0, 12);
-      for (const s of cssSyms) {
-        symbols.push({
-          kind: s.kind,
-          name: s.name,
-          startLine: s.startLine + innerStart,
-          endLine: s.endLine + innerStart,
-          depth: 1
-        });
-      }
+    if (!selfClosing && !isVoid) {
+      pushFrame({
+        lowerTag,
+        startLine,
+        emitted: shouldEmit,
+        symbol: emittedSymbol
+      });
+      if (shouldEmit) emittedCount++;
     }
-    i = endIdx + 1;
+    i = gtPos + 1;
   }
-  return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
+  const eofLine = lines.length;
+  while (stack.length > 0) {
+    const frame = popFrame();
+    if (frame.emitted && frame.symbol) {
+      frame.symbol.endLine = Math.max(frame.symbol.endLine, eofLine);
+    }
+  }
+  return symbols;
+}
+function extractSfcSymbols(lines, mode = "vue") {
+  const language = typeof mode === "boolean" ? (mode ? "html" : "vue") : mode;
+  const symbols = extractTemplateSymbols(lines, language);
+  return language !== "html" && symbols.length === 0 ? extractTsJsSymbols(lines) : symbols;
 }
 function parseGitDiffPath(line) {
   if (!line || line.length > 1024) return "";
@@ -1586,12 +2156,12 @@ function extractDeclarations(filePath, lines) {
       return extractTsJsSymbols(lines);
     case ".vue":
     case ".svelte":
-      return extractSfcSymbols(lines, false);
+      return extractSfcSymbols(lines, ext.slice(1));
     case ".html":
     case ".htm":
     case ".xhtml":
     case ".astro":
-      return extractSfcSymbols(lines, true);
+      return extractSfcSymbols(lines, "html");
     case ".css":
     case ".scss":
     case ".less":

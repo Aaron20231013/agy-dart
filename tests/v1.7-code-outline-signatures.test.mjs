@@ -6,7 +6,7 @@ import {spawnSync} from "node:child_process";
 import {fileURLToPath} from "node:url";
 import {ContextModeStore} from "../context/lib/store.js";
 import assert from "node:assert/strict";
-import {extractSymbolsFromLines,renderOutlineWithinBudget} from "../context/lib/code-outline.js";
+import {OUTLINE_SCHEMA_VERSION,extractSymbolsFromLines,renderOutlineWithinBudget} from "../context/lib/code-outline.js";
 test("v1.7 compact TS signatures and wrapped suites",t=>{
   const source=["function parse(","  x: string","): { ok: boolean }","{"," return {ok:true};","}"];
   const [s]=extractSymbolsFromLines("a.ts",source);
@@ -34,7 +34,7 @@ test("v1.7 compact TS signatures and wrapped suites",t=>{
   const response=JSON.parse(line);assert.equal(response.result.isError,false,response.result.content[0].text);
   for(const file of paths) assert.ok(response.result.content[0].text.includes(path.basename(file)));
   assert.doesNotMatch(line,/STALE/);
-  try {assert.match(store.getOutlineCache(paths[0],stat.mtimeMs,stat.size,2).symbols[0].signature,/parse\(/);} finally {store.close();}
+  try {assert.match(store.getOutlineCache(paths[0],stat.mtimeMs,stat.size,OUTLINE_SCHEMA_VERSION).symbols[0].signature,/parse\(/);} finally {store.close();}
   const wrapped=["(function(){","  function inner(a) {}","  describe.concurrent('中文',()=>{});","  it.each([1])('case',()=>{});","})();"];
   assert.deepEqual(extractSymbolsFromLines("a.js",wrapped).map(x=>x.name),["inner","中文","case"]);
   const symbols=Array.from({length:160},(_,i)=>({...s,name:"名称"+i,signature:"函数"+"字".repeat(24)}));

@@ -119,10 +119,10 @@ test("Opt 1: fast/mcp-server.mjs schema slimming cuts Turn-0 budget while preser
     const bs = byName.get("batch_search").inputSchema;
     assert.deepEqual(bs.required, ["queries"]);
     assert.deepEqual(Object.keys(bs.properties).sort(), ["cwd", "maxChars", "queries"]);
-    assert.deepEqual(bs.properties.queries.items.properties.type.enum, ["text", "regex", "glob", "git"]);
+    assert.deepEqual(bs.properties.queries.items.properties.type.enum, ["text", "regex", "glob", "fuzzy", "git"]);
     assert.deepEqual(
       Object.keys(bs.properties.queries.items.properties).sort(),
-      ["caseSensitive", "contextLines", "glob", "maxResults", "path", "pattern", "type"]
+      ["caseSensitive", "contextLines", "fileType", "glob", "maxResults", "multiline", "outputMode", "path", "pattern", "sortBy", "type"]
     );
     assert.equal(bs.properties.maxChars.maximum, 8800);
 

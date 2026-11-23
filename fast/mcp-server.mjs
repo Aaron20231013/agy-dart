@@ -603,8 +603,110 @@ import { promises as fs2 } from "node:fs";
 import path2 from "node:path";
 
 // src/utils/exec-utils.ts
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+var WINDOWS_CODEPAGE_LABELS = {
+  866: "ibm866",
+  874: "windows-874",
+  936: "gb18030",
+  54936: "gb18030",
+  950: "big5",
+  932: "shift_jis",
+  949: "euc-kr",
+  1250: "windows-1250",
+  1251: "windows-1251",
+  1252: "windows-1252",
+  1253: "windows-1253",
+  1254: "windows-1254",
+  1255: "windows-1255",
+  1256: "windows-1256",
+  1257: "windows-1257",
+  1258: "windows-1258",
+  65001: "utf-8"
+};
+var strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+var cachedWindowsFallbackEncoding;
+var fallbackDecoderCache = /* @__PURE__ */ new Map();
+function parseWindowsCodePage(output) {
+  const match = /\b(\d{3,5})\b/.exec(output);
+  if (!match) return null;
+  const cp = Number.parseInt(match[1], 10);
+  const mapped = WINDOWS_CODEPAGE_LABELS[cp];
+  return mapped && mapped !== "utf-8" ? mapped : null;
+}
+function stripTrailingIncompleteUtf8(buf) {
+  if (buf.length === 0) return buf;
+  let i = buf.length - 1;
+  const minIdx = Math.max(0, buf.length - 4);
+  while (i >= minIdx && (buf[i] & 192) === 128) {
+    i--;
+  }
+  if (i < minIdx) return buf;
+  const lead = buf[i];
+  if ((lead & 128) === 0) return buf;
+  let expectedLen = 0;
+  if ((lead & 224) === 192) expectedLen = 2;
+  else if ((lead & 240) === 224) expectedLen = 3;
+  else if ((lead & 248) === 240) expectedLen = 4;
+  else return buf;
+  return buf.length - i < expectedLen ? buf.subarray(0, i) : buf;
+}
+function getWindowsSystem32Binary(name) {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "";
+  if (systemRoot) {
+    return {
+      bin: path.join(systemRoot, "System32", name),
+      cwd: systemRoot
+    };
+  }
+  return { bin: name, cwd: process.cwd() };
+}
+function getWindowsFallbackEncoding() {
+  if (cachedWindowsFallbackEncoding !== void 0) {
+    return cachedWindowsFallbackEncoding;
+  }
+  try {
+    const { bin: chcpBin, cwd } = getWindowsSystem32Binary("chcp.com");
+    const res = spawnSync(chcpBin, [], {
+      cwd,
+      encoding: "latin1",
+      timeout: 1500,
+      windowsHide: true
+    });
+    if (!res.error && res.status === 0) {
+      const mapped = parseWindowsCodePage(res.stdout || "");
+      if (mapped) {
+        cachedWindowsFallbackEncoding = mapped;
+        return cachedWindowsFallbackEncoding;
+      }
+    }
+  } catch {
+  }
+  cachedWindowsFallbackEncoding = null;
+  return null;
+}
+function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
+  if (buf.length === 0) return "";
+  const candidate = truncated ? stripTrailingIncompleteUtf8(buf) : buf;
+  try {
+    return strictUtf8Decoder.decode(candidate);
+  } catch {
+    const label = fallbackEncoding ?? (process.platform === "win32" ? getWindowsFallbackEncoding() : null);
+    if (!label || label === "utf-8") {
+      return buf.toString("utf8");
+    }
+    try {
+      let decoder = fallbackDecoderCache.get(label);
+      if (!decoder) {
+        decoder = new TextDecoder(label);
+        fallbackDecoderCache.set(label, decoder);
+      }
+      return decoder.decode(buf);
+    } catch {
+      return buf.toString("utf8");
+    }
+  }
+}
 function killChildTree(pid, detached) {
   if (!pid) return;
   if (process.platform === "win32") {
@@ -650,7 +752,184 @@ function killChildTree(pid, detached) {
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
 }
-function runShellCommandAsync(command, options) {
+var WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE = /(?<![\\`])(?:\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE)\b)/i;
+var WINDOWS_PS_UNQUOTED_SYNTAX_RE = /(?<![\\`])\$(?:HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
+var WINDOWS_PS_CMDLET_RE = /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Z][A-Za-z0-9]*\b(?!-)/;
+var EXPLICIT_POWERSHELL_INVOCATION_RE = /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
+var PS_NON_INVOCATION_TAIL_RE = /^(?:[|;&+}=),*?]|(?:[1-6*])?>|-(?:c|i)?(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|replace|split|join|in|notin|contains|notcontains|is|isnot|as|and|or|xor|shl|shr|band|bor|bxor)\b|-f\b|$)/i;
+var PS_UTF8_PREFIX = "try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}; $OutputEncoding = [System.Text.UTF8Encoding]::new($false);";
+function stripQuotedSpans(command, stripDoubleQuotes) {
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    const next = command[i + 1];
+    if (quote === "'") {
+      if (ch === "'") {
+        if (next === "'") {
+          i++;
+        } else {
+          quote = null;
+          out += " ";
+        }
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if ((ch === "\\" || ch === "`") && next === '"') {
+        i++;
+        if (!stripDoubleQuotes) out += ch + next;
+        continue;
+      }
+      if (ch === '"') {
+        if (next === '"') {
+          i++;
+          if (!stripDoubleQuotes) out += '""';
+        } else {
+          quote = null;
+          out += stripDoubleQuotes ? " " : '"';
+        }
+        continue;
+      }
+      if (!stripDoubleQuotes) out += ch;
+      continue;
+    }
+    if (ch === "'") {
+      quote = "'";
+      out += " ";
+      continue;
+    }
+    if (ch === '"') {
+      quote = '"';
+      out += stripDoubleQuotes ? " " : '"';
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+function needsPowerShellOnWindows(command) {
+  if (!command || EXPLICIT_POWERSHELL_INVOCATION_RE.test(command)) {
+    return false;
+  }
+  const withoutSingle = stripQuotedSpans(command, false);
+  if (WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE.test(withoutSingle)) {
+    return true;
+  }
+  const unquoted = stripQuotedSpans(command, true);
+  return WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS_CMDLET_RE.test(unquoted);
+}
+function formatPowerShellCommand(command) {
+  const trimmed = command.trim();
+  if (!trimmed || trimmed[0] !== '"' && trimmed[0] !== "'") {
+    return command;
+  }
+  const quote = trimmed[0];
+  let idx = 1;
+  while (idx < trimmed.length) {
+    if (quote === '"' && trimmed[idx] === "`" && idx + 1 < trimmed.length) {
+      idx += 2;
+      continue;
+    }
+    if (trimmed[idx] === quote) {
+      if (trimmed[idx + 1] === quote) {
+        idx += 2;
+        continue;
+      }
+      const afterQuote = trimmed.slice(idx + 1);
+      if (!/^\s+/.test(afterQuote)) {
+        return command;
+      }
+      const rest = afterQuote.trimStart();
+      if (rest && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
+        return `& ${trimmed}`;
+      }
+      return command;
+    }
+    idx++;
+  }
+  return command;
+}
+function buildPowerShellUtf8Command(command) {
+  return `${PS_UTF8_PREFIX} ${formatPowerShellCommand(command)}`;
+}
+var cachedWindowsPowerShell;
+var cachedWindowsPowerShellExecPath = null;
+var pendingWindowsPowerShellProbe = null;
+async function defaultProbeWindowsShell(bin) {
+  const { bin: whereBin, cwd } = getWindowsSystem32Binary("where.exe");
+  const exeQuery = bin.toLowerCase().endsWith(".exe") ? bin : `${bin}.exe`;
+  const whereRes = await execBinaryAsync(whereBin, [exeQuery], {
+    cwd,
+    timeoutMs: 2e3,
+    maxOutputBytes: 4096
+  });
+  if (!whereRes.error && !whereRes.timedOut) {
+    if (whereRes.exitCode !== 0) return false;
+    const resolved = whereRes.stdout.split(/\r?\n/).map((line) => line.trim()).find((line) => /\.exe$/i.test(line));
+    if (!resolved) return false;
+    cachedWindowsPowerShellExecPath = resolved;
+    return true;
+  }
+  const res = await execBinaryAsync(
+    exeQuery,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+    {
+      cwd,
+      timeoutMs: 3e3,
+      maxOutputBytes: 4096
+    }
+  );
+  if (!res.error && !res.timedOut && res.exitCode === 0) {
+    cachedWindowsPowerShellExecPath = exeQuery;
+    return true;
+  }
+  return false;
+}
+async function resolveWindowsPowerShell(probe = defaultProbeWindowsShell) {
+  if (cachedWindowsPowerShell !== void 0) {
+    return cachedWindowsPowerShell;
+  }
+  if (pendingWindowsPowerShellProbe) {
+    return pendingWindowsPowerShellProbe;
+  }
+  pendingWindowsPowerShellProbe = (async () => {
+    try {
+      cachedWindowsPowerShellExecPath = null;
+      if (await probe("pwsh")) {
+        cachedWindowsPowerShell = "pwsh";
+        return cachedWindowsPowerShell;
+      }
+      cachedWindowsPowerShellExecPath = null;
+      if (await probe("powershell.exe")) {
+        cachedWindowsPowerShell = "powershell.exe";
+        return cachedWindowsPowerShell;
+      }
+      cachedWindowsPowerShellExecPath = null;
+      cachedWindowsPowerShell = null;
+      return null;
+    } finally {
+      pendingWindowsPowerShellProbe = null;
+    }
+  })();
+  return pendingWindowsPowerShellProbe;
+}
+async function runShellCommandAsync(command, options) {
+  if (process.platform === "win32") {
+    if (needsPowerShellOnWindows(command)) {
+      const psBin = await resolveWindowsPowerShell();
+      if (psBin) {
+        const utf8Command = buildPowerShellUtf8Command(command);
+        return spawnAndCollect(
+          cachedWindowsPowerShellExecPath ?? psBin,
+          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
+          false,
+          options
+        );
+      }
+    }
+    return spawnAndCollect(command, [], true, options);
+  }
   return spawnAndCollect(command, [], true, options);
 }
 function spawnAndCollect(commandOrBin, args, shell, options) {
@@ -660,7 +939,8 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
   return new Promise((resolve) => {
     let stdoutBytes = 0;
     let stderrBytes = 0;
-    let truncated = false;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let timedOut = false;
     let settled = false;
     const stdoutChunks = [];
@@ -710,22 +990,22 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
-        truncated,
+        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), stdoutTruncated),
+        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), stderrTruncated),
+        truncated: stdoutTruncated || stderrTruncated,
         error
       });
     };
     child.stdout?.on("data", (chunk) => {
       if (stdoutBytes >= maxOutputBytes) {
-        truncated = true;
+        stdoutTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stdoutBytes;
       if (chunk.length > remaining) {
         stdoutChunks.push(chunk.subarray(0, remaining));
         stdoutBytes += remaining;
-        truncated = true;
+        stdoutTruncated = true;
       } else {
         stdoutChunks.push(chunk);
         stdoutBytes += chunk.length;
@@ -733,14 +1013,14 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
     });
     child.stderr?.on("data", (chunk) => {
       if (stderrBytes >= maxOutputBytes) {
-        truncated = true;
+        stderrTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stderrBytes;
       if (chunk.length > remaining) {
         stderrChunks.push(chunk.subarray(0, remaining));
         stderrBytes += remaining;
-        truncated = true;
+        stderrTruncated = true;
       } else {
         stderrChunks.push(chunk);
         stderrBytes += chunk.length;
@@ -2369,30 +2649,202 @@ function validateReadonlyGitArgs(pattern) {
   }
   return ["--no-pager", subcmd, ...rest];
 }
+// src/utils/fuzzy-match.ts
+function findContiguousIndex(haystack, needle) {
+  const maxStart = haystack.length - needle.length;
+  for (let start = 0; start <= maxStart; start++) {
+    let matched = true;
+    for (let offset = 0; offset < needle.length; offset++) {
+      if (haystack[start + offset] !== needle[offset]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return start;
+  }
+  return -1;
+}
+function isAscii(text) {
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 127) return false;
+  }
+  return true;
+}
+function subsequenceCost(needle, haystack) {
+  if (!needle) return 2147483647;
+  if (isAscii(needle) && isAscii(haystack)) {
+    const query2 = needle.toLowerCase();
+    const lowered2 = haystack.toLowerCase();
+    const contiguousAt2 = lowered2.indexOf(query2);
+    if (contiguousAt2 >= 0) {
+      return contiguousAt2 === 0 ? -100 : -60 + Math.min(25, contiguousAt2);
+    }
+    let cursor2 = 0;
+    let first2 = -1;
+    let last2 = -1;
+    const hLen = lowered2.length;
+    for (let i = 0; i < query2.length; i++) {
+      const targetCode = query2.charCodeAt(i);
+      while (cursor2 < hLen && lowered2.charCodeAt(cursor2) !== targetCode) cursor2++;
+      if (cursor2 === hLen) return void 0;
+      if (first2 < 0) first2 = cursor2;
+      last2 = cursor2++;
+    }
+    return Math.max(0, last2 - first2 + 1 - query2.length) - (first2 === 0 ? 20 : 0);
+  }
+  const lowered = [...haystack.toLowerCase()];
+  const query = [...needle.toLowerCase()];
+  const contiguousAt = findContiguousIndex(lowered, query);
+  if (contiguousAt >= 0) {
+    return contiguousAt === 0 ? -100 : -60 + Math.min(25, contiguousAt);
+  }
+  let cursor = 0;
+  let first = -1;
+  let last = -1;
+  for (const ch of query) {
+    while (cursor < lowered.length && lowered[cursor] !== ch) cursor++;
+    if (cursor === lowered.length) return void 0;
+    if (first < 0) first = cursor;
+    last = cursor++;
+  }
+  return Math.max(0, last - first + 1 - query.length) - (first === 0 ? 20 : 0);
+}
+function scoreSubsequence(query, target) {
+  const cost = subsequenceCost(query, target);
+  return cost === void 0 ? -1 : Math.max(1, 1e3 - cost);
+}
+function fuzzyScorePath(query, candidatePosix) {
+  const trimmed = query.trim().replace(/\\/g, "/");
+  if (!trimmed) return -1;
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  const slashIdx = candidatePosix.lastIndexOf("/");
+  const basename = slashIdx === -1 ? candidatePosix : candidatePosix.slice(slashIdx + 1);
+  let totalScore = 0;
+  for (const token of tokens) {
+    const fullScore = scoreSubsequence(token, candidatePosix);
+    if (fullScore < 0) return -1;
+    const baseScore = !token.includes("/") ? scoreSubsequence(token, basename) : -1;
+    totalScore += baseScore >= 0 ? Math.max(fullScore, baseScore + 45) : fullScore;
+    if (basename.toLowerCase() === token.toLowerCase()) totalScore += 60;
+  }
+  return totalScore;
+}
+function rankFuzzyPaths(query, candidates, maxResults) {
+  const scored = [];
+  for (const candidate of candidates) {
+    const score = fuzzyScorePath(query, candidate);
+    if (score >= 0) scored.push({ path: candidate, score });
+  }
+  scored.sort((a, b) => b.score - a.score || a.path.length - b.path.length || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return {
+    matches: scored.slice(0, maxResults),
+    totalMatched: scored.length
+  };
+}
+var FILE_TYPE_GLOBS = {
+  ts: ["*.ts", "*.tsx", "*.mts", "*.cts"],
+  typescript: ["*.ts", "*.tsx", "*.mts", "*.cts"],
+  js: ["*.js", "*.jsx", "*.mjs", "*.cjs"],
+  javascript: ["*.js", "*.jsx", "*.mjs", "*.cjs"],
+  py: ["*.py", "*.pyi"],
+  python: ["*.py", "*.pyi"],
+  go: ["*.go"],
+  gd: ["*.gd"],
+  gdscript: ["*.gd"],
+  rust: ["*.rs"],
+  rs: ["*.rs"],
+  java: ["*.java"],
+  kt: ["*.kt", "*.kts"],
+  kotlin: ["*.kt", "*.kts"],
+  c: ["*.c", "*.h"],
+  cpp: ["*.cc", "*.cpp", "*.cxx", "*.hpp", "*.hh", "*.hxx", "*.h"],
+  cs: ["*.cs"],
+  csharp: ["*.cs"],
+  swift: ["*.swift"],
+  rb: ["*.rb"],
+  ruby: ["*.rb"],
+  php: ["*.php"],
+  css: ["*.css", "*.scss", "*.sass", "*.less"],
+  html: ["*.html", "*.htm"],
+  vue: ["*.vue"],
+  svelte: ["*.svelte"],
+  md: ["*.md", "*.mdx", "*.markdown"],
+  markdown: ["*.md", "*.mdx", "*.markdown"],
+  json: ["*.json", "*.jsonc"],
+  yaml: ["*.yml", "*.yaml"],
+  yml: ["*.yml", "*.yaml"],
+  toml: ["*.toml"],
+  xml: ["*.xml"],
+  sql: ["*.sql"],
+  sh: ["*.sh", "*.bash", "*.zsh"],
+  shell: ["*.sh", "*.bash", "*.zsh"]
+};
+function resolveFileTypeGlobs(fileType) {
+  if (fileType === void 0) return null;
+  if (typeof fileType !== "string") throw new Error("fileType must be a string");
+  const key = fileType.trim().toLowerCase().replace(/^\./, "");
+  if (!key) return null;
+  const mapped = FILE_TYPE_GLOBS[key];
+  if (Object.hasOwn(FILE_TYPE_GLOBS, key)) return mapped;
+  if (/^[a-z0-9]+$/i.test(key)) return [`*.${key}`];
+  throw new Error(`Unsupported fileType '${fileType}'`);
+}
+function fileTypeMatcher(fileType) {
+  const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
+  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path3.basename(file)));
+}
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
   const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
-  const args = [
-    "--json",
-    "--no-messages",
-    "--max-filesize",
-    "2M"
-  ];
+  const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
+  const typeGlobs = resolveFileTypeGlobs(query.fileType);
+  const matchesType = fileTypeMatcher(query.fileType);
+  const fileStat = await fs3.stat(searchRoot);
+  const isFileTarget = fileStat.isFile();
+  if (isFileTarget) {
+    if (checkSensitiveFastPath(searchRoot) || (typeGlobs && !matchesType(searchRoot))) {
+      return { files: [], totalMatches: 0, truncated: false };
+    }
+    if (fileStat.size > 2 * 1024 * 1024) {
+      return { files: [], totalMatches: 0, truncated: false };
+    }
+    if (query.glob) {
+      const negated = query.glob.startsWith("!");
+      const rawGlob = negated ? query.glob.slice(1) : query.glob;
+      const globRe = globToRegExp(rawGlob);
+      const relPosix = relativeFile(baseCwd, searchRoot);
+      const matched = globRe.test(relPosix) || globRe.test(path3.basename(searchRoot));
+      if (negated ? matched : !matched) {
+        return { files: [], totalMatches: 0, truncated: false };
+      }
+    }
+    const fh = await fs3.open(searchRoot, "r");
+    try {
+      const head = Buffer.alloc(Math.min(fileStat.size, 8192));
+      const { bytesRead } = await fh.read(head, 0, head.length, 0);
+      if (isLikelyBinary(head.subarray(0, bytesRead))) {
+        return { files: [], totalMatches: 0, truncated: false };
+      }
+    } finally {
+      await fh.close();
+    }
+  }
+  const perFileCap = isFileTarget ? maxResults : Math.min(maxResults, 50);
+  const args = ["--no-config", "--no-messages", "--max-filesize", "2M", "--crlf"];
+  if (query.multiline) args.push("--multiline", "--multiline-dotall");
+  if (typeGlobs) {
+    for (const glob of typeGlobs) args.push("--type-add", `agyfilter:${glob}`);
+    args.push("--type", "agyfilter");
+  }
   if (query.type === "text") {
     args.push("--fixed-strings");
   }
   if (query.caseSensitive === false) {
     args.push("--ignore-case");
   }
-  if (contextLines > 0) {
-    args.push("-C", String(contextLines));
-  }
-  const normalizedGlob = query.glob ? query.glob.replace(/\\/g, "/") : "";
-  if (normalizedGlob) {
-    if (normalizedGlob.startsWith(".") || normalizedGlob.includes("/.")) {
-      args.push("--hidden");
-    }
-    args.push(`--glob=${normalizedGlob}`);
+  if (query.glob) {
+    if (query.glob.startsWith(".") || query.glob.includes("/.")) args.push("--hidden");
+    args.push(`--glob=${query.glob}`);
   }
   const normRoot = toPosixPath(searchRoot);
   for (const dir of [
@@ -2410,171 +2862,331 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
-  const perFileCap = Math.min(maxResults, 50);
-  args.push("--max-count", String(perFileCap + 1));
-  args.push("--", query.pattern, searchRoot);
-  const res = await execBinaryAsync("rg", args, {
-    cwd: baseCwd,
-    timeoutMs: 15e3,
-    maxOutputBytes: 2 * 1024 * 1024
-  });
-  if (res.error) {
-    throw new Error(`rg spawn error: ${res.error}`);
-  }
-  if (res.timedOut) {
-    throw new Error("rg search timed out");
-  }
-  if (res.exitCode === 2) {
-    throw new Error(res.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
-  }
-  const byFile = /* @__PURE__ */ new Map();
-  let totalMatches = 0;
-  let truncated = false;
-  let matchesInCurrentFile = 0;
-  let pendingBeforeContext = [];
-  let lastKeptMatchFile = "";
-  let lastKeptMatchLine = -1;
-  const upsertLine = (relFile, entry) => {
-    let lineMap = byFile.get(relFile);
-    if (!lineMap) {
-      lineMap = /* @__PURE__ */ new Map();
-      byFile.set(relFile, lineMap);
+  const runRg = async (runArgs, opts) => {
+    const res = await execBinaryAsync("rg", runArgs, {
+      cwd: baseCwd,
+      timeoutMs: 15e3,
+      maxOutputBytes: 2 * 1024 * 1024
+    });
+    if (res.error) {
+      throw new Error(`rg spawn error: ${res.error}`);
     }
-    const existing = lineMap.get(entry.lineNumber);
-    if (!existing || entry.isMatch) {
-      lineMap.set(entry.lineNumber, {
-        lineNumber: entry.lineNumber,
-        text: entry.text,
-        isMatch: entry.isMatch || Boolean(existing?.isMatch)
-      });
+    if (res.exitCode === 2 && !(opts?.allowPartialError && !res.stderr.trim())) {
+      throw new Error(res.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
     }
+    return res;
   };
-  for (const rawLine of res.stdout.split("\n")) {
-    if (!rawLine.trim()) continue;
-    let ev;
-    try {
-      ev = JSON.parse(rawLine);
-    } catch {
-      continue;
-    }
-    if (ev.type === "begin" || ev.type === "end") {
-      matchesInCurrentFile = 0;
-      pendingBeforeContext = [];
-      lastKeptMatchFile = "";
-      lastKeptMatchLine = -1;
-      continue;
-    }
-    if (ev.type !== "match" && ev.type !== "context") continue;
-    const rawFile = ev.data?.path?.text ?? (ev.data?.path?.bytes ? Buffer.from(ev.data.path.bytes, "base64").toString("utf8") : void 0);
-    const lineNumber = ev.data?.line_number;
-    const rawText = ev.data?.lines?.text ?? (ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64").toString("utf8") : "");
-    const lineText = rawText.replace(/\r?\n$/, "");
-    if (!rawFile || typeof lineNumber !== "number") continue;
-    const absFile = path3.isAbsolute(rawFile) ? rawFile : path3.resolve(baseCwd, rawFile);
-    if (checkSensitiveFastPath(absFile)) continue;
-    const relFile = toPosixPath(path3.relative(baseCwd, absFile)) || path3.basename(absFile);
-    if (ev.type === "context") {
-      if (lastKeptMatchFile === relFile && lastKeptMatchLine !== -1 && lineNumber > lastKeptMatchLine && lineNumber <= lastKeptMatchLine + contextLines) {
-        upsertLine(relFile, { lineNumber, text: lineText, isMatch: false });
-      } else if (totalMatches < maxResults && matchesInCurrentFile < perFileCap) {
-        pendingBeforeContext.push({ relFile, lineNumber, text: lineText });
+  const cutShort = (res) => res.truncated || res.timedOut || res.exitCode === null;
+  if (summary) {
+    const res = await runRg([
+      ...args,
+      ...query.outputMode === "count" ? [query.multiline ? "--count-matches" : "--count", "--with-filename", "--null"] : ["--files-with-matches", "--null"],
+      "--",
+      query.pattern,
+      searchRoot
+    ]);
+    const files2 = [];
+    const out = res.stdout;
+    let pos = 0;
+    while (pos < out.length) {
+      const nul = out.indexOf("\0", pos);
+      if (nul === -1) break;
+      const rawFile = out.slice(pos, nul);
+      let count = 0;
+      if (query.outputMode === "count") {
+        const nl = out.indexOf("\n", nul + 1);
+        if (nl === -1) break;
+        const rawCount = out.slice(nul + 1, nl).trim();
+        count = Number(rawCount);
+        pos = nl + 1;
+      } else {
+        pos = nul + 1;
       }
-      continue;
+      if (!rawFile || !matchesType(rawFile) || checkSensitiveFastPath(path3.resolve(baseCwd, rawFile))) continue;
+      files2.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number.isFinite(count) ? count : 0 });
     }
-    matchesInCurrentFile += 1;
-    if (matchesInCurrentFile > perFileCap || totalMatches >= maxResults) {
-      truncated = true;
-      pendingBeforeContext = [];
-      continue;
-    }
-    totalMatches += 1;
-    for (const ctx of pendingBeforeContext) {
-      if (ctx.relFile === relFile) {
-        upsertLine(ctx.relFile, {
-          lineNumber: ctx.lineNumber,
-          text: ctx.text,
-          isMatch: false
-        });
-      }
-    }
-    pendingBeforeContext = [];
-    upsertLine(relFile, { lineNumber, text: lineText, isMatch: true });
-    lastKeptMatchFile = relFile;
-    lastKeptMatchLine = lineNumber;
+    files2.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
+    return {
+      files: files2.slice(0, maxResults),
+      totalMatches: 0,
+      truncated: files2.length > maxResults || cutShort(res)
+    };
   }
-  const files = [...byFile.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([file, lineMap]) => ({
-    file,
-    lines: [...lineMap.values()].sort((a, b) => a.lineNumber - b.lineNumber)
-  }));
-  return { files, totalMatches, truncated: truncated || res.truncated };
+  const maxCountArgs = query.multiline ? [] : ["--max-count", String(perFileCap + 1)];
+  let chosen;
+  let truncated = false;
+  if (isFileTarget) {
+    chosen = [
+      {
+        rawFile: searchRoot,
+        relFile: relativeFile(baseCwd, searchRoot),
+        count: Number.POSITIVE_INFINITY
+      }
+    ];
+  } else {
+    const counts = await runRg([
+      ...args,
+      ...maxCountArgs,
+      "--count",
+      "--with-filename",
+      "--null",
+      "--",
+      query.pattern,
+      searchRoot
+    ]);
+    const counted = [];
+    for (const record of counts.stdout.split("\n").slice(0, -1)) {
+      const sep = record.lastIndexOf("\0");
+      const count = Number(record.slice(sep + 1));
+      if (sep <= 0 || !Number.isInteger(count) || count <= 0) continue;
+      const rawFile = record.slice(0, sep);
+      if (!matchesType(rawFile) || checkSensitiveFastPath(path3.resolve(baseCwd, rawFile))) continue;
+      counted.push({ rawFile, relFile: relativeFile(baseCwd, rawFile), count });
+    }
+    counted.sort((a, b) => a.relFile < b.relFile ? -1 : a.relFile > b.relFile ? 1 : 0);
+    chosen = [];
+    let coveredMatches = 0;
+    for (const item of counted) {
+      if (coveredMatches >= maxResults) break;
+      chosen.push(item);
+      coveredMatches += query.multiline ? item.count : Math.min(item.count, perFileCap);
+    }
+    truncated = cutShort(counts) || chosen.length < counted.length;
+    if (chosen.length === 0) {
+      return { files: [], totalMatches: 0, truncated };
+    }
+  }
+  const toRgArgPath = (rawFile) => {
+    const rel = path3.relative(baseCwd, rawFile);
+    const chosenPath = rel && !rel.startsWith("..") && !path3.isAbsolute(rel) ? rel : rawFile;
+    return chosenPath === "-" ? `.${path3.sep}-` : chosenPath;
+  };
+  const rgChunks = [];
+  let currentChunk = [];
+  let currentChunkChars = 0;
+  const maxArgChars = 2e4;
+  for (const item of chosen) {
+    const argPath = toRgArgPath(item.rawFile);
+    const est = argPath.length + 3;
+    if (currentChunk.length > 0 && currentChunkChars + est > maxArgChars) {
+      rgChunks.push(currentChunk);
+      currentChunk = [];
+      currentChunkChars = 0;
+    }
+    currentChunk.push(argPath);
+    currentChunkChars += est;
+  }
+  if (currentChunk.length > 0) rgChunks.push(currentChunk);
+  const byFile = /* @__PURE__ */ new Map();
+  for (const chunk of rgChunks) {
+    const res = await runRg(
+      [
+        ...args,
+        ...maxCountArgs,
+        "--json",
+        ...contextLines > 0 ? ["-C", String(contextLines)] : [],
+        "--",
+        query.pattern,
+        ...chunk
+      ],
+      { allowPartialError: !isFileTarget }
+    );
+    if (cutShort(res)) truncated = true;
+    for (const rawLine of res.stdout.split("\n")) {
+      if (!rawLine.trim()) continue;
+      let ev;
+      try {
+        ev = JSON.parse(rawLine);
+      } catch {
+        continue;
+      }
+      if (ev.type !== "match" && ev.type !== "context") continue;
+      const rawFile = ev.data?.path?.text ?? (ev.data?.path?.bytes ? Buffer.from(ev.data.path.bytes, "base64").toString("utf8") : void 0);
+      const lineNumber = ev.data?.line_number;
+      const rawBuf = ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64") : null;
+      const rawText = ev.data?.lines?.text ?? (rawBuf ? rawBuf.toString("utf8") : "");
+      if (!rawFile || typeof lineNumber !== "number") continue;
+      const relFile = relativeFile(baseCwd, rawFile);
+      let lineMap = byFile.get(relFile);
+      if (!lineMap) {
+        lineMap = /* @__PURE__ */ new Map();
+        byFile.set(relFile, lineMap);
+      }
+      const isMatch = ev.type === "match";
+      const lineText = rawText.replace(/\r?\n$/, "");
+      const segments = isMatch && query.multiline ? lineText.split(/\r?\n/) : [lineText];
+      for (const [offset, text] of segments.entries()) {
+        const line = lineNumber + offset;
+        if (!lineMap.get(line)?.isMatch) lineMap.set(line, { lineNumber: line, text, isMatch });
+      }
+    }
+  }
+  const files = [];
+  let totalMatches = 0;
+  for (const { relFile, count } of chosen) {
+    if (totalMatches >= maxResults) {
+      truncated = true;
+      break;
+    }
+    const fileCap = query.multiline ? maxResults : Math.min(count, perFileCap);
+    const budget = Math.min(fileCap, maxResults - totalMatches);
+    const sorted = [...byFile.get(relFile)?.values() ?? []].sort(
+      (a, b) => a.lineNumber - b.lineNumber
+    );
+    const lines = [];
+    let kept = 0;
+    let lastKeptMatchLine = -1;
+    for (const line of sorted) {
+      if (line.isMatch) {
+        if (kept === budget) {
+          truncated = true;
+          if (lastKeptMatchLine !== -1 && line.lineNumber <= lastKeptMatchLine + contextLines) {
+            lines.push({ lineNumber: line.lineNumber, text: line.text, isMatch: false });
+          }
+          continue;
+        }
+        kept += 1;
+        lastKeptMatchLine = line.lineNumber;
+        lines.push(line);
+      } else if (kept < budget || line.lineNumber <= lastKeptMatchLine + contextLines) {
+        lines.push(line);
+      }
+    }
+    if (kept === 0) continue;
+    files.push({ file: relFile, lines });
+    totalMatches += kept;
+  }
+  return { files, totalMatches, truncated };
+}
+function* multilineMatches(content, regex) {
+  let previousEnd = -1;
+  for (const match of content.matchAll(regex)) {
+    const start = match.index;
+    if (start === content.length && (content.length === 0 || content.endsWith("\n"))) break;
+    if (match[0] === "") {
+      if (start === previousEnd || content[start - 1] === "\r" && content[start] === "\n") continue;
+    }
+    previousEnd = start + match[0].length;
+    yield match;
+  }
+}
+function multilineMatchLines(content, regex, limit) {
+  const results = [];
+  let line = 0;
+  let lineStart = 0;
+  let nextBreak = content.indexOf("\n");
+  for (const match of multilineMatches(content, regex)) {
+    const start = match.index;
+    const end = start + Math.max(0, match[0].length - 1);
+    while (nextBreak !== -1 && nextBreak < start) {
+      line++;
+      lineStart = nextBreak + 1;
+      nextBreak = content.indexOf("\n", lineStart);
+    }
+    while (true) {
+      if (results.at(-1) !== line) results.push(line);
+      if (results.length >= limit) return results;
+      if (nextBreak === -1 || nextBreak >= end) break;
+      line++;
+      lineStart = nextBreak + 1;
+      nextBreak = content.indexOf("\n", lineStart);
+    }
+  }
+  return results;
 }
 async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
   const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
-  const caseSensitive = query.caseSensitive !== false;
+  const flags = (query.caseSensitive === false ? "i" : "") + (query.multiline ? "gmsu" : "");
   let regex;
   if (query.type === "regex") {
-    if (!isSafeRegex(query.pattern)) {
-      throw new Error(`Unsafe regex '${query.pattern}': rejected to prevent catastrophic backtracking`);
-    }
+    if (!isSafeRegex(query.pattern)) throw new Error("Unsafe regex: rejected to prevent catastrophic backtracking");
     try {
-      regex = new RegExp(query.pattern, caseSensitive ? "" : "i");
+      regex = new RegExp(query.pattern, flags);
     } catch (err) {
-      throw new Error(
-        `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`
-      );
+      if (flags.includes("u")) {
+        try {
+          regex = new RegExp(query.pattern, flags.replace("u", ""));
+        } catch {
+          throw new Error(
+            `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      } else {
+        throw new Error(
+          `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }
   } else {
     const escaped = query.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    regex = new RegExp(escaped, caseSensitive ? "" : "i");
+    regex = new RegExp(escaped, flags);
   }
-  const normalizedGlob = query.glob ? query.glob.replace(/\\/g, "/") : "";
-  const globRegex = normalizedGlob ? globToRegExp(normalizedGlob) : null;
+  const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
+  const matchesType = fileTypeMatcher(query.fileType);
+  let discoveryTruncated = false;
+  const globNegated = Boolean(query.glob && query.glob.startsWith("!"));
+  const rawGlob = query.glob ? globNegated ? query.glob.slice(1) : query.glob : null;
+  const globRegex = rawGlob ? globToRegExp(rawGlob) : null;
   const globMatchesFile = (relPosix) => {
+    if (!matchesType(relPosix)) return false;
     if (!globRegex) return true;
-    if (globRegex.test(relPosix)) return true;
-    if (!normalizedGlob.includes("/")) {
+    let matched = globRegex.test(relPosix);
+    if (!matched && !rawGlob.includes("/")) {
       const base = relPosix.split("/").pop() ?? relPosix;
-      return globRegex.test(base);
+      matched = globRegex.test(base);
     }
-    return false;
+    return globNegated ? !matched : matched;
   };
   const stat = await fs3.stat(searchRoot);
+  const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
-  let walkTruncated = false;
   if (stat.isFile()) {
     const relPosix = toPosixPath(path3.relative(baseCwd, searchRoot)) || path3.basename(searchRoot);
     targetFiles = globMatchesFile(relPosix) ? [searchRoot] : [];
   } else {
     const includeHidden = Boolean(
-      normalizedGlob && (normalizedGlob.startsWith(".") || normalizedGlob.includes("/."))
+      rawGlob && !globNegated && (rawGlob.startsWith(".") || rawGlob.includes("/."))
     );
     const walked = await walkFiles(searchRoot, {
       maxFiles: 8e3,
       includeHidden,
       fileFilter: globMatchesFile
     });
-    walkTruncated = Boolean(walked.truncated);
+    discoveryTruncated = walked.truncated;
     targetFiles = walked.files.map((rel) => path3.join(searchRoot, rel));
+    targetFiles.sort((a, b) => {
+      const ra = relativeFile(baseCwd, a);
+      const rb = relativeFile(baseCwd, b);
+      return ra < rb ? -1 : ra > rb ? 1 : 0;
+    });
   }
   const files = [];
   let totalMatches = 0;
-  let hitGlobalLimit = false;
-  let anyFileTruncated = false;
-  const perFileCap = Math.min(maxResults, 50);
-  const buildFileMatches = (relFile, allLines, keptIndices) => {
+  let truncated = false;
+  const buildFileMatches = (relFile, allLines, keptMatches) => {
     const lineMap = /* @__PURE__ */ new Map();
-    for (const mIdx of keptIndices) {
+    for (const mIdx of keptMatches) {
       const from = Math.max(0, mIdx - contextLines);
       const to = Math.min(allLines.length - 1, mIdx + contextLines);
       for (let j = from; j <= to; j++) {
         const ln = j + 1;
         const prev = lineMap.get(ln);
-        lineMap.set(ln, {
-          lineNumber: ln,
-          text: allLines[j],
-          isMatch: j === mIdx || Boolean(prev?.isMatch)
-        });
+        if (j === mIdx) {
+          if (!prev?.isMatch) {
+            lineMap.set(ln, {
+              lineNumber: ln,
+              text: allLines[j],
+              isMatch: true
+            });
+          }
+        } else if (!prev) {
+          lineMap.set(ln, {
+            lineNumber: ln,
+            text: allLines[j],
+            isMatch: false
+          });
+        }
       }
     }
     return {
@@ -2583,7 +3195,8 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     };
   };
   const batchSize = 16;
-  for (let i = 0; i < targetFiles.length && !hitGlobalLimit; i += batchSize) {
+  let anyFileTruncated = false;
+  for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
     const batch = targetFiles.slice(i, i + batchSize);
     const results = await Promise.all(
       batch.map(async (absFile) => {
@@ -2593,22 +3206,36 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
           if (st.size > 2 * 1024 * 1024) return null;
           const buf = await fs3.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
-          const lines = buf.toString("utf8").replace(/\r\n/g, "\n").split("\n");
-          const matchedIndices = [];
+          const content = buf.toString("utf8");
+          const lines = content.split(/\r?\n/);
+          if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+          const relFile = relativeFile(baseCwd, absFile);
+          let matchedLines = [];
+          let count = 0;
           let fileTruncated = false;
-          for (let idx = 0; idx < lines.length; idx++) {
-            const candidateLine = lines[idx].length > 8192 ? lines[idx].slice(0, 8192) : lines[idx];
-            if (regex.test(candidateLine)) {
-              if (matchedIndices.length >= perFileCap) {
+          if (query.multiline && summary) {
+            for (const _match of multilineMatches(content, regex)) {
+              count++;
+              if (query.outputMode === "files_with_matches") break;
+            }
+          } else if (query.multiline) {
+            matchedLines = multilineMatchLines(content, regex, maxResults + 1);
+            count = matchedLines.length;
+          } else {
+            for (let idx = 0; idx < lines.length; idx++) {
+              const line = lines[idx];
+              if (!regex.test(line)) continue;
+              count++;
+              if (query.outputMode === "files_with_matches") break;
+              if (summary) continue;
+              if (matchedLines.length === perFileCap) {
                 fileTruncated = true;
                 break;
               }
-              matchedIndices.push(idx);
+              matchedLines.push(idx);
             }
           }
-          if (matchedIndices.length === 0) return null;
-          const relFile = toPosixPath(path3.relative(baseCwd, absFile)) || path3.basename(absFile);
-          return { relFile, lines, matchedIndices, fileTruncated };
+          return count ? { relFile, lines, matchedLines, count, fileTruncated } : null;
         } catch {
           return null;
         }
@@ -2616,22 +3243,52 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     );
     for (const item of results) {
       if (!item) continue;
-      if (item.fileTruncated) anyFileTruncated = true;
-      if (totalMatches + item.matchedIndices.length > maxResults) {
+      if (summary) {
+        if (files.length === maxResults) {
+          truncated = true;
+          break;
+        }
+        files.push({ file: item.relFile, lines: [], count: item.count });
+        continue;
+      }
+      if (item.fileTruncated) {
+        anyFileTruncated = true;
+      }
+      if (totalMatches + item.matchedLines.length > maxResults) {
         const remaining = maxResults - totalMatches;
         if (remaining > 0) {
-          const kept = item.matchedIndices.slice(0, remaining);
+          const kept = item.matchedLines.slice(0, remaining);
           files.push(buildFileMatches(item.relFile, item.lines, kept));
           totalMatches += kept.length;
         }
-        hitGlobalLimit = true;
+        truncated = true;
         break;
       }
-      files.push(buildFileMatches(item.relFile, item.lines, item.matchedIndices));
-      totalMatches += item.matchedIndices.length;
+      files.push(buildFileMatches(item.relFile, item.lines, item.matchedLines));
+      totalMatches += item.matchedLines.length;
     }
   }
-  return { files, totalMatches, truncated: hitGlobalLimit || anyFileTruncated || walkTruncated };
+  return {
+    files,
+    totalMatches,
+    truncated: truncated || anyFileTruncated || (summary || query.multiline === true) && discoveryTruncated
+  };
+}
+function relativeFile(baseCwd, file) {
+  return toPosixPath(path3.relative(baseCwd, path3.resolve(baseCwd, file))) || path3.basename(file);
+}
+async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
+  const pattern = query.pattern.trim();
+  if (!pattern) throw new Error("Fuzzy pattern must not be blank");
+  const matchesType = fileTypeMatcher(query.fileType);
+  const maxResults = clampInt(query.maxResults ?? 30, 1, 200);
+  const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, { maxFiles: 8e3, fileFilter: matchesType });
+  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path3.resolve(searchRoot, file)));
+  const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
+  const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
+  const footer = walked.truncated || totalMatched > maxResults ? `
+... [truncated; showing ${matches.length} files]` : "";
+  return body + footer;
 }
 function buildGlobFallbackPlan(pattern) {
   if (!pattern.includes("{") && pattern.includes("|")) {
@@ -2669,9 +3326,19 @@ function buildGlobFallbackPlan(pattern) {
   }
   return null;
 }
-function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, notePrefix) {
+async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix) {
   const relPrefix = toPosixPath(path3.relative(baseCwd, searchRoot));
-  const sortedFiles = [...walked.files].sort((a, b) => a.localeCompare(b));
+  const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
+  if (sortBy === "mtime") {
+    const mtimes = /* @__PURE__ */ new Map();
+    for (let i = 0; i < sortedFiles.length; i += 32) {
+      await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
+        const stat = await fs3.lstat(path3.join(searchRoot, file)).catch(() => void 0);
+        mtimes.set(file, stat?.mtimeMs ?? -Infinity);
+      }));
+    }
+    sortedFiles.sort((a, b) => mtimes.get(b) - mtimes.get(a) || (a < b ? -1 : a > b ? 1 : 0));
+  }
   const items = sortedFiles.slice(0, maxResults).map((f) => {
     if (!relPrefix || relPrefix === ".") return f;
     return `${relPrefix}/${f}`;
@@ -2747,7 +3414,7 @@ ${rel}`;
   });
   if (walked.files.length > 0) {
     recordGlobPaths(walked.files);
-    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults);
+    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, query.sortBy);
   }
   const fallback = buildGlobFallbackPlan(pattern);
   if (fallback) {
@@ -2766,6 +3433,7 @@ ${rel}`;
         searchRoot,
         baseCwd,
         maxResults,
+        query.sortBy,
         fallback.matchedNote
       );
     }
@@ -3049,6 +3717,16 @@ async function executeSingleQuery(query, index, baseCwd, useRg, trackCtx = null)
     if (!query.pattern || typeof query.pattern !== "string") {
       throw new Error("Query 'pattern' must be a non-empty string");
     }
+    if (query.multiline !== void 0 && typeof query.multiline !== "boolean") {
+      throw new Error("multiline must be a boolean");
+    }
+    if (query.outputMode !== void 0 && !["content", "files_with_matches", "count"].includes(query.outputMode)) {
+      throw new Error("Invalid outputMode");
+    }
+    if (query.sortBy !== void 0 && !["path", "mtime"].includes(query.sortBy)) {
+      throw new Error("Invalid sortBy");
+    }
+    if (query.glob) query = { ...query, glob: query.glob.replace(/\\/g, "/") };
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
     try {
@@ -3061,6 +3739,10 @@ async function executeSingleQuery(query, index, baseCwd, useRg, trackCtx = null)
       const out = await runGitQuery(query, gitCwd);
       return `${header}
 ${out}`;
+    }
+    if (query.type === "fuzzy") {
+      const out = await runFuzzyQuery(query, searchRoot, baseCwd, targetStat.isFile());
+      return `${header}\n${out}`;
     }
     if (query.type === "glob") {
       const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile(), trackCtx);
@@ -3089,6 +3771,12 @@ ${out}`;
             trackCtx.matchedAbsPaths.add(path3.resolve(baseCwd, fm.file));
           }
         }
+      }
+      if (query.outputMode === "count" || query.outputMode === "files_with_matches") {
+        const lines = res.files.map(({ file, count }) => query.outputMode === "count"
+          ? `${file}: ${count} ${query.multiline ? "matches" : "matching lines"}` : file);
+        if (res.truncated) lines.push(`... [truncated; showing ${res.files.length} files]`);
+        return `${header}\n${lines.join("\n") || "(no matches)"}`;
       }
       return `${header}
 ${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
@@ -3168,9 +3856,9 @@ async function runBatchSearch(input, options = {}) {
   }
   const maxChars = clampInt(input.maxChars ?? 8500, 500, DEFAULT_INLINE_MAX_BYTES);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
-  // Working-tree git queries (status/diff/log) depend on arbitrary tracked/untracked files across subdirs; bypass cache.
-  const hasGitQuery = queriesList.some((q) => q && q.type === "git");
-  const ttlMs = hasGitQuery ? 0 : getSearchCacheTtlMs();
+  // Git state, fuzzy rankings and mtime ordering depend on candidates outside the tracked result set.
+  const bypassCache = queriesList.some((q) => q?.type === "git" || q?.type === "fuzzy" || q?.sortBy === "mtime");
+  const ttlMs = bypassCache ? 0 : getSearchCacheTtlMs();
   let cacheKey = null;
   if (ttlMs > 0) {
     const worktreeFp = await computeWorktreeFingerprint(baseCwd, queriesList);
@@ -3968,7 +4656,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "batch_search",
-      description: "Search files in parallel. For git, pattern is a read-only subcommand.",
+      description: "Batch file or read-only git searches.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3980,11 +4668,15 @@ function createAgyFastServer() {
             items: {
               type: "object",
               properties: {
-                type: { type: "string", enum: ["text", "regex", "glob", "git"] },
+                type: { type: "string", enum: ["text", "regex", "glob", "fuzzy", "git"] },
                 pattern: { type: "string" },
                 path: { type: "string" },
                 glob: { type: "string" },
                 caseSensitive: { type: "boolean" },
+                fileType: { type: "string" },
+                multiline: { type: "boolean" },
+                outputMode: { type: "string", enum: ["content", "files_with_matches", "count"] },
+                sortBy: { type: "string", enum: ["path", "mtime"] },
                 contextLines: { type: "integer", minimum: 0, maximum: 5 },
                 maxResults: { type: "integer", minimum: 1, maximum: 200 }
               },
@@ -4001,7 +4693,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "apply_edits",
-      description: "Edit files atomically using hunks or create (full content). bestEffort skips invalid files. verify runs a shell command after writing.",
+      description: "Apply atomic edits. bestEffort skips invalid files. verify runs after writing.",
       inputSchema: {
         type: "object",
         properties: {
@@ -4048,7 +4740,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "read_slices",
-      description: "Outline files by path or read 1-based inclusive ranges. lineRanges accepts 'path:1-5,9-12'.",
+      description: "Outline files or read lineRanges like 'path:1-5,9-12'.",
       inputSchema: {
         type: "object",
         properties: {
@@ -4093,7 +4785,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "run_checks",
-      description: "Run independent shell checks concurrently. Compact output (default) keeps test diagnostics.",
+      description: "Run independent shell checks concurrently.",
       inputSchema: {
         type: "object",
         properties: {

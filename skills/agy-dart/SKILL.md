@@ -11,7 +11,7 @@ Call exposed tools directly. In Antigravity's `call_mcp_tool`, set `ServerName` 
 
 | Tool | Arguments for common tasks |
 | --- | --- |
-| `batch_search` | Pass `queries` with `type` (`text`, `regex`, `glob`, `git`) and `pattern`. Narrow with `path`, `glob`, `contextLines` or `maxResults`. |
+| `batch_search` | Pass `queries` with `type` (`text`, `regex`, `glob`, `fuzzy` path or read-only `git`) and `pattern`. For text/regex, use `outputMode` (`content`, `files_with_matches` or `count`) and optional `multiline`. Counts are matching lines or, in multiline mode, occurrences. Use `fileType` on text/regex/fuzzy, and `sortBy: "mtime"` for newest-first globs. Limit scope with `path`, `glob`, `contextLines` or `maxResults`. |
 | `read_slices` | Pass `outlines` for symbols or patch hunks, preferably 10–20 files per batch. For 1-based inclusive ranges use `slices: [{path, ranges: [[start, end]]}]` or `lineRanges: ["file:start-end"]`. |
 | `apply_edits` | Pass `edits: [{path, hunks: [{target, replacement}]}]` or use `create` for a new file. Use `dryRun` to preview and `verify` to check after writing. Use `bestEffort` only when committing valid files independently is acceptable. |
 | `run_checks` | Pass `commands: [{name, command}]`, with optional per-command `cwd` and `timeoutSec`. For long builds or async jobs (`WaitMsBeforeAsync <= 2000`, `IsDaemon: true`), use native `run_command` and monitor with `manage_task`. |
