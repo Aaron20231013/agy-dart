@@ -2525,13 +2525,7 @@ export class WatchdogMonitor {
       activeChildParents = null
     }
   ) {
-    const envNotifyRaw = process.env.AGY_DART_TTL_DESKTOP_NOTIFY;
-    const explicitlyMutedByEnv =
-      typeof envNotifyRaw === "string" && /^(?:0|false|no|off)$/i.test(envNotifyRaw.trim());
-    const hasExhaustedKeepalive = Boolean(
-      exhaustedConvMap && exhaustedConvMap.size > 0 && !explicitlyMutedByEnv
-    );
-    if ((!ttlDesktopNotifyEnabled && !hasExhaustedKeepalive) || !Array.isArray(leases) || leases.length === 0) {
+    if (!ttlDesktopNotifyEnabled || !Array.isArray(leases) || leases.length === 0) {
       return;
     }
     const minTokens = Math.min(500000, Math.max(4000, Math.floor(Number(cfg.ttlNotifyMinTokens) || 60000)));
@@ -2570,9 +2564,7 @@ export class WatchdogMonitor {
       if (/^(?:EXECUTOR_TERMINATION_REASON_)?(?:USER_CANCELED|USER_CANCELLED|CANCELED|CANCELLED|ABORTED|ERROR)\b/i.test(stopReason)) {
         continue;
       }
-      const exhaustedInfo =
-        !explicitlyMutedByEnv && exhaustedConvMap ? exhaustedConvMap.get(lease.conversationId) || null : null;
-      if (!exhaustedInfo && !ttlDesktopNotifyEnabled) continue;
+      const exhaustedInfo = exhaustedConvMap?.get(lease.conversationId);
 
       const ctxTokens = Number(lease.contextTokens || 0);
       if (!exhaustedInfo && ctxTokens < minTokens) continue;

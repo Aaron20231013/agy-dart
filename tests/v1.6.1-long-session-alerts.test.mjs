@@ -733,7 +733,7 @@ test("v1.6.1-4: Suppress false-idle TTL alerts during stopped_bg_pending, active
           getStore: () => store,
           getConfig: () => ({
             stallWatchdog: true,
-            ttlDesktopNotify: false, // Even with ttlDesktopNotify=false, exhausted 3/3 fires 1 limit reminder!
+            ttlDesktopNotify: true,
             ttlKeepalive: true,
             ttlKeepaliveMaxCount: 3,
             ttlNotifyLeadSec: 60
@@ -750,6 +750,10 @@ test("v1.6.1-4: Suppress false-idle TTL alerts during stopped_bg_pending, active
         monExhausted.tick();
         assert.equal(ttlPopups.length, 0, "Turning off warming must silence a previously exhausted conversation");
         store.setTtlKeepaliveEnabled(true, "conv-parent-with-child");
+        store.setTtlDesktopNotifyEnabled(false);
+        monExhausted.tick();
+        assert.equal(ttlPopups.length, 0, "A muted TTL alert must stay silent when warming is exhausted");
+        store.setTtlDesktopNotifyEnabled(true);
         monExhausted.tick();
         assert.equal(ttlPopups.length, 1, "True-idle conversation after exhausting 3/3 keepalives must fire 1 desktop alert");
         assert.ok(ttlPopups[0].title.includes("3/3"));

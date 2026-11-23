@@ -200,7 +200,8 @@ test("v1.5.4-ka-1: Opt-in TTL auto-keepalive, per-session isolation, failure rol
       });
     };
 
-    // 1. Small context (8.5k < 60k, even with ttlDesktopNotify OFF by default) triggers 1/3, 2/3, 3/3 silently (0 popups, even on in-flight ticks after 3/3!), and pops up ONLY AFTER 3/3 on the 4th expiring cycle!
+    // With alerts enabled, small contexts stay quiet until the final renewed cache is expiring.
+    store.setTtlDesktopNotifyEnabled(true);
     for (let round = 1; round <= 4; round++) {
       const anchor = nowMs;
       seedStoppedLease("conv-small-ctx", anchor, 8500);
@@ -1560,7 +1561,7 @@ test("v1.5.4-ka-8: Sticky topbar keepalive capsule & strict per-conversation win
     const sentNotifications = [];
     const monitor = new WatchdogMonitor({
       getStore: () => store,
-      getConfig: () => ({ ttlKeepaliveLeadSec: 30 }),
+      getConfig: () => ({ ttlKeepaliveLeadSec: 30, ttlDesktopNotify: true }),
       nowFn: () => nowMs,
       monoNsFn: () => monoNs,
       keepaliveSendFn: async (p) => {
