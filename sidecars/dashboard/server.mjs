@@ -52,6 +52,7 @@ const __selfPath = path.resolve(fileURLToPath(import.meta.url));
 const __dirname = path.dirname(__selfPath);
 const HTML_FILE = path.join(__dirname, "index.html");
 export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
+const OVERSIZED_BODY_DRAIN_TIMEOUT_MS = 5_000;
 const SIDECAR_CSRF_TOKEN = crypto.randomBytes(24).toString("hex");
 
 let _runtimeStore = null;
@@ -363,6 +364,19 @@ export function timingSafeTokenMatch(provided, expected) {
   return crypto.timingSafeEqual(a, b);
 }
 
+function discardOversizedBody(req) {
+  req.resume();
+  if (req.complete || req.destroyed) return;
+  // Let a normal upload finish after the 413, but bound time spent draining an unfinished one.
+  const timer = setTimeout(() => {
+    if (!req.complete && !req.destroyed) req.destroy();
+  }, OVERSIZED_BODY_DRAIN_TIMEOUT_MS);
+  timer.unref();
+  const cancelTimer = () => clearTimeout(timer);
+  req.once("end", cancelTimer);
+  req.once("close", cancelTimer);
+}
+
 export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
   return new Promise((resolve) => {
     const rawContentLen = req.headers?.["content-length"];
@@ -370,9 +384,7 @@ export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
       const declaredLen = Number(rawContentLen);
       if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
         req.on("error", () => {});
-        try {
-          req.pause();
-        } catch {}
+        discardOversizedBody(req);
         resolve({ ok: false, status: 413, error: `Request body exceeds ${Math.round(maxBytes / 1024)} KB limit` });
         return;
       }
@@ -395,9 +407,7 @@ export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
       if (totalBytes > maxBytes) {
         overflowed = true;
         chunks.length = 0;
-        try {
-          req.pause();
-        } catch {}
+        discardOversizedBody(req);
         finish({ ok: false, status: 413, error: `Request body exceeds ${Math.round(maxBytes / 1024)} KB limit` });
         return;
       }
@@ -436,17 +446,6 @@ export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
         finish({ ok: false, status: 400, error: "Request stream closed prematurely" });
       }
     });
-  });
-}
-
-function scheduleOversizedSocketClose(req, res) {
-  res.once("finish", () => {
-    const closeTimer = setTimeout(() => {
-      try {
-        req.destroy();
-      } catch {}
-    }, 150);
-    closeTimer.unref?.();
   });
 }
 
@@ -1992,10 +1991,7 @@ export function createStandaloneServer({
           }
           const parsed = await readBoundedJsonBody(req, maxBodyBytes);
           if (!parsed.ok) {
-            if (parsed.status === 413) {
-              scheduleOversizedSocketClose(req, res);
-            }
-            sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
+            sendJson(res, parsed.status, { error: parsed.error });
             return;
           }
           data = { ...data, ...parsed.data };
@@ -2051,10 +2047,7 @@ export function createStandaloneServer({
         }
         const parsed = await readBoundedJsonBody(req, maxBodyBytes);
         if (!parsed.ok) {
-          if (parsed.status === 413) {
-            scheduleOversizedSocketClose(req, res);
-          }
-          sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
+          sendJson(res, parsed.status, { error: parsed.error });
           return;
         }
         const searchCheck = validateAndNormalizeSearchInput(parsed.data);
@@ -2079,10 +2072,7 @@ export function createStandaloneServer({
         }
         const parsed = await readBoundedJsonBody(req, maxBodyBytes);
         if (!parsed.ok) {
-          if (parsed.status === 413) {
-            scheduleOversizedSocketClose(req, res);
-          }
-          sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
+          sendJson(res, parsed.status, { error: parsed.error });
           return;
         }
         const data = parsed.data;

@@ -200,7 +200,7 @@ node scripts/install.mjs tool-loading eager         # All 12 tools eager-loaded
 npm test                                    # Run full test suite
 npm run verify:pkg                          # Verify installer file list
 npm run prefix:budget                       # Estimate configured Antigravity startup and full-catalog token usage
-npm run cache:audit -- --workspace . --no-live
+node scripts/cache-audit.mjs --workspace . --no-live
 npm run cache:simulate
 ```
 

@@ -3,7 +3,7 @@
 > **本文档用途**：面向代码审阅 AI / 架构审计 AI / 安全审查 AI 的高密度项目总览与审阅路线图。对应正式发布标签 `v1.6.0`（上一版本基线 `d8fc5ba` / `v1.5.4`）。代码行数、模块映射与测试数量由 `scripts/gen-review-brief.mjs` 自动同步并受 `--check` 漂移守卫保护。
 
 <!-- AUTO:META:START -->
-> **同步快照（由 `scripts/gen-review-brief.mjs` 自动维护）**：版本 `v1.7.0` · 核心追踪文件 41 个（合计 60,147 行） · 测试套件 37 个 / 234 个用例 · 可运行 `node scripts/gen-review-brief.mjs --check` 检验零漂移。
+> **同步快照（由 `scripts/gen-review-brief.mjs` 自动维护）**：版本 `v1.7.0` · 核心追踪文件 41 个（合计 60,137 行） · 测试套件 37 个 / 234 个用例 · 可运行 `node scripts/gen-review-brief.mjs --check` 检验零漂移。
 <!-- AUTO:META:END -->
 
 ---
@@ -153,7 +153,7 @@ flowchart TB
 | `scripts/verify-package-graph.mjs` | 1,235 | 静态 Import 图打包校验器（devtools）：线性 JS 词法解析器提取含/无分号（ASI）、多行、注释穿插与带属性动态导入的 ESM/CJS 依赖，证明无漏打模块且 devtools 零泄漏 |
 | `scripts/prefix-budget.mjs` | 978 | Turn-0 前缀预算、双 MCP 指纹与 `--calibrate` 跨语种 Token 估算误差校准审计（devtools，读取统一 `config.json`，超预算/非规范时非零退出码卡口 CI） |
 | `scripts/gen-review-brief.mjs` | 358 | `AI_REVIEW_BRIEF.md` 代码行数/测试基线自动生成与 `--check` 漂移守卫（devtools） |
-| `sidecars/dashboard/server.mjs` | 2,445 | Sidecar HTTP / SidecarApp 服务 + 常驻 Stall Watchdog 巡检：严格 `Host`/同源 `Origin`/`Sec-Fetch-Site` 白名单、`X-Frame-Options: DENY`、独立 HTTP 全部 `/api/*` 强制 `X-Agy-Dart-Token`、SidecarApp 全部 `/api/*` 仅限 `POST`（强制 `X-Sidecar-Token`）、新增 `/api/watchdog` 与 `POST`-only `/api/watchdog/action`、卡死时 `/api/handoff` 自动附带抢救快照 |
+| `sidecars/dashboard/server.mjs` | 2,435 | Sidecar HTTP / SidecarApp 服务 + 常驻 Stall Watchdog 巡检：严格 `Host`/同源 `Origin`/`Sec-Fetch-Site` 白名单、`X-Frame-Options: DENY`、独立 HTTP 全部 `/api/*` 强制 `X-Agy-Dart-Token`、SidecarApp 全部 `/api/*` 仅限 `POST`（强制 `X-Sidecar-Token`）、新增 `/api/watchdog` 与 `POST`-only `/api/watchdog/action`、卡死时 `/api/handoff` 自动附带抢救快照 |
 | `sidecars/dashboard/index.html` | 7,135 | 实时仪表盘前端：自动注入并携带 CSRF Token、全部 `/api/*` 调用统一 POST JSON、XSS 转义加固、1s 本地 TTL 与卡死静默倒计时、Stall Watchdog 抢救卡片（根因归因/排障指引/一键复制抢救简报/Opt-in 桌面提醒开关）与 Handoff 抽屉 |
 <!-- AUTO:CODE_MAP:END -->
 
@@ -243,7 +243,7 @@ node scripts/prefix-budget.mjs --calibrate --auto-transcript
 # configuredStartup.estimatedTokens 按清单统计预载工具；totalTokens 包含全部工具，启动摘要随工作区变化
 
 # 4. 全域环境 Prompt Cache 体检 & 离线 9 策略回放
-npm run cache:audit -- --workspace . --no-live
+node scripts/cache-audit.mjs --workspace . --no-live
 npm run cache:simulate
 
 # 5. 审阅简报行数与测试基线零漂移检验
