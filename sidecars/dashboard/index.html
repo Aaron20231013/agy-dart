@@ -1997,8 +1997,8 @@
             <span id="active-dot" class="status-dot is-active"></span>
             <span id="active-text">Active</span>
           </button>
-          <div id="kv-keepalive-group" class="keepalive-group is-on">
-            <button id="kv-keepalive-btn" onclick="toggleTtlKeepalive()" class="toggle-chip is-on" data-enabled="1" data-used="0" data-max="1" data-custom="0" data-cold="0" data-i18n-title="kvKeepaliveTip" title="Per-conversation auto-keepalive: cloud-aligned ~60s before TTL expires (default 1x, >=15% window; resets on your next message)">Auto-Keepalive: 0/1</button>
+          <div id="kv-keepalive-group" class="keepalive-group">
+            <button id="kv-keepalive-btn" onclick="toggleTtlKeepalive()" class="toggle-chip" data-enabled="0" data-used="0" data-max="1" data-custom="0" data-cold="0" data-i18n-title="kvKeepaliveTip" title="Off by default. When enabled, sends a message requesting an OK reply about 60s before cache expiry. Each reply uses model input.">Auto-Keepalive: OFF</button>
             <label class="keepalive-max-wrap" data-i18n-title="kvKeepaliveMaxTip" title="Max auto-keepalive count for this conversation window (1–20; clear input to follow global)">
               <span>&times;</span>
               <input id="kv-keepalive-max" type="number" min="1" max="20" step="1" value="1" class="keepalive-max-input" onchange="changeTtlKeepaliveMax(this.value)" onkeydown="if(event.key==='Enter'){const b=document.getElementById('kv-keepalive-btn');if(b&&b.dataset?.custom!=='1'&&String(this.value).trim()===String(b.dataset?.max||'')){changeTtlKeepaliveMax(this.value);}this.blur();}" />
@@ -2047,10 +2047,10 @@
             <span class="band-title" data-i18n="kvCardTitle">KV-Cache &amp; Context Watermark</span>
           </div>
           <div class="band-actions">
-            <div id="kv-global-keepalive-group" class="keepalive-group keepalive-global-group is-on">
-              <button id="kv-global-keepalive-btn" onclick="toggleGlobalTtlKeepalive()" class="toggle-chip is-on" data-max="1" data-fallback="1" data-i18n-title="kvGlobalKeepaliveTip" title="Global default cache keepalive count (0 = off by default for uncustomized windows; 1–20 = auto-warm count)">Global Warm: &times;</button>
+            <div id="kv-global-keepalive-group" class="keepalive-group keepalive-global-group">
+              <button id="kv-global-keepalive-btn" onclick="toggleGlobalTtlKeepalive()" class="toggle-chip" data-max="0" data-fallback="1" data-i18n-title="kvGlobalKeepaliveTip" title="Global default cache keepalive count (0 = off by default for uncustomized windows; 1–20 = auto-warm count)">Global Warm: OFF</button>
               <label class="keepalive-max-wrap" data-i18n-title="kvGlobalKeepaliveMaxTip" title="Set global default keepalive count (0–20; 0 turns off default keepalive)">
-                <input id="kv-global-keepalive-max" type="number" min="0" max="20" step="1" value="1" class="keepalive-max-input" onchange="changeGlobalTtlKeepaliveMax(this.value)" onkeydown="if(event.key==='Enter'){this.blur();}" />
+                <input id="kv-global-keepalive-max" type="number" min="0" max="20" step="1" value="0" class="keepalive-max-input" onchange="changeGlobalTtlKeepaliveMax(this.value)" onkeydown="if(event.key==='Enter'){this.blur();}" />
               </label>
             </div>
             <button id="kv-ttl-notify-btn" onclick="toggleTtlNotify()" class="toggle-chip" data-enabled="0" data-i18n-title="kvTtlNotifyTip" title="Opt-in OS desktop alert when high-context (&gt;=60k) idle cache is about to expire (never auto-sends messages or burns quota)">TTL Alert: OFF</button>
@@ -2699,7 +2699,7 @@
         kvKeepaliveColdSuffix: ' (Cold)',
         kvKeepaliveColdTip: 'Cold-miss circuit breaker tripped (cache_read = 0); paused until your next message or ↺ reset',
         kvKeepaliveBelowMinTip: 'Current {cur}k < {min}k ({pct}%) threshold; custom window override bypasses this gate',
-        kvKeepaliveTip: 'Per-conversation auto-keepalive: cloud-aligned ~60s before TTL expires (default 1x, >=15% window; resets on your next message)',
+        kvKeepaliveTip: 'Off by default. When enabled, sends a message requesting an OK reply about 60s before cache expiry. Each reply uses model input.',
         kvKeepaliveSubagentState: 'Skipped',
         kvKeepaliveSubagentTip: 'Background subagent: auto-keepalive is automatically skipped so subagents never burn quota',
         kvKeepaliveMaxTip: 'Max auto-keepalive count for this conversation window (1–20; clear input to follow global)',
@@ -3033,7 +3033,7 @@
         kvKeepaliveColdSuffix: '（冷断）',
         kvKeepaliveColdTip: '已触发冷未命中自动熔断（cache_read = 0），本轮空闲停止后续续温，真人发新消息或点 ↺ 自动恢复',
         kvKeepaliveBelowMinTip: '当前 {cur}k 未达 {min}k（{pct}%）默认门槛；单窗口手动设置续温可豁免',
-        kvKeepaliveTip: '当前对话专属自动续温：对齐云端时钟提前约 60 秒发极短 OK 保活（默认 1 次、窗口 ≥15% 触发，真人发新消息后归零）',
+        kvKeepaliveTip: '默认关闭。开启后，在预计缓存到期前约 60 秒发送一次要求回复 OK 的消息，每次回复都会产生模型输入用量。',
         kvKeepaliveSubagentState: '已跳过',
         kvKeepaliveSubagentTip: '当前为子智能体：已自动跳过续温，避免对一次性后台子任务无意义保活浪费额度',
         kvKeepaliveMaxTip: '当前对话允许自动续温的最大次数（1–20 次；清空输入框可恢复随全局）',
@@ -6488,13 +6488,13 @@
       }
     }
 
-    let cachedGlobalKeepalive = { globalMaxCount: 1, fallbackMaxCount: 1, minContextPct: 15 };
+    let cachedGlobalKeepalive = { globalMaxCount: 0, fallbackMaxCount: 1, minContextPct: 15 };
     let minCtxActionSeq = 0;
     let inFlightMinCtxActionCount = 0;
     let unboundKeepaliveState = {
-      enabled: true,
+      enabled: false,
       maxCount: 1,
-      globalMaxCount: 1,
+      globalMaxCount: 0,
       fallbackMaxCount: 1,
       isCustomOverride: false,
       usedCount: 0,
@@ -6763,7 +6763,7 @@
         isSubagent,
         isCustomOverride,
         coldMissTripped,
-        enabled: isSubagent ? false : (btn ? btn.dataset?.enabled !== '0' : true),
+        enabled: !isSubagent && btn?.dataset?.enabled === '1',
         maxCount: Math.min(20, Math.max(1, parseInt(btn?.dataset?.max || maxInput?.value || '1', 10) || 1)),
         usedCount: isSubagent ? 0 : Math.max(0, parseInt(btn?.dataset?.used || '0', 10) || 0)
       };
@@ -6784,7 +6784,7 @@
       if (!btn) return;
       const isSubagent = ka ? ka.isSubagent === true : (btn.dataset?.subagent === '1');
       const isCustom = !isSubagent && (ka ? ka.isCustomOverride === true : (btn.dataset?.custom === '1'));
-      const enabled = isSubagent ? false : (ka ? ka.enabled !== false : (btn.dataset?.enabled !== '0'));
+      const enabled = !isSubagent && (ka?.enabled ?? (btn.dataset?.enabled === '1'));
       const maxCount = ka && Number.isFinite(Number(ka.maxCount))
         ? Math.min(20, Math.max(1, Math.floor(Number(ka.maxCount))))
         : Math.min(20, Math.max(1, parseInt(btn.dataset?.max || maxInput?.value || '1', 10) || 1));

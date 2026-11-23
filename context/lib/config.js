@@ -63,7 +63,7 @@ export const CONFIG_DEFAULTS = Object.freeze({
   ttlDesktopNotify: false,
   ttlNotifyLeadSec: 60,
   ttlNotifyMinTokens: 60000,
-  ttlKeepalive: true,
+  ttlKeepalive: false,
   ttlKeepaliveMaxCount: 1,
   ttlKeepaliveLeadSec: 60,
   ttlKeepaliveMinContextPct: 15,
@@ -537,11 +537,13 @@ export function getConfigSnapshot(options = {}) {
       parseEnvBool(env?.AGY_DART_TTL_KEEPALIVE) ??
       parseDisableEnvFlag(env?.AGY_DART_DISABLE_TTL_KEEPALIVE);
   }
-  pick("ttlKeepalive", ttlKeepaliveEnv, cfgBool("ttlKeepalive"));
+  const configuredKeepaliveCount = clampInt(parseNonNegativeInt(cfg.ttlKeepaliveMaxCount), 0, 20);
+  // Existing configs can opt in with a positive count alone.
+  pick("ttlKeepalive", ttlKeepaliveEnv, cfgBool("ttlKeepalive") ?? (configuredKeepaliveCount > 0 ? true : undefined));
   pick(
     "ttlKeepaliveMaxCount",
     clampInt(parseNonNegativeInt(env?.AGY_DART_TTL_KEEPALIVE_MAX_COUNT), 0, 20),
-    clampInt(parseNonNegativeInt(cfg.ttlKeepaliveMaxCount), 0, 20)
+    configuredKeepaliveCount
   );
   pick(
     "ttlKeepaliveLeadSec",

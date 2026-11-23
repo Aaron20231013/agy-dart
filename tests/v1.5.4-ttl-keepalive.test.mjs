@@ -143,7 +143,7 @@ function httpJsonRequest(port, reqPath, { method = "POST", headers = {}, body = 
   });
 }
 
-test("v1.5.4-ka-1: Default 3x per-conversation TTL auto-keepalive (no 60k threshold), per-session isolation, failure rollback & desktop notify coordination", async () => {
+test("v1.5.4-ka-1: Opt-in TTL auto-keepalive, per-session isolation, failure rollback & desktop notify coordination", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-ka-unit-"));
   const dbPath = path.join(tmpDir, "context.db");
   const store = new ContextModeStore({ dbPath });
@@ -176,7 +176,7 @@ test("v1.5.4-ka-1: Default 3x per-conversation TTL auto-keepalive (no 60k thresh
   });
 
   try {
-    assert.equal(store.isTtlKeepaliveEnabled(), true, "Auto-keepalive defaults to ON");
+    assert.equal(store.isTtlKeepaliveEnabled(), false, "Auto-keepalive defaults to OFF");
     assert.equal(store.getTtlKeepaliveMaxCount(), 1, "Default max keepalive count is 1");
     assert.equal(store.getGlobalTtlKeepaliveMinContextPct(), 15, "Default min context % is 15%");
     store.setGlobalTtlKeepaliveMaxCount(3);
@@ -483,7 +483,7 @@ test("v1.5.4-ka-2: PreInvocation preserves lastUserInput on keepalive turn, rese
   }
 });
 
-test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundary, array content + SYSTEM_MESSAGE shadowing, and decoupled default-ON keepalive with stallWatchdog disabled", async () => {
+test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundary, array content + SYSTEM_MESSAGE shadowing, and opt-in keepalive with stallWatchdog disabled", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-ka-edge-"));
   const dbPath = path.join(tmpDir, "context.db");
   const cfgPath = path.join(tmpDir, "config.json");
@@ -606,7 +606,7 @@ test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundar
         conversationId: "conv-decoupled-ka",
         transcriptPath: txPath,
         invocationNum: 0,
-        lastUserInput: "测试关闭看门狗后默认自动续温"
+        lastUserInput: "测试关闭看门狗后手动开启续温"
       },
       decoupledEnv
     );
@@ -622,7 +622,7 @@ test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundar
     const stDec = new ContextModeStore({ dbPath });
     try {
       const decLease = readWatchdogLease(stDec, "conv-decoupled-ka");
-      assert.ok(decLease, "Default-ON auto-keepalive must still record lease when stallWatchdog is disabled");
+      assert.ok(decLease, "Explicit keepalive must still record a lease when stallWatchdog is disabled");
       assert.equal(decLease.phase, WATCHDOG_PHASES.IDLE);
       assert.equal(decLease.subphase, "stopped");
       assert.ok(decLease.idleAnchorTs > 0);
@@ -631,7 +631,7 @@ test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundar
       const simNow = decLease.idleAnchorTs + 280_000; // 20s left on 300s Claude TTL (<= 30s lead)
       const mon = new WatchdogMonitor({
         getStore: () => stDec,
-        getConfig: () => ({ stallWatchdog: false, ttlDesktopNotify: false }),
+        getConfig: () => ({ stallWatchdog: false, ttlDesktopNotify: false, ttlKeepalive: true }),
         nowFn: () => simNow,
         monoNsFn: () => 10_000_000_000n,
         keepaliveSendFn: async (p) => {
@@ -641,7 +641,7 @@ test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundar
       });
       mon.tick();
       await flushMicrotasks();
-      assert.equal(sent.length, 1, "WatchdogMonitor with stallWatchdog=false must still fire default-ON keepalive");
+      assert.equal(sent.length, 1, "Explicit keepalive must still fire with stallWatchdog=false");
       assert.equal(sent[0].conversationId, "conv-decoupled-ka");
     } finally {
       stDec.close();
@@ -1523,16 +1523,16 @@ test("v1.5.4-ka-8: Sticky topbar keepalive capsule & strict per-conversation win
   let srv = null;
   let openStore = null;
   try {
-    // 2. Legacy global keys (`cache:ttl_keepalive_enabled = "false"` & `cache:ttl_keepalive_max_count = "9"`)
+    // 2. Legacy global keys (`cache:ttl_keepalive_enabled = "true"` & `cache:ttl_keepalive_max_count = "9"`)
     //    must NEVER poison new conversations, and sanitizeModelTtlState() scrubs them cleanly!
     const store = new ContextModeStore({ dbPath });
     openStore = store;
     store.open();
     store.setUiLang("zh");
-    store.setMeta("cache:ttl_keepalive_enabled", "false");
+    store.setMeta("cache:ttl_keepalive_enabled", "true");
     store.setMeta("cache:ttl_keepalive_max_count", "9");
 
-    assert.equal(store.isTtlKeepaliveEnabled("conv-fresh-window"), true, "Stale global false in meta must NOT disable new conversations");
+    assert.equal(store.isTtlKeepaliveEnabled("conv-fresh-window"), false, "Obsolete global keys must not enable new conversations");
     assert.equal(store.getTtlKeepaliveMaxCount("conv-fresh-window"), 1, "Stale global maxCount in meta must NOT override default 1");
 
     const scrubRes = store.sanitizeModelTtlState();
@@ -1931,11 +1931,12 @@ test("v1.5.4-ka-8: Sticky topbar keepalive capsule & strict per-conversation win
     assert.equal(kaGrp.className, "keepalive-group is-on");
 
     // Open brand-new empty tab (`hostConvId = ""`) while another window ("conv-other-window") is OFF:
-    // empty tab must NOT inherit conv-other-window's OFF state; shows clean default 0/1!
+    // The new tab follows the factory default without a custom window override.
     hostConvId = "";
     await vmCtx.refreshData(true);
-    assert.equal(kaBtn.innerText, "自动续温：0/1");
-    assert.equal(kaGrp.className, "keepalive-group is-on");
+    assert.equal(kaBtn.innerText, "自动续温：关");
+    assert.equal(kaBtn.dataset.custom, "0");
+    assert.equal(kaGrp.className, "keepalive-group");
   } finally {
     if (openStore) {
       try {
@@ -2033,7 +2034,7 @@ test("v1.5.4-ka-9: Review hardening — SidecarApp app.config.conversationId iso
       conversationId: "conv-boot-window",
       fromSidecarHost: true
     });
-    assert.equal(wdBoot.ttlKeepalive.enabled, true, "conv-boot-window must stay untouched at default ON");
+    assert.equal(wdBoot.ttlKeepalive.enabled, false, "conv-boot-window must follow the default OFF setting");
     assert.equal(wdBoot.ttlKeepalive.maxCount, 1, "conv-boot-window must stay untouched at default maxCount=1");
 
     closeRuntimeStore();
@@ -2098,8 +2099,8 @@ test("v1.5.4-ka-9: Review hardening — SidecarApp app.config.conversationId iso
         assert.equal(stCheck.isTtlKeepaliveEnabled("conv-new-chat-1"), false, "New chat Turn 0 must inherit pre-message OFF toggle");
         assert.equal(stCheck.getTtlKeepaliveMaxCount("conv-new-chat-1"), 7, "New chat Turn 0 must inherit pre-message maxCount=7");
         assert.equal(stCheck.getMeta("cache:ttl_keepalive_state:__unbound__", null), null, "__unbound__ must be cleared after Turn-0 claim");
-        assert.equal(stCheck.isTtlKeepaliveEnabled("conv-subagent-1"), true);
-        assert.equal(stCheck.isTtlKeepaliveEnabled("conv-next-chat-2"), true, "Subsequent new chat starts cleanly at default ON");
+        assert.equal(stCheck.isTtlKeepaliveEnabled("conv-subagent-1"), false);
+        assert.equal(stCheck.isTtlKeepaliveEnabled("conv-next-chat-2"), false, "Subsequent new chat follows the default OFF setting");
 
         // Stale >30m `__unbound__` auto-expires on read
         const staleUnboundTs = Date.now() - 35 * 60 * 1000;
@@ -3268,7 +3269,7 @@ test("v1.5.4-ka-11: Review hardening — real CortexTrajectoryMetadata workflow 
     {
       const stOrphan = new ContextModeStore({ dbPath });
       try {
-        stOrphan.setTtlKeepaliveState("conv-custom-profile-human", { enabled: null });
+        stOrphan.clearTtlKeepaliveOverride("conv-custom-profile-human");
         assert.equal(
           stOrphan.hasAnyExplicitTtlKeepaliveEnabled(),
           false,
@@ -4188,11 +4189,18 @@ test("v1.5.4-ka-13: Global keepalive maxCount (0..20), per-window override vs fo
     // 1. Store-level global inheritance, custom override isolation, 0-count OFF semantics & survival across sanitize/prune/clear
     const st = new ContextModeStore({ dbPath });
     try {
-      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 1);
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 0);
       assert.equal(st.getFallbackNonZeroKeepaliveMaxCount(), 1);
-      assert.equal(st.isTtlKeepaliveEnabled("conv-win-a", true), true);
+      assert.equal(st.isTtlKeepaliveEnabled("conv-win-a"), false);
       assert.equal(st.getTtlKeepaliveMaxCount("conv-win-a"), 1);
       assert.equal(st.hasCustomTtlKeepaliveOverride("conv-win-a"), false);
+
+      // Upgrades preserve an explicit count in config.json and an explicit disable takes precedence.
+      fs.writeFileSync(cfgPath, JSON.stringify({ ttlKeepaliveMaxCount: 4 }));
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 4);
+      fs.writeFileSync(cfgPath, JSON.stringify({ ttlKeepalive: false, ttlKeepaliveMaxCount: 4 }));
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 0);
+      fs.writeFileSync(cfgPath, "{}");
 
       // Window B sets custom override maxCount = 6
       st.setTtlKeepaliveMaxCount(6, "conv-win-b");
@@ -5011,6 +5019,7 @@ test("v1.5.4-ka-14: Cloud clock alignment + 60s lead + delivery EMA, default 1x,
   let srv = null;
   try {
     // 1. Verify updated product defaults: maxCount=1, leadSec=60s, minContextPct=15%
+    assert.equal(CONFIG_DEFAULTS.ttlKeepalive, false);
     assert.equal(CONFIG_DEFAULTS.ttlKeepaliveMaxCount, 1);
     assert.equal(CONFIG_DEFAULTS.ttlKeepaliveLeadSec, 60);
     assert.equal(CONFIG_DEFAULTS.ttlKeepaliveMinContextPct, 15);
@@ -5024,7 +5033,7 @@ test("v1.5.4-ka-14: Cloud clock alignment + 60s lead + delivery EMA, default 1x,
     st.open();
     st.setUiLang("zh");
     try {
-      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 1);
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 0);
       assert.equal(st.getGlobalTtlKeepaliveMinContextPct(), 15);
       assert.equal(st.getTtlKeepaliveDeliveryMs(), 0);
 
@@ -5078,6 +5087,10 @@ test("v1.5.4-ka-14: Cloud clock alignment + 60s lead + delivery EMA, default 1x,
 
       // At t0 + 240s (185s after Stop, 60s left on cloud 5m TTL — 55s earlier than old late Stop+240s!): fires 1/1!
       setClock(t0 + 240_000);
+      mon.tick();
+      await flushMicrotasks();
+      assert.equal(sent.length, 0, "A fresh install must send no keepalive even inside the trigger window");
+      st.setGlobalTtlKeepaliveMaxCount(1);
       mon.tick();
       await flushMicrotasks();
       assert.equal(sent.length, 1, "Cloud-aligned keepalive must fire at t0 + 240s (4m00s cloud time), not Stop + 240s");

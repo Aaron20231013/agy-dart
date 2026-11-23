@@ -118,7 +118,7 @@ Restart or reload Antigravity after installing and open a new chat. User-created
 
 ## Settings
 
-Nothing needs tuning day to day. Open the **agy-dart Context** panel in the right sidebar to toggle auto-keepalive, desktop alerts, protection pause, local cleanup, or file-size limits.
+Automatic cache keepalive is off by default. To opt in for one chat, turn on **Auto-Keepalive** in the **agy-dart Context** panel. **Global Warm** sets the default for chats without an override. Each keepalive requests an `OK` reply and consumes model input, including the full prompt on a cache miss. The panel also controls desktop alerts, protection, local cleanup, and file-size limits.
 
 Preset modes & tool-loading modes via CLI:
 

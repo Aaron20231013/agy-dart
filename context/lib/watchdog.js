@@ -1950,26 +1950,16 @@ export class WatchdogMonitor {
       const metaGlobal = store.getGlobalTtlKeepaliveMaxCount();
       return metaGlobal === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : metaGlobal;
     }
-    if (this._hasCustomConfig) {
-      if (cfg.ttlKeepalive === false && !kaEnvOn) return 0;
-      const rawCfgMax = cfg.ttlKeepaliveMaxCount;
-      if (
-        rawCfgMax !== undefined &&
-        rawCfgMax !== null &&
-        Number.isFinite(Number(rawCfgMax)) &&
-        Number(rawCfgMax) >= 0
-      ) {
-        const clampedCfg = clampGlobal(rawCfgMax);
-        return clampedCfg === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : clampedCfg;
-      }
-      return 1;
-    }
-    if (store && typeof store.getGlobalTtlKeepaliveMaxCount === "function") {
+    if (!this._hasCustomConfig && store && typeof store.getGlobalTtlKeepaliveMaxCount === "function") {
       return store.getGlobalTtlKeepaliveMaxCount();
     }
     if (cfg.ttlKeepalive === false && !kaEnvOn) return 0;
-    const clampedDefault = clampGlobal(cfg.ttlKeepaliveMaxCount ?? 1);
-    return clampedDefault === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : clampedDefault;
+    const fallbackCount = cfg.ttlKeepalive === true || kaEnvOn ? 1 : 0;
+    const configuredCount = Number(cfg.ttlKeepaliveMaxCount ?? fallbackCount);
+    const count = Number.isFinite(configuredCount) && configuredCount >= 0
+      ? clampGlobal(configuredCount)
+      : fallbackCount;
+    return count === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : count;
   }
 
   _resolveFallbackTtlKeepaliveMaxCount(store, cfg) {

@@ -1437,7 +1437,7 @@ export class SettingsMaintenanceMethods {
     return next;
   }
 
-  /** Check if KV-cache TTL auto-keepalive is enabled for a conversation (default ON; env kill-switch > per-conv sqlite > env max/on > global sqlite > config) */
+  /** Resolve opt-in keepalive: env kill-switch > per-conv sqlite > env max/on > global sqlite > config. */
   isTtlKeepaliveEnabled(conversationId = null) {
     const snap = getConfigSnapshot();
     if (snap.sources.ttlKeepalive === "env" && snap.values.ttlKeepalive === false) {
