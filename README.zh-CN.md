@@ -11,7 +11,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-10b981.svg)](LICENSE)
 [![Node.js >= 22](https://img.shields.io/badge/Node.js-%3E%3D22-38bdf8.svg)](package.json)
 [![Security Policy](https://img.shields.io/badge/Security-Policy-818cf8.svg)](SECURITY.md)
-[![Glama MCP](https://glama.ai/mcp/servers/zou172866/agy-dart/badge)](https://glama.ai/mcp/servers/zou172866/agy-dart)
+[![Glama MCP](https://glama.ai/mcp/servers/zou172866/agy-dart/badges/score.svg)](https://glama.ai/mcp/servers/zou172866/agy-dart)
 
 简体中文 · [English](README.md) · [怎么安装](#怎么安装) · [更新日志](#更新日志) · [安全说明](SECURITY.md) · [开源致谢](THIRD_PARTY_NOTICES.md)
 
@@ -139,11 +139,11 @@ node scripts/install.mjs tool-loading eager         # 12 个工具全部预载
 ## 更新日志
 
 ### v1.6.0
-- **跨目录钩子启动与 Desktop 2.0 防误改守卫**：修复 Windows / CLI 在任意项目目录下触发钩子时的路径漂移；双 MCP 服务支持按需查询 `roots/list`，省略 `cwd` 落入插件安装目录时立即拦截报错，防止误搜或误改插件自身文件。
-- **默认 `fast-eager` 预载与坏参自愈**：默认开启 4 个高频 `fast` 工具预载（可用 `--tool-loading` 切换），兼容字符串化 `edits` 参数，遇到宿主 `call_mcp_tool` 空数组损坏时自动熔断引导改用原生编辑工具。
-- **扁平 `lineRanges` 与动态配额匀水**：`read_slices` 支持 `"path:10-50,80-120"` 简写（兼容 `E:\work\foo.mjs:1-60` 盘符路径）；`run_checks` 与多文件目录提取会自动把短项省下的字数额度让给长报错堆栈和大文件。
-- **Git 只读沙盒、`170s` 预算封顶与一键免克隆安装**：封堵陌生仓库 `.git/config` 挂载外部 diff/GPG/textconv 命令及 `status -v`；单次 MCP 检查共享 `170s` 时钟上限避开宿主 `180s` 强杀；修复 Windows 退出管道卡死；升级保留 `rules/*.local.md`，支持 `irm | iex` 一行直装及 T3 ACP / `GEMINI_HOME` 自动同步。
-- **单会话吸顶续温气泡与细节打磨**：吸顶栏按当前对话独立控制缓存续温次数，严密跳过后台子智能体与批处理任务，并补齐中英文界面细节。
+- **常用 4 个工具改为默认直连，修好多文件修改偶发丢内容问题**：批量搜索、看目录、改文件、跑检查 4 个高频工具默认直接预载，避开中转层偶尔把多文件改动清空的问题；其余 8 个大日志工具保持按需加载省初始额度（可用 `tool-loading` 切换）。
+- **修好缓存自动续期失效，彻底跳过后台子智能体**：清理旧面板进程残留的全局关闭冲突并加防重锁，更新插件后后台面板会自动重启生效；`/boost`、浏览器、工作流派出的子智能体和已关闭的旧对话一律不再发续期请求，也不再挤占面板顶部的续期状态栏。
+- **子智能体读文件直接放行，防误改插件目录**：后台子智能体读大文件或重读文件不再弹红字拦截；未传路径误落入插件安装目录时直接拦住，防止误搜或误改插件自身文件。
+- **支持一行命令免下载直装**：新增 PowerShell 与 Shell 一行安装命令，不用先手动克隆仓库。
+- 换用跨平台通用钩子启动方式；短检查省下的字数额度自动让给长报错堆栈；Git 查询限制只读防外部挂载命令；修 Windows 退出卡死，升级保留 `rules/*.local.md`，补安全说明与深浅色架构图。
 
 ### v1.5.4
 - **点击提醒直达对应会话**：点右下角弹窗或右侧面板里的跨窗口告警，自动切出对应项目窗口并跳进那段对话；面板新增多窗口会话切换栏。

@@ -11,7 +11,7 @@ No extra dependencies · Works automatically in the background · Built-in side 
 [![License: MIT](https://img.shields.io/badge/License-MIT-10b981.svg)](LICENSE)
 [![Node.js >= 22](https://img.shields.io/badge/Node.js-%3E%3D22-38bdf8.svg)](package.json)
 [![Security Policy](https://img.shields.io/badge/Security-Policy-818cf8.svg)](SECURITY.md)
-[![Glama MCP](https://glama.ai/mcp/servers/zou172866/agy-dart/badge)](https://glama.ai/mcp/servers/zou172866/agy-dart)
+[![Glama MCP](https://glama.ai/mcp/servers/zou172866/agy-dart/badges/score.svg)](https://glama.ai/mcp/servers/zou172866/agy-dart)
 
 [简体中文](README.zh-CN.md) · English · [How to Install](#how-to-install) · [Changelog](#changelog) · [Security](SECURITY.md) · [Third-Party Notices](THIRD_PARTY_NOTICES.md)
 
@@ -139,11 +139,11 @@ node scripts/install.mjs tool-loading eager         # All 12 tools eager-loaded
 ## Changelog
 
 ### v1.6.0
-- **Cross-workspace hook loader & Desktop 2.0 `roots/list` guard**: Lifecycle hooks now resolve the plugin path reliably from any working directory on Windows/macOS/Linux; both MCP servers query `roots/list` on demand and block accidental writes/searches inside the installed plugin folder when `cwd` is omitted.
-- **Default `fast-eager` loading & `apply_edits` self-healing**: Eager-loads the 4 `agy-dart_fast` tools by default (`--tool-loading <fast-eager|lazy|eager>`), accepts JSON-stringified `edits`, and circuit-breaks host `call_mcp_tool` empty-array corruption.
-- **Flat `lineRanges` & dynamic water-filling quota**: `read_slices` supports `"path:10-50,80-120"` (including Windows drive letters like `E:\work\foo.mjs:1-60`); `run_checks` and multi-file outlines dynamically give short items' unused quota to long error traces and large files.
-- **Git sandbox, `170s` call budget & clean Windows exit**: Blocks untrusted `.git/config` external diff/GPG/textconv hooks and `status -v`, caps shared MCP call budgets at `170s` (below Antigravity's `180s` hard kill), handles Windows `SIGBREAK` / pipe flush cleanly, preserves `rules/*.local.md` on upgrade, and adds one-line clone-free installers plus T3 ACP / `GEMINI_HOME` sync.
-- **Per-window sticky keepalive & ghost-read tracking**: Isolated per-conversation keepalive controls in the sticky top bar with strict subagent/workflow suppression and localized UI polish.
+- **4 core fast tools preloaded directly, fixing occasional multi-file edit drops**: Batch search, outlines, multi-file edits, and concurrent checks now preload directly instead of going through the wrapper tool that occasionally emptied multi-file edit arrays; the other 8 large-log tools stay on-demand to save initial context (switchable via `tool-loading`).
+- **Fixed automatic cache keepalive & skipped all subagents**: Cleared legacy global-off state conflicts from old panel processes, added duplicate-send locks, and auto-restarts the background panel after plugin updates; subagents spawned by `/boost`, browser tasks, or workflows — plus closed chats — no longer trigger keepalives or take over the top keepalive bar.
+- **Direct file reads for subagents, plugin-folder write protection**: Background subagents can read large or repeated files directly without red-text blocks; calls missing a project path that land inside the installed plugin folder are blocked so the plugin never searches or edits its own files.
+- **One-line install without cloning**: Added single-line PowerShell and Shell install commands.
+- Cross-platform hook launcher; unused quota from short checks shifts to long error traces; read-only Git sandboxing against external `.git/config` hooks; clean Windows exit, preserved `rules/*.local.md` on upgrade, plus `SECURITY.md` and light/dark architecture diagrams.
 
 ### v1.5.4
 - **Click alerts to jump to that chat**: Clicking a desktop popup or cross-window panel alert brings the matching project window to the front and opens that conversation; added a multi-window session switcher bar in the panel.
