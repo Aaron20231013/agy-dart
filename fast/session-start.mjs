@@ -324,7 +324,7 @@ var MANIFEST_SKIP_SUBDIRS = /* @__PURE__ */ new Set([
 function shortEntryName(name, maxLen = 28) {
   return name.length > maxLen ? `${name.slice(0, maxLen - 3)}...` : name;
 }
-async function getTwoLevelTree(workspaceDir) {
+async function getWorkspaceLayout(workspaceDir, topLevelOnly) {
   let topEntries;
   try {
     topEntries = await fs.readdir(workspaceDir, { withFileTypes: true });
@@ -349,6 +349,11 @@ async function getTwoLevelTree(workspaceDir) {
   const lines = [];
   const maxTop = 20;
   const shownTop = filteredTop.slice(0, maxTop);
+  if (topLevelOnly) {
+    const names = shownTop.map((entry) => shortEntryName(entry.name) + (entry.isDirectory() ? "/" : ""));
+    if (filteredTop.length > maxTop) names.push(`+${filteredTop.length - maxTop} more`);
+    return `Layout (top level): ${names.join(", ")}`;
+  }
   const subResults = await Promise.all(
     shownTop.map(async (entry) => {
       if (!entry.isDirectory()) {
@@ -586,7 +591,7 @@ export async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
   }
   const [gitSummary, treeSummary, projectSummary] = await Promise.all([
     omitGit ? Promise.resolve(null) : getGitSummary(workspaceDir, gitTimeoutMs),
-    getTwoLevelTree(workspaceDir),
+    getWorkspaceLayout(workspaceDir, options.topLevelOnly),
     getProjectManifestSummary(workspaceDir)
   ]);
   const header = `[agy-dart startup snapshot] Workspace: ${workspaceDir}`;

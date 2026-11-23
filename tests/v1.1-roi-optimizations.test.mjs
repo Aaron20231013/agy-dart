@@ -99,14 +99,11 @@ test("Opt 1: fast/mcp-server.mjs schema slimming cuts Turn-0 budget while preser
   assert.equal(report.blocks.tools.canonical, true);
   assert.equal(report.blocks.tools.fast.toolCount, 4);
   assert.equal(report.blocks.tools.context.toolCount, 8);
-  assert.ok(
-    report.blocks.tools.fast.bytes < 3600,
-    `Expected fast schema < 3600 B (down from 6132 B), got ${report.blocks.tools.fast.bytes}`
-  );
-  assert.ok(
-    report.totalTokens < 3150,
-    `Expected Turn-0 total < 3150 est. tokens (down from 3632), got ${report.totalTokens}`
-  );
+  assert.ok(report.blocks.tools.fast.bytes < 3100);
+  assert.ok(report.blocks.brake.tokens < 400, "Keep detailed tool arguments in the on-demand skill");
+  assert.equal(report.configuredStartup.toolCount, 4);
+  assert.equal(report.configuredStartup.schemaTokens, report.blocks.tools.fast.tokens);
+  assert.equal(report.configuredStartup.estimatedTokens, report.totalTokens - report.blocks.tools.context.tokens);
 
   const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
   try {

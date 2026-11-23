@@ -323,7 +323,8 @@ test("P1-5B: SessionStart stable-prefix-only & subagent payloads stay byte-ident
     const largeCleanSub = runSessionStart({ ...largePayload, subagent: true }, tmpDb);
     assert.equal(largeCleanSub, largeCleanStable);
     assert.ok(!largeCleanStable.includes("Git:"));
-    assert.ok(largeCleanStable.includes("Layout (2 levels):"));
+    assert.ok(largeCleanStable.includes("Layout (top level):"));
+    assert.ok(!largeCleanStable.includes("component_0_impl.js"), "Start with a directory map; discover child files on demand");
 
     // Modify 6 tracked files across subdirectories so gitSummary would normally grow by >250 chars
     for (let d = 0; d < 6; d++) {

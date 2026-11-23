@@ -1666,7 +1666,7 @@ test("P1-Hardening 7: Token estimator empirical calibration + per-feature ROI te
 
     // (a) Bloated AGENTS.md exceeds upper bound -> CLI MUST exit 1
     const origAgents = fs.readFileSync(path.join(fakeRoot, "rules", "AGENTS.md"), "utf8");
-    fs.writeFileSync(path.join(fakeRoot, "rules", "AGENTS.md"), origAgents + "\n" + "规则测试内容说明".repeat(220) + "\n", "utf8");
+    fs.writeFileSync(path.join(fakeRoot, "rules", "AGENTS.md"), origAgents + "\n" + "中".repeat(4000) + "\n", "utf8");
     const overBudgetCli = spawnSync(
       process.execPath,
       [path.join(ROOT, "scripts", "prefix-budget.mjs"), "--target", fakeRoot, "--json"],
@@ -1676,9 +1676,16 @@ test("P1-Hardening 7: Token estimator empirical calibration + per-feature ROI te
     const overBudgetReport = JSON.parse(overBudgetCli.stdout);
     assert.ok(overBudgetReport.exceedsBudget || overBudgetReport.exceedsUpperBound);
     assert.ok(overBudgetReport.warning);
+    assert.equal(overBudgetReport.configuredStartup, null, "A missing manifest has no configured estimate");
 
     // (b) Restore AGENTS.md but inject unsorted tools/list into fake fast/mcp-server.mjs -> CLI MUST exit 1
     fs.writeFileSync(path.join(fakeRoot, "rules", "AGENTS.md"), origAgents, "utf8");
+    for (const eager of [false, true]) {
+      fs.writeFileSync(path.join(fakeRoot, "mcp_config.json"), JSON.stringify({ mcpServers: { fast: { eager }, context: { eager } } }));
+      const audit = await auditPrefixBudget(fakeRoot);
+      assert.equal(audit.configuredStartup.toolCount, eager ? 12 : 0);
+      assert.equal(audit.configuredStartup.schemaTokens, eager ? audit.blocks.tools.tokens : 0);
+    }
     const stubFast = `
 import readline from "node:readline";
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });

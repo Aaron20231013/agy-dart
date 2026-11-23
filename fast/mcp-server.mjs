@@ -3968,7 +3968,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "batch_search",
-      description: "Run concurrent text/regex searches, globs, and read-only git queries (<=8.8KB).",
+      description: "Search files in parallel. For git, pattern is a read-only subcommand.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3981,7 +3981,7 @@ function createAgyFastServer() {
               type: "object",
               properties: {
                 type: { type: "string", enum: ["text", "regex", "glob", "git"] },
-                pattern: { type: "string", description: "Text, regex, glob (*,{a,b}), or read-only git subcommand" },
+                pattern: { type: "string" },
                 path: { type: "string" },
                 glob: { type: "string" },
                 caseSensitive: { type: "boolean" },
@@ -4001,7 +4001,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "apply_edits",
-      description: "Atomically apply multi-hunk edits or file creation across files, with optional verify command.",
+      description: "Edit files atomically using hunks or create (full content). bestEffort skips invalid files. verify runs a shell command after writing.",
       inputSchema: {
         type: "object",
         properties: {
@@ -4028,15 +4028,15 @@ function createAgyFastServer() {
                     required: ["target", "replacement"]
                   }
                 },
-                create: { type: "string", description: "Full content instead of hunks" },
+                create: { type: "string" },
                 overwrite: { type: "boolean" }
               },
               required: ["path"]
             }
           },
           dryRun: { type: "boolean" },
-          bestEffort: { type: "boolean", description: "Commit valid files even if others fail" },
-          verify: { type: "string", description: "Post-write shell command" },
+          bestEffort: { type: "boolean" },
+          verify: { type: "string" },
           verifyTimeoutSec: { type: "integer", minimum: 1, maximum: 170 },
           maxVerifyChars: { type: "integer", minimum: 300, maximum: 7500 }
         },
@@ -4048,7 +4048,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "read_slices",
-      description: "Batch-extract symbol outlines (max 40 files) and small 1-based line slices (<=8.8KB).",
+      description: "Outline files by path or read 1-based inclusive ranges. lineRanges accepts 'path:1-5,9-12'.",
       inputSchema: {
         type: "object",
         properties: {
@@ -4056,13 +4056,11 @@ function createAgyFastServer() {
           outlines: {
             type: "array",
             maxItems: 40,
-            items: { type: "string" },
-            description: "File paths to outline (prefer 10-20/batch)"
+            items: { type: "string" }
           },
           slices: {
             type: "array",
             maxItems: 30,
-            description: "1-based inclusive [startLine,endLine] ranges",
             items: {
               type: "object",
               properties: {
@@ -4084,8 +4082,7 @@ function createAgyFastServer() {
           lineRanges: {
             type: "array",
             maxItems: 30,
-            items: { type: "string" },
-            description: "Shorthand 'path:start-end,s2-e2'"
+            items: { type: "string" }
           },
           maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
         }
@@ -4096,7 +4093,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "run_checks",
-      description: "Run independent shell checks concurrently (<=8.8KB).",
+      description: "Run independent shell checks concurrently. Compact output (default) keeps test diagnostics.",
       inputSchema: {
         type: "object",
         properties: {
@@ -4120,8 +4117,7 @@ function createAgyFastServer() {
           timeoutSec: { type: "integer", minimum: 1, maximum: 170 },
           outputMode: {
             type: "string",
-            enum: ["compact", "full"],
-            description: "compact retains test diagnostics and shortens noisy check logs (default)"
+            enum: ["compact", "full"]
           },
           maxChars: { type: "integer", minimum: 500, maximum: 8800 }
         },

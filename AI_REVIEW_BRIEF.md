@@ -3,7 +3,7 @@
 > **本文档用途**：面向代码审阅 AI / 架构审计 AI / 安全审查 AI 的高密度项目总览与审阅路线图。对应正式发布标签 `v1.6.0`（上一版本基线 `d8fc5ba` / `v1.5.4`）。代码行数、模块映射与测试数量由 `scripts/gen-review-brief.mjs` 自动同步并受 `--check` 漂移守卫保护。
 
 <!-- AUTO:META:START -->
-> **同步快照（由 `scripts/gen-review-brief.mjs` 自动维护）**：版本 `v1.7.0` · 核心追踪文件 41 个（合计 58,425 行） · 测试套件 35 个 / 218 个用例 · 可运行 `node scripts/gen-review-brief.mjs --check` 检验零漂移。
+> **同步快照（由 `scripts/gen-review-brief.mjs` 自动维护）**：版本 `v1.7.0` · 核心追踪文件 41 个（合计 58,452 行） · 测试套件 35 个 / 218 个用例 · 可运行 `node scripts/gen-review-brief.mjs --check` 检验零漂移。
 <!-- AUTO:META:END -->
 
 ---
@@ -137,21 +137,21 @@ flowchart TB
 | `hooks/post-tool-use.mjs` | 894 | 编辑触发单文件 `file_reads` 失效（保快照）并记录 `modifiedFiles`；`ctx_resume` 同时清共享与直接对话快照；写入测试/构建结论到 `sessionCheckpoint`；工具完成后刷新看门狗租约回到 `LLM_INFLIGHT`/`SUBAGENT_BG` |
 | `hooks/stop.mjs` | 407 | 轻量 `Stop` 钩子（<5ms、零 stderr、Fail-Open，遵循官方 `{"decision":"allow"}` 与 `terminationReason`/`fullyIdle`/`error` 契约）：对话轮次结束时将 `watchdog_lease:<convId>` 切换为 `IDLE` |
 | `hooks/cli-filter.mjs` | 449 | `PreToolUse.overwrite` 执行代理：Windows `cmd.exe`/`powershell.exe` 精确透传退出码、密钥脱敏、原输出入 FTS5、降噪并死守 `<= 8.8 KB` |
-| `hooks/session-start.mjs` | 323 | 前缀稳定启动钩子：支持 `stablePrefixOnly` 与子 Agent 自动省略易变 Git 尾段（并在子进程隔离禁用 Git） |
+| `hooks/session-start.mjs` | 324 | 前缀稳定启动钩子：支持 `stablePrefixOnly` 与子 Agent 自动省略易变 Git 尾段（并在子进程隔离禁用 Git） |
 | `hooks/compile-cache.mjs` | 206 | 版本化 V8 编译缓存管理（保留最近 3 个版本）与跨 Node 22/24 的 `suppressSqliteExperimentalWarning()` 零 stderr 护栏 |
 
 ### 3.3 双 MCP 引擎、Sidecar 面板与审计脚本
 
 | 文件 | 行数 | 核心职责与关键导出 |
 | :--- | ---: | :--- |
-| `fast/mcp-server.mjs` | 4,191 | `agy-dart_fast` 4 工具批处理引擎：V8 编译缓存、`read_slices` L1+L2 SQLite `outline_cache`（含原生 `.patch`/`.diff` 变更大纲）与 4 MB 切片缓存、`batch_search` 工作区指纹缓存 |
+| `fast/mcp-server.mjs` | 4,187 | `agy-dart_fast` 4 工具批处理引擎：V8 编译缓存、`read_slices` L1+L2 SQLite `outline_cache`（含原生 `.patch`/`.diff` 变更大纲）与 4 MB 切片缓存、`batch_search` 工作区指纹缓存 |
 | `fast/benchmark.mjs` | 1,675 | 离线轨迹基准 CLI（devtools）：`analyze`、`compare`、`cache`、`cache simulate` |
-| `fast/session-start.mjs` | 740 | 上游工作区结构与 Git 状态快照生成器（由 `hooks/session-start.mjs` 封装调用，已禁自动更新） |
+| `fast/session-start.mjs` | 745 | 上游工作区结构与 Git 状态快照生成器（由 `hooks/session-start.mjs` 封装调用，已禁自动更新） |
 | `context/server.js` | 619 | `agy-dart_context` MCP stdio 服务端：先激活 V8 编译缓存与 SQLite 告警静默再动态加载库模块；导出冻结规范排序 `TOOL_DEFINITIONS` |
 | `scripts/cache-audit.mjs` | 2,806 | 全域环境 Prompt Cache 体检 `npm run cache:audit`（devtools）：规则/技能 CJK 估 token、双次握手探测 MCP 确定性、静态分析中段 Hook |
 | `scripts/install.mjs` | 1,499 | 跨平台安装/卸载/模式切换/`doctor` 健康自检：拆分 `RUNTIME_FILES`（默认）与 `DEVTOOLS_FILES`（`--with-devtools`），校验 5 大 Hook 与 Watchdog 并输出生效配置 |
 | `scripts/verify-package-graph.mjs` | 1,235 | 静态 Import 图打包校验器（devtools）：线性 JS 词法解析器提取含/无分号（ASI）、多行、注释穿插与带属性动态导入的 ESM/CJS 依赖，证明无漏打模块且 devtools 零泄漏 |
-| `scripts/prefix-budget.mjs` | 953 | Turn-0 前缀预算、双 MCP 指纹与 `--calibrate` 跨语种 Token 估算误差校准审计（devtools，读取统一 `config.json`，超预算/非规范时非零退出码卡口 CI） |
+| `scripts/prefix-budget.mjs` | 978 | Turn-0 前缀预算、双 MCP 指纹与 `--calibrate` 跨语种 Token 估算误差校准审计（devtools，读取统一 `config.json`，超预算/非规范时非零退出码卡口 CI） |
 | `scripts/gen-review-brief.mjs` | 358 | `AI_REVIEW_BRIEF.md` 代码行数/测试基线自动生成与 `--check` 漂移守卫（devtools） |
 | `sidecars/dashboard/server.mjs` | 2,440 | Sidecar HTTP / SidecarApp 服务 + 常驻 Stall Watchdog 巡检：严格 `Host`/同源 `Origin`/`Sec-Fetch-Site` 白名单、`X-Frame-Options: DENY`、独立 HTTP 全部 `/api/*` 强制 `X-Agy-Dart-Token`、SidecarApp 全部 `/api/*` 仅限 `POST`（强制 `X-Sidecar-Token`）、新增 `/api/watchdog` 与 `POST`-only `/api/watchdog/action`、卡死时 `/api/handoff` 自动附带抢救快照 |
 | `sidecars/dashboard/index.html` | 7,135 | 实时仪表盘前端：自动注入并携带 CSRF Token、全部 `/api/*` 调用统一 POST JSON、XSS 转义加固、1s 本地 TTL 与卡死静默倒计时、Stall Watchdog 抢救卡片（根因归因/排障指引/一键复制抢救简报/Opt-in 桌面提醒开关）与 Handoff 抽屉 |
@@ -240,7 +240,7 @@ npm run prefix:budget
 node scripts/prefix-budget.mjs --stable-only --json
 node scripts/prefix-budget.mjs --calibrate
 node scripts/prefix-budget.mjs --calibrate --auto-transcript
-# 预期基线：~2,960 est. tokens（+15% 上界 <= 4,000）, canonical=true, MAPE ~5.3%
+# configuredStartup.estimatedTokens 按清单统计预载工具；totalTokens 包含全部工具，启动摘要随工作区变化
 
 # 4. 全域环境 Prompt Cache 体检 & 离线 9 策略回放
 npm run cache:audit -- --workspace . --no-live

@@ -195,7 +195,7 @@ node scripts/install.mjs tool-loading eager         # All 12 tools eager-loaded
 ```bash
 npm test                                    # Run full test suite
 npm run verify:pkg                          # Verify installer file list
-npm run prefix:budget                       # Check default prompt token size
+npm run prefix:budget                       # Estimate configured Antigravity startup and full-catalog token usage
 npm run cache:audit -- --workspace . --no-live
 npm run cache:simulate
 ```

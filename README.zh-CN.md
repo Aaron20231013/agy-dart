@@ -195,7 +195,7 @@ node scripts/install.mjs tool-loading eager         # 12 个工具全部预载
 ```bash
 npm test                                    # 跑全套测试
 npm run verify:pkg                          # 检查安装包文件完整性
-npm run prefix:budget                       # 查看默认提示词占用量
+npm run prefix:budget                       # 分别估算 Antigravity 配置的首轮占用和全部工具加载后的占用
 npm run cache:audit -- --workspace . --no-live
 npm run cache:simulate
 ```

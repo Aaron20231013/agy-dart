@@ -193,7 +193,7 @@ const tools = createTools({
 const RAW_TOOL_DEFINITIONS = [
   {
     name: "ctx_batch",
-    description: "Run sequential shell commands, index output into FTS5, and return matching snippets (<=8.8 KB).",
+    description: "Run shell commands in order. Index output and return a preview or query hits.",
     inputSchema: {
       type: "object",
       properties: {
@@ -206,7 +206,7 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_doctor",
-    description: "Check SQLite WAL/FTS5 health, DB size, feature toggles, and runtimes.",
+    description: "Check database, settings and runtime health.",
     inputSchema: {
       type: "object",
       properties: {
@@ -216,7 +216,7 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_execute",
-    description: "Run JS/Python/Shell/PowerShell in sandbox to filter >16 KB logs or giant JSON/CSV/API data (<=8.8 KB inline + FTS5). Pass short intent first; for >5-line scripts, write to conversation scratch dir (or OS temp) and pass file + args.",
+    description: "Filter large data with code. Return a preview and index the output. Give intent first. For >5 lines use a conversation scratch dir (or OS temp) and pass file + args.",
     inputSchema: {
       type: "object",
       properties: {
@@ -233,7 +233,7 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_index",
-    description: "Index local file, URL, or raw text into SQLite FTS5 (heading-aware for Markdown).",
+    description: "Index a file, URL or text for ctx_search.",
     inputSchema: {
       type: "object",
       properties: {
@@ -247,7 +247,7 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_purge",
-    description: "Purge indexed sources/events for session, worktree, all, or stale TTL entries (optional VACUUM).",
+    description: "Delete indexed data in scope (default: session).",
     inputSchema: {
       type: "object",
       properties: {
@@ -261,7 +261,7 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_resume",
-    description: "Recover indexed sources/events and PostToolUse checkpoint after /compact.",
+    description: "Recover session state after /compact or fetch an event by seq.",
     inputSchema: {
       type: "object",
       properties: {
@@ -272,7 +272,7 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_search",
-    description: "Search SQLite FTS5 sources via Porter BM25 + Trigram RRF.",
+    description: "Find ranked snippets in indexed sources.",
     inputSchema: {
       type: "object",
       properties: {
@@ -288,7 +288,7 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_stats",
-    description: "Show context savings report (sandbox, CLI filter, read dedup, interceptions).",
+    description: "Report context savings. reset purges session data.",
     inputSchema: {
       type: "object",
       properties: {

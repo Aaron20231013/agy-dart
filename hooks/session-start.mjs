@@ -17,7 +17,7 @@ import { buildWorkspaceSnapshot } from "../fast/session-start.mjs";
 const __selfPath = path.resolve(fileURLToPath(import.meta.url));
 
 export const STATIC_COOP_NOTE =
-  "agy-dart active: use agy-dart_fast + parallel ranged read_file (45 KiB/800 lines) for code/diffs; use agy-dart_context (ctx_execute / ctx_index / ctx_search) for >16 KB logs, large JSON/CSV/API dumps, or long docs/URLs.";
+  "agy-dart active: agy-dart_fast for code; agy-dart_context for large output.";
 
 function readStdin(timeoutMs = 1500) {
   return new Promise((resolve) => {
@@ -274,7 +274,8 @@ async function main() {
       try {
         return (
           (await buildWorkspaceSnapshot(workspaceDir, {
-            maxChars: 1500,
+            maxChars: 800,
+            topLevelOnly: true,
             gitTimeoutMs: 800,
             omitGit: stablePrefixOnly
           })) || ""
