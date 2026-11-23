@@ -38,6 +38,76 @@ const ROOT = path.resolve(__dirname, "..");
 
 const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 25));
 
+test("keepalive checks late parent links even for titled leases without a summary row", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-parent-link-"));
+  const summaryPath = path.join(dir, "conversation_summaries.db");
+  const previous = process.env.AGY_DART_SUMMARY_DB_PATH;
+  process.env.AGY_DART_SUMMARY_DB_PATH = summaryPath;
+  const db = new DatabaseSync(summaryPath);
+  const store = new ContextModeStore({ dbPath: path.join(dir, "context.db") });
+  t.after(() => {
+    db.close();
+    store.close();
+    if (previous === undefined) delete process.env.AGY_DART_SUMMARY_DB_PATH;
+    else process.env.AGY_DART_SUMMARY_DB_PATH = previous;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  db.exec(`
+    CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT);
+    CREATE TABLE conversation_parents (conversation_id TEXT PRIMARY KEY, parent_id TEXT);
+    INSERT INTO conversation_summaries VALUES ('parent-chat', 'Main', '[]');
+    INSERT INTO conversation_parents VALUES ('parent-chat', 'parent-chat');
+  `);
+  const now = Date.now();
+  const sends = [];
+  const parentTranscript = path.join(dir, "parent.jsonl");
+  fs.writeFileSync(parentTranscript, [
+    { step_index: 0, type: "USER_INPUT", content: "Review the changes" },
+    { step_index: 1, type: "PLANNER_RESPONSE", is_subagent: true, tool_calls: [{ name: "finish" }] }
+  ].map(step => JSON.stringify(step)).join("\n"));
+  const monitor = new WatchdogMonitor({
+    getStore: () => store,
+    getConfig: () => ({ stallWatchdog: true, ttlKeepalive: true, ttlKeepaliveMaxCount: 3, ttlKeepaliveLeadSec: 30 }),
+    nowFn: () => now,
+    keepaliveSendFn: async ({ conversationId }) => { sends.push(conversationId); return { ok: true }; }
+  });
+  for (const id of ["child-chat", "parent-chat"]) {
+    writeWatchdogLease(store, {
+      conversationId: id, rootSessionId: id, convTitle: "Cached title",
+      transcriptPath: id === "parent-chat" ? parentTranscript : "",
+      phase: WATCHDOG_PHASES.IDLE, subphase: "stopped", stopReason: "NO_TOOL_CALL",
+      contextTokens: 150000, cacheTtlSec: 300, idleAnchorTs: now - 275000, updatedTs: now - 275000
+    });
+    store.setTtlKeepaliveState(id, { enabled: true });
+    assert.equal(monitor._isConversationSubagent(store, id), false);
+  }
+  db.exec("INSERT INTO conversation_parents VALUES ('child-chat', 'parent-chat')");
+  monitor.tick();
+  await flushMicrotasks();
+  assert.deepEqual(sends, ["parent-chat"]);
+  assert.equal(readWatchdogLease(store, "child-chat").parentConversationId, "parent-chat");
+  assert.equal(store.getMeta("cache:ttl_keepalive_state:child-chat", null), null);
+
+  const calls = [];
+  const result = await sendSidecarKeepaliveMessage("child-chat", "OK", {
+    execFn: async ([cmd]) => { calls.push(cmd); return {}; }
+  });
+  assert.equal(result.skippedSubagent, true);
+  assert.ok(!calls.includes("send-message"));
+
+  calls.length = 0;
+  const fallback = await sendSidecarKeepaliveMessage("parent-chat", "OK", {
+    allowDefaultSummaryDb: true,
+    execFn: async ([cmd]) => {
+      calls.push(cmd);
+      if (cmd === "get-conversation-metadata") throw new Error("offline");
+      return { ok: true };
+    }
+  });
+  assert.equal(fallback.ok, true);
+  assert.deepEqual(calls, ["get-conversation-metadata", "send-message"]);
+});
+
 function httpJsonRequest(port, reqPath, { method = "POST", headers = {}, body = null } = {}) {
   return new Promise((resolve, reject) => {
     const payload = body !== null ? JSON.stringify(body) : "";
@@ -386,7 +456,7 @@ test("v1.5.4-ka-2: PreInvocation preserves lastUserInput on keepalive turn, rese
     assert.equal(calls.length, 2, "Must query get-conversation-metadata first even when ANTIGRAVITY_PROJECT_ID exists");
     assert.equal(calls[1].projectId, "proj-test-123");
 
-    // When get-conversation-metadata fails, falls back cleanly to ambient ANTIGRAVITY_PROJECT_ID
+    // An ambient project identifies the window, but cannot establish conversation identity.
     const fallbackCalls = [];
     const fbSend = await sendSidecarKeepaliveMessage("552f7955-908a-476e-aaf2-bcdba7254f92", "[agy-dart TTL保活 1/3] OK", {
       execFn: async (args, opts) => {
@@ -397,9 +467,8 @@ test("v1.5.4-ka-2: PreInvocation preserves lastUserInput on keepalive turn, rese
         return { ok: true };
       }
     });
-    assert.equal(fbSend.ok, true);
-    assert.equal(fallbackCalls.length, 2);
-    assert.equal(fallbackCalls[1].projectId, "proj-ambient-window-a");
+    assert.equal(fbSend.error, "conversation_identity_unavailable");
+    assert.deepEqual(fallbackCalls.map(c => c.args[0]), ["get-conversation-metadata"]);
   } finally {
     if (srv) await new Promise((resolve) => srv.close(resolve));
     closeRuntimeStore();

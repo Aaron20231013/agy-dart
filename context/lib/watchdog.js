@@ -1766,7 +1766,6 @@ export class WatchdogMonitor {
     const expiresTs = isDefinitive ? Number.POSITIVE_INFINITY : Number(nowMs || 0) + 15_000;
     this._subagentIdentityCache.set(conversationId, {
       isSubagent: boolVal,
-      definitive: isDefinitive,
       expiresTs
     });
   }
@@ -1804,22 +1803,19 @@ export class WatchdogMonitor {
         this._rememberSubagentIdentity(cleanId, true, { definitive: true });
         return true;
       }
-      if (lease.convTitle) {
-        this._rememberSubagentIdentity(cleanId, false, { definitive: true });
-        return false;
-      }
     }
 
     const nowMs = this.nowFn();
     const cached = this._subagentIdentityCache.get(cleanId);
-    if (cached && nowMs < cached.expiresTs && (cached.definitive || !requireDefinitive)) {
+    // A child can gain its official parent link after its title and transcript exist.
+    // Only a positive worker identity may bypass the final pre-send check.
+    if (cached && nowMs < cached.expiresTs && (cached.isSubagent || !requireDefinitive)) {
       return Boolean(cached.isSubagent);
     }
 
     let detected = false;
     let definitive = false;
     let discoveredParent = "";
-    let discoveredTitle = "";
     const allowDefaultDb = this._shouldAllowDefaultSummaryDb(store);
     let txPath = lease?.transcriptPath || "";
     if (!txPath) {
@@ -1852,15 +1848,12 @@ export class WatchdogMonitor {
             detected = true;
             definitive = true;
           }
-          if (summary.title) {
-            discoveredTitle = summary.title;
-            if (!detected) definitive = true;
-          }
+          if (summary.title) definitive = true;
         }
       } catch {}
     }
 
-    if (!detected && !discoveredTitle && txPath) {
+    if (!detected && txPath) {
       try {
         const genesisCls = classifyTranscriptGenesisFile(txPath);
         if (genesisCls === "subagent") {

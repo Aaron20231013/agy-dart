@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { getConfigSnapshot, getEffectiveConfig, parseUiLang } from "../config.js";
+import { readConversationParentId } from "../watchdog-lease.js";
 import {
   DEFAULT_ACTIVE_CATEGORIES,
   DEFAULT_CUTOFF_BYTES,
@@ -86,6 +87,7 @@ function inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, { transcriptPath = "
     if (home) {
       candidates.push(path.join(home, ".gemini", "antigravity", "conversation_summaries.db"));
       candidates.push(path.join(home, ".gemini", "antigravity-ide", "conversation_summaries.db"));
+      candidates.push(path.join(home, ".gemini", "antigravity-cli", "conversation_summaries.db"));
     }
   }
   const seen = new Set();
@@ -115,11 +117,10 @@ function inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, { transcriptPath = "
           row = sdb.prepare("SELECT title FROM conversation_summaries WHERE conversation_id = ? LIMIT 1").get(cid);
         }
       }
-      if (!row) continue;
+      const parentId = readConversationParentId(sdb, cid, row?.parent_conversation_id);
+      if (!row && !parentId) continue;
+      row ??= {};
       const title = typeof row.title === "string" ? row.title.trim() : "";
-      const rawParent = typeof row.parent_conversation_id === "string" ? row.parent_conversation_id.trim() : "";
-      const parentId =
-        rawParent && rawParent !== cid && /^[A-Za-z0-9._-]+$/.test(rawParent) ? rawParent.slice(0, 128) : "";
       const depth = Number(row.nesting_depth);
       const agent = typeof row.agent_name === "string" ? row.agent_name.trim() : "";
       const killed = Boolean(row.killed === true || (Number.isFinite(Number(row.killed)) && Number(row.killed) > 0));
@@ -1525,22 +1526,18 @@ export class SettingsMaintenanceMethods {
               continue;
             }
           }
-          if (!leaseObj?.convTitle) {
-            const txPath = resolveStoreCandidateTranscriptPath(cid, {
-              transcriptPath: typeof leaseObj?.transcriptPath === "string" ? leaseObj.transcriptPath : "",
+          const txPath = resolveStoreCandidateTranscriptPath(cid, {
+            transcriptPath: typeof leaseObj?.transcriptPath === "string" ? leaseObj.transcriptPath : "",
+            allowDefaultDb: allowDefaultSummaryDb
+          });
+          if ((allowDefaultSummaryDb || txPath) && DatabaseSyncCtor) {
+            const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
+              transcriptPath: txPath,
               allowDefaultDb: allowDefaultSummaryDb
             });
-            if ((allowDefaultSummaryDb || txPath) && DatabaseSyncCtor) {
-              const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
-                transcriptPath: txPath,
-                allowDefaultDb: allowDefaultSummaryDb
-              });
-              if (summary.isSubagent) continue;
-              if (!summary.title && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) continue;
-            } else if (txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
-              continue;
-            }
+            if (summary.isSubagent) continue;
           }
+          if (txPath && inspectTranscriptGenesisFileForSubagent(txPath)) continue;
           return true;
         } catch {}
       }
@@ -2117,33 +2114,9 @@ export class SettingsMaintenanceMethods {
             });
             continue;
           }
-          if (lease.convTitle) {
-            if (
-              lease.phase === "IDLE" &&
-              lease.stopReason !== "USER_CANCELED" &&
-              (allowDefaultSummaryDb || lease.transcriptPath) &&
-              DatabaseSyncCtor
-            ) {
-              const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
-                transcriptPath: typeof lease.transcriptPath === "string" ? lease.transcriptPath : "",
-                allowDefaultDb: allowDefaultSummaryDb
-              });
-              if (summary.killed) {
-                subagentRepairMap.set(cid, {
-                  markSubagent: false,
-                  markKilled: true,
-                  scrubKeepalive: true,
-                  parentId: ""
-                });
-              }
-            }
-            continue;
-          }
-
           let detectedSub = false;
           let detectedKilled = false;
           let foundParent = "";
-          let foundTitle = "";
           const txPath = resolveStoreCandidateTranscriptPath(cid, {
             transcriptPath: typeof lease.transcriptPath === "string" ? lease.transcriptPath : "",
             allowDefaultDb: allowDefaultSummaryDb
@@ -2158,9 +2131,8 @@ export class SettingsMaintenanceMethods {
             if (summary.parentId && summary.parentId !== cid) {
               foundParent = summary.parentId;
             }
-            if (summary.title) foundTitle = summary.title;
           }
-          if (!detectedSub && !foundTitle && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
+          if (!detectedSub && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
             detectedSub = true;
           }
           if (detectedSub || detectedKilled) {
@@ -2186,7 +2158,6 @@ export class SettingsMaintenanceMethods {
           const txPath = resolveStoreCandidateTranscriptPath(cid, { allowDefaultDb: allowDefaultSummaryDb });
           let detectedSub = false;
           let detectedKilled = false;
-          let foundTitle = "";
           if ((allowDefaultSummaryDb || txPath) && DatabaseSyncCtor) {
             const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
               transcriptPath: txPath,
@@ -2194,9 +2165,8 @@ export class SettingsMaintenanceMethods {
             });
             if (summary.isSubagent) detectedSub = true;
             if (summary.killed) detectedKilled = true;
-            if (summary.title) foundTitle = summary.title;
           }
-          if (!detectedSub && !foundTitle && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
+          if (!detectedSub && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
             detectedSub = true;
           }
           if (detectedSub || detectedKilled) {

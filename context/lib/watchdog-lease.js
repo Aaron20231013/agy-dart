@@ -197,7 +197,7 @@ function extractGenesisStepText(step) {
 export function classifyTranscriptGenesisSteps(steps = [], { isFromStart = false } = {}) {
   if (!Array.isArray(steps) || steps.length === 0) return "unknown";
   for (const s of steps) {
-    if (!s || typeof s !== "object") continue;
+    if (!s || typeof s !== "object" || isEmbeddedSubagentStepLite(s)) continue;
     const stType = String(s.type || "").toUpperCase();
     const stRole = String(s.role || "").toLowerCase();
     if (stType === "USER_INPUT" || stRole === "user" || typeof s.user_input === "string") {
@@ -222,7 +222,7 @@ export function classifyTranscriptGenesisSteps(steps = [], { isFromStart = false
   let sawRealUserInput = false;
   for (let i = 0; i < steps.length && i < 10; i++) {
     const o = steps[i];
-    if (!o || typeof o !== "object") continue;
+    if (!o || typeof o !== "object" || isEmbeddedSubagentStepLite(o)) continue;
     const t = String(o.type || "").toUpperCase();
     const role = String(o.role || "").toLowerCase();
     if (t === "PLANNER_RESPONSE" || role === "assistant" || role === "model") {
@@ -1202,6 +1202,7 @@ function resolveCandidateSummaryDbPaths({ transcriptPath = "", summaryDbPath = "
     if (home) {
       pushUnique(path.join(home, ".gemini", "antigravity", "conversation_summaries.db"));
       pushUnique(path.join(home, ".gemini", "antigravity-ide", "conversation_summaries.db"));
+      pushUnique(path.join(home, ".gemini", "antigravity-cli", "conversation_summaries.db"));
     }
   }
 
@@ -1270,6 +1271,20 @@ export function resolveCandidateTranscriptPath(
     }
   }
   return "";
+}
+
+export function readConversationParentId(db, conversationId, summaryParent) {
+  const parent = sanitizeConversationId(summaryParent);
+  if (parent && parent !== conversationId) return parent;
+  try {
+    const link = db.prepare(
+      "SELECT parent_id FROM conversation_parents WHERE conversation_id = ? AND parent_id <> conversation_id LIMIT 1"
+    ).get(conversationId);
+    return sanitizeConversationId(link?.parent_id);
+  } catch {
+    // Older hosts have only the parent column on the summary row.
+    return "";
+  }
 }
 
 /**
@@ -1358,14 +1373,12 @@ export function lookupConversationSummary(conversationId, options = {}) {
             .get(safeId);
         }
       }
-      if (row) {
+      const dbParent = readConversationParentId(db, safeId, row?.parent_conversation_id);
+      if (row || dbParent) {
+        // A delegated conversation may have only a conversation_parents entry.
+        row ??= {};
         const dbTitle = typeof row.title === "string" ? sanitizeWatchdogText(row.title, 36) : "";
         const dbCwd = typeof row.workspace_uris === "string" ? parseWorkspaceUriToPath(row.workspace_uris) : "";
-        const rawDbParent =
-          typeof row.parent_conversation_id === "string"
-            ? sanitizeConversationId(row.parent_conversation_id)
-            : "";
-        const dbParent = rawDbParent && rawDbParent !== safeId ? rawDbParent : "";
         const dbDepth = Number.isFinite(Number(row.nesting_depth))
           ? Math.max(0, Math.floor(Number(row.nesting_depth)))
           : 0;

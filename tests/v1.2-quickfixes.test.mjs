@@ -541,6 +541,7 @@ test("Fix 4: prefix-budget.mjs estimateTokens is CJK/UTF-8 aware with numeric fa
       "context/lib/store/checkpoints.js",
       "context/lib/store/reads.js",
       "context/lib/store/settings-maintenance.js",
+      "context/lib/watchdog-lease.js",
       "context/lib/executor.js",
       "context/lib/tools.js",
       "context/lib/repo-skeleton.js",

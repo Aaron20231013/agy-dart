@@ -13,7 +13,7 @@ import {
   DEFAULT_STALE_LEASE_MS,
   WatchdogMonitor,
   collectChildSubagentActivity,
-  detectSubagentFromTranscriptFile,
+  classifyTranscriptGenesisFile,
   inspectLatestTurnInSteps,
   isHeadlessWorkerPrompt,
   isKeepaliveTurnFlushedForRound,
@@ -94,14 +94,8 @@ function isDefaultRuntimeStoreDb(store) {
   return false;
 }
 
-function isSidecarConversationSubagent(conversationId, { store = null, transcriptPath = "", allowDefaultDb = null } = {}) {
-  if (!conversationId || conversationId === "__unbound__" || !isSafeConversationId(conversationId)) {
-    return false;
-  }
+function localConversationIdentity(conversationId, { store = null, transcriptPath = "", allowDefaultDb = null } = {}) {
   const activeStore = store || _runtimeStore;
-  if (_watchdogMonitor && activeStore) {
-    return _watchdogMonitor._isConversationSubagent(activeStore, conversationId);
-  }
   const lease = activeStore ? readWatchdogLease(activeStore, conversationId) : null;
   if (lease) {
     if (
@@ -110,29 +104,35 @@ function isSidecarConversationSubagent(conversationId, { store = null, transcrip
       (lease.rootSessionId && lease.rootSessionId !== conversationId) ||
       (lease.lastUserInput && isHeadlessWorkerPrompt(lease.lastUserInput))
     ) {
-      return true;
+      return "subagent";
     }
-    if (lease.convTitle) return false;
   }
   const effectiveAllowDefaultDb = allowDefaultDb !== null ? Boolean(allowDefaultDb) : isDefaultRuntimeStoreDb(activeStore);
   const txPath =
     transcriptPath ||
     lease?.transcriptPath ||
     resolveCandidateTranscriptPath(conversationId, { allowDefaultDb: effectiveAllowDefaultDb });
-  let foundTitle = "";
+  let summary;
   if (effectiveAllowDefaultDb || txPath) {
-    const summary = lookupConversationSummary(conversationId, {
+    summary = lookupConversationSummary(conversationId, {
       transcriptPath: txPath,
       allowDefaultDb: effectiveAllowDefaultDb,
       checkSubagent: true
     });
-    if (summary.isSubagent) return true;
-    if (summary.title) foundTitle = summary.title;
+    if (summary.isSubagent) return "subagent";
   }
-  if (!foundTitle && txPath && detectSubagentFromTranscriptFile(txPath)) {
-    return true;
+  const genesis = classifyTranscriptGenesisFile(txPath);
+  if (genesis !== "unknown") return genesis;
+  return summary?.found ? "human" : "unknown";
+}
+
+function isSidecarConversationSubagent(conversationId, options = {}) {
+  if (!isSafeConversationId(conversationId) || conversationId === "__unbound__") return false;
+  const store = options.store || _runtimeStore;
+  if (_watchdogMonitor && store) {
+    return _watchdogMonitor._isConversationSubagent(store, conversationId);
   }
-  return false;
+  return localConversationIdentity(conversationId, options) === "subagent";
 }
 
 function isSidecarConversationKilled(conversationId, { store = null, transcriptPath = "", allowDefaultDb = null } = {}) {
@@ -163,7 +163,8 @@ export async function sendSidecarKeepaliveMessage(
   if (!cleanMsg) {
     return { ok: false, error: "empty_message" };
   }
-  if (isSidecarConversationSubagent(conversationId, { allowDefaultDb: allowDefaultSummaryDb })) {
+  const localIdentity = localConversationIdentity(conversationId, { allowDefaultDb: allowDefaultSummaryDb });
+  if (localIdentity === "subagent") {
     _convProjectIdCache.delete(conversationId);
     return { ok: false, skippedSubagent: true, error: "subagent_keepalive_suppressed" };
   }
@@ -174,10 +175,12 @@ export async function sendSidecarKeepaliveMessage(
 
   const cachedProjectId = _convProjectIdCache.get(conversationId) || "";
   let projectId = "";
+  let hasMetadata = false;
   try {
     const metaRes = await execFn(["get-conversation-metadata", conversationId], { timeoutMs: 8000 });
     const metaEvent = metaRes?.response?.conversationMetadata || metaRes?.response?.conversation_metadata;
     const metaObj = metaEvent?.metadata && typeof metaEvent.metadata === "object" ? metaEvent.metadata : metaEvent || {};
+    hasMetadata = Boolean(metaEvent && typeof metaObj === "object" && !Array.isArray(metaObj) && Object.keys(metaObj).length);
     if (isTrajectoryMetadataSubagent(conversationId, metaEvent || metaObj)) {
       _convProjectIdCache.delete(conversationId);
       return { ok: false, skippedSubagent: true, error: "subagent_keepalive_suppressed" };
@@ -201,7 +204,10 @@ export async function sendSidecarKeepaliveMessage(
       _convProjectIdCache.set(conversationId, projectId);
     }
   } catch {
-    // Fall back to cached or ambient ANTIGRAVITY_PROJECT_ID if metadata lookup is unavailable
+    // A locally identified primary chat can still use its cached or ambient project.
+  }
+  if (!hasMetadata && localIdentity === "unknown") {
+    return { ok: false, error: "conversation_identity_unavailable" };
   }
   if (!projectId) {
     projectId = cachedProjectId || process.env.ANTIGRAVITY_PROJECT_ID || "";
