@@ -68,3 +68,37 @@ test("Windows checks and edit verification recognize PowerShell and retain Chine
   assert.equal(edit.isError, false, edit.text);
   assert.match(edit.text, /verified/);
 });
+
+test("apply_edits validates verify before writing or previewing the batch", async t => {
+  const cwd = temporaryWorkspace(t);
+  const existing = path.join(cwd, "existing.txt");
+  const created = path.join(cwd, "new.txt");
+  fs.writeFileSync(existing, "before");
+  const edits = [
+    { path: "existing.txt", hunks: [{ target: "before", replacement: "after" }] },
+    { path: "new.txt", create: "new" }
+  ];
+
+  for (const verify of [{}, { command: "  " }, { command: 1 }, { command: "node --version", cwd: false }, [], null, true]) {
+    for (const mode of [{}, { bestEffort: true }, { dryRun: true }]) {
+      const result = await runApplyEdits({ cwd, edits, verify, ...mode });
+      assert.equal(result.isError, true, result.text);
+      assert.match(result.text, /0 files modified.*verify/s);
+      assert.equal(fs.readFileSync(existing, "utf8"), "before");
+      assert.equal(fs.existsSync(created), false);
+    }
+  }
+
+  // The verifier can run inside a directory created by this same batch.
+  const valid = await runApplyEdits({
+    cwd, edits: [{ path: "checks/files.txt", create: "ok" }],
+    verify: { command: "node --version", cwd: "checks", timeoutSec: "5" }
+  });
+  assert.equal(valid.isError, false, valid.text);
+  assert.match(valid.text, /Verify \[PASS/);
+
+  const noVerify = await runApplyEdits({ cwd, edits, verify: "  " });
+  assert.equal(noVerify.isError, false, noVerify.text);
+  assert.doesNotMatch(noVerify.text, /Verify/);
+  assert.equal(fs.readFileSync(existing, "utf8"), "after");
+});

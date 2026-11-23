@@ -1514,3 +1514,36 @@ test("Hardening regressions: SSRF IPv6/dual-stack/slowloris, lowercase/URL secre
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
+
+test("run_checks keeps both ends of failed commands under character and JSON-RPC byte limits", async t => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "agy-failure-ends-"));
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(cwd, "fail.cjs"), [
+    "const name = process.argv[2];",
+    'console.error("setup begins " + name);',
+    'const line = "error " + ("中🧪" + String.fromCharCode(34, 92)).repeat(32) + "\\n";',
+    'process.stderr.write(line.repeat(name === "large" ? 7500 : 80));',
+    'console.error("final cause " + name);',
+    "process.exitCode = 1;"
+  ].join("\n"));
+  const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
+  t.after(() => client.close());
+  for (const outputMode of ["compact", "full"]) {
+    for (const maxChars of [1000, 8800]) {
+      const response = await client.request("tools/call", { name: "run_checks", arguments: {
+        cwd, commands: ["node fail.cjs large", "node fail.cjs small"], outputMode, maxChars
+      } });
+      assert.equal(response.result.isError, false);
+      const text = response.result.content[0].text;
+      assert.match(text, /2 failed/);
+      for (const name of ["large", "small"]) {
+        assert.ok(text.includes("setup begins " + name), text);
+        assert.ok(text.includes("final cause " + name), text);
+      }
+      assert.match(text, /truncated/);
+      assert.ok(text.isWellFormed());
+      assert.ok(text.length <= maxChars);
+      assert.ok(Buffer.byteLength(JSON.stringify(response) + "\n") <= 8800);
+    }
+  }
+});

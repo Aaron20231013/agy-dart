@@ -13,6 +13,7 @@ import {
   isInsideInstalledPluginDir,
   parseFlatLineRangeSpec,
   runApplyEdits,
+  runBatchSearch,
   runChecks,
   runReadSlices,
   validateReadonlyGitArgs
@@ -1014,5 +1015,37 @@ test("v1.6-5: Phase 3 installer --tool-loading persistence, rules/*.local.md pre
   } finally {
     resetConfigCache();
     cleanTmpDir(tmpDir);
+  }
+});
+
+test("batch_search keeps late Unicode matches visible on long lines across both backends", async t => {
+  const cwd = makeTmpDir();
+  t.after(() => cleanTmpDir(cwd));
+  const context = "🙂".repeat(150);
+  const before = "文🙂".repeat(129);
+  const after = "🟢".repeat(150);
+  fs.writeFileSync(path.join(cwd, "long.txt"), [
+    context, before + "针🧵尾" + after, "early" + after,
+    before + "FIRST", "SECOND" + after, before + "END"
+  ].join("\r\n"));
+  for (const forceNodeFallback of [false, true]) {
+    const search = async query => {
+      const { text } = await runBatchSearch({
+        cwd, queries: [{ path: "long.txt", ...query }]
+      }, { forceNodeFallback });
+      assert.ok(text.isWellFormed(), "snippet boundaries must preserve surrogate pairs");
+      return text.split("\n").filter(line => /^  \d/.test(line));
+    };
+    const near = await search({ type: "text", pattern: "针🧵尾", contextLines: 1 });
+    assert.equal(near[0], "  1- " + context.slice(0, 240) + "...");
+    assert.match(near[1], /^  2: \.\.\..*针🧵尾.*\.\.\.$/);
+    assert.equal(near[2], "  3- " + ("early" + after).slice(0, 239) + "...");
+    const early = await search({ type: "text", pattern: "early" });
+    assert.equal(early[0], near[2].replace("3-", "3:"));
+    const multi = await search({ type: "regex", multiline: true, pattern: "FIRST\\r?\\nSECOND" });
+    assert.match(multi[0], /^  4: \.\.\..*FIRST$/);
+    assert.match(multi[1], /^  5: SECOND.*\.\.\.$/);
+    const end = await search({ type: "regex", pattern: "END$" });
+    assert.match(end[0], /^  6: \.\.\..*END$/);
   }
 });

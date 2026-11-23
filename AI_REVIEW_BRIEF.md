@@ -3,7 +3,7 @@
 > **本文档用途**：面向代码审阅 AI / 架构审计 AI / 安全审查 AI 的高密度项目总览与审阅路线图。对应正式发布标签 `v1.6.0`（上一版本基线 `d8fc5ba` / `v1.5.4`）。代码行数、模块映射与测试数量由 `scripts/gen-review-brief.mjs` 自动同步并受 `--check` 漂移守卫保护。
 
 <!-- AUTO:META:START -->
-> **同步快照（由 `scripts/gen-review-brief.mjs` 自动维护）**：版本 `v1.7.0` · 核心追踪文件 41 个（合计 59,716 行） · 测试套件 36 个 / 221 个用例 · 可运行 `node scripts/gen-review-brief.mjs --check` 检验零漂移。
+> **同步快照（由 `scripts/gen-review-brief.mjs` 自动维护）**：版本 `v1.7.0` · 核心追踪文件 41 个（合计 59,793 行） · 测试套件 36 个 / 224 个用例 · 可运行 `node scripts/gen-review-brief.mjs --check` 检验零漂移。
 <!-- AUTO:META:END -->
 
 ---
@@ -144,7 +144,7 @@ flowchart TB
 
 | 文件 | 行数 | 核心职责与关键导出 |
 | :--- | ---: | :--- |
-| `fast/mcp-server.mjs` | 4,879 | `agy-dart_fast` 4 工具批处理引擎：V8 编译缓存、`read_slices` L1+L2 SQLite `outline_cache`（含原生 `.patch`/`.diff` 变更大纲）与 4 MB 切片缓存、`batch_search` 工作区指纹缓存 |
+| `fast/mcp-server.mjs` | 4,956 | `agy-dart_fast` 4 工具批处理引擎：V8 编译缓存、`read_slices` L1+L2 SQLite `outline_cache`（含原生 `.patch`/`.diff` 变更大纲）与 4 MB 切片缓存、`batch_search` 工作区指纹缓存 |
 | `fast/benchmark.mjs` | 1,675 | 离线轨迹基准 CLI（devtools）：`analyze`、`compare`、`cache`、`cache simulate` |
 | `fast/session-start.mjs` | 745 | 上游工作区结构与 Git 状态快照生成器（由 `hooks/session-start.mjs` 封装调用，已禁自动更新） |
 | `context/server.js` | 619 | `agy-dart_context` MCP stdio 服务端：先激活 V8 编译缓存与 SQLite 告警静默再动态加载库模块；导出冻结规范排序 `TOOL_DEFINITIONS` |

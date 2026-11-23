@@ -117,17 +117,13 @@ function checkSensitiveFastPath(absPath) {
   } catch {}
   return null;
 }
+function makeToolRpcResponse(id, text, isError) {
+  return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError: Boolean(isError) } };
+}
 function buildBoundedToolRpcResponse(id, rawText, isError, maxRpcBytes = 8799) {
   const safeInput = redactSecrets(typeof rawText === "string" ? rawText : String(rawText ?? "")).text;
   const wellFormed = typeof safeInput.toWellFormed === "function" ? safeInput.toWellFormed() : sliceSafeChars(safeInput, safeInput.length);
-  const makeEnv = (txt) => ({
-    jsonrpc: "2.0",
-    id,
-    result: {
-      content: [{ type: "text", text: txt }],
-      isError: Boolean(isError)
-    }
-  });
+  const makeEnv = (txt) => makeToolRpcResponse(id, txt, isError);
   const initialEnv = makeEnv(wellFormed);
   if (Buffer.byteLength(JSON.stringify(initialEnv), "utf8") <= maxRpcBytes) {
     return initialEnv;
@@ -396,7 +392,7 @@ var McpStdioServer = class {
         }
       }
       try {
-        const res = await tool.handler(args, { server: this });
+        const res = await tool.handler(args, { server: this, rpcId: id });
         return buildBoundedToolRpcResponse(id, res.text, Boolean(res.isError), DEFAULT_INLINE_MAX_BYTES - 1);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -932,19 +928,59 @@ async function runShellCommandAsync(command, options) {
   }
   return spawnAndCollect(command, [], true, options);
 }
+function captureProcessStream(stream, limit, keepFailureTail) {
+  const chunks = [];
+  let captured = 0;
+  let overflow = 0;
+  // One inline response fits in 8.8 KB. Keep extra space for log filtering.
+  const tailCapacity = Math.min(Math.floor(limit / 2), 16 * 1024);
+  let ring;
+  stream.on("data", chunk => {
+    const take = Math.min(chunk.length, limit - captured);
+    if (take > 0) {
+      chunks.push(chunk.subarray(0, take));
+      captured += take;
+    }
+    const excess = chunk.length - take;
+    if (!excess) return;
+    if (keepFailureTail && tailCapacity) {
+      ring ??= Buffer.allocUnsafe(tailCapacity);
+      const length = Math.min(excess, tailCapacity);
+      const offset = (overflow + excess - length) % tailCapacity;
+      const split = Math.min(length, tailCapacity - offset);
+      chunk.copy(ring, offset, chunk.length - length, chunk.length - length + split);
+      if (split < length) chunk.copy(ring, 0, chunk.length - length + split);
+    }
+    overflow += excess;
+  });
+  return {
+    get truncated() { return overflow > 0; },
+    text(failed) {
+      const head = Buffer.concat(chunks, captured);
+      if (!failed || !ring) return decodeProcessOutput(head, overflow > 0);
+      const cursor = overflow % tailCapacity;
+      const tail = overflow >= tailCapacity
+        ? Buffer.concat([ring.subarray(cursor), ring.subarray(0, cursor)])
+        : Buffer.concat([head.subarray(captured - tailCapacity + overflow), ring.subarray(0, overflow)]);
+      // The split can fall in the middle of a UTF-8 sequence. Only strip the
+      // continuation bytes if the rest decodes as UTF-8 (Windows also uses legacy encodings).
+      let start = 0;
+      while (start < Math.min(3, tail.length) && (tail[start] & 192) === 128) start++;
+      let endText;
+      try { endText = strictUtf8Decoder.decode(tail.subarray(start)); }
+      catch { endText = decodeProcessOutput(tail); }
+      return decodeProcessOutput(head.subarray(0, captured - tailCapacity), true) +
+        "\n... [process output omitted] ...\n" + endText;
+    }
+  };
+}
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const detached = process.platform !== "win32";
   return new Promise((resolve) => {
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let stdoutTruncated = false;
-    let stderrTruncated = false;
     let timedOut = false;
     let settled = false;
-    const stdoutChunks = [];
-    const stderrChunks = [];
     let child;
     try {
       child = spawn(commandOrBin, args, {
@@ -968,6 +1004,8 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
       });
       return;
     }
+    const stdout = captureProcessStream(child.stdout, maxOutputBytes, options.keepFailureTail);
+    const stderr = captureProcessStream(child.stderr, maxOutputBytes, options.keepFailureTail);
     let settleFallbackTimer = null;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -990,42 +1028,12 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), stdoutTruncated),
-        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), stderrTruncated),
-        truncated: stdoutTruncated || stderrTruncated,
+        stdout: stdout.text(exitCode !== 0 || timedOut),
+        stderr: stderr.text(exitCode !== 0 || timedOut),
+        truncated: stdout.truncated || stderr.truncated,
         error
       });
     };
-    child.stdout?.on("data", (chunk) => {
-      if (stdoutBytes >= maxOutputBytes) {
-        stdoutTruncated = true;
-        return;
-      }
-      const remaining = maxOutputBytes - stdoutBytes;
-      if (chunk.length > remaining) {
-        stdoutChunks.push(chunk.subarray(0, remaining));
-        stdoutBytes += remaining;
-        stdoutTruncated = true;
-      } else {
-        stdoutChunks.push(chunk);
-        stdoutBytes += chunk.length;
-      }
-    });
-    child.stderr?.on("data", (chunk) => {
-      if (stderrBytes >= maxOutputBytes) {
-        stderrTruncated = true;
-        return;
-      }
-      const remaining = maxOutputBytes - stderrBytes;
-      if (chunk.length > remaining) {
-        stderrChunks.push(chunk.subarray(0, remaining));
-        stderrBytes += remaining;
-        stderrTruncated = true;
-      } else {
-        stderrChunks.push(chunk);
-        stderrBytes += chunk.length;
-      }
-    });
     child.on("error", (err) => {
       finish(null, null, err.message);
     });
@@ -1513,9 +1521,11 @@ function formatCompactCommandOutput(params) {
   const err = normalizeTerminalOutput(params.stderr);
   const combined = [out, err].filter(Boolean).join("\n");
   if (params.error) {
+    if (params.retainFailureEnds) return `spawn error: ${params.error}`;
     return truncateWithNotice(`spawn error: ${params.error}`, params.maxChars);
   }
   if (params.timedOut) {
+    if (params.retainFailureEnds) return combined ? `TIMED OUT\n${combined}` : "TIMED OUT (no output)";
     const tail = getTailLines(combined, 20);
     return truncateWithNotice(
       tail ? `TIMED OUT
@@ -1539,6 +1549,7 @@ ${tail}` : "TIMED OUT (no output)",
     return cleanedCombined || `Exited with code ${params.exitCode ?? "unknown"}`;
   }
   const keepIndices = /* @__PURE__ */ new Set();
+  if (params.retainFailureEnds) keepIndices.add(0);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (ROOT_CAUSE_HEADER_PATTERN.test(line)) {
@@ -1565,7 +1576,8 @@ ${tail}` : "TIMED OUT (no output)",
     outLines.push(lines[idx]);
     prev = idx;
   }
-  return truncateWithNotice(outLines.join("\n"), params.maxChars);
+  const diagnostic = outLines.join("\n");
+  return params.retainFailureEnds ? diagnostic : truncateWithNotice(diagnostic, params.maxChars);
 }
 function getTailLines(text, count) {
   if (!text) return "";
@@ -1996,6 +2008,22 @@ async function runApplyEdits(input, options = {}) {
       isError: true
     };
   }
+  let verifySpec;
+  const verify = input.verify;
+  if (typeof verify === "string") {
+    if (verify.trim()) verifySpec = { command: verify };
+  } else if (verify !== undefined) {
+    if (!verify || typeof verify !== "object" || Array.isArray(verify)) {
+      return { text: "Validation failed (0 files modified): 'verify' must be a command string or an object.", isError: true };
+    }
+    if (typeof verify.command !== "string" || !verify.command.trim()) {
+      return { text: "Validation failed (0 files modified): 'verify.command' must be a non-empty string.", isError: true };
+    }
+    if (verify.cwd !== undefined && typeof verify.cwd !== "string") {
+      return { text: "Validation failed (0 files modified): 'verify.cwd' must be a string.", isError: true };
+    }
+    verifySpec = { command: verify.command, cwd: verify.cwd, timeoutSec: verify.timeoutSec };
+  }
   const wsRes = await resolveToolWorkspaceCwd(input.cwd, options.server);
   if (wsRes.error) {
     return { text: wsRes.error, isError: true };
@@ -2213,7 +2241,7 @@ ${summaryLines.join("\n")}`,
       `Failed (fix only these):
 - ${errors.join("\n- ")}`
     ];
-    if (!input.dryRun && input.verify) {
+    if (!input.dryRun && verifySpec) {
       partialParts.push(
         "Verify skipped because failed file(s) remain; fix only the failed file(s) and re-run verify."
       );
@@ -2229,50 +2257,47 @@ ${summaryLines.join("\n")}`,
   const header = input.dryRun ? `Dry run validated ${plans.length} file(s) (0 files modified):` : `Applied edits to ${plans.length} file(s):`;
   const parts = [`${header}
 ${summaryLines.join("\n")}`];
-  if (!input.dryRun && input.verify) {
-    const verifySpec = typeof input.verify === "string" ? { command: input.verify } : input.verify;
-    if (verifySpec.command && verifySpec.command.trim()) {
-      const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
-      const requestedTimeoutMs =
-        clampIntWithDefault(
-          verifySpec.timeoutSec ?? input.verifyTimeoutSec,
-          60,
-          1,
-          MAX_MCP_CALL_BUDGET_SEC
-        ) * 1e3;
-      const remainingMs = callDeadline - perfNode.now();
-      if (remainingMs < 500) {
-        parts.push(
-          `\nVerify [NOT RUN: ${MAX_MCP_CALL_BUDGET_SEC}s MCP call budget exhausted] \`${verifySpec.command}\``
-        );
-      } else {
-        const timeoutMs = Math.max(100, Math.min(requestedTimeoutMs, Math.floor(remainingMs)));
-        const maxVerifyChars = clampIntWithDefault(
-          input.maxVerifyChars,
-          4e3,
-          300,
-          7500
-        );
-        const res = await runShellCommandAsync(verifySpec.command, {
-          cwd: verifyCwd,
-          timeoutMs
-        });
-        BATCH_SEARCH_CACHE.clear();
-        const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
-        const verifyHeader = `\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n`;
-        const verifyBytes = DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(parts.join("\n")) - 1 - Buffer.byteLength(verifyHeader);
-        const formatted = formatCompactCommandOutput({
-          stdout: res.stdout,
-          stderr: res.stderr,
-          exitCode: res.exitCode,
-          timedOut: res.timedOut,
-          error: res.error,
-          maxChars: maxVerifyChars,
-          maxBytes: Math.max(0, verifyBytes),
-          passingTest: res.exitCode === 0 && isRecognizedTestCheck(verifySpec.command, verifyCwd)
-        });
-        parts.push(verifyHeader + formatted);
-      }
+  if (!input.dryRun && verifySpec) {
+    const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
+    const requestedTimeoutMs =
+      clampIntWithDefault(
+        verifySpec.timeoutSec ?? input.verifyTimeoutSec,
+        60,
+        1,
+        MAX_MCP_CALL_BUDGET_SEC
+      ) * 1e3;
+    const remainingMs = callDeadline - perfNode.now();
+    if (remainingMs < 500) {
+      parts.push(
+        `\nVerify [NOT RUN: ${MAX_MCP_CALL_BUDGET_SEC}s MCP call budget exhausted] \`${verifySpec.command}\``
+      );
+    } else {
+      const timeoutMs = Math.max(100, Math.min(requestedTimeoutMs, Math.floor(remainingMs)));
+      const maxVerifyChars = clampIntWithDefault(
+        input.maxVerifyChars,
+        4e3,
+        300,
+        7500
+      );
+      const res = await runShellCommandAsync(verifySpec.command, {
+        cwd: verifyCwd,
+        timeoutMs
+      });
+      BATCH_SEARCH_CACHE.clear();
+      const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
+      const verifyHeader = `\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n`;
+      const verifyBytes = DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(parts.join("\n")) - 1 - Buffer.byteLength(verifyHeader);
+      const formatted = formatCompactCommandOutput({
+        stdout: res.stdout,
+        stderr: res.stderr,
+        exitCode: res.exitCode,
+        timedOut: res.timedOut,
+        error: res.error,
+        maxChars: maxVerifyChars,
+        maxBytes: Math.max(0, verifyBytes),
+        passingTest: res.exitCode === 0 && isRecognizedTestCheck(verifySpec.command, verifyCwd)
+      });
+      parts.push(verifyHeader + formatted);
     }
   }
   const outText = parts.join("\n");
@@ -3015,9 +3040,34 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       const isMatch = ev.type === "match";
       const lineText = rawText.replace(/\r?\n$/, "");
       const segments = isMatch && query.multiline ? lineText.split(/\r?\n/) : [lineText];
+      // rg's offsets are UTF-8 bytes within the entire event, including CRLF.
+      // Only long matching lines need conversion to JavaScript string offsets.
+      const submatches = ev.data.submatches ?? [];
+      const bytes = isMatch && submatches.length && segments.some(s => s.length > SEARCH_LINE_CHARS)
+        ? rawBuf ?? Buffer.from(rawText)
+        : null;
+      let byteStart = 0;
+      let hitIndex = 0;
       for (const [offset, text] of segments.entries()) {
         const line = lineNumber + offset;
-        if (!lineMap.get(line)?.isMatch) lineMap.set(line, { lineNumber: line, text, isMatch });
+        const entry = { lineNumber: line, text, isMatch };
+        if (bytes) {
+          const lf = bytes.indexOf(10, byteStart);
+          const byteEnd = lf === -1 ? bytes.length : lf;
+          while (hitIndex < submatches.length &&
+                 submatches[hitIndex].start < byteStart && submatches[hitIndex].end <= byteStart) {
+            hitIndex++;
+          }
+          const hit = submatches[hitIndex];
+          if (text.length > SEARCH_LINE_CHARS && hit && hit.start <= byteEnd) {
+            const from = Math.max(byteStart, hit.start);
+            const to = Math.min(byteEnd, hit.end);
+            entry.matchStart = bytes.toString("utf8", byteStart, from).length;
+            entry.matchEnd = entry.matchStart + bytes.toString("utf8", from, to).length;
+          }
+          byteStart = byteEnd + 1;
+        }
+        if (!lineMap.get(line)?.isMatch) lineMap.set(line, entry);
       }
     }
   }
@@ -3084,7 +3134,13 @@ function multilineMatchLines(content, regex, limit) {
       nextBreak = content.indexOf("\n", lineStart);
     }
     while (true) {
-      if (results.at(-1) !== line) results.push(line);
+      if (results.at(-1)?.lineIndex !== line) {
+        results.push({
+          lineIndex: line,
+          matchStart: Math.max(0, start - lineStart),
+          matchEnd: Math.max(0, start + match[0].length - lineStart)
+        });
+      }
       if (results.length >= limit) return results;
       if (nextBreak === -1 || nextBreak >= end) break;
       line++;
@@ -3166,7 +3222,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   let truncated = false;
   const buildFileMatches = (relFile, allLines, keptMatches) => {
     const lineMap = /* @__PURE__ */ new Map();
-    for (const mIdx of keptMatches) {
+    for (const { lineIndex: mIdx, matchStart, matchEnd } of keptMatches) {
       const from = Math.max(0, mIdx - contextLines);
       const to = Math.min(allLines.length - 1, mIdx + contextLines);
       for (let j = from; j <= to; j++) {
@@ -3177,7 +3233,9 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
             lineMap.set(ln, {
               lineNumber: ln,
               text: allLines[j],
-              isMatch: true
+              isMatch: true,
+              matchStart,
+              matchEnd
             });
           }
         } else if (!prev) {
@@ -3224,7 +3282,8 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
           } else {
             for (let idx = 0; idx < lines.length; idx++) {
               const line = lines[idx];
-              if (!regex.test(line)) continue;
+              const hit = summary ? regex.test(line) : regex.exec(line);
+              if (!hit) continue;
               count++;
               if (query.outputMode === "files_with_matches") break;
               if (summary) continue;
@@ -3232,7 +3291,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
                 fileTruncated = true;
                 break;
               }
-              matchedLines.push(idx);
+              matchedLines.push({ lineIndex: idx, matchStart: hit.index, matchEnd: hit.index + hit[0].length });
             }
           }
           return count ? { relFile, lines, matchedLines, count, fileTruncated } : null;
@@ -3465,6 +3524,27 @@ async function runGitQuery(query, searchRoot) {
   const out = res.stdout.trimEnd();
   return out || "(empty output)";
 }
+const SEARCH_LINE_CHARS = 240;
+
+function formatSearchLine({ text, isMatch, matchStart, matchEnd }) {
+  const prefix = sliceSafeChars(text, SEARCH_LINE_CHARS);
+  if (text.length <= SEARCH_LINE_CHARS) return prefix;
+  if (!isMatch || matchStart === undefined || (matchStart < prefix.length && matchEnd <= prefix.length)) {
+    return prefix + "...";
+  }
+
+  // A multiline span may begin on a newline or continue past the end of this line.
+  const from = Math.min(matchStart, text.length);
+  const span = Math.min(matchEnd, text.length) - from;
+  const lead = Math.max(0, Math.floor((SEARCH_LINE_CHARS - span) / 2));
+  let start = Math.max(0, Math.min(from - lead, text.length - SEARCH_LINE_CHARS));
+  const end = Math.min(text.length, start + SEARCH_LINE_CHARS);
+  const first = text.charCodeAt(start);
+  if (start > 0 && first >= 0xdc00 && first <= 0xdfff) start += start === from ? -1 : 1;
+  const snippet = sliceSafeChars(text.slice(start, end), end - start);
+  return (start ? "..." : "") + snippet + (start + snippet.length < text.length ? "..." : "");
+}
+
 function formatFileMatches(files, totalMatches, truncated) {
   if (files.length === 0) {
     return "(no matches)";
@@ -3473,8 +3553,7 @@ function formatFileMatches(files, totalMatches, truncated) {
   for (const fm of files) {
     const lines = fm.lines.map((l) => {
       const sep = l.isMatch ? ":" : "-";
-      const text = l.text.length > 240 ? `${sliceSafeChars(l.text, 240)}...` : sliceSafeChars(l.text, l.text.length);
-      return `  ${l.lineNumber}${sep} ${text}`;
+      return `  ${l.lineNumber}${sep} ${formatSearchLine(l)}`;
     });
     blocks.push(`${fm.file}
 ${lines.join("\n")}`);
@@ -4402,6 +4481,32 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
 
 // src/tools/run-checks.ts
 import { promises as fs4 } from "node:fs";
+function escapedTextBytes(text) {
+  return Buffer.byteLength(JSON.stringify(text)) - 2;
+}
+function fitCheckText(text, maxChars, maxBytes, keepTail = false) {
+  if (text.length <= maxChars && escapedTextBytes(text) <= maxBytes) return text;
+  const limit = Math.max(0, Math.min(maxChars, maxBytes));
+  const marker = limit >= 64 ? "\n... [truncated] ...\n" : limit >= 6 ? "..." : "";
+  let lo = 0;
+  let hi = Math.min(text.length, limit - marker.length);
+  let fitted = marker;
+  while (lo <= hi) {
+    const size = Math.floor((lo + hi) / 2);
+    const headSize = keepTail ? Math.floor(size / 2) : size;
+    let tailStart = text.length - (size - headSize);
+    const firstUnit = text.charCodeAt(tailStart);
+    if (firstUnit >= 0xdc00 && firstUnit <= 0xdfff) tailStart++;
+    const candidate = sliceSafeChars(text, headSize) + marker + text.slice(tailStart);
+    if (escapedTextBytes(candidate) <= maxBytes) {
+      fitted = candidate;
+      lo = size + 1;
+    } else {
+      hi = size - 1;
+    }
+  }
+  return fitted;
+}
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
   let nextIdx = 0;
@@ -4520,6 +4625,7 @@ async function runChecks(input, options = {}) {
       const effectiveTimeoutMs = Math.max(100, Math.min(spec.timeoutMs, Math.floor(remainingMs)));
       const result = await runShellCommandAsync(spec.command, {
         cwd: spec.cwd,
+        keepFailureTail: true,
         timeoutMs: effectiveTimeoutMs
       });
       const passed = !result.error && !result.timedOut && result.exitCode === 0;
@@ -4565,6 +4671,7 @@ async function runChecks(input, options = {}) {
       error: result.error,
       maxChars: maxProbe,
       maxBytes,
+      retainFailureEnds: !passed,
       passingTest
     });
     const headerPrefix = passed
@@ -4580,65 +4687,35 @@ async function runChecks(input, options = {}) {
       naturalLen: headerPrefix.length + rawCompact.length
     };
   });
-  const hasPassingTests = preFormatted.some((pre) => pre.passingTest);
-  const separators = 2 * outcomes.length;
-  const itemBudgets = computeWaterFillBudgets(
-    preFormatted.map((p) => p.naturalLen),
-    hasPassingTests ? maxChars - summaryHeader.length - separators : usableChars,
-    160
+  const separator = "\n\n";
+  const bodyChars = maxChars - summaryHeader.length - separator.length * outcomes.length;
+  // Quotes, backslashes and line breaks take extra bytes in the final JSON-RPC frame.
+  const rpcOverhead = options.rpcId === undefined ? 0 :
+    Buffer.byteLength(JSON.stringify(makeToolRpcResponse(options.rpcId, "", false))) + 1;
+  const bodyBytes = maxBytes - rpcOverhead - escapedTextBytes(summaryHeader) - escapedTextBytes(separator) * outcomes.length;
+  const charBudgets = computeWaterFillBudgets(preFormatted.map((p) => p.naturalLen), bodyChars);
+  const byteBudgets = computeWaterFillBudgets(
+    preFormatted.map((p) => escapedTextBytes(p.fixedBlock ?? p.headerPrefix + p.rawBody)), bodyBytes
   );
-  const itemByteBudgets = hasPassingTests ? computeWaterFillBudgets(
-    preFormatted.map((pre) => Buffer.byteLength(pre.fixedBlock ?? pre.headerPrefix + pre.rawBody)),
-    maxBytes - Buffer.byteLength(summaryHeader) - separators
-  ) : [];
-  const blocks = outcomes.map(({ result }, idx) => {
-    const pre = preFormatted[idx];
-    if (pre.skippedForBudget) return pre.fixedBlock;
-    if (pre.passingTest) {
-      const charLimit = Math.max(0, itemBudgets[idx] - pre.headerPrefix.length);
-      const byteLimit = Math.max(0, itemByteBudgets[idx] - Buffer.byteLength(pre.headerPrefix));
-      if (pre.rawBody.length <= charLimit && Buffer.byteLength(pre.rawBody) <= byteLimit) {
-        return pre.headerPrefix + pre.rawBody;
-      }
-      return pre.headerPrefix + formatCompactCommandOutput({
-        ...result, passingTest: true, maxChars: charLimit, maxBytes: byteLimit
-      });
+  const blocks = preFormatted.map((pre, idx) => {
+    const chars = charBudgets[idx];
+    const bytes = byteBudgets[idx];
+    if (pre.skippedForBudget) return fitCheckText(pre.fixedBlock, chars, bytes, true);
+    if (pre.naturalLen <= chars && escapedTextBytes(pre.headerPrefix + pre.rawBody) <= bytes) {
+      return pre.headerPrefix + pre.rawBody;
     }
-    const bodyAvail = Math.max(160, itemBudgets[idx] - pre.headerPrefix.length);
-    if (outputMode === "full") {
-      const body2 = pre.rawBody.length <= bodyAvail ? pre.rawBody : truncateWithNotice(pre.rawBody, bodyAvail);
-      return `${pre.headerPrefix}${body2}`;
-    }
-    if (pre.rawBody.length <= bodyAvail) {
-      return `${pre.headerPrefix}${pre.rawBody}`;
-    }
-    const fittedBody = formatCompactCommandOutput({
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      error: result.error,
-      maxChars: bodyAvail
-    });
-    return `${pre.headerPrefix}${fittedBody}`;
+    // A long command line should not consume the entire allowance of a failed check.
+    const reservedChars = pre.passed ? 0 : Math.min(Math.floor(chars / 2), pre.rawBody.length);
+    const reservedBytes = pre.passed ? 0 : Math.min(Math.floor(bytes / 2), escapedTextBytes(pre.rawBody));
+    const prefix = fitCheckText(pre.headerPrefix, chars - reservedChars, bytes - reservedBytes);
+    const bodyCharLimit = chars - prefix.length;
+    const bodyByteLimit = bytes - escapedTextBytes(prefix);
+    const body = pre.passingTest ? formatCompactCommandOutput({
+      ...outcomes[idx].result, passingTest: true, maxChars: bodyCharLimit, maxBytes: bodyByteLimit
+    }) : pre.rawBody;
+    return prefix + fitCheckText(body, bodyCharLimit, bodyByteLimit, !pre.passed);
   });
-  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - 2);
-  const bodyByteBudget = maxBytes !== void 0 ? Math.max(0, maxBytes - Buffer.byteLength(summaryHeader, "utf8") - 2) : void 0;
-  const fittedBlocks = fitSectionsToByteBudget(
-    blocks,
-    bodyBudget,
-    bodyByteBudget,
-    "\n\n"
-  );
-  let text = truncateWithNotice(
-    `${summaryHeader}
-
-${fittedBlocks}`,
-    maxChars
-  );
-  if (maxBytes !== void 0) {
-    text = truncateWithByteNotice(text, maxBytes);
-  }
+  const text = [summaryHeader, ...blocks].join(separator);
   return { text, isError: false };
 }
 function clampInt2(val, min, max) {
