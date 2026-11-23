@@ -2053,7 +2053,7 @@
                 <input id="kv-global-keepalive-max" type="number" min="0" max="20" step="1" value="0" class="keepalive-max-input" onchange="changeGlobalTtlKeepaliveMax(this.value)" onkeydown="if(event.key==='Enter'){this.blur();}" />
               </label>
             </div>
-            <button id="kv-ttl-notify-btn" onclick="toggleTtlNotify()" class="toggle-chip" data-enabled="0" data-i18n-title="kvTtlNotifyTip" title="Opt-in OS desktop alert when high-context (&gt;=60k) idle cache is about to expire (never auto-sends messages or burns quota)">TTL Alert: OFF</button>
+            <button id="kv-ttl-notify-btn" onclick="toggleTtlNotify()" class="toggle-chip" data-enabled="0" data-i18n-title="kvTtlNotifyTip" title="Alert before a high-context (&gt;=60k) idle cache expires in a window with auto-keepalive on. Turning off warming also silences its TTL alerts.">TTL Alert: OFF</button>
             <button id="kv-handoff-btn" onclick="toggleHandoffDrawer()" class="btn btn-secondary btn-sm" title="Generate cache-friendly compaction / session-switch Handoff Brief">
               <svg class="btn-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
@@ -2690,7 +2690,7 @@
         srcHistory: 'history',
         srcSession: 'session',
         kvTtlNotifyLabel: 'TTL Alert',
-        kvTtlNotifyTip: 'Opt-in OS desktop alert when high-context (>=60k) idle cache is about to expire (never auto-sends messages or burns quota)',
+        kvTtlNotifyTip: 'Alert before a high-context (>=60k) idle cache expires in a window with auto-keepalive on. Turning off warming also silences its TTL alerts.',
         kvGlobalKeepaliveLabel: 'Global Warm',
         kvGlobalKeepaliveTip: 'Global default cache keepalive count (0 = off by default for uncustomized windows; 1–20 = auto-warm count)',
         kvGlobalKeepaliveMaxTip: 'Set global default keepalive count (0–20; 0 turns off default keepalive)',
@@ -3024,7 +3024,7 @@
         srcHistory: '历史校准',
         srcSession: '本会话',
         kvTtlNotifyLabel: '临期提醒',
-        kvTtlNotifyTip: '默认关闭：仅在高上下文（≥60k）空闲即将过期时弹一次系统提醒，绝不自动发消息烧额度',
+        kvTtlNotifyTip: '开启后，自动续温窗口的高上下文（≥60k）缓存即将过期时弹一次系统提醒。关闭该窗口的续温也会静音其续温次数用尽和缓存到期弹窗。',
         kvGlobalKeepaliveLabel: '全局加热',
         kvGlobalKeepaliveTip: '全局默认缓存续温次数（0 = 未单独设置的窗口默认关闭；1–20 = 默认自动加热次数）',
         kvGlobalKeepaliveMaxTip: '设置全局默认续温次数（0–20 次；填 0 关闭默认自动加热）',

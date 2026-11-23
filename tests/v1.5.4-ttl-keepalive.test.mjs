@@ -4054,7 +4054,7 @@ test("v1.5.4-ka-12: Adversarial hardening — PreToolUse agentName/isSubagent wi
       await flushMicrotasks();
       assert.equal(dualSent.length, 1, "Two concurrent WatchdogMonitor instances must NOT double-send keepalive");
 
-      // Now test cross-process TTL popup deduplication when keepalive is OFF (`ttlKeepalive: false`, `ttlDesktopNotify: true`)
+      // Muted windows must not consume the shared popup claim. Re-enabling allows one notification.
       const anchorPopupDual = baseNow - 255_000;
       writeWatchdogLease(st, {
         ...readWatchdogLease(st, "conv-primary-main"),
@@ -4079,6 +4079,10 @@ test("v1.5.4-ka-12: Adversarial hardening — PreToolUse agentName/isSubagent wi
         });
       const pMonA = makePopupMon();
       const pMonB = makePopupMon();
+      pMonA.tick();
+      pMonB.tick();
+      assert.equal(dualPopups.length, 0, "Both monitors must remain silent while warming is off");
+      st.setTtlKeepaliveEnabled(true, "conv-primary-main");
       pMonA.tick();
       pMonB.tick();
       assert.equal(dualPopups.length, 1, "Two concurrent WatchdogMonitor instances must NOT fire duplicate TTL desktop popups");

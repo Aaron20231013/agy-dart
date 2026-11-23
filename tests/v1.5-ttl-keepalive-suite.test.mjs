@@ -509,6 +509,13 @@ test("v1.5-4: Watchdog IDLE high-context TTL expiry desktop alert — zero statS
     // 2. Enable ttlDesktopNotify -> fires exactly 1x in (0, 60] window, with <=60B title, <=220B sanitized body & zero user input
     cfgState.ttlDesktopNotify = true;
     monitor.tick();
+    assert.equal(notifications.length, 0, "A TTL alert preference alone must not send a popup");
+    cfgState.ttlKeepalive = true;
+    store.setTtlKeepaliveEnabled(false, "conv-main-85k");
+    monitor.tick();
+    assert.equal(notifications.length, 0, "Disabling warming in one window overrides the global setting");
+    store.clearTtlKeepaliveOverride("conv-main-85k");
+    monitor.tick();
     assert.equal(notifications.length, 1);
     assert.equal(monitor.ttlNotificationCount, 1);
     assert.equal(monitor.statSyncCount, 0, "TTL desktop alert MUST maintain 0 statSync");
@@ -703,6 +710,7 @@ test("v1.5-5: Decoupled stallWatchdog=false + ttlDesktopNotify=true, env precede
       getStore: () => store,
       getConfig: () => ({
         stallWatchdog: false,
+        ttlKeepalive: true,
         ttlDesktopNotify: true,
         ttlNotifyLeadSec: 60,
         ttlNotifyMinTokens: 60000
@@ -1125,6 +1133,7 @@ test("v1.5-7: Chinese (uiLang='zh') localization across desktop popups, PreInvoc
       getConfig: () => ({
         stallWatchdog: true,
         watchdogDesktopNotify: true,
+        ttlKeepalive: true,
         ttlDesktopNotify: true,
         ttlNotifyLeadSec: 60,
         ttlNotifyMinTokens: 60000

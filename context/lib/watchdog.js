@@ -2592,6 +2592,8 @@ export class WatchdogMonitor {
       if (this._isConversationKilled(store, lease.conversationId, lease)) continue;
 
       const ttlAlertMetaKey = `cache_alert:${lease.conversationId}:ttl_desktop`;
+      // Resolve per-window overrides before claiming either kind of TTL popup.
+      if (!this._resolveTtlKeepaliveEnabled(store, cfg, lease.conversationId, lease)) continue;
       if (store && (typeof store.getTimedMeta === "function" || typeof store.getMeta === "function")) {
         const claimTtlPopup = () => {
           const prev =

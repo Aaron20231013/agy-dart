@@ -118,7 +118,7 @@ Restart or reload Antigravity after installing and open a new chat. User-created
 
 ## Settings
 
-Automatic cache keepalive is off by default. To opt in for one chat, turn on **Auto-Keepalive** in the **agy-dart Context** panel. **Global Warm** sets the default for chats without an override. Each keepalive requests an `OK` reply and consumes model input, including the full prompt on a cache miss. The panel also controls desktop alerts, protection, local cleanup, and file-size limits.
+Automatic cache keepalive is off by default. To opt in for one chat, turn on **Auto-Keepalive** in the **agy-dart Context** panel. **Global Warm** sets the default for chats without an override. Turning off warming for a chat silences its cache-expiry and keepalive-limit desktop alerts. Desktop alerts for stalled tasks default to off and can be enabled separately. Each keepalive requests an `OK` reply and consumes model input, including the full prompt on a cache miss. The panel also controls desktop alerts, protection, local cleanup, and file-size limits.
 
 Preset modes & tool-loading modes via CLI:
 
