@@ -210,6 +210,7 @@ function parseSafeShellSegments(cmd) {
   let current = [];
   const len = cmd.length;
   let i = 0;
+  let writesOutputFile = false;
   const pushSegment = () => {
     if (current.length > 0) {
       segments.push(current);
@@ -231,7 +232,8 @@ function parseSafeShellSegments(cmd) {
           value += cmd[i];
           i += 1;
         }
-        if (i < len) i += 1;
+        if (i === len) return null;
+        i += 1;
         continue;
       }
       if (ch === '"') {
@@ -258,7 +260,8 @@ function parseSafeShellSegments(cmd) {
           value += inner;
           i += 1;
         }
-        if (i < len) i += 1;
+        if (i === len) return null;
+        i += 1;
         continue;
       }
       if (ch === "\\") {
@@ -331,7 +334,8 @@ function parseSafeShellSegments(cmd) {
         i += cmd[i + 2] === ">" ? 3 : 2;
         while (i < len && (cmd[i] === " " || cmd[i] === "	")) i += 1;
         const target = readWord();
-        if (!target || target.value !== "/dev/null") return null;
+        if (!target?.value) return null;
+        if (target.value !== "/dev/null") writesOutputFile = true;
         continue;
       }
       return null;
@@ -362,7 +366,8 @@ function parseSafeShellSegments(cmd) {
       if (cmd[i] === ">" || cmd[i] === "|") i += 1;
       while (i < len && (cmd[i] === " " || cmd[i] === "	")) i += 1;
       const target = readWord();
-      if (!target || target.value !== "/dev/null") return null;
+      if (!target?.value) return null;
+      if (target.value !== "/dev/null") writesOutputFile = true;
       continue;
     }
     if (op === "<") {
@@ -393,7 +398,7 @@ function parseSafeShellSegments(cmd) {
     }
   }
   pushSegment();
-  return segments;
+  return { segments, writesOutputFile };
 }
 function normalizeCommandName(raw) {
   for (const prefix of KNOWN_SYSTEM_BIN_PREFIXES) {
@@ -567,6 +572,19 @@ function classifyShellSegment(tokens) {
   }
   const cmdName = normalizeCommandName(tokens[idx].value);
   const args = tokens.slice(idx + 1).map((t) => t.value);
+  switch (cmdName.toLowerCase()) {
+    case "get-content":
+    case "get-childitem":
+    case "select-string":
+      return "readonly_search";
+    case "select-object":
+      return "benign_glue";
+    case "set-content":
+    case "add-content":
+    case "out-file":
+    case "remove-item":
+      return "write";
+  }
   if (READONLY_SIMPLE_CMDS.has(cmdName)) return "readonly_search";
   if (cmdName === "find") {
     return args.some((a) => FIND_MUTATING_ARGS.has(a)) ? "other" : "readonly_search";
@@ -590,17 +608,17 @@ function classifyShellSegment(tokens) {
   }
   return "other";
 }
-function isReadonlySearchShell(cmd) {
-  if (!cmd.trim()) return false;
-  const segments = parseSafeShellSegments(cmd);
-  if (!segments || segments.length === 0) return false;
-  let hasReadonlySearch = false;
-  for (const seg of segments) {
-    const kind = classifyShellSegment(seg);
-    if (kind === "other") return false;
-    if (kind === "readonly_search") hasReadonlySearch = true;
-  }
-  return hasReadonlySearch;
+function classifySearchShell(cmd) {
+  // A script block can run arbitrary commands inside a cmdlet's arguments.
+  if (/[{}]/.test(cmd) && /\b[a-z]+-[a-z]+\b/i.test(cmd)) return "unknown";
+  const parsed = parseSafeShellSegments(cmd);
+  if (!parsed?.segments.length) return "unknown";
+  if (parsed.writesOutputFile) return "write";
+  const { segments } = parsed;
+  const kinds = segments.map(classifyShellSegment);
+  if (kinds.includes("write")) return "write";
+  if (kinds.includes("other") || !kinds.includes("readonly_search")) return "unknown";
+  return "readonly_search";
 }
 function parseTranscriptJsonl(content) {
   const steps = [];
@@ -656,6 +674,144 @@ function sessionUsesAgyFast(steps) {
   }
   return false;
 }
+const diagnosticLabels = {
+  measuredReadCalls: "Reads with verified line payloads",
+  unknownReadCalls: "Reads with unavailable or unverified payloads",
+  deniedReadCalls: "Hook-denied reads",
+  targetedAfterDenial: "Denials followed by a successful targeted read",
+  observedReadBytes: "Verified UTF-8 line content bytes (excluding line endings)",
+  repeatedReadBytes: "Repeated identical line content bytes",
+  sameLogicalToolTurns: "Consecutive same logical tool turns",
+  parallelReadCandidates: "Potential parallel reads of user-named files",
+  knownWriteShellCalls: "Shell calls with recognized write commands",
+  unknownShellCalls: "Unclassified shell calls"
+};
+
+function logicalToolName(call) {
+  if (call.name !== "call_mcp_tool") {
+    const qualified = /^mcp__(.+?)__(.+)$/.exec(call.name ?? "");
+    const hostName = /^mcp_(agy[-_]dart_(?:fast|context)|agy-fast)_(.+)$/.exec(call.name ?? "");
+    if (hostName) return hostName[1] + "/" + hostName[2];
+    return qualified ? qualified[1] + "/" + qualified[2] : call.name;
+  }
+  const args = getCallArgs(call);
+  const server = unwrapJsonString(args?.ServerName ?? args?.serverName ?? args?.server_name);
+  const tool = unwrapJsonString(args?.ToolName ?? args?.toolName ?? args?.tool_name);
+  return server && tool ? server + "/" + tool : null;
+}
+
+function readTarget(call) {
+  const file = getTargetPath(getCallArgs(call));
+  if (!file) return "";
+  return /^(?:[A-Za-z]:[\\/]|\\\\)/.test(file)
+    ? path.win32.normalize(file) : path.posix.normalize(file);
+}
+
+function matchedResult(call, calls, results) {
+  const id = call.id ?? call.tool_call_id ?? call.call_id;
+  const resultId = r => r.tool_call_id ?? r.call_id ?? r.toolCallId;
+  if (id != null) {
+    const matches = results.filter(r => resultId(r) === id);
+    if (matches.length === 1) return matches[0];
+    if (results.some(r => resultId(r) != null)) return null;
+  }
+  if (calls.length === 1 && results.length === 1 && resultId(results[0]) == null) return results[0];
+  return null;
+}
+
+function parseReturnedLines(text) {
+  // Ignore host timestamps, line numbers and wrappers. A partial/truncated
+  // payload cannot establish the advertised range even if its last line is numbered.
+  if (/<truncated \d+ bytes>/i.test(text)) return null;
+  const lines = text.split(/\r?\n/);
+  if (lines.at(-1) === "") lines.pop();
+  let i = 0;
+  while (/^(?:Created At|Completed At): /.test(lines[i])) i++;
+  const header = /^Showing lines (\d+)-(\d+) of (\d+)\s*$/.exec(lines[i] ?? "");
+  if (!header) return null;
+  const [first, last, total] = header.slice(1).map(Number);
+  i++;
+  if (first < 1 || last < first || last > total || last - first + 1 !== lines.length - i) return null;
+  const contents = [];
+  for (let n = first; i < lines.length; i++, n++) {
+    const match = /^(\d+): ?(.*)$/u.exec(lines[i]);
+    if (!match || Number(match[1]) !== n) return null;
+    contents.push(match[2]);
+  }
+  return { first, total, contents };
+}
+
+function pairByRequestedStart(calls, results) {
+  // Without IDs, use a bijection only for all-read batches with distinct,
+  // explicit starts and complete numbered responses. Never use batch order.
+  if (calls.length < 2 || calls.length !== results.length ||
+      calls.some(c => c.id != null || c.tool_call_id != null || c.call_id != null) ||
+      results.some(r => r.tool_call_id != null || r.call_id != null || r.toolCallId != null)) return null;
+  const byStart = new Map();
+  for (const call of calls) {
+    const start = Number(getCallArgs(call)?.StartLine);
+    if (!Number.isSafeInteger(start) || start < 1 || byStart.has(start)) return null;
+    byStart.set(start, call);
+  }
+  const matched = new Map();
+  for (const result of results) {
+    const text = result.content ?? result.output ?? result.tool_result;
+    const payload = typeof text === "string" && parseReturnedLines(text);
+    const call = payload && byStart.get(payload.first);
+    if (!call || matched.has(call)) return null;
+    matched.set(call, result);
+  }
+  return matched;
+}
+
+function observeReads(calls, results, state, metrics) {
+  const isRead = call => call.name === "read_file" || call.name === "view_file";
+  const readOnly = calls.every(isRead);
+  const byStart = readOnly && pairByRequestedStart(calls, results);
+  // An opaque command or edit may have changed any file, even in a parallel batch.
+  if (!readOnly) state.files.clear();
+  let singleRead = "";
+  for (const call of calls.filter(isRead)) {
+    const file = readTarget(call);
+    const args = getCallArgs(call) ?? {};
+    const result = byStart ? byStart.get(call) : matchedResult(call, calls, results);
+    const text = result?.content ?? result?.output ?? result?.tool_result;
+    const previousDenial = state.denied;
+    state.denied = "";
+    if (typeof text === "string" && /^(?:(?:Created At|Completed At): [^\n]*\n)*(?:Encountered error in step execution: )?tool call denied by pre-tool hook:/i.test(text)) {
+      metrics.deniedReadCalls++;
+      if (calls.length === 1) state.denied = file;
+      continue;
+    }
+    const payload = file && typeof text === "string" && !result?.isError &&
+      !/ERROR|FAIL|CANCEL|DENIED/i.test(result?.status ?? "") && parseReturnedLines(text);
+    if (!payload) {
+      metrics.unknownReadCalls++;
+      continue;
+    }
+    metrics.measuredReadCalls++;
+    if (calls.length === 1) {
+      singleRead = file;
+      if (previousDenial === file && (args.StartLine != null || args.EndLine != null)) metrics.targetedAfterDenial++;
+    }
+    const { first, total, contents } = payload;
+    let previous = state.files.get(file);
+    if (!previous || previous.total !== total || contents.some((line, i) =>
+      previous.lines.has(first + i) && previous.lines.get(first + i) !== line)) {
+      previous = { total, lines: new Map() };
+      if (readOnly) state.files.set(file, previous);
+    }
+    for (const [i, line] of contents.entries()) {
+      const bytes = Buffer.byteLength(line);
+      metrics.observedReadBytes += bytes;
+      if (previous.lines.has(first + i)) metrics.repeatedReadBytes += bytes;
+      previous.lines.set(first + i, line);
+    }
+  }
+  if (singleRead && state.lastRead && singleRead !== state.lastRead &&
+      state.userFiles.has(singleRead) && state.userFiles.has(state.lastRead)) metrics.parallelReadCandidates++;
+  state.lastRead = singleRead;
+}
 function filterStepsByTime(steps, sinceMs, untilMs) {
   if (sinceMs === void 0 && untilMs === void 0) return steps;
   const out = [];
@@ -670,6 +826,7 @@ function filterStepsByTime(steps, sinceMs, untilMs) {
 }
 const billingFields = ["totalInputTokens", "totalCacheReadTokens", "totalCacheCreationTokens", "totalTokenThroughput", "peakContextTokens", "readFileCalls", "blindReadFileCalls", "compactionCount", "suspectedTruncationCount"];
 function analyzeTranscriptSessions(sessions) {
+  const diagnostics = Object.fromEntries(Object.keys(diagnosticLabels).map(key => [key, 0]));
   const billing = Object.fromEntries(billingFields.map(key => [key, 0]));
   const compactionSteps = [], topContextGrowth = [];
   let elapsedSec = 0;
@@ -717,6 +874,8 @@ function analyzeTranscriptSessions(sessions) {
     let sessionFastCalls = 0;
     let sessionMediaCount = 0;
     let prevSingleToolName = null;
+    let prevLogicalTool = null;
+    const readState = { files: new Map(), userFiles: new Set(), lastRead: "", denied: "" };
     let prevPlannerMs = null;
     let prevTurnHadUserInputBetween = false;
     let prevTurnHadCalls = false;
@@ -731,12 +890,20 @@ function analyzeTranscriptSessions(sessions) {
         billing.compactionCount++;
         compactionSteps.push(step.step_index ?? i);
         checkpointSincePlanner = true;
+        readState.files.clear();
+        readState.lastRead = readState.denied = "";
+        readState.userFiles.clear();
+        prevLogicalTool = null;
       }
       if (Array.isArray(step.media) && step.media.length > 0) {
         sessionMediaCount += step.media.length;
         mediaLoadedCount += step.media.length;
       }
       if (step.type === "USER_INPUT") {
+        const words = typeof step.content === "string" ? step.content.match(/[\p{L}\p{N}_./:\\-]+/gu) ?? [] : [];
+        readState.userFiles = new Set(words.map(word => readTarget({ args: { Path: word } })));
+        readState.lastRead = readState.denied = "";
+        prevLogicalTool = null;
         prevSingleToolName = null;
         prevTurnHadUserInputBetween = true;
         prevTurnHadCalls = false;
@@ -745,6 +912,8 @@ function analyzeTranscriptSessions(sessions) {
       if (step.type === "SYSTEM_MESSAGE") {
         if (!prevTurnHadCalls) {
           prevSingleToolName = null;
+          prevLogicalTool = null;
+          readState.lastRead = "";
           prevTurnHadUserInputBetween = true;
         }
         continue;
@@ -801,6 +970,9 @@ function analyzeTranscriptSessions(sessions) {
         }
       }
       const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+      const logicalName = calls.length === 1 ? logicalToolName(calls[0]) : null;
+      if (logicalName && logicalName === prevLogicalTool) diagnostics.sameLogicalToolTurns++;
+      prevLogicalTool = logicalName;
       const hasBlockingTool = calls.some(
         (c) => typeof c.name === "string" && BLOCKING_TOOLS.has(c.name)
       );
@@ -827,7 +999,7 @@ function analyzeTranscriptSessions(sessions) {
           const callArgs = getCallArgs(call);
           if (name === "read_file" || name === "view_file") {
             billing.readFileCalls++;
-            if (["StartLine", "EndLine", "ByteOffset"].every(key => callArgs[key] == null)) billing.blindReadFileCalls++;
+            if (callArgs && ["StartLine", "EndLine", "ByteOffset"].every(key => callArgs[key] == null)) billing.blindReadFileCalls++;
           }
           if (name === "edit_file") {
             editFileCalls += 1;
@@ -841,9 +1013,11 @@ function analyzeTranscriptSessions(sessions) {
             runCommandCalls += 1;
             runCmdCallsThisTurn += 1;
             const cmd = getCommandString(callArgs);
-            if (isReadonlySearchShell(cmd)) {
+            const kind = classifySearchShell(cmd);
+            if (kind === "readonly_search") {
               readonlySearchRunCommandCalls += 1;
-            }
+            } else if (kind === "write") diagnostics.knownWriteShellCalls++;
+            else diagnostics.unknownShellCalls++;
           } else {
             const fastTool = extractAgyFastToolName(call);
             if (fastTool && agyFastToolCalls[fastTool] !== void 0) {
@@ -877,6 +1051,7 @@ function analyzeTranscriptSessions(sessions) {
           if (gt !== null) genericTimes.push(gt);
         }
       }
+      observeReads(calls, genericSteps, readState, diagnostics);
       for (const callIdx of agyCallIndices) {
         const resStep = genericSteps[callIdx];
         if (!resStep) continue;
@@ -935,7 +1110,7 @@ function analyzeTranscriptSessions(sessions) {
   }
   const cacheAttribution = analyzeMultipleSessionsCache(sessions);
   return {
-    ...billing, compactionSteps, topContextGrowth, elapsedSec,
+    ...billing, ...diagnostics, compactionSteps, topContextGrowth, elapsedSec,
     sessions: validSessions,
     sessionsWithAgyFast,
     sessionsWithSnapshot,
@@ -1195,6 +1370,8 @@ function formatMetricsMarkdown(m) {
     `| Sessions using agy-fast | ${m.sessionsWithAgyFast}/${m.sessions} (snapshot: ${m.sessionsWithSnapshot}) |`,
     `| LLM turns | ${m.llmTurns} |`,
     `| Tool calls | ${m.totalToolCalls} |`,
+    ...Object.entries(diagnosticLabels).map(([key, label]) => `| ${label} | ${m[key]} |`),
+    `| Read measurement coverage | ${m.measuredReadCalls}/${m.readFileCalls} |`,
     `| Active time (s) | ${m.activeTimeSec.toFixed(1)} |`,
     `| LLM wait & decode (s) | ${m.llmTimeSec.toFixed(1)} |`,
     `| Multi-tool stream buffer wait (s) | ${m.streamWaitSec.toFixed(1)} |`,
@@ -1243,6 +1420,7 @@ function formatCompareMarkdown(before, after) {
     "| Metric | Before | After | Change |",
     "| :--- | ---: | ---: | ---: |",
     ...billingFields.map(key => `| ${key} | ${before[key]} | ${after[key]} | ${formatDelta(before[key], after[key])} |`),
+    ...Object.entries(diagnosticLabels).map(([key, label]) => `| ${label} | ${before[key]} | ${after[key]} | ${formatDelta(before[key], after[key])} |`),
     `| Sessions | ${before.sessions} | ${after.sessions} | - |`,
     `| LLM turns | ${before.llmTurns} | ${after.llmTurns} | ${formatDelta(before.llmTurns, after.llmTurns)} |`,
     `| Tool calls | ${before.totalToolCalls} | ${after.totalToolCalls} | ${formatDelta(before.totalToolCalls, after.totalToolCalls)} |`,
@@ -1269,6 +1447,7 @@ function formatUsageSplitMarkdown(split) {
     "| Metric | Overall | Without agy-fast | With agy-fast | With vs Without |",
     "| :--- | ---: | ---: | ---: | ---: |",
     `| Sessions | ${overall.sessions} | ${wo.sessions} | ${wf.sessions} | - |`,
+    ...Object.entries(diagnosticLabels).map(([key, label]) => `| ${label} | ${overall[key]} | ${wo[key]} | ${wf[key]} | - |`),
     `| Sessions with snapshot | ${overall.sessionsWithSnapshot} | ${wo.sessionsWithSnapshot} | ${wf.sessionsWithSnapshot} | - |`,
     `| LLM turns | ${overall.llmTurns} | ${wo.llmTurns} | ${wf.llmTurns} | - |`,
     `| Tool calls | ${overall.totalToolCalls} | ${wo.totalToolCalls} | ${wf.totalToolCalls} | - |`,
