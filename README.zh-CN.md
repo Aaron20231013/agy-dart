@@ -204,6 +204,10 @@ npm run cache:simulate
 
 ## 致谢与开源协议
 
+感谢 `INK-Q/agy-fast` 的贡献者。批量编辑会在写文件前校验验证命令，搜索长行时会围绕命中位置截取片段，检查失败时会保留长日志的首尾。这三处实现都借鉴了该项目。[对应的上游源码与许可说明](THIRD_PARTY_NOTICES.md#11-ink-qagy-fast-mit-license)
+
+`daoif/tokless` 为 v1.7 的代码大纲、读取大文件时的大纲提示、分角色工具权限、会话用量对比和多宿主安装提供了参考。结构化日志压缩借鉴了 `headroomlabs-ai/headroom` 的 SmartCrusher，定期清理过期数据的思路来自 `antigravity-panel`。[设计来源与本地实现](THIRD_PARTY_NOTICES.md#additional-design-references)
+
 [MIT 协议](LICENSE) 开源。部分代码整合改造自同为 MIT 协议的 [INK-Q/agy-fast](https://github.com/INK-Q/agy-fast) 与 [Domush/antigravity-plugin-context-mode](https://github.com/Domush/antigravity-plugin-context-mode)，完整第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## v1.7 CLI
