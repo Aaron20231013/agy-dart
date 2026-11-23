@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 210" width="880" height="210" role="img" aria-label="开启 agy-dart 前后效果对比">
+  <style>
+    .pulse { animation: glow 2.8s ease-in-out infinite; }
+    .barGrow { animation: fillBar 3.6s ease-out infinite; transform-origin: left center; }
+    @keyframes glow { 0%, 100% { opacity: 0.78; } 50% { opacity: 1; } }
+    @keyframes fillBar { 0% { transform: scaleX(0.82); } 50% { transform: scaleX(1); } 100% { transform: scaleX(0.82); } }
+  </style>
+  <rect width="880" height="210" rx="14" fill="#0b1120" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- Left: Without agy-dart -->
+  <rect x="20" y="18" width="408" height="174" rx="10" fill="#18181b" stroke="#3f3f46" stroke-width="1.2"/>
+  <circle cx="38" cy="36" r="5" fill="#ef4444"/>
+  <text x="52" y="40" fill="#fca5a5" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif" font-size="12.5" font-weight="700">未开启 agy-dart —— 连跑 6 轮 + 日志刷屏</text>
+  <text x="36" y="66" fill="#a1a1aa" font-family="ui-monospace,SFMono-Regular,Consolas,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">第 1..4 轮：逐词搜索、硬读 2,400 行文件、分 3 次改代码</text>
+  <text x="36" y="86" fill="#f87171" font-family="ui-monospace,SFMono-Regular,Consolas,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">第 5 轮   ：npm test 吐出 94 KB 日志塞爆临时文件</text>
+  <text x="36" y="106" fill="#fbbf24" font-family="ui-monospace,SFMono-Regular,Consolas,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">第 6 轮   ：离开 6 分钟 -&gt; 缓存过期失效（命中率 0%）</text>
+  <rect x="36" y="128" width="376" height="14" rx="7" fill="#27272a"/>
+  <rect x="36" y="128" width="342" height="14" rx="7" fill="#dc2626"/>
+  <text x="36" y="164" fill="#fca5a5" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5">上下文消耗：91% · 缓存失效全量重复计费</text>
+
+  <!-- Right: With agy-dart -->
+  <rect x="452" y="18" width="408" height="174" rx="10" fill="#0f172a" stroke="#10b981" stroke-width="1.5"/>
+  <circle cx="470" cy="36" r="5" fill="#10b981" class="pulse"/>
+  <text x="484" y="40" fill="#6ee7b7" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif" font-size="12.5" font-weight="700">开启 agy-dart —— 动作合并 + 后台自动续温</text>
+  <text x="468" y="66" fill="#bae6fd" font-family="ui-monospace,SFMono-Regular,Consolas,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">1 次调用：合并 4 组搜索 + 按行号精准读取目标片段</text>
+  <text x="468" y="86" fill="#86efac" font-family="ui-monospace,SFMono-Regular,Consolas,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">1 次调用：同时改完 3 个文件并顺手跑完测试（&lt;=8.8 KB）</text>
+  <text x="468" y="106" fill="#c4b5fd" font-family="ui-monospace,SFMono-Regular,Consolas,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">右侧面板：到期前 30 秒自动续温 1/3 -&gt; 缓存命中 94.6%</text>
+  <rect x="468" y="128" width="376" height="14" rx="7" fill="#1e293b"/>
+  <rect x="468" y="128" width="96" height="14" rx="7" fill="#10b981" class="barGrow"/>
+  <text x="468" y="164" fill="#6ee7b7" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5">上下文仅用：24%（挡掉 67% 废话）· 缓存保持温热</text>
+</svg>

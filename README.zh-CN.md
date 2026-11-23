@@ -19,14 +19,14 @@
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="assets/architecture-light.svg" />
-    <img alt="agy-dart 架构示意图" src="assets/architecture-dark.svg" width="860" />
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.zh-CN.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/architecture-light.zh-CN.svg" />
+    <img alt="agy-dart 架构示意图" src="assets/architecture-dark.zh-CN.svg" width="860" />
   </picture>
 </p>
 
 <p align="center">
-  <img alt="开启 agy-dart 前后对比" src="assets/demo-comparison.svg" width="860" />
+  <img alt="开启 agy-dart 前后对比" src="assets/demo-comparison.zh-CN.svg" width="860" />
 </p>
 
 ---
