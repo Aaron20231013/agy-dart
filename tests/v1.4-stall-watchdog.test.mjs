@@ -108,7 +108,9 @@ test("v1.4-1: Stall Watchdog config defaults, config.json/env precedence, store 
     assert.equal(CONFIG_DEFAULTS.watchdogLlmMultimodalSec, 360);
     assert.equal(CONFIG_DEFAULTS.watchdogToolFastSec, 90);
     assert.equal(CONFIG_DEFAULTS.watchdogToolCmdSec, 300);
-    assert.equal(CONFIG_DEFAULTS.watchdogSubagentSec, 600);
+    assert.equal(CONFIG_DEFAULTS.watchdogSubagentSec, 1200);
+    assert.equal(CONFIG_DEFAULTS.watchdogLlmReasoningSec, 600);
+    assert.equal(CONFIG_DEFAULTS.watchdogLlmCompoundSec, 900);
     assert.equal(CONFIG_DEFAULTS.watchdogNotifyCooldownSec, 300);
 
     // 2. config.json overrides & clamping
@@ -406,7 +408,7 @@ test("v1.4-3: Dynamic timeout matrix across all phases/buckets + yellow suspect 
     assert.equal(resolveDynamicThresholds({ phase: "TOOL_RUNNING", activeTool: "batch_search", activeToolKind: "mcp" }).stalledSec, 90);
     assert.equal(resolveDynamicThresholds({ phase: "TOOL_RUNNING", activeTool: "ctx_execute", activeToolKind: "mcp_long" }).stalledSec, 300);
     assert.equal(resolveDynamicThresholds({ phase: "TOOL_RUNNING", activeTool: "run_command", activeToolKind: "sync_cmd" }).stalledSec, 300);
-    assert.equal(resolveDynamicThresholds({ phase: "SUBAGENT_BG" }).stalledSec, 600);
+    assert.equal(resolveDynamicThresholds({ phase: "SUBAGENT_BG" }).stalledSec, 1200);
 
     // 2. Dual-silence test with injectable wall & monotonic clocks
     let nowMs = 1_700_000_000_000;
@@ -1372,9 +1374,9 @@ test("v1.4-9: Production Sidecar env > sqlite precedence, UI disable clears leas
     recordHookLeaseTransition(seed, "Stop", { conversationId: "conv-idle-app" }, { nowMs: baseNow });
     seed.close();
 
-    // Advance 400s -> conv-stalled-app (>360s multimodal) is STALLED
-    virtualNow = baseNow + 400_000;
-    virtualMono = 420_000_000_000n;
+    // Advance 950s -> conv-stalled-app (>900s opus + >=100k multimodal compound) is STALLED
+    virtualNow = baseNow + 950_000;
+    virtualMono = 970_000_000_000n;
 
     const token = "test-v14-prod-csrf-0123456789abcdef";
     const srv = createStandaloneServer({
@@ -2417,7 +2419,7 @@ test("v1.4-11: Antigravity Stop protocol alignment, PostToolUse parallel slow-to
     assert.equal(stReadStall.current.severity, "stalled");
     assert.equal(stReadStall.current.diagnosis.causeId, "host_tool_blocked");
 
-    advanceSec(520); // total 620s > 600s SUBAGENT_BG threshold
+    advanceSec(1120); // total 1220s > 1200s SUBAGENT_BG threshold
     const stSubStall = monitor.getStatus({ conversationId: "conv-sub-stall" });
     assert.equal(stSubStall.current.severity, "stalled");
     assert.equal(stSubStall.current.diagnosis.causeId, "subagent_or_bg_stalled");

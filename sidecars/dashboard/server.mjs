@@ -9,11 +9,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { getEffectiveConfig } from "../../context/lib/config.js";
 import { buildHandoffBrief, inferWorkspaceFromStore } from "../../context/lib/handoff.js";
 import {
+  DEFAULT_STALE_LEASE_MS,
   WatchdogMonitor,
+  collectChildSubagentActivity,
   detectSubagentFromTranscriptFile,
   isHeadlessWorkerPrompt,
   isSameWorkspacePath,
   isTrajectoryMetadataSubagent,
+  listWatchdogLeases,
   lookupConversationSummary,
   readWatchdogLease,
   resolveCandidateTranscriptPath
@@ -695,12 +698,47 @@ function isUnboundSidecarHostRequest(data = {}) {
   return !rawExplicitConv;
 }
 
+function isSidecarConversationActive(conversationId, store, nowMs = Date.now()) {
+  if (!conversationId || conversationId === "__unbound__" || conversationId === "default" || !store) {
+    return false;
+  }
+  try {
+    if (typeof store.isWatchdogEnabled === "function" && !store.isWatchdogEnabled()) {
+      return false;
+    }
+    const leases = listWatchdogLeases(store);
+    if (!Array.isArray(leases) || leases.length === 0) return false;
+    const { childHeartbeatByParent, activeChildParents } = collectChildSubagentActivity(leases, {
+      nowMs,
+      maxAgeMs: DEFAULT_STALE_LEASE_MS
+    });
+    if (activeChildParents.has(conversationId)) return true;
+    const lease = leases.find((l) => l && l.conversationId === conversationId) || null;
+    if (!lease || (lease.phase === "IDLE" && lease.subphase !== "stopped_bg_pending")) {
+      return false;
+    }
+    const latestHb = Math.max(
+      Number(lease.lastHeartbeatTs || 0),
+      Number(lease.updatedTs || 0),
+      Number(childHeartbeatByParent.get(conversationId) || 0)
+    );
+    if (latestHb <= 0 || nowMs - latestHb > DEFAULT_STALE_LEASE_MS) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function getCacheDiagPayload(data, defaultConvId = "default") {
   const unboundHostTab = isUnboundSidecarHostRequest(data);
   const { scope, convId } = resolveTargetSession(data, unboundHostTab ? "default" : defaultConvId);
   const cfg = getEffectiveConfig();
   const store = getRuntimeStore();
   const ttlDesktopNotifyEnabled = store.isTtlDesktopNotifyEnabled();
+  const globalTtlKeepaliveMaxCount = store.getGlobalTtlKeepaliveMaxCount();
+  const fallbackTtlKeepaliveMaxCount = store.getFallbackNonZeroKeepaliveMaxCount();
   const isSpecificConvForKa = Boolean(
     convId && convId !== "default" && convId !== "all" && convId !== "app"
   );
@@ -720,6 +758,11 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     supported: !isExplicitSubagentForKa,
     isSubagent: isExplicitSubagentForKa,
     maxCount: store.getTtlKeepaliveMaxCount(kaConvId || null),
+    globalMaxCount: globalTtlKeepaliveMaxCount,
+    fallbackMaxCount: fallbackTtlKeepaliveMaxCount,
+    isCustomOverride: Boolean(
+      !isExplicitSubagentForKa && kaConvId && store.hasCustomTtlKeepaliveOverride(kaConvId)
+    ),
     usedCount: kaState.usedCount,
     leadSec: Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30))),
     lastSentTs: kaState.lastSentTs || 0,
@@ -738,6 +781,12 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     transcriptPath = isSafeConversationId(convId)
       ? findTranscriptForConversation(convId, { exactOnly: true })
       : null;
+    if (!transcriptPath) {
+      const leaseTx = readWatchdogLease(store, convId)?.transcriptPath;
+      if (leaseTx && typeof leaseTx === "string" && !isUncPath(leaseTx) && fs.existsSync(leaseTx)) {
+        transcriptPath = leaseTx;
+      }
+    }
   } else {
     const now = Date.now();
     if (now - cachedLatestScan.ts < LATEST_SCAN_TTL_MS && cachedLatestScan.path && fs.existsSync(cachedLatestScan.path)) {
@@ -753,13 +802,17 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     const windowSource = envWindowTokens !== undefined ? "explicit" : "profile";
     const ttlSource = explicitTtlSec !== undefined ? "explicit" : "profile";
     const effTtl = explicitTtlSec ?? defProfile.ttlSec;
+    const conversationActive = isSpecificConv ? isSidecarConversationActive(convId, store) : false;
     return {
       ok: true,
       transcriptFound: false,
       scope,
       conversationId: convId,
+      conversationActive,
       serverNowMs: Date.now(),
       ttlDesktopNotifyEnabled,
+      globalTtlKeepaliveMaxCount,
+      fallbackTtlKeepaliveMaxCount,
       ttlKeepalive,
       cacheTtlSec: effTtl,
       ttlSource,
@@ -841,6 +894,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
           enabled: false,
           supported: false,
           isSubagent: true,
+          isCustomOverride: false,
           usedCount: 0,
           lastSentTs: 0,
           lastError: ""
@@ -860,6 +914,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
           supported: true,
           isSubagent: false,
           maxCount: store.getTtlKeepaliveMaxCount(fallbackPrimaryConvId),
+          isCustomOverride: store.hasCustomTtlKeepaliveOverride(fallbackPrimaryConvId),
           usedCount: resolvedKa.usedCount,
           lastSentTs: resolvedKa.lastSentTs || 0,
           lastError: resolvedKa.lastError || ""
@@ -907,13 +962,25 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       });
       diag = { ...diag, serverNowMs: nowMs };
     }
+    const activeTargetConvId = resolvedObsConvId || (isSpecificConv ? convId : "");
+    const conversationActive = isSidecarConversationActive(activeTargetConvId, store);
+    if (
+      conversationActive &&
+      diag.watermark !== "critical" &&
+      diag.compactAdvice === "opportunistic_cold_compact"
+    ) {
+      diag = { ...diag, compactAdvice: "none" };
+    }
     return {
       ok: true,
       transcriptFound: true,
       scope,
       conversationId: convId,
       resolvedConversationId: resolvedObsConvId || convId,
+      conversationActive,
       ttlDesktopNotifyEnabled,
+      globalTtlKeepaliveMaxCount,
+      fallbackTtlKeepaliveMaxCount,
       ttlKeepalive: effectiveTtlKeepalive,
       ...diag,
       contextComposition: diag.contextComposition ?? createEmptyContextComposition(),
@@ -1253,7 +1320,33 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
     };
   }
-  if (action === "setTtlKeepalive" || action === "resetTtlKeepalive") {
+  if (action === "setGlobalTtlKeepalive") {
+    const rawMax = data.maxCount;
+    const invalidType =
+      rawMax === undefined ||
+      rawMax === null ||
+      typeof rawMax === "boolean" ||
+      typeof rawMax === "object" ||
+      (typeof rawMax === "string" && rawMax.trim() === "");
+    const parsedMax = invalidType ? NaN : Number(rawMax);
+    if (!Number.isFinite(parsedMax) || !Number.isInteger(parsedMax) || parsedMax < 0 || parsedMax > 20) {
+      return { ok: false, status: 400, error: "Invalid 'maxCount' value: expected integer between 0 and 20" };
+    }
+    store.setGlobalTtlKeepaliveMaxCount(parsedMax);
+    const effectiveGlobal = store.getGlobalTtlKeepaliveMaxCount();
+    const fallbackMax = store.getFallbackNonZeroKeepaliveMaxCount();
+    return {
+      ok: true,
+      globalTtlKeepaliveMaxCount: effectiveGlobal,
+      fallbackTtlKeepaliveMaxCount: fallbackMax,
+      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
+    };
+  }
+  if (
+    action === "setTtlKeepalive" ||
+    action === "resetTtlKeepalive" ||
+    action === "resetTtlKeepaliveOverride"
+  ) {
     const rawExplicitConv = typeof data.conversationId === "string" ? data.conversationId.trim() : "";
     const hasExplicitEmptyConv = typeof data.conversationId === "string" && rawExplicitConv === "";
     const isReservedConv =
@@ -1286,7 +1379,20 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       };
     }
 
+    if (action === "resetTtlKeepaliveOverride" || (action === "setTtlKeepalive" && data.followGlobal === true)) {
+      store.clearTtlKeepaliveOverride(kaConv);
+      return {
+        ok: true,
+        conversationId: kaConv,
+        isCustomOverride: false,
+        ttlKeepaliveEnabled: store.isTtlKeepaliveEnabled(kaConv),
+        ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(kaConv),
+        status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
+      };
+    }
+
     if (action === "setTtlKeepalive") {
+      const wasEnabledBefore = store.isTtlKeepaliveEnabled(kaConv);
       if (data.maxCount !== undefined) {
         const rawMax = data.maxCount;
         const invalidType =
@@ -1299,6 +1405,9 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
           return { ok: false, status: 400, error: "Invalid 'maxCount' value: expected integer between 1 and 20" };
         }
         store.setTtlKeepaliveMaxCount(parsedMax, kaConv);
+        if (data.enabled === undefined && !wasEnabledBefore) {
+          store.setTtlKeepaliveEnabled(true, kaConv);
+        }
       }
       if (data.enabled !== undefined) {
         const next = data.enabled === true || data.enabled === "true" || data.enabled === "1";
@@ -1313,6 +1422,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       return {
         ok: true,
         conversationId: kaConv,
+        isCustomOverride: store.hasCustomTtlKeepaliveOverride(kaConv),
         ttlKeepaliveEnabled: store.isTtlKeepaliveEnabled(kaConv),
         ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(kaConv),
         status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
@@ -1371,7 +1481,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     ok: false,
     status: 400,
     error:
-      "Invalid watchdog action: expected 'ack', 'snooze', 'clear', 'markIdle', 'setEnabled', 'setDesktopNotify', 'setTtlDesktopNotify', 'setTtlKeepalive', 'resetTtlKeepalive', 'setUiLang', 'focusConversation', 'ackJump', or 'tick'"
+      "Invalid watchdog action: expected 'ack', 'snooze', 'clear', 'markIdle', 'setEnabled', 'setDesktopNotify', 'setTtlDesktopNotify', 'setTtlKeepalive', 'setGlobalTtlKeepalive', 'resetTtlKeepalive', 'resetTtlKeepaliveOverride', 'setUiLang', 'focusConversation', 'ackJump', or 'tick'"
   };
 }
 

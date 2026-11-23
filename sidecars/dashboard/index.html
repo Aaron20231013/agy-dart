@@ -416,6 +416,37 @@
       .star-link-tag [data-i18n="starHeaderLabel"] {
         display: none;
       }
+
+      .band.band-context-first {
+        padding: 10px 10px;
+      }
+
+      .ctx-overview-box {
+        padding: 11px 11px;
+      }
+
+      .keepalive-group .toggle-chip {
+        padding: 3px 7px 3px 8px;
+        font-size: 11.5px;
+      }
+
+      .keepalive-max-wrap {
+        padding: 0 4px;
+      }
+
+      .keepalive-max-input {
+        width: 30px;
+        font-size: 11.5px;
+      }
+
+      .keepalive-follow-btn {
+        padding: 2px 5px;
+        font-size: 10.5px;
+      }
+
+      .keepalive-reset-btn {
+        padding: 2px 6px 2px 5px;
+      }
     }
 
     .app-title {
@@ -988,6 +1019,10 @@
       border-color: var(--danger-border);
     }
 
+    .ttl-track.is-active {
+      border-color: var(--accent-border);
+    }
+
     .ttl-fill {
       height: 100%;
       background: var(--ok);
@@ -1002,10 +1037,21 @@
       background: var(--danger);
     }
 
+    .ttl-fill.is-active {
+      background: var(--accent);
+    }
+
     .ttl-text-ok {
       font-family: var(--font-mono);
       font-variant-numeric: tabular-nums;
       color: var(--text-primary);
+      font-weight: 500;
+    }
+
+    .ttl-text-info {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      color: var(--accent-text);
       font-weight: 500;
     }
 
@@ -1567,6 +1613,7 @@
     .keepalive-group {
       display: inline-flex;
       align-items: center;
+      max-width: 100%;
       border-radius: 999px;
       border: 1px solid var(--border-strong);
       background: var(--bg-subtle);
@@ -1706,6 +1753,42 @@
     .keepalive-reset-btn:hover {
       background: rgba(15, 23, 42, 0.05);
       color: var(--text-primary);
+    }
+
+    .keepalive-group.is-custom {
+      box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.22);
+    }
+
+    .keepalive-follow-btn {
+      padding: 2px 7px;
+      border: none;
+      border-left: 1px solid var(--border-strong);
+      background: transparent;
+      color: var(--text-secondary);
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.25;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+
+    .keepalive-group.is-on .keepalive-follow-btn {
+      border-left-color: rgba(37, 99, 235, 0.22);
+      color: var(--accent-text);
+    }
+
+    .keepalive-group.is-on.is-exhausted .keepalive-follow-btn {
+      border-left-color: rgba(217, 119, 6, 0.28);
+      color: var(--warn-text);
+    }
+
+    .keepalive-follow-btn:hover {
+      background: rgba(15, 23, 42, 0.05);
+      color: var(--text-primary);
+    }
+
+    .keepalive-global-group .keepalive-max-wrap {
+      padding: 0 6px;
     }
 
     .ext-chip {
@@ -1882,11 +1965,12 @@
             <span id="active-text">Active</span>
           </button>
           <div id="kv-keepalive-group" class="keepalive-group is-on">
-            <button id="kv-keepalive-btn" onclick="toggleTtlKeepalive()" class="toggle-chip is-on" data-enabled="1" data-used="0" data-max="3" data-i18n-title="kvKeepaliveTip" title="Per-conversation auto-keepalive: sends a tiny OK ~30s before TTL expires (independent per chat window; resets on your next message)">Auto-Keepalive: 0/3</button>
-            <label class="keepalive-max-wrap" data-i18n-title="kvKeepaliveMaxTip" title="Max auto-keepalive count for this conversation window (1–20)">
+            <button id="kv-keepalive-btn" onclick="toggleTtlKeepalive()" class="toggle-chip is-on" data-enabled="1" data-used="0" data-max="3" data-custom="0" data-i18n-title="kvKeepaliveTip" title="Per-conversation auto-keepalive: sends a tiny OK ~30s before TTL expires (independent per chat window; resets on your next message)">Auto-Keepalive: 0/3</button>
+            <label class="keepalive-max-wrap" data-i18n-title="kvKeepaliveMaxTip" title="Max auto-keepalive count for this conversation window (1–20; clear input to follow global)">
               <span>&times;</span>
               <input id="kv-keepalive-max" type="number" min="1" max="20" step="1" value="3" class="keepalive-max-input" onchange="changeTtlKeepaliveMax(this.value)" onkeydown="if(event.key==='Enter'){this.blur();}" />
             </label>
+            <button id="kv-keepalive-follow-btn" onclick="resetTtlKeepaliveOverride()" class="keepalive-follow-btn hidden" data-i18n="kvKeepaliveFollowBtn" data-i18n-title="kvKeepaliveFollowTip" title="Clear this window's custom setting and follow global default (keeps used count)">Global</button>
             <button id="kv-keepalive-reset-btn" onclick="resetTtlKeepalive()" class="keepalive-reset-btn hidden" data-i18n-title="kvKeepaliveResetTip" title="Reset used keepalive count for this conversation back to 0">&#8634;</button>
           </div>
         </div>
@@ -1930,6 +2014,12 @@
             <span class="band-title" data-i18n="kvCardTitle">KV-Cache &amp; Context Watermark</span>
           </div>
           <div class="band-actions">
+            <div id="kv-global-keepalive-group" class="keepalive-group keepalive-global-group is-on">
+              <button id="kv-global-keepalive-btn" onclick="toggleGlobalTtlKeepalive()" class="toggle-chip is-on" data-max="3" data-fallback="3" data-i18n-title="kvGlobalKeepaliveTip" title="Global default cache keepalive count (0 = off by default for uncustomized windows; 1–20 = auto-warm count)">Global Warm: &times;</button>
+              <label class="keepalive-max-wrap" data-i18n-title="kvGlobalKeepaliveMaxTip" title="Set global default keepalive count (0–20; 0 turns off default keepalive)">
+                <input id="kv-global-keepalive-max" type="number" min="0" max="20" step="1" value="3" class="keepalive-max-input" onchange="changeGlobalTtlKeepaliveMax(this.value)" onkeydown="if(event.key==='Enter'){this.blur();}" />
+              </label>
+            </div>
             <button id="kv-ttl-notify-btn" onclick="toggleTtlNotify()" class="toggle-chip" data-enabled="0" data-i18n-title="kvTtlNotifyTip" title="Opt-in OS desktop alert when high-context (&gt;=60k) idle cache is about to expire (never auto-sends messages or burns quota)">TTL Alert: OFF</button>
             <button id="kv-handoff-btn" onclick="toggleHandoffDrawer()" class="btn btn-secondary btn-sm" title="Generate cache-friendly compaction / session-switch Handoff Brief">
               <svg class="btn-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -2485,6 +2575,8 @@
         ghostRecRaise45k: 'Cutoff may be too tight for this repo; consider switching to 45 KB (host-45k).',
         ghostRecAtHostCap: 'Already at 45 KB host cap; multi-slice reads on >45 KB files are normal (use read_slices outlines or exemptPaths if needed).',
         ttlBarLabel: 'Prompt Cache TTL',
+        ttlActiveBar: 'Turn active · refreshes on completion',
+        ttlActiveBadge: 'TTL: turn active',
         ttlExpiredBar: '0s / {total} · Expired ({idle} idle)',
         ttlExpiredBadge: 'TTL EXPIRED ({idle} idle)',
         ttlExpiringBar: '{rem} / {total} · Expiring soon',
@@ -2560,11 +2652,17 @@
         srcSession: 'session',
         kvTtlNotifyLabel: 'TTL Alert',
         kvTtlNotifyTip: 'Opt-in OS desktop alert when high-context (>=60k) idle cache is about to expire (never auto-sends messages or burns quota)',
+        kvGlobalKeepaliveLabel: 'Global Warm',
+        kvGlobalKeepaliveTip: 'Global default cache keepalive count (0 = off by default for uncustomized windows; 1–20 = auto-warm count)',
+        kvGlobalKeepaliveMaxTip: 'Set global default keepalive count (0–20; 0 turns off default keepalive)',
         kvKeepaliveLabel: 'Auto-Keepalive',
+        kvKeepaliveCustomLabel: 'Window Warm',
         kvKeepaliveTip: 'Per-conversation auto-keepalive: sends a tiny OK ~30s before TTL expires (independent per chat window; resets on your next message)',
         kvKeepaliveSubagentState: 'Skipped',
         kvKeepaliveSubagentTip: 'Background subagent: auto-keepalive is automatically skipped so subagents never burn quota',
-        kvKeepaliveMaxTip: 'Max auto-keepalive count for this conversation window (1–20)',
+        kvKeepaliveMaxTip: 'Max auto-keepalive count for this conversation window (1–20; clear input to follow global)',
+        kvKeepaliveFollowBtn: 'Global',
+        kvKeepaliveFollowTip: 'Clear this window\'s custom setting and follow global default (keeps used count)',
         kvKeepaliveResetTip: 'Reset used keepalive count for this conversation back to 0',
         confirmResetExempt: 'Reset file categories to defaults and clear custom extensions?',
         confirmPurgeConv: 'Clear indexed chunks and metrics for this conversation?',
@@ -2598,6 +2696,10 @@
         wdBucketLlmHigh: 'High context',
         wdBucketLlmCompact: 'Compacting',
         wdBucketLlmMedia: 'High-ctx + images',
+        wdBucketLlmReasoning: 'Deep reasoning',
+        wdBucketLlmUltraHigh: 'Ultra-long context',
+        wdBucketLlmCompound: 'Deep reasoning + long ctx',
+        wdBucketSubagentLlm: 'Subagent thinking',
         wdBucketToolCmd: 'Shell command',
         wdBucketToolMcpLong: 'Long MCP task',
         wdBucketToolMcpFast: 'MCP tool',
@@ -2801,6 +2903,8 @@
         ghostRecRaise45k: '当前仓库的截断阈值可能偏紧，建议切换至 45 KB（宿主上限）。',
         ghostRecAtHostCap: '已对齐 45 KB 宿主单次读取上限；超 45 KB 大文件分段读取属正常现象（可配合 read_slices 大纲或添加豁免路径）。',
         ttlBarLabel: '提示词缓存 TTL',
+        ttlActiveBar: '执行中 · 本轮完成后刷新',
+        ttlActiveBadge: 'TTL：执行中',
         ttlExpiredBar: '0s / {total} · 已过期（空闲 {idle}）',
         ttlExpiredBadge: 'TTL 已过期（空闲 {idle}）',
         ttlExpiringBar: '{rem} / {total} · 即将过期',
@@ -2876,11 +2980,17 @@
         srcSession: '本会话',
         kvTtlNotifyLabel: '临期提醒',
         kvTtlNotifyTip: '默认关闭：仅在高上下文（≥60k）空闲即将过期时弹一次系统提醒，绝不自动发消息烧额度',
+        kvGlobalKeepaliveLabel: '全局加热',
+        kvGlobalKeepaliveTip: '全局默认缓存续温次数（0 = 未单独设置的窗口默认关闭；1–20 = 默认自动加热次数）',
+        kvGlobalKeepaliveMaxTip: '设置全局默认续温次数（0–20 次；填 0 关闭默认自动加热）',
         kvKeepaliveLabel: '自动续温',
+        kvKeepaliveCustomLabel: '本窗续温',
         kvKeepaliveTip: '当前对话专属自动续温：TTL 过期前约 30 秒自动发极短 OK 保活（每个对话窗口独立开关与计次，你本人发新消息后归零）',
         kvKeepaliveSubagentState: '已跳过',
         kvKeepaliveSubagentTip: '当前为子智能体：已自动跳过续温，避免对一次性后台子任务无意义保活浪费额度',
-        kvKeepaliveMaxTip: '当前对话允许自动续温的最大次数（1–20 次，仅作用于本对话窗口）',
+        kvKeepaliveMaxTip: '当前对话允许自动续温的最大次数（1–20 次；清空输入框可恢复随全局）',
+        kvKeepaliveFollowBtn: '随全局',
+        kvKeepaliveFollowTip: '清除本窗口独立覆盖，恢复跟随全局设置（保留当前已用次数）',
         kvKeepaliveResetTip: '手动将当前对话已续温次数重置为 0',
         confirmResetExempt: '确认恢复默认文件分组并清空所有自定义扩展名？',
         confirmPurgeConv: '确认清空当前对话的索引分块与统计指标？',
@@ -2914,6 +3024,10 @@
         wdBucketLlmHigh: '高上下文',
         wdBucketLlmCompact: '压缩上下文中',
         wdBucketLlmMedia: '高上下文含图片',
+        wdBucketLlmReasoning: '深度推理',
+        wdBucketLlmUltraHigh: '超长上下文',
+        wdBucketLlmCompound: '深度推理·超长窗',
+        wdBucketSubagentLlm: '子代理推理',
         wdBucketToolCmd: '终端命令',
         wdBucketToolMcpLong: '长耗时 MCP',
         wdBucketToolMcpFast: 'MCP 工具',
@@ -3072,6 +3186,11 @@
     let handoffFetchSeq = 0;
     let refreshSeq = 0;
     let watchdogActionSeq = 0;
+    let inFlightWatchdogActionCount = 0;
+    let latestStartedWatchdogActionSeq = 0;
+    let latestAppliedWatchdogActionSeq = 0;
+    let sawOutOfOrderWatchdogAction = false;
+    let pendingCustomOverrideConvId = '';
     const GITHUB_REPO_URL = 'https://github.com/zou172866/agy-dart';
     const GH_STAR_CLI_CMD = 'gh api -X PUT /user/starred/zou172866/agy-dart';
     let cachedStarPrompt = null;
@@ -3098,9 +3217,21 @@
         lastSeenNativeConvId = nativeId;
         selectedConvOverride = '';
         inferredFallbackConvId = '';
+        pendingCustomOverrideConvId = '';
+        sawOutOfOrderWatchdogAction = false;
         ++watchdogActionSeq;
         if (!prevNative && nativeId) {
-          unboundKeepaliveState = { enabled: true, maxCount: 3, usedCount: 0, lastError: '' };
+          const gm = cachedGlobalKeepalive.globalMaxCount;
+          const fm = cachedGlobalKeepalive.fallbackMaxCount;
+          unboundKeepaliveState = {
+            enabled: gm >= 1,
+            maxCount: gm >= 1 ? gm : fm,
+            globalMaxCount: gm,
+            fallbackMaxCount: fm,
+            isCustomOverride: false,
+            usedCount: 0,
+            lastError: ''
+          };
         }
       }
       return selectedConvOverride || nativeId || (!window.sidecar ? inferredFallbackConvId : '');
@@ -3480,6 +3611,7 @@
         updateFeaturePill('wd-enable-btn', t('wdEnableLabel'), wdEnableBtn?.dataset?.enabled !== '0');
         updateFeaturePill('wd-notify-btn', t('wdNotifyLabel'), wdNotifyBtn?.dataset?.enabled === '1');
         updateFeaturePill('kv-ttl-notify-btn', t('kvTtlNotifyLabel'), kvTtlNotifyBtn?.dataset?.enabled === '1');
+        renderGlobalKeepaliveControls(cachedGlobalKeepalive.globalMaxCount, cachedGlobalKeepalive.fallbackMaxCount);
         renderKeepaliveControls(null);
         const sevBadge = document.getElementById('wd-severity-badge');
         const phaseBadge = document.getElementById('wd-phase-badge');
@@ -4332,6 +4464,10 @@
           if (wdRes && wdRes.ok) {
             const wd = await wdRes.json();
             if (isStale()) return;
+            if (wd.enabled === false) {
+              if (cachedKv) cachedKv.conversationActive = false;
+              if (kvTtlState) kvTtlState.conversationActive = false;
+            }
             cachedWatchdog = wd;
             renderWatchdogCard(wd);
           }
@@ -4636,6 +4772,55 @@
       };
     }
 
+    function isCurrentConversationTurnActive(kvOverride = null) {
+      if (cachedWatchdog && cachedWatchdog.enabled === false) {
+        return false;
+      }
+      if (kvOverride && kvOverride.conversationActive === true) {
+        return true;
+      }
+      const wdActive = cachedWatchdog?.enabled !== false;
+      const curWd = wdActive ? (cachedWatchdog?.current || null) : null;
+      const activeId = getActiveConversationId();
+      const targetId = activeId || kvOverride?.resolvedConversationId || cachedKv?.resolvedConversationId || '';
+      const sessions = wdActive && Array.isArray(cachedWatchdog?.sessions) ? cachedWatchdog.sessions : [];
+      if (targetId) {
+        const activeChild = sessions.some(
+          (s) =>
+            s &&
+            s.isSubagent &&
+            (s.parentConversationId === targetId || s.rootSessionId === targetId) &&
+            (s.phase !== 'IDLE' || s.subphase === 'stopped_bg_pending')
+        );
+        if (activeChild) return true;
+      }
+      const hasActiveChildInWd = Boolean(
+        targetId &&
+          sessions.some(
+            (s) =>
+              s &&
+              s.conversationId !== targetId &&
+              ((s.phase && s.phase !== 'IDLE') || s.subphase === 'stopped_bg_pending') &&
+              (s.parentConversationId === targetId || s.rootSessionId === targetId)
+          )
+      );
+      if (hasActiveChildInWd) return true;
+      if (curWd && (!targetId || curWd.conversationId === targetId)) {
+        if (curWd.phase && curWd.phase !== 'IDLE') return true;
+        if (curWd.subphase === 'stopped_bg_pending') return true;
+        if (curWd.phase === 'IDLE') return Boolean(cachedKv?.conversationActive === true);
+      }
+      if (targetId) {
+        const matchedSess = sessions.find((s) => s && s.conversationId === targetId);
+        if (matchedSess) {
+          if (matchedSess.phase && matchedSess.phase !== 'IDLE') return true;
+          if (matchedSess.subphase === 'stopped_bg_pending') return true;
+          if (matchedSess.phase === 'IDLE') return Boolean(cachedKv?.conversationActive === true);
+        }
+      }
+      return Boolean(wdActive && (cachedKv?.conversationActive === true || kvTtlState?.conversationActive === true));
+    }
+
     function renderLocalTtlCountdown() {
       const rowEl = document.getElementById('kv-ttl-bar-row');
       const labelEl = document.getElementById('kv-ttl-bar-label');
@@ -4659,6 +4844,31 @@
       const ttlSrcTag = ttlSrcLabel ? (currentLang === 'zh' ? `（${ttlSrcLabel}）` : ` (${ttlSrcLabel})`) : '';
       if (labelEl) {
         labelEl.textContent = `${t('ttlBarLabel')}${ttlSrcTag}`;
+      }
+
+      const turnActive = isCurrentConversationTurnActive();
+      if (turnActive) {
+        if (fillEl) {
+          fillEl.style.width = '100%';
+          fillEl.className = 'ttl-fill is-active';
+        }
+        if (trackEl) trackEl.className = 'ttl-track is-active';
+        if (textEl) {
+          textEl.className = 'ttl-text-info';
+          textEl.textContent = t('ttlActiveBar');
+        }
+        if (ttlEl) {
+          ttlEl.className = 'meta-tag is-info';
+          ttlEl.textContent = t('ttlActiveBadge');
+        }
+        if (tempEl && snap.cacheTemperature === 'cold') {
+          tempEl.className = 'meta-tag is-info';
+          tempEl.textContent = t('tempWarm');
+        }
+        if (cachedCompactAdvice === 'opportunistic_cold_compact') {
+          updateHandoffButtonStyle('none');
+        }
+        return;
       }
 
       if (snap.ttlStatus === 'expired') {
@@ -4751,6 +4961,7 @@
         currentContextTokens: ctxTokens,
         coldCompactTokens: Number(kv.coldCompactTokens) > 0 ? Number(kv.coldCompactTokens) : 60000,
         compactAdvice: kv.compactAdvice || 'none',
+        conversationActive: kv.conversationActive === true,
         ttlSource: kv.ttlSource || 'profile',
         maxWarmHitGapSec: kv.maxWarmHitGapSec ?? null
       };
@@ -5089,6 +5300,12 @@
       if (kv.ttlDesktopNotifyEnabled !== undefined) {
         updateFeaturePill('kv-ttl-notify-btn', t('kvTtlNotifyLabel'), kv.ttlDesktopNotifyEnabled === true);
       }
+      if (kv.globalTtlKeepaliveMaxCount !== undefined || kv.ttlKeepalive?.globalMaxCount !== undefined) {
+        syncGlobalKeepaliveFromPayload(
+          kv.globalTtlKeepaliveMaxCount ?? kv.ttlKeepalive?.globalMaxCount,
+          kv.fallbackTtlKeepaliveMaxCount ?? kv.ttlKeepalive?.fallbackMaxCount
+        );
+      }
       if (kv.ttlKeepalive) {
         if (shouldAcceptKeepalivePayload(kv.ttlKeepalive)) {
           renderKeepaliveControls(kv.ttlKeepalive);
@@ -5227,8 +5444,12 @@
         savingsEl.classList.remove('hidden');
       }
 
+      const kvTurnActive = isCurrentConversationTurnActive(kv);
       if (ttlEl) {
-        if (kv.ttlStatus === 'expired') {
+        if (kvTurnActive) {
+          ttlEl.className = 'meta-tag is-info';
+          ttlEl.innerText = t('ttlActiveBadge');
+        } else if (kv.ttlStatus === 'expired') {
           ttlEl.className = 'meta-tag is-danger';
           ttlEl.innerText = t('ttlExpiredBadge', { idle: fmtSec(kv.idleSeconds) });
         } else if (kv.ttlStatus === 'expiring') {
@@ -5260,7 +5481,9 @@
       }
 
       renderSynthesizedContextSummary();
-      updateHandoffButtonStyle(kv.compactAdvice);
+      updateHandoffButtonStyle(
+        kvTurnActive && kv.compactAdvice === 'opportunistic_cold_compact' ? 'none' : kv.compactAdvice
+      );
       syncKvTtlState(kv);
       renderContextComposition(kv.contextComposition, kv.subagentBreakdown);
 
@@ -5446,6 +5669,10 @@
       llm_high_ctx: 'wdBucketLlmHigh',
       llm_compact: 'wdBucketLlmCompact',
       llm_multimodal_high_ctx: 'wdBucketLlmMedia',
+      llm_reasoning: 'wdBucketLlmReasoning',
+      llm_ultra_high_ctx: 'wdBucketLlmUltraHigh',
+      llm_reasoning_compound: 'wdBucketLlmCompound',
+      subagent_llm: 'wdBucketSubagentLlm',
       tool_sync_cmd: 'wdBucketToolCmd',
       tool_mcp_long: 'wdBucketToolMcpLong',
       tool_mcp_fast: 'wdBucketToolMcpFast',
@@ -5489,6 +5716,12 @@
       if (wd.ttlDesktopNotifyEnabled !== undefined) {
         updateFeaturePill('kv-ttl-notify-btn', t('kvTtlNotifyLabel'), wd.ttlDesktopNotifyEnabled === true);
       }
+      if (wd.globalTtlKeepaliveMaxCount !== undefined || wd.ttlKeepalive?.globalMaxCount !== undefined) {
+        syncGlobalKeepaliveFromPayload(
+          wd.globalTtlKeepaliveMaxCount ?? wd.ttlKeepalive?.globalMaxCount,
+          wd.fallbackTtlKeepaliveMaxCount ?? wd.ttlKeepalive?.fallbackMaxCount
+        );
+      }
       if (wd.ttlKeepalive) {
         if (shouldAcceptKeepalivePayload(wd.ttlKeepalive)) {
           renderKeepaliveControls(wd.ttlKeepalive);
@@ -5525,6 +5758,9 @@
         if (sessionSwitcher) {
           sessionSwitcher.classList.add('hidden');
           sessionSwitcher.innerHTML = '';
+        }
+        if (kvTtlState) {
+          renderLocalTtlCountdown();
         }
         return;
       }
@@ -5705,6 +5941,9 @@
           sessionSwitcher.innerHTML = '';
         }
       }
+      if (kvTtlState) {
+        renderLocalTtlCountdown();
+      }
     }
 
     function clearPendingJumpFallbackTimer() {
@@ -5760,6 +5999,8 @@
           rememberBoundedId(consumedJumpIds, opts.jumpId);
         }
         selectedConvOverride = targetId === nativeId ? '' : targetId;
+        pendingCustomOverrideConvId = '';
+        sawOutOfOrderWatchdogAction = false;
         ++watchdogActionSeq;
         const ackPromise = opts.jumpId ? ackPendingJumpOnServer(opts.jumpId) : Promise.resolve();
         if (hasHostToggle) {
@@ -5793,6 +6034,8 @@
       }
       if (!crossWorkspaceConfirmed && myJumpSeq === jumpActionSeq) {
         selectedConvOverride = targetId === nativeId ? '' : targetId;
+        pendingCustomOverrideConvId = '';
+        sawOutOfOrderWatchdogAction = false;
         ++watchdogActionSeq;
       }
 
@@ -6052,36 +6295,85 @@
 
     async function sendWatchdogAction(payload) {
       const reqActionSeq = ++watchdogActionSeq;
+      latestStartedWatchdogActionSeq = reqActionSeq;
+      inFlightWatchdogActionCount += 1;
+      if (inFlightWatchdogActionCount > 1) {
+        sawOutOfOrderWatchdogAction = true;
+      }
       ++refreshSeq;
       const act = payload?.action || '';
       const isIncidentAct = act === 'ack' || act === 'snooze' || act === 'clear' || act === 'markIdle';
+      const activeId = getActiveConversationId();
       const fallbackPrimaryConv =
         cachedWatchdog?.ttlKeepalive?.conversationId ||
         (!cachedWatchdog?.current?.isSubagent ? cachedWatchdog?.current?.conversationId : '') ||
         '';
       const convId = isIncidentAct
-        ? (cachedWatchdog?.current?.conversationId || getActiveConversationId())
-        : (getActiveConversationId() || fallbackPrimaryConv);
-      const res = await apiFetch('/api/watchdog/action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scope: currentScope, conversationId: convId, ...payload })
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (reqActionSeq !== watchdogActionSeq) {
-        return data;
-      }
-      if (data && data.status) {
-        cachedWatchdog = data.status;
-        if (cachedKv && data.status.ttlKeepalive && shouldAcceptKeepalivePayload(data.status.ttlKeepalive)) {
-          cachedKv.ttlKeepalive = data.status.ttlKeepalive;
+        ? (cachedWatchdog?.current?.conversationId || activeId)
+        : (activeId || (window.sidecar ? '' : fallbackPrimaryConv));
+      try {
+        const res = await apiFetch('/api/watchdog/action', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            scope: currentScope,
+            conversationId: convId,
+            ...(window.sidecar ? { fromSidecarHost: true } : {}),
+            ...payload
+          })
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (reqActionSeq !== watchdogActionSeq) {
+          if (latestStartedWatchdogActionSeq === watchdogActionSeq) {
+            sawOutOfOrderWatchdogAction = true;
+          }
+          return data;
         }
-        renderWatchdogCard(data.status);
-      } else {
-        refreshData(false);
+        latestAppliedWatchdogActionSeq = reqActionSeq;
+        pendingCustomOverrideConvId = '';
+        if (inFlightWatchdogActionCount > 1 && latestStartedWatchdogActionSeq === watchdogActionSeq) {
+          sawOutOfOrderWatchdogAction = true;
+        }
+        if (data && data.status) {
+          cachedWatchdog = data.status;
+          if (
+            data.status.enabled === false ||
+            payload?.action === 'clear' ||
+            payload?.action === 'markIdle' ||
+            (data.status.current &&
+              data.status.current.phase === 'IDLE' &&
+              data.status.current.subphase !== 'stopped_bg_pending')
+          ) {
+            if (cachedKv) cachedKv.conversationActive = false;
+            if (kvTtlState) kvTtlState.conversationActive = false;
+          }
+          if (cachedKv && data.status.ttlKeepalive && shouldAcceptKeepalivePayload(data.status.ttlKeepalive)) {
+            cachedKv.ttlKeepalive = data.status.ttlKeepalive;
+          }
+          renderWatchdogCard(data.status);
+        } else {
+          refreshData(false);
+        }
+        return data;
+      } catch (err) {
+        if (
+          (reqActionSeq !== watchdogActionSeq || inFlightWatchdogActionCount > 1) &&
+          latestStartedWatchdogActionSeq === watchdogActionSeq
+        ) {
+          sawOutOfOrderWatchdogAction = true;
+        }
+        throw err;
+      } finally {
+        inFlightWatchdogActionCount = Math.max(0, inFlightWatchdogActionCount - 1);
+        if (inFlightWatchdogActionCount === 0) {
+          pendingCustomOverrideConvId = '';
+          if (sawOutOfOrderWatchdogAction && latestStartedWatchdogActionSeq === watchdogActionSeq) {
+            sawOutOfOrderWatchdogAction = false;
+            refreshData(false);
+          }
+        }
       }
-      return data;
     }
 
     async function snoozeWatchdogAlert() {
@@ -6120,7 +6412,137 @@
       }
     }
 
-    let unboundKeepaliveState = { enabled: true, maxCount: 3, usedCount: 0, lastError: '' };
+    let cachedGlobalKeepalive = { globalMaxCount: 3, fallbackMaxCount: 3 };
+    let unboundKeepaliveState = {
+      enabled: true,
+      maxCount: 3,
+      globalMaxCount: 3,
+      fallbackMaxCount: 3,
+      isCustomOverride: false,
+      usedCount: 0,
+      lastError: ''
+    };
+
+    function syncGlobalKeepaliveFromPayload(rawGlobalMax, rawFallbackMax) {
+      const nextGlobal = Number.isFinite(Number(rawGlobalMax))
+        ? Math.min(20, Math.max(0, Math.floor(Number(rawGlobalMax))))
+        : cachedGlobalKeepalive.globalMaxCount;
+      const nextFallback = Number.isFinite(Number(rawFallbackMax)) && Number(rawFallbackMax) >= 1
+        ? Math.min(20, Math.max(1, Math.floor(Number(rawFallbackMax))))
+        : nextGlobal >= 1
+          ? nextGlobal
+          : cachedGlobalKeepalive.fallbackMaxCount;
+      cachedGlobalKeepalive = { globalMaxCount: nextGlobal, fallbackMaxCount: nextFallback };
+      if (!unboundKeepaliveState.isCustomOverride) {
+        unboundKeepaliveState = {
+          ...unboundKeepaliveState,
+          enabled: nextGlobal >= 1,
+          maxCount: nextGlobal >= 1 ? nextGlobal : nextFallback,
+          globalMaxCount: nextGlobal,
+          fallbackMaxCount: nextFallback
+        };
+      }
+      renderGlobalKeepaliveControls(nextGlobal, nextFallback);
+    }
+
+    function renderGlobalKeepaliveControls(rawGlobalMax, rawFallbackMax) {
+      const btn = document.getElementById('kv-global-keepalive-btn');
+      const grp = document.getElementById('kv-global-keepalive-group');
+      const maxInput = document.getElementById('kv-global-keepalive-max');
+      const globalMax = Number.isFinite(Number(rawGlobalMax))
+        ? Math.min(20, Math.max(0, Math.floor(Number(rawGlobalMax))))
+        : cachedGlobalKeepalive.globalMaxCount;
+      const fallbackMax = Number.isFinite(Number(rawFallbackMax)) && Number(rawFallbackMax) >= 1
+        ? Math.min(20, Math.max(1, Math.floor(Number(rawFallbackMax))))
+        : globalMax >= 1
+          ? globalMax
+          : cachedGlobalKeepalive.fallbackMaxCount;
+      const isOn = globalMax >= 1;
+      if (btn) {
+        if (btn.dataset) {
+          btn.dataset.max = String(globalMax);
+          btn.dataset.fallback = String(fallbackMax);
+        }
+        btn.className = isOn ? 'toggle-chip is-on' : 'toggle-chip';
+        const label = t('kvGlobalKeepaliveLabel');
+        const sep = currentLang === 'zh' ? '：' : ': ';
+        btn.innerText = isOn ? `${label}${sep}×` : `${label}${sep}${t('stateOff')}`;
+        btn.title = t('kvGlobalKeepaliveTip');
+      }
+      if (grp) {
+        grp.className = isOn
+          ? 'keepalive-group keepalive-global-group is-on'
+          : 'keepalive-group keepalive-global-group';
+      }
+      if (maxInput && document.activeElement !== maxInput) {
+        maxInput.value = String(globalMax);
+      }
+    }
+
+    async function toggleGlobalTtlKeepalive() {
+      const btn = document.getElementById('kv-global-keepalive-btn');
+      const curGlobal = Number.isFinite(Number(btn?.dataset?.max))
+        ? Math.min(20, Math.max(0, Math.floor(Number(btn.dataset.max))))
+        : cachedGlobalKeepalive.globalMaxCount;
+      const curFallback = Number.isFinite(Number(btn?.dataset?.fallback)) && Number(btn?.dataset?.fallback) >= 1
+        ? Math.min(20, Math.max(1, Math.floor(Number(btn.dataset.fallback))))
+        : cachedGlobalKeepalive.fallbackMaxCount;
+      const nextMax = curGlobal >= 1 ? 0 : curFallback;
+      return changeGlobalTtlKeepaliveMax(nextMax);
+    }
+
+    async function changeGlobalTtlKeepaliveMax(rawVal) {
+      const prevGlobal = { ...cachedGlobalKeepalive };
+      const prevUnbound = { ...unboundKeepaliveState };
+      const prevWindowSnap = snapshotKeepaliveUiState();
+      const trimmed = rawVal === null || rawVal === undefined ? '' : String(rawVal).trim();
+      const maxInput = document.getElementById('kv-global-keepalive-max');
+      if (trimmed === '' || !Number.isFinite(Number(trimmed))) {
+        if (maxInput) maxInput.value = String(prevGlobal.globalMaxCount);
+        return;
+      }
+      const parsed = Math.min(20, Math.max(0, Math.floor(Number(trimmed))));
+      const nextFallback = parsed >= 1 ? parsed : prevGlobal.fallbackMaxCount;
+      if (maxInput) maxInput.value = String(parsed);
+      syncGlobalKeepaliveFromPayload(parsed, nextFallback);
+      const curTargetId = resolveKeepaliveConversationId() || '__default__';
+      const hasInFlightWindowCustom =
+        Boolean(pendingCustomOverrideConvId) && pendingCustomOverrideConvId === curTargetId;
+      if (!prevWindowSnap.isSubagent && !prevWindowSnap.isCustomOverride && !hasInFlightWindowCustom) {
+        renderKeepaliveControls({
+          ...prevWindowSnap,
+          enabled: parsed >= 1,
+          maxCount: parsed >= 1 ? parsed : nextFallback,
+          globalMaxCount: parsed,
+          fallbackMaxCount: nextFallback
+        });
+      }
+      const expectedSeq = watchdogActionSeq + 1;
+      try {
+        const data = await sendWatchdogAction({
+          action: 'setGlobalTtlKeepalive',
+          maxCount: parsed,
+          ...(window.sidecar ? { fromSidecarHost: true } : {})
+        });
+        if (
+          watchdogActionSeq === expectedSeq &&
+          maxInput &&
+          data &&
+          Number.isFinite(Number(data.globalTtlKeepaliveMaxCount)) &&
+          Number(data.globalTtlKeepaliveMaxCount) !== parsed
+        ) {
+          maxInput.value = String(Math.min(20, Math.max(0, Math.floor(Number(data.globalTtlKeepaliveMaxCount)))));
+        }
+      } catch (e) {
+        console.error(e);
+        if (watchdogActionSeq === expectedSeq) {
+          cachedGlobalKeepalive = prevGlobal;
+          unboundKeepaliveState = prevUnbound;
+          renderGlobalKeepaliveControls(prevGlobal.globalMaxCount, prevGlobal.fallbackMaxCount);
+          renderKeepaliveControls(prevWindowSnap);
+        }
+      }
+    }
 
     function resolveKeepaliveConversationId() {
       const activeId = getActiveConversationId();
@@ -6157,8 +6579,10 @@
       const btn = document.getElementById('kv-keepalive-btn');
       const maxInput = document.getElementById('kv-keepalive-max');
       const isSubagent = btn ? btn.dataset?.subagent === '1' : false;
+      const isCustomOverride = !isSubagent && (btn ? btn.dataset?.custom === '1' : false);
       return {
         isSubagent,
+        isCustomOverride,
         enabled: isSubagent ? false : (btn ? btn.dataset?.enabled !== '0' : true),
         maxCount: Math.min(20, Math.max(1, parseInt(btn?.dataset?.max || maxInput?.value || '3', 10) || 3)),
         usedCount: isSubagent ? 0 : Math.max(0, parseInt(btn?.dataset?.used || '0', 10) || 0)
@@ -6169,9 +6593,14 @@
       const btn = document.getElementById('kv-keepalive-btn');
       const grp = document.getElementById('kv-keepalive-group');
       const maxInput = document.getElementById('kv-keepalive-max');
+      const followBtn = document.getElementById('kv-keepalive-follow-btn');
       const resetBtn = document.getElementById('kv-keepalive-reset-btn');
+      if (ka && (ka.globalMaxCount !== undefined || ka.fallbackMaxCount !== undefined)) {
+        syncGlobalKeepaliveFromPayload(ka.globalMaxCount, ka.fallbackMaxCount);
+      }
       if (!btn) return;
       const isSubagent = ka ? ka.isSubagent === true : (btn.dataset?.subagent === '1');
+      const isCustom = !isSubagent && (ka ? ka.isCustomOverride === true : (btn.dataset?.custom === '1'));
       const enabled = isSubagent ? false : (ka ? ka.enabled !== false : (btn.dataset?.enabled !== '0'));
       const maxCount = ka && Number.isFinite(Number(ka.maxCount))
         ? Math.min(20, Math.max(1, Math.floor(Number(ka.maxCount))))
@@ -6183,6 +6612,7 @@
           : Math.max(0, parseInt(btn.dataset?.used || '0', 10) || 0);
       if (btn.dataset) {
         btn.dataset.subagent = isSubagent ? '1' : '0';
+        btn.dataset.custom = isCustom ? '1' : '0';
         btn.dataset.enabled = enabled ? '1' : '0';
         btn.dataset.max = String(maxCount);
         btn.dataset.used = String(usedCount);
@@ -6190,11 +6620,16 @@
       btn.className = enabled ? 'toggle-chip is-on' : 'toggle-chip';
       if (grp) {
         const exhausted = enabled && usedCount >= maxCount;
-        grp.className = enabled
+        const baseCls = enabled
           ? (exhausted ? 'keepalive-group is-on is-exhausted' : 'keepalive-group is-on')
           : 'keepalive-group';
+        grp.className = isCustom ? `${baseCls} is-custom` : baseCls;
       }
-      const label = t('kvKeepaliveLabel');
+      const label = isSubagent
+        ? t('kvKeepaliveLabel')
+        : isCustom
+          ? t('kvKeepaliveCustomLabel')
+          : t('kvKeepaliveLabel');
       const sep = currentLang === 'zh' ? '：' : ': ';
       btn.innerText = isSubagent
         ? `${label}${sep}${t('kvKeepaliveSubagentState')}`
@@ -6214,6 +6649,11 @@
           maxInput.value = String(maxCount);
         }
       }
+      if (followBtn) {
+        followBtn.textContent = t('kvKeepaliveFollowBtn');
+        followBtn.title = t('kvKeepaliveFollowTip');
+        followBtn.className = !isSubagent && isCustom ? 'keepalive-follow-btn' : 'keepalive-follow-btn hidden';
+      }
       if (resetBtn) {
         resetBtn.className = !isSubagent && usedCount > 0 ? 'keepalive-reset-btn' : 'keepalive-reset-btn hidden';
       }
@@ -6224,7 +6664,8 @@
       if (prevSnap.isSubagent) return;
       const next = !prevSnap.enabled;
       const targetId = resolveKeepaliveConversationId();
-      const optimistic = { ...prevSnap, enabled: next };
+      pendingCustomOverrideConvId = targetId || '__default__';
+      const optimistic = { ...prevSnap, isCustomOverride: true, enabled: next };
       if (targetId === '__unbound__') {
         unboundKeepaliveState = { ...unboundKeepaliveState, ...optimistic };
       }
@@ -6240,6 +6681,7 @@
       } catch (e) {
         console.error(e);
         if (watchdogActionSeq === expectedSeq && resolveKeepaliveConversationId() === targetId) {
+          pendingCustomOverrideConvId = '';
           if (targetId === '__unbound__') {
             unboundKeepaliveState = { ...unboundKeepaliveState, ...prevSnap };
           }
@@ -6251,16 +6693,71 @@
     async function changeTtlKeepaliveMax(rawVal) {
       const prevSnap = snapshotKeepaliveUiState();
       if (prevSnap.isSubagent) return;
-      const fallbackMax = prevSnap.maxCount;
       const trimmed = rawVal === null || rawVal === undefined ? '' : String(rawVal).trim();
-      const num = trimmed === '' ? NaN : Number(trimmed);
-      const parsed = Number.isFinite(num)
-        ? Math.min(20, Math.max(1, Math.floor(num)))
-        : fallbackMax;
+      if (trimmed === '') {
+        return resetTtlKeepaliveOverride();
+      }
       const maxInput = document.getElementById('kv-keepalive-max');
+      const num = Number(trimmed);
+      if (!Number.isFinite(num)) {
+        if (maxInput) maxInput.value = String(prevSnap.maxCount);
+        return;
+      }
+      const parsed = Math.min(20, Math.max(1, Math.floor(num)));
       if (maxInput) maxInput.value = String(parsed);
       const targetId = resolveKeepaliveConversationId();
-      const optimistic = { ...prevSnap, maxCount: parsed };
+      pendingCustomOverrideConvId = targetId || '__default__';
+      const optimistic = { ...prevSnap, isCustomOverride: true, enabled: true, maxCount: parsed };
+      if (targetId === '__unbound__') {
+        unboundKeepaliveState = { ...unboundKeepaliveState, ...optimistic };
+      }
+      renderKeepaliveControls(optimistic);
+      const expectedSeq = watchdogActionSeq + 1;
+      try {
+        const data = await sendWatchdogAction({
+          action: 'setTtlKeepalive',
+          maxCount: parsed,
+          ...(targetId ? { conversationId: targetId } : {}),
+          ...(window.sidecar ? { fromSidecarHost: true } : {})
+        });
+        const effMax = data?.ttlKeepaliveMaxCount ?? data?.status?.ttlKeepalive?.maxCount;
+        if (
+          watchdogActionSeq === expectedSeq &&
+          resolveKeepaliveConversationId() === targetId &&
+          maxInput &&
+          Number.isFinite(Number(effMax)) &&
+          Number(effMax) !== parsed
+        ) {
+          maxInput.value = String(Math.min(20, Math.max(1, Math.floor(Number(effMax)))));
+        }
+      } catch (e) {
+        console.error(e);
+        if (watchdogActionSeq === expectedSeq && resolveKeepaliveConversationId() === targetId) {
+          pendingCustomOverrideConvId = '';
+          if (maxInput) maxInput.value = String(prevSnap.maxCount);
+          if (targetId === '__unbound__') {
+            unboundKeepaliveState = { ...unboundKeepaliveState, ...prevSnap };
+          }
+          renderKeepaliveControls(prevSnap);
+        }
+      }
+    }
+
+    async function resetTtlKeepaliveOverride() {
+      const prevSnap = snapshotKeepaliveUiState();
+      if (prevSnap.isSubagent) return;
+      const targetId = resolveKeepaliveConversationId();
+      pendingCustomOverrideConvId = '';
+      const gm = cachedGlobalKeepalive.globalMaxCount;
+      const fm = cachedGlobalKeepalive.fallbackMaxCount;
+      const optimistic = {
+        ...prevSnap,
+        isCustomOverride: false,
+        enabled: gm >= 1,
+        maxCount: gm >= 1 ? gm : fm
+      };
+      const maxInput = document.getElementById('kv-keepalive-max');
+      if (maxInput) maxInput.value = String(optimistic.maxCount);
       if (targetId === '__unbound__') {
         unboundKeepaliveState = { ...unboundKeepaliveState, ...optimistic };
       }
@@ -6268,14 +6765,14 @@
       const expectedSeq = watchdogActionSeq + 1;
       try {
         await sendWatchdogAction({
-          action: 'setTtlKeepalive',
-          maxCount: parsed,
+          action: 'resetTtlKeepaliveOverride',
           ...(targetId ? { conversationId: targetId } : {}),
           ...(window.sidecar ? { fromSidecarHost: true } : {})
         });
       } catch (e) {
         console.error(e);
         if (watchdogActionSeq === expectedSeq && resolveKeepaliveConversationId() === targetId) {
+          if (maxInput) maxInput.value = String(prevSnap.maxCount);
           if (targetId === '__unbound__') {
             unboundKeepaliveState = { ...unboundKeepaliveState, ...prevSnap };
           }

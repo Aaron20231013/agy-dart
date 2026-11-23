@@ -1299,11 +1299,83 @@ export class SettingsMaintenanceMethods {
     return boolVal;
   }
 
-  /** Check if KV-cache TTL auto-keepalive is enabled for a conversation (default ON; env > per-conv sqlite > config) */
+  /** Return last remembered non-zero global keepalive max count (1..20, fallback 3) */
+  getFallbackNonZeroKeepaliveMaxCount() {
+    this.open();
+    const raw = this.getMeta("cache:ttl_keepalive_last_nonzero_max", null);
+    if (raw !== null && raw !== "") {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n >= 1) {
+        return Math.min(20, Math.max(1, Math.floor(n)));
+      }
+    }
+    const snap = getConfigSnapshot();
+    const cfgMax = Number(snap.values.ttlKeepaliveMaxCount);
+    if (Number.isFinite(cfgMax) && cfgMax >= 1) {
+      return Math.min(20, Math.max(1, Math.floor(cfgMax)));
+    }
+    return 3;
+  }
+
+  /** True iff global keepalive max count (0..20) has been explicitly persisted in SQLite meta */
+  hasExplicitGlobalTtlKeepaliveMaxCount() {
+    this.open();
+    const raw = this.getMeta("cache:ttl_keepalive_global_max_count", null);
+    if (raw === null || raw === "") return false;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 && n <= 20;
+  }
+
+  /** Resolve global default auto-keepalive max count (0..20; 0 means off by default for uncustomized windows) */
+  getGlobalTtlKeepaliveMaxCount() {
+    const snap = getConfigSnapshot();
+    const clampGlobal = (v) => Math.min(20, Math.max(0, Math.floor(Number(v))));
+    if (snap.sources.ttlKeepalive === "env" && snap.values.ttlKeepalive === false) {
+      return 0;
+    }
+    if (snap.sources.ttlKeepaliveMaxCount === "env") {
+      return clampGlobal(snap.values.ttlKeepaliveMaxCount ?? 3);
+    }
+    const envForcedOn = snap.sources.ttlKeepalive === "env" && snap.values.ttlKeepalive === true;
+    this.open();
+    const raw = this.getMeta("cache:ttl_keepalive_global_max_count", null);
+    if (raw !== null && raw !== "") {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n >= 0) {
+        const clampedMeta = clampGlobal(n);
+        return clampedMeta === 0 && envForcedOn ? this.getFallbackNonZeroKeepaliveMaxCount() : clampedMeta;
+      }
+    }
+    if (snap.values.ttlKeepalive === false) {
+      return 0;
+    }
+    const cfgVal = clampGlobal(snap.values.ttlKeepaliveMaxCount ?? 3);
+    return cfgVal === 0 && envForcedOn ? this.getFallbackNonZeroKeepaliveMaxCount() : cfgVal;
+  }
+
+  /** Persist global default auto-keepalive max count (0..20) in SQLite meta and remember last non-zero count */
+  setGlobalTtlKeepaliveMaxCount(maxCount) {
+    this.open();
+    const isBlankOrInvalid =
+      maxCount === null ||
+      maxCount === undefined ||
+      typeof maxCount === "boolean" ||
+      typeof maxCount === "object" ||
+      (typeof maxCount === "string" && maxCount.trim() === "");
+    const n = isBlankOrInvalid ? NaN : Number(maxCount);
+    const clamped = Number.isFinite(n) ? Math.min(20, Math.max(0, Math.floor(n))) : 3;
+    this.setMeta("cache:ttl_keepalive_global_max_count", String(clamped));
+    if (clamped >= 1) {
+      this.setMeta("cache:ttl_keepalive_last_nonzero_max", String(clamped));
+    }
+    return clamped;
+  }
+
+  /** Check if KV-cache TTL auto-keepalive is enabled for a conversation (default ON; env kill-switch > per-conv sqlite > env max/on > global sqlite > config) */
   isTtlKeepaliveEnabled(conversationId = null) {
     const snap = getConfigSnapshot();
-    if (snap.sources.ttlKeepalive === "env") {
-      return Boolean(snap.values.ttlKeepalive);
+    if (snap.sources.ttlKeepalive === "env" && snap.values.ttlKeepalive === false) {
+      return false;
     }
     const cleanId = this._sanitizeKeepaliveConvId(conversationId);
     if (cleanId) {
@@ -1311,8 +1383,17 @@ export class SettingsMaintenanceMethods {
       if (typeof st.enabled === "boolean") {
         return st.enabled;
       }
+      if (typeof st.maxCount === "number" && Number.isFinite(st.maxCount) && st.maxCount >= 1) {
+        return true;
+      }
     }
-    return Boolean(snap.values.ttlKeepalive);
+    if (snap.sources.ttlKeepaliveMaxCount === "env") {
+      return Number(snap.values.ttlKeepaliveMaxCount) >= 1;
+    }
+    if (snap.sources.ttlKeepalive === "env" && snap.values.ttlKeepalive === true) {
+      return true;
+    }
+    return this.getGlobalTtlKeepaliveMaxCount() >= 1;
   }
 
   /** Enable or disable KV-cache TTL auto-keepalive for a specific conversation in SQLite meta */
@@ -1324,18 +1405,20 @@ export class SettingsMaintenanceMethods {
     return boolVal;
   }
 
-  /** True iff this specific conversation was explicitly toggled ON in SQLite meta */
-  hasExplicitTtlKeepaliveEnabled(conversationId) {
+  /** True iff this specific conversation was explicitly toggled ON (or given an explicit count >= 1 while global is 0) in SQLite meta */
+  hasExplicitTtlKeepaliveEnabled(conversationId, { globalOff = this.getGlobalTtlKeepaliveMaxCount() === 0 } = {}) {
     const cleanId = this._sanitizeKeepaliveConvId(conversationId);
     if (!cleanId || cleanId === "__unbound__") return false;
     const st = this.getTtlKeepaliveState(cleanId);
-    return st.enabled === true;
+    if (st.enabled === true) return true;
+    return Boolean(globalOff && st.enabled !== false && typeof st.maxCount === "number" && st.maxCount >= 1);
   }
 
-  /** True iff ANY real conversation in SQLite meta has an explicit enabled=true keepalive override */
-  hasAnyExplicitTtlKeepaliveEnabled() {
+  /** True iff ANY real conversation in SQLite meta has an explicit keepalive ON override */
+  hasAnyExplicitTtlKeepaliveEnabled({ globalOff = this.getGlobalTtlKeepaliveMaxCount() === 0 } = {}) {
     this.open();
     try {
+      const isGlobalOff = Boolean(globalOff);
       const allowDefaultSummaryDb = Boolean(
         (typeof process.env.AGY_DART_SUMMARY_DB_PATH === "string" && process.env.AGY_DART_SUMMARY_DB_PATH.trim()) ||
           (typeof this.dbPath === "string" &&
@@ -1352,7 +1435,18 @@ export class SettingsMaintenanceMethods {
         if (!cid) continue;
         try {
           const parsed = JSON.parse(row.value);
-          if (!parsed || parsed.enabled !== true) continue;
+          const explicitlyOn =
+            parsed &&
+            (parsed.enabled === true ||
+              (isGlobalOff &&
+                parsed.enabled !== false &&
+                parsed.maxCount !== null &&
+                parsed.maxCount !== undefined &&
+                parsed.maxCount !== "" &&
+                typeof parsed.maxCount !== "boolean" &&
+                Number.isFinite(Number(parsed.maxCount)) &&
+                Number(parsed.maxCount) >= 1));
+          if (!explicitlyOn) continue;
           const leaseRaw = this.getMeta(`watchdog_lease:${cid}`, null);
           let leaseObj = null;
           if (leaseRaw && typeof leaseRaw === "string") {
@@ -1389,13 +1483,10 @@ export class SettingsMaintenanceMethods {
     return false;
   }
 
-  /** Resolve max auto-keepalive activations for a conversation before a fresh user message (1..20, default 3) */
+  /** Resolve max auto-keepalive activations for a conversation before a fresh user message (1..20, fallback to last non-zero when global is 0) */
   getTtlKeepaliveMaxCount(conversationId = null) {
     const snap = getConfigSnapshot();
     const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 3)));
-    if (snap.sources.ttlKeepaliveMaxCount === "env") {
-      return clampMax(snap.values.ttlKeepaliveMaxCount);
-    }
     const cleanId = this._sanitizeKeepaliveConvId(conversationId);
     if (cleanId) {
       const st = this.getTtlKeepaliveState(cleanId);
@@ -1403,15 +1494,64 @@ export class SettingsMaintenanceMethods {
         return clampMax(st.maxCount);
       }
     }
-    return clampMax(snap.values.ttlKeepaliveMaxCount ?? 3);
+    if (snap.sources.ttlKeepaliveMaxCount === "env") {
+      const envVal = Number(snap.values.ttlKeepaliveMaxCount);
+      return envVal >= 1 ? clampMax(envVal) : this.getFallbackNonZeroKeepaliveMaxCount();
+    }
+    const globalMax = this.getGlobalTtlKeepaliveMaxCount();
+    if (globalMax >= 1) {
+      return clampMax(globalMax);
+    }
+    return this.getFallbackNonZeroKeepaliveMaxCount();
   }
 
   /** Persist per-conversation max auto-keepalive count (1..20) in SQLite meta */
   setTtlKeepaliveMaxCount(maxCount, conversationId = null) {
     const clamped = Math.min(20, Math.max(1, Math.floor(Number(maxCount) || 3)));
     const targetId = this._sanitizeKeepaliveConvId(conversationId) || "__unbound__";
-    this.setTtlKeepaliveState(targetId, { maxCount: clamped });
+    const cur = this.getTtlKeepaliveState(targetId);
+    const shouldAutoEnable = cur.enabled === null && this.getGlobalTtlKeepaliveMaxCount() === 0;
+    this.setTtlKeepaliveState(targetId, {
+      ...(shouldAutoEnable ? { enabled: true } : {}),
+      maxCount: clamped
+    });
     return clamped;
+  }
+
+  /** True iff a conversation (or __unbound__ tab) has an explicit per-window enabled or maxCount override */
+  hasCustomTtlKeepaliveOverride(conversationId) {
+    const cleanId = this._sanitizeKeepaliveConvId(conversationId);
+    if (!cleanId) return false;
+    const st = this.getTtlKeepaliveState(cleanId);
+    return st.enabled !== null || st.maxCount !== null;
+  }
+
+  /** Clear per-conversation enabled/maxCount override so the window follows global again while preserving usedCount */
+  clearTtlKeepaliveOverride(conversationId, nowMs = Date.now()) {
+    const cleanId = this._sanitizeKeepaliveConvId(conversationId);
+    if (!cleanId) return null;
+    this.open();
+    const metaKey = `cache:ttl_keepalive_state:${cleanId}`;
+    if (cleanId === "__unbound__") {
+      this.deleteMeta(metaKey);
+      return this.getTtlKeepaliveState(cleanId, nowMs);
+    }
+    const cur = this.getTtlKeepaliveState(cleanId, nowMs);
+    if (
+      cur.usedCount === 0 &&
+      !cur.lastIdleAnchorTs &&
+      !cur.lastSentTs &&
+      !cur.pendingAck &&
+      !cur.lastError
+    ) {
+      this.deleteMeta(metaKey);
+      return this.getTtlKeepaliveState(cleanId, nowMs);
+    }
+    return this.setTtlKeepaliveState(cleanId, {
+      enabled: null,
+      maxCount: null,
+      updatedTs: nowMs
+    });
   }
 
   _sanitizeKeepaliveConvId(conversationId) {

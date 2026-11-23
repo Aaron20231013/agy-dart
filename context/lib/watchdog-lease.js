@@ -33,8 +33,11 @@ const PRIMARY_HOST_AGENT_NAME_RE = /^(?:antigravity|main|default|primary|chat|us
 const SUBAGENT_GENESIS_SYS_MSG_RE =
   /\[Message\]\s+timestamp=\S+\s+sender=[0-9a-f-]{8,}|<original_task>|<subagent_reminder>|\brunning as a subagent,\s*invoked by a caller agent\b/i;
 export const SUBAGENT_TOOL_RE =
-  /^(?:subagent|task|agent|delegate|call_subagent|invoke_subagent|schedule|manage_task|send_message|browser_subagent|spawn_subagent|run_subagent)$/i;
+  /^(?:subagent|task|agent|delegate|call_subagent|invoke_subagent|run_workflow|schedule|manage_task|send_message|browser_subagent|spawn_subagent|run_subagent)$/i;
 export const LONG_MCP_TOOL_RE = /^(?:ctx_execute|ctx_batch|run_checks)$/i;
+export const SLOW_GEN_TOOL_RE = /^(?:generate_image|image_generator)$/i;
+const HIGH_REASONING_MODEL_RE =
+  /(?:^|[-_/\s(])(?:high|xhigh)(?:$|[-_/\s)])|thinking|(?:^|[-_/\s(])o[134](?:$|[-_/\s.)])|deepseek[-_/\s]?r1|(?:^|[-_/\s(])opus(?:$|[-_/\s).\d])/i;
 export const KNOWN_MCP_TOOL_RE =
   /^(?:ctx_execute|ctx_batch|ctx_index|ctx_search|ctx_resume|ctx_stats|ctx_doctor|ctx_purge|batch_search|apply_edits|read_slices|run_checks|list_resources|read_resource)$/i;
 const HOST_NAMESPACE_RE = /^(?:default_api|builtin|host|antigravity|core|native)$/i;
@@ -1055,10 +1058,25 @@ export function extractBareToolName(rawName) {
   return afterColon;
 }
 
-export function deriveLlmSubphase({ contextTokens = 0, mediaCount = 0, isCompactCmd = false } = {}) {
-  if (contextTokens >= 150000 && mediaCount > 0) return "multimodal_high_ctx";
+export function isHighReasoningModel(model) {
+  if (typeof model !== "string") return false;
+  const trimmed = model.trim();
+  if (!trimmed) return false;
+  return HIGH_REASONING_MODEL_RE.test(trimmed);
+}
+
+export function deriveLlmSubphase({ contextTokens = 0, mediaCount = 0, isCompactCmd = false, model = "" } = {}) {
+  const ctx = Number(contextTokens || 0);
+  const media = Number(mediaCount || 0);
+  const highReasoning = isHighReasoningModel(model);
+  if (ctx >= 500000 || (highReasoning && (ctx >= 250000 || (ctx >= 100000 && media > 0)))) {
+    return "reasoning_compound";
+  }
+  if (highReasoning) return "reasoning";
+  if (ctx >= 250000) return "ultra_high_ctx";
+  if ((ctx >= 150000 && media > 0) || (ctx >= 100000 && media >= 3)) return "multimodal_high_ctx";
   if (isCompactCmd) return "compact";
-  if (contextTokens >= 120000) return "high_ctx";
+  if (ctx >= 120000) return "high_ctx";
   return "normal";
 }
 
@@ -1137,6 +1155,9 @@ export function classifyToolExecutionKind(toolName, rawArgs = {}, options = {}) 
       effectiveArgs.Prompt ||
       effectiveArgs.prompt ||
       effectiveArgs.description ||
+      effectiveArgs.workflow ||
+      effectiveArgs.name ||
+      effectiveArgs.code ||
       effectiveArgs.Action ||
       effectiveArgs.action ||
       "";
@@ -1145,6 +1166,34 @@ export function classifyToolExecutionKind(toolName, rawArgs = {}, options = {}) 
       activeToolKind: "subagent",
       isBackground: true,
       summary: sanitizeWatchdogText(desc, 140)
+    };
+  }
+
+  if (
+    bare === "apply_edits" &&
+    typeof effectiveArgs.verify === "string" &&
+    effectiveArgs.verify.trim() !== ""
+  ) {
+    return {
+      activeTool: "apply_edits",
+      activeToolKind: "mcp_long",
+      isBackground: false,
+      summary: sanitizeWatchdogText(effectiveArgs.verify.trim(), 160)
+    };
+  }
+
+  if (SLOW_GEN_TOOL_RE.test(bare)) {
+    const desc =
+      effectiveArgs.ImageName ||
+      effectiveArgs.imageName ||
+      effectiveArgs.Prompt ||
+      effectiveArgs.prompt ||
+      "";
+    return {
+      activeTool: bare,
+      activeToolKind: "mcp_long",
+      isBackground: false,
+      summary: sanitizeWatchdogText(desc, 160)
     };
   }
 
@@ -1648,12 +1697,11 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
         : "";
     const isMidTurn = invNum !== null && invNum >= 1;
     const isKeepaliveInput = Boolean(safeOptions.isKeepaliveTurn) || isTtlKeepalivePrompt(rawInput);
-    if (rawInput.trim() && !isKeepaliveInput) {
+    const isSyntheticWake = isKeepaliveInput || Boolean(safeOptions.isBackgroundWakeup);
+    if (rawInput.trim() && !isSyntheticWake) {
       next.lastUserInput = sanitizeWatchdogText(rawInput, 240);
       next.isCompactCmd = SLASH_COMPACT_RE.test(rawInput);
-    } else if (!isMidTurn && !isKeepaliveInput) {
-      next.isCompactCmd = false;
-    } else if (isKeepaliveInput) {
+    } else if (!isMidTurn || isSyntheticWake) {
       next.isCompactCmd = false;
     }
     if (invNum !== null) next.invocationNum = invNum;
@@ -1663,7 +1711,8 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
     next.subphase = deriveLlmSubphase({
       contextTokens: next.contextTokens,
       mediaCount: next.mediaCount,
-      isCompactCmd: next.isCompactCmd
+      isCompactCmd: next.isCompactCmd,
+      model: next.model
     });
     if (!isMidTurn || !existing || existing.phase === WATCHDOG_PHASES.IDLE) {
       next.startedTs = now;
@@ -1741,7 +1790,8 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
       next.subphase = deriveLlmSubphase({
         contextTokens: next.contextTokens,
         mediaCount: next.mediaCount,
-        isCompactCmd: next.isCompactCmd
+        isCompactCmd: next.isCompactCmd,
+        model: next.model
       });
       next.activeTool = "";
       next.activeToolKind = "";
@@ -1871,7 +1921,8 @@ export function recordHookLeaseTransition(store, eventName, payload = {}, option
       next.subphase = deriveLlmSubphase({
         contextTokens: next.contextTokens,
         mediaCount: next.mediaCount,
-        isCompactCmd: next.isCompactCmd
+        isCompactCmd: next.isCompactCmd,
+        model: next.model
       });
       next.activeTool = "";
       next.activeToolKind = "";

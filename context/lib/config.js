@@ -52,9 +52,11 @@ export const CONFIG_DEFAULTS = Object.freeze({
   watchdogLlmLowSec: 120,
   watchdogLlmHighSec: 240,
   watchdogLlmMultimodalSec: 360,
+  watchdogLlmReasoningSec: 600,
+  watchdogLlmCompoundSec: 900,
   watchdogToolCmdSec: 300,
   watchdogToolFastSec: 90,
-  watchdogSubagentSec: 600,
+  watchdogSubagentSec: 1200,
   watchdogDesktopNotify: false,
   watchdogNotifyCooldownSec: 300,
   ttlDesktopNotify: false,
@@ -475,6 +477,16 @@ export function getConfigSnapshot(options = {}) {
     clampInt(parsePositiveInt(cfg.watchdogLlmMultimodalSec), 30, 7200)
   );
   pick(
+    "watchdogLlmReasoningSec",
+    clampInt(parsePositiveInt(env?.AGY_DART_WATCHDOG_LLM_REASONING_SEC), 30, 7200),
+    clampInt(parsePositiveInt(cfg.watchdogLlmReasoningSec), 30, 7200)
+  );
+  pick(
+    "watchdogLlmCompoundSec",
+    clampInt(parsePositiveInt(env?.AGY_DART_WATCHDOG_LLM_COMPOUND_SEC), 60, 14400),
+    clampInt(parsePositiveInt(cfg.watchdogLlmCompoundSec), 60, 14400)
+  );
+  pick(
     "watchdogToolCmdSec",
     clampInt(parsePositiveInt(env?.AGY_DART_WATCHDOG_TOOL_CMD_SEC), 30, 7200),
     clampInt(parsePositiveInt(cfg.watchdogToolCmdSec), 30, 7200)
@@ -525,8 +537,8 @@ export function getConfigSnapshot(options = {}) {
   pick("ttlKeepalive", ttlKeepaliveEnv, cfgBool("ttlKeepalive"));
   pick(
     "ttlKeepaliveMaxCount",
-    clampInt(parsePositiveInt(env?.AGY_DART_TTL_KEEPALIVE_MAX_COUNT), 1, 20),
-    clampInt(parsePositiveInt(cfg.ttlKeepaliveMaxCount), 1, 20)
+    clampInt(parseNonNegativeInt(env?.AGY_DART_TTL_KEEPALIVE_MAX_COUNT), 0, 20),
+    clampInt(parseNonNegativeInt(cfg.ttlKeepaliveMaxCount), 0, 20)
   );
   pick(
     "ttlKeepaliveLeadSec",
@@ -621,6 +633,7 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra
   lines.push(
     `  - Stall watchdog: enabled=${values.stallWatchdog} (${sources.stallWatchdog}), ` +
       `llm=${values.watchdogLlmLowSec}s/${values.watchdogLlmHighSec}s/${values.watchdogLlmMultimodalSec}s, ` +
+      `reasoning=${values.watchdogLlmReasoningSec}s/${values.watchdogLlmCompoundSec}s, ` +
       `tool=${values.watchdogToolFastSec}s/${values.watchdogToolCmdSec}s, bg=${values.watchdogSubagentSec}s, ` +
       `desktopNotify=${values.watchdogDesktopNotify} (${sources.watchdogDesktopNotify})`
   );

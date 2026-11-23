@@ -2219,7 +2219,7 @@ test("v1.5.4-ka-9: Review hardening — SidecarApp app.config.conversationId iso
 
     // Start slow toggle OFF on conv-race-a -> optimistic UI updates immediately before fetch resolves!
     const pendingToggleA = vmCtx.toggleTtlKeepalive();
-    assert.equal(kaBtn.innerText, "自动续温：关", "Optimistic UI must update immediately on click");
+    assert.equal(kaBtn.innerText, "本窗续温：关", "Optimistic UI must update immediately on click with custom-override label");
 
     // Switch host tab to conv-race-b BEFORE conv-race-a's action resolves
     hostConvId = "conv-race-b";
@@ -4080,5 +4080,824 @@ test("v1.5.4-ka-12: Adversarial hardening — PreToolUse agentName/isSubagent wi
     resetConfigCache();
     await new Promise((resolve) => setTimeout(resolve, 60));
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+  }
+});
+
+test("v1.5.4-ka-13: Global keepalive maxCount (0..20), per-window override vs follow-global, zero-statSync when 0, sanitize/prune survival & Sidecar VM", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-ka-global-"));
+  const dbPath = path.join(tmpDir, "context.db");
+  const cfgPath = path.join(tmpDir, "config.json");
+  fs.writeFileSync(cfgPath, "{}", "utf8");
+
+  const prevDbEnv = process.env.AGY_DART_DB_PATH;
+  const prevCfgEnv = process.env.AGY_DART_CONFIG_PATH;
+  process.env.AGY_DART_DB_PATH = dbPath;
+  process.env.AGY_DART_CONFIG_PATH = cfgPath;
+  resetConfigCache();
+
+  let srv = null;
+  try {
+    // 1. Store-level global inheritance, custom override isolation, 0-count OFF semantics & survival across sanitize/prune/clear
+    const st = new ContextModeStore({ dbPath });
+    try {
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(3), 3);
+      assert.equal(st.getFallbackNonZeroKeepaliveMaxCount(3), 3);
+      assert.equal(st.isTtlKeepaliveEnabled("conv-win-a", true), true);
+      assert.equal(st.getTtlKeepaliveMaxCount("conv-win-a", 3), 3);
+      assert.equal(st.hasCustomTtlKeepaliveOverride("conv-win-a"), false);
+
+      // Window B sets custom override maxCount = 6
+      st.setTtlKeepaliveMaxCount(6, "conv-win-b");
+      assert.equal(st.hasCustomTtlKeepaliveOverride("conv-win-b"), true);
+      assert.equal(st.getTtlKeepaliveMaxCount("conv-win-b"), 6);
+
+      // Global changed 3 -> 8: uncustomized Window A & brand-new Window C follow 8; custom Window B stays 6
+      st.setGlobalTtlKeepaliveMaxCount(8);
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 8);
+      assert.equal(st.getFallbackNonZeroKeepaliveMaxCount(), 8);
+      assert.equal(st.getTtlKeepaliveMaxCount("conv-win-a"), 8);
+      assert.equal(st.getTtlKeepaliveMaxCount("conv-win-c"), 8);
+      assert.equal(st.getTtlKeepaliveMaxCount("conv-win-b"), 6);
+
+      // Global changed 8 -> 5 -> 0: uncustomized Window A turns OFF; last non-zero fallback remembers 5
+      st.setGlobalTtlKeepaliveMaxCount(5);
+      st.setGlobalTtlKeepaliveMaxCount(0);
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 0);
+      assert.equal(st.getFallbackNonZeroKeepaliveMaxCount(), 5);
+      assert.equal(st.isTtlKeepaliveEnabled("conv-win-a"), false, "Uncustomized window must turn OFF when global maxCount = 0");
+      assert.equal(st.getTtlKeepaliveMaxCount("conv-win-a"), 5, "Display fallback for OFF uncustomized window uses last non-zero (5)");
+
+      // Window D manually toggled ON while global=0 inherits fallback 5
+      st.setTtlKeepaliveEnabled(true, "conv-win-d");
+      assert.equal(st.isTtlKeepaliveEnabled("conv-win-d"), true);
+      assert.equal(st.getTtlKeepaliveMaxCount("conv-win-d"), 5);
+      assert.equal(st.hasCustomTtlKeepaliveOverride("conv-win-d"), true);
+
+      // Window E given only maxCount=4 while global=0 auto-enables in store resolution AND passes hasAnyExplicitTtlKeepaliveEnabled()
+      st.clearTtlKeepaliveOverride("conv-win-b");
+      st.clearTtlKeepaliveOverride("conv-win-d");
+      st.setTtlKeepaliveMaxCount(4, "conv-win-e");
+      assert.equal(st.isTtlKeepaliveEnabled("conv-win-e"), true, "Per-window maxCount override must enable window even when global=0");
+      assert.equal(st.getTtlKeepaliveMaxCount("conv-win-e"), 4);
+      assert.equal(
+        st.hasAnyExplicitTtlKeepaliveEnabled(),
+        true,
+        "maxCount-only per-window override must trigger WatchdogMonitor decoupled lease evaluation when stallWatchdog=false"
+      );
+
+      // Preserve usedCount when clearing override (`随全局`), while `resetTtlKeepalive` preserves custom override
+      st.setGlobalTtlKeepaliveMaxCount(7);
+      st.setTtlKeepaliveMaxCount(6, "conv-win-f");
+      st.setTtlKeepaliveState("conv-win-f", { usedCount: 2, lastSentTs: Date.now() - 5000 });
+      assert.equal(st.hasCustomTtlKeepaliveOverride("conv-win-f"), true);
+      st.clearTtlKeepaliveOverride("conv-win-f");
+      assert.equal(st.hasCustomTtlKeepaliveOverride("conv-win-f"), false);
+      assert.equal(st.getTtlKeepaliveMaxCount("conv-win-f", 3), 7, "Cleared override immediately follows global (7)");
+      assert.equal(st.getTtlKeepaliveState("conv-win-f").usedCount, 2, "Clearing override must preserve usedCount=2");
+
+      // Survival across sanitizeModelTtlState(), pruneByTtl(), and clearSessionOverrides()
+      st.sanitizeModelTtlState();
+      st.pruneByTtl({ maxAgeDays: 14 });
+      st.clearSessionOverrides("conv-win-f");
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(3), 7, "Global maxCount must survive sanitizeModelTtlState + pruneByTtl + clearSessionOverrides");
+      assert.equal(st.getFallbackNonZeroKeepaliveMaxCount(3), 7);
+
+      // Watchdog tick with global=0 on uncustomized IDLE lease: 0 keepalives sent AND 0 fs.statSync calls!
+      st.clearTtlKeepaliveOverride("conv-win-e");
+      st.setGlobalTtlKeepaliveMaxCount(0);
+      const baseNow = Date.now();
+      writeWatchdogLease(st, {
+        conversationId: "conv-idle-global-zero",
+        rootSessionId: "conv-idle-global-zero",
+        isSubagent: false,
+        convTitle: "全局关闭测试窗",
+        phase: WATCHDOG_PHASES.IDLE,
+        subphase: "stopped",
+        stopReason: "NO_TOOL_CALL",
+        contextTokens: 160_000,
+        cacheTtlSec: 300,
+        idleAnchorTs: baseNow - 285_000,
+        phaseChangedTs: baseNow - 285_000,
+        updatedTs: baseNow - 285_000
+      });
+
+      let statCalls = 0;
+      const sentZero = [];
+      const monZero = new WatchdogMonitor({
+        getStore: () => st,
+        getConfig: () => ({
+          stallWatchdog: true,
+          ttlKeepalive: true,
+          ttlKeepaliveMaxCount: 3,
+          ttlKeepaliveLeadSec: 30,
+          ttlDesktopNotify: false
+        }),
+        nowFn: () => baseNow,
+        statFn: (p) => {
+          statCalls += 1;
+          return fs.statSync(p);
+        },
+        keepaliveSendFn: async (p) => {
+          sentZero.push(p);
+          return { ok: true };
+        }
+      });
+      monZero.tick();
+      await flushMicrotasks();
+      assert.equal(sentZero.length, 0, "Global maxCount=0 must suppress auto-keepalive on uncustomized windows");
+      assert.equal(monZero.statSyncCount, 0, "IDLE WatchdogMonitor.tick() with global maxCount=0 must maintain statSyncCount === 0");
+      assert.equal(statCalls, 0, "IDLE WatchdogMonitor.tick() with global maxCount=0 must perform 0 transcript statSync calls");
+
+      // Re-seed clean global=3 + Window A (follow global, used=1) & Window B (custom 6, used=2) for HTTP + VM checks
+      st.setGlobalTtlKeepaliveMaxCount(3);
+      writeWatchdogLease(st, {
+        conversationId: "conv-http-a",
+        rootSessionId: "conv-http-a",
+        isSubagent: false,
+        convTitle: "窗口 A",
+        phase: WATCHDOG_PHASES.IDLE,
+        subphase: "stopped",
+        stopReason: "NO_TOOL_CALL",
+        updatedTs: baseNow
+      });
+      st.setTtlKeepaliveState("conv-http-a", { usedCount: 1, updatedTs: baseNow });
+      writeWatchdogLease(st, {
+        conversationId: "conv-http-b",
+        rootSessionId: "conv-http-b",
+        isSubagent: false,
+        convTitle: "窗口 B",
+        phase: WATCHDOG_PHASES.IDLE,
+        subphase: "stopped",
+        stopReason: "NO_TOOL_CALL",
+        updatedTs: baseNow
+      });
+      st.setTtlKeepaliveMaxCount(6, "conv-http-b");
+      st.setTtlKeepaliveState("conv-http-b", { usedCount: 2, updatedTs: baseNow });
+    } finally {
+      st.close();
+    }
+
+    // 2. HTTP `/api/watchdog/action` boundary validation (`0..20` valid; out-of-range/non-int -> 400) + auto-enable + resetTtlKeepaliveOverride
+    const token = "csrf-global-ka-test-token-012345";
+    srv = createStandaloneServer({ csrfToken: token });
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    const port = srv.address().port;
+    const headers = {
+      Host: `127.0.0.1:${port}`,
+      Connection: "close",
+      "Content-Type": "application/json",
+      "X-Agy-Dart-Token": token
+    };
+
+    for (const badVal of [-1, 21, 1.5, "", "   ", true, false, null, {}, []]) {
+      const resBad = await httpJsonRequest(port, "/api/watchdog/action", {
+        headers,
+        body: { action: "setGlobalTtlKeepalive", maxCount: badVal }
+      });
+      assert.equal(resBad.status, 400, `setGlobalTtlKeepalive(${JSON.stringify(badVal)}) must return HTTP 400`);
+    }
+
+    for (const okVal of [20, 0, 8]) {
+      const resOk = await httpJsonRequest(port, "/api/watchdog/action", {
+        headers,
+        body: { action: "setGlobalTtlKeepalive", maxCount: okVal, conversationId: "conv-http-a" }
+      });
+      assert.equal(resOk.status, 200, `setGlobalTtlKeepalive(${okVal}) must return HTTP 200`);
+      assert.equal(resOk.json.status.globalTtlKeepaliveMaxCount, okVal);
+      assert.equal(resOk.json.status.ttlKeepalive.globalMaxCount, okVal);
+    }
+
+    // Window A (uncustomized) followed global -> 8; Window B (custom=6) stayed 6 with isCustomOverride=true
+    const wdA = await httpJsonRequest(port, "/api/watchdog", { headers, body: { conversationId: "conv-http-a" } });
+    const wdB = await httpJsonRequest(port, "/api/watchdog", { headers, body: { conversationId: "conv-http-b" } });
+    assert.equal(wdA.json.ttlKeepalive.maxCount, 8);
+    assert.equal(wdA.json.ttlKeepalive.isCustomOverride, false);
+    assert.equal(wdB.json.ttlKeepalive.maxCount, 6);
+    assert.equal(wdB.json.ttlKeepalive.isCustomOverride, true);
+
+    // `resetTtlKeepalive` (`↺`) resets usedCount -> 0 while keeping custom override = 6
+    const resetUsedB = await httpJsonRequest(port, "/api/watchdog/action", {
+      headers,
+      body: { action: "resetTtlKeepalive", conversationId: "conv-http-b" }
+    });
+    assert.equal(resetUsedB.status, 200);
+    assert.equal(resetUsedB.json.status.ttlKeepalive.usedCount, 0);
+    assert.equal(resetUsedB.json.status.ttlKeepalive.maxCount, 6);
+    assert.equal(resetUsedB.json.status.ttlKeepalive.isCustomOverride, true);
+
+    // Re-seed usedCount=2 on B, then `resetTtlKeepaliveOverride` (`随全局`) clears custom override while preserving usedCount=2
+    {
+      const stSeed = new ContextModeStore({ dbPath });
+      stSeed.setTtlKeepaliveState("conv-http-b", { usedCount: 2, updatedTs: Date.now() });
+      stSeed.close();
+    }
+    const resetOvrB = await httpJsonRequest(port, "/api/watchdog/action", {
+      headers,
+      body: { action: "resetTtlKeepaliveOverride", conversationId: "conv-http-b" }
+    });
+    assert.equal(resetOvrB.status, 200);
+    assert.equal(resetOvrB.json.status.ttlKeepalive.isCustomOverride, false);
+    assert.equal(resetOvrB.json.status.ttlKeepalive.maxCount, 8, "After resetTtlKeepaliveOverride, Window B follows global=8");
+    assert.equal(resetOvrB.json.status.ttlKeepalive.usedCount, 2, "resetTtlKeepaliveOverride must preserve usedCount=2");
+
+    // When global=0, setting per-window maxCount=4 without `enabled` auto-enables that window (`enabled: true, maxCount: 4`)
+    await httpJsonRequest(port, "/api/watchdog/action", {
+      headers,
+      body: { action: "setGlobalTtlKeepalive", maxCount: 0, conversationId: "conv-http-a" }
+    });
+    const autoEnA = await httpJsonRequest(port, "/api/watchdog/action", {
+      headers,
+      body: { action: "setTtlKeepalive", maxCount: 4, conversationId: "conv-http-a" }
+    });
+    assert.equal(autoEnA.status, 200);
+    assert.equal(autoEnA.json.status.ttlKeepalive.enabled, true, "Setting per-window maxCount=4 on OFF window must auto-enable it");
+    assert.equal(autoEnA.json.status.ttlKeepalive.maxCount, 4);
+    assert.equal(autoEnA.json.status.ttlKeepalive.isCustomOverride, true);
+
+    // Restore Window A to follow global=5 and Window B to custom=6 (used=2) for Frontend VM checks
+    await httpJsonRequest(port, "/api/watchdog/action", {
+      headers,
+      body: { action: "resetTtlKeepaliveOverride", conversationId: "conv-http-a" }
+    });
+    await httpJsonRequest(port, "/api/watchdog/action", {
+      headers,
+      body: { action: "setGlobalTtlKeepalive", maxCount: 5, conversationId: "conv-http-b" }
+    });
+    await httpJsonRequest(port, "/api/watchdog/action", {
+      headers,
+      body: { action: "setTtlKeepalive", maxCount: 6, conversationId: "conv-http-b" }
+    });
+
+    // 3. Sidecar HTML layout order & Frontend VM integration against live HTTP server (ZH/EN, custom badge, clear-to-follow-global, `__unbound__` tab)
+    const htmlSrc = fs.readFileSync(path.join(ROOT, "sidecars", "dashboard", "index.html"), "utf8");
+    const idxCard = htmlSrc.indexOf('id="kv-cache-card"');
+    const idxGlobalGroup = htmlSrc.indexOf('id="kv-global-keepalive-group"');
+    const idxTtlNotifyBtn = htmlSrc.indexOf('id="kv-ttl-notify-btn"');
+    const idxFollowBtn = htmlSrc.indexOf('id="kv-keepalive-follow-btn"');
+    const idxResetBtn = htmlSrc.indexOf('id="kv-keepalive-reset-btn"');
+    assert.ok(idxCard > 0 && idxGlobalGroup > idxCard, "#kv-global-keepalive-group must be inside #kv-cache-card");
+    assert.ok(idxGlobalGroup < idxTtlNotifyBtn, "#kv-global-keepalive-group must appear directly left of #kv-ttl-notify-btn");
+    assert.ok(idxFollowBtn > 0 && idxFollowBtn < idxResetBtn, "#kv-keepalive-follow-btn must appear inside #kv-keepalive-group before reset button");
+
+    const scriptMatch = htmlSrc.match(/<script>([\s\S]*?)<\/script>/);
+    assert.ok(scriptMatch && scriptMatch[1]);
+
+    const runVmForSearch = async (searchQuery, initLang = "zh") => {
+      const elements = new Map();
+      let lang = initLang;
+      const makeEl = (id) => ({
+        id,
+        textContent: "",
+        innerText: "",
+        innerHTML: "",
+        title: "",
+        value: "3",
+        disabled: false,
+        className: "",
+        style: {},
+        dataset: { enabled: "1", used: "0", max: "3", globalMax: "3", fallbackMax: "3", custom: "0", subagent: "0" },
+        options: [],
+        classList: { add() {}, remove() {}, contains() { return false; }, toggle() { return false; } },
+        addEventListener() {},
+        querySelector() { return null; },
+        querySelectorAll() { return []; },
+        getAttribute() { return ""; },
+        setAttribute() {}
+      });
+      const getEl = (id) => {
+        if (!elements.has(id)) elements.set(id, makeEl(id));
+        return elements.get(id);
+      };
+      const vmFetch = async (url, opts = {}) => {
+        const body = opts.body ? JSON.parse(opts.body) : null;
+        const res = await httpJsonRequest(port, url, {
+          method: opts.method || (body ? "POST" : "GET"),
+          headers,
+          body
+        });
+        return {
+          ok: res.status >= 200 && res.status < 300,
+          status: res.status,
+          json: async () => res.json || {}
+        };
+      };
+      const vmCtx = vm.createContext({
+        window: {
+          location: { search: searchQuery, href: `http://127.0.0.1:${port}/${searchQuery}` },
+          addEventListener() {}
+        },
+        document: {
+          hidden: false,
+          activeElement: null,
+          documentElement: { lang: initLang === "en" ? "en" : "zh-CN" },
+          getElementById: getEl,
+          querySelector: () => ({ getAttribute: () => token }),
+          querySelectorAll() { return []; },
+          addEventListener() {}
+        },
+        localStorage: { getItem: () => lang, setItem(_k, v) { lang = v; } },
+        navigator: { language: initLang === "en" ? "en-US" : "zh-CN", clipboard: { writeText: async () => {} } },
+        fetch: vmFetch,
+        Headers,
+        URLSearchParams,
+        setInterval: () => 1,
+        clearInterval() {},
+        setTimeout: () => 1,
+        clearTimeout() {},
+        queueMicrotask,
+        Date,
+        Math,
+        JSON,
+        Number,
+        String,
+        Boolean,
+        Array,
+        Object,
+        Set,
+        Map,
+        Promise,
+        Error,
+        RegExp,
+        parseInt,
+        parseFloat,
+        isFinite,
+        encodeURIComponent,
+        decodeURIComponent,
+        console: { error() {}, log() {}, warn() {} }
+      });
+      vm.runInContext(scriptMatch[1], vmCtx);
+      await flushMicrotasks();
+      await flushMicrotasks();
+      return { vmCtx, getEl };
+    };
+
+    // VM Case A: Custom Window B (`?conversationId=conv-http-b`) shows `本窗续温：2/6`, `随全局` visible, global `全局加热：×` + `5`
+    const { vmCtx: vmB, getEl: elB } = await runVmForSearch("?conversationId=conv-http-b", "zh");
+    assert.equal(elB("kv-global-keepalive-btn").innerText, "全局加热：×");
+    assert.equal(elB("kv-global-keepalive-max").value, "5");
+    assert.equal(elB("kv-keepalive-btn").innerText, "本窗续温：2/6");
+    assert.equal(elB("kv-keepalive-follow-btn").className, "keepalive-follow-btn");
+    assert.equal(elB("kv-keepalive-follow-btn").textContent, "随全局");
+
+    // Switch to English and verify EN labels
+    vmB.setLanguage("en", true);
+    await flushMicrotasks();
+    assert.equal(elB("kv-global-keepalive-btn").innerText, "Global Warm: ×");
+    assert.equal(elB("kv-keepalive-btn").innerText, "Window Warm: 2/6");
+    assert.equal(elB("kv-keepalive-follow-btn").textContent, "Global");
+
+    // Switch back to ZH, clear per-window input (`""`) -> triggers resetTtlKeepaliveOverride(), hides `随全局`, keeps used=2, follows global=5!
+    vmB.setLanguage("zh", true);
+    await flushMicrotasks();
+    await vmB.changeTtlKeepaliveMax("");
+    await flushMicrotasks();
+    assert.equal(elB("kv-keepalive-btn").innerText, "自动续温：2/5");
+    assert.equal(elB("kv-keepalive-follow-btn").className, "keepalive-follow-btn hidden");
+
+    // Toggle global button OFF -> `全局加热：关` + `0`, and uncustomized Window B turns OFF (`自动续温：关`)
+    await vmB.toggleGlobalTtlKeepalive();
+    await flushMicrotasks();
+    assert.equal(elB("kv-global-keepalive-btn").innerText, "全局加热：关");
+    assert.equal(elB("kv-global-keepalive-max").value, "0");
+    assert.equal(elB("kv-keepalive-btn").innerText, "自动续温：关");
+
+    // Toggle global button back ON -> restores fallback `5` (`全局加热：×` + `5`)
+    await vmB.toggleGlobalTtlKeepalive();
+    await flushMicrotasks();
+    assert.equal(elB("kv-global-keepalive-btn").innerText, "全局加热：×");
+    assert.equal(elB("kv-global-keepalive-max").value, "5");
+    assert.equal(elB("kv-keepalive-btn").innerText, "自动续温：2/5");
+
+    // VM Case B: Unbound empty tab (`__unbound__`) tracks global count (`0/5` -> changeGlobalTtlKeepaliveMax("9") -> `0/9`)
+    const { vmCtx: vmUnbound, getEl: elU } = await runVmForSearch("?conversationId=__unbound__", "zh");
+    assert.equal(elU("kv-global-keepalive-max").value, "5");
+    await vmUnbound.changeGlobalTtlKeepaliveMax("9");
+    await flushMicrotasks();
+    assert.equal(elU("kv-global-keepalive-max").value, "9");
+    assert.equal(elU("kv-keepalive-max").value, "9");
+
+    // VM Case C: Real `window.sidecar` unbound tab (`conversationId: ""`) never leaks foreign convId on notify/global actions,
+    // AND out-of-order rapid `toggle -> followGlobal -> setGlobal` reconciles deterministically!
+    const hostActionBodies = [];
+    let delayResetOverrideResolve = null;
+    const { vmCtx: vmHostRace, getEl: elR } = await (async () => {
+      const elements = new Map();
+      const makeEl = (id) => ({
+        id,
+        textContent: "",
+        innerText: "",
+        innerHTML: "",
+        title: "",
+        value: "3",
+        disabled: false,
+        className: "",
+        style: {},
+        dataset: { enabled: "1", used: "0", max: "3", fallback: "3", custom: "0", subagent: "0" },
+        options: [],
+        classList: { add() {}, remove() {}, contains() { return false; }, toggle() { return false; } },
+        addEventListener() {},
+        querySelector() { return null; },
+        querySelectorAll() { return []; },
+        getAttribute() { return ""; },
+        setAttribute() {}
+      });
+      const getEl = (id) => {
+        if (!elements.has(id)) elements.set(id, makeEl(id));
+        return elements.get(id);
+      };
+      let sidecarConvId = "";
+      const raceFetch = async (url, opts = {}) => {
+        const body = opts.body ? JSON.parse(opts.body) : null;
+        if (url === "/api/watchdog/action" && body) {
+          hostActionBodies.push(body);
+          if (body.action === "resetTtlKeepaliveOverride" && !delayResetOverrideResolve) {
+            await new Promise((r) => {
+              delayResetOverrideResolve = r;
+            });
+          }
+        }
+        const res = await httpJsonRequest(port, url, {
+          method: opts.method || (body ? "POST" : "GET"),
+          headers,
+          body
+        });
+        return {
+          ok: res.status >= 200 && res.status < 300,
+          status: res.status,
+          json: async () => res.json || {}
+        };
+      };
+      const vmCtx = vm.createContext({
+        window: {
+          sidecar: {
+            get conversationId() {
+              return sidecarConvId;
+            },
+            set conversationId(v) {
+              sidecarConvId = v;
+            },
+            fetch: raceFetch,
+            ui: { toggleConversation() {} }
+          },
+          location: { search: "", href: `http://127.0.0.1:${port}/` },
+          addEventListener() {}
+        },
+        document: {
+          hidden: false,
+          activeElement: null,
+          documentElement: { lang: "zh-CN" },
+          getElementById: getEl,
+          querySelector: () => ({ getAttribute: () => token }),
+          querySelectorAll() { return []; },
+          addEventListener() {}
+        },
+        localStorage: { getItem: () => "zh", setItem() {} },
+        navigator: { language: "zh-CN", clipboard: { writeText: async () => {} } },
+        fetch: raceFetch,
+        Headers,
+        URLSearchParams,
+        setInterval: () => 1,
+        clearInterval() {},
+        setTimeout: () => 1,
+        clearTimeout() {},
+        queueMicrotask,
+        Date,
+        Math,
+        JSON,
+        Number,
+        String,
+        Boolean,
+        Array,
+        Object,
+        Set,
+        Map,
+        Promise,
+        Error,
+        RegExp,
+        parseInt,
+        parseFloat,
+        isFinite,
+        encodeURIComponent,
+        decodeURIComponent,
+        console: { error() {}, log() {}, warn() {} }
+      });
+      vm.runInContext(scriptMatch[1], vmCtx);
+      await flushMicrotasks();
+      await flushMicrotasks();
+      return { vmCtx, getEl };
+    })();
+
+    // Unbound `window.sidecar` tab: `toggleTtlNotify` + `changeGlobalTtlKeepaliveMax` must pass `fromSidecarHost: true` and `conversationId: ""`
+    hostActionBodies.length = 0;
+    await vmHostRace.toggleTtlNotify();
+    await vmHostRace.changeGlobalTtlKeepaliveMax("7");
+    for (const actBody of hostActionBodies) {
+      assert.equal(actBody.fromSidecarHost, true, "Sidecar host action must always send fromSidecarHost=true");
+      assert.equal(actBody.conversationId, "", "Unbound Sidecar host tab must never leak another window's conversationId");
+    }
+
+    // Switch host tab to `conv-http-b`, then trigger out-of-order race:
+    // 1. toggleTtlKeepalive() -> custom OFF
+    // 2. resetTtlKeepaliveOverride() (delayed on network!) -> follow global
+    // 3. changeGlobalTtlKeepaliveMax("11") (resolves BEFORE #2 mutates SQLite!)
+    vmHostRace.window.sidecar.conversationId = "conv-http-b";
+    await vmHostRace.refreshData(true);
+    await vmHostRace.toggleTtlKeepalive();
+    assert.equal(elR("kv-keepalive-btn").innerText, "本窗续温：关");
+
+    const pFollow = vmHostRace.resetTtlKeepaliveOverride();
+    const pGlobal = vmHostRace.changeGlobalTtlKeepaliveMax("11");
+    await pGlobal; // Server ran setGlobalTtlKeepalive(11) BEFORE resetTtlKeepaliveOverride()!
+    delayResetOverrideResolve(); // Now let resetTtlKeepaliveOverride() hit server and finish!
+    await pFollow;
+    await flushMicrotasks();
+    await flushMicrotasks();
+    assert.equal(
+      elR("kv-keepalive-btn").innerText,
+      "自动续温：2/11",
+      "Out-of-order resetTtlKeepaliveOverride + setGlobalTtlKeepalive must reconcile to authoritative 2/11 follow-global state"
+    );
+    assert.equal(elR("kv-keepalive-follow-btn").className, "keepalive-follow-btn hidden");
+
+    // 4. Optimistic custom-override UI state (`isCustomOverride: true`) BEFORE network response + error rollback
+    {
+      let holdSetKaResolve = null;
+      let failSetKaOnce = false;
+      let failGlobalOnce = false;
+      const origSidecarFetch = vmHostRace.window.sidecar.fetch;
+      vmHostRace.window.sidecar.fetch = async (url, opts = {}) => {
+        const body = opts.body ? JSON.parse(opts.body) : null;
+        if (url === "/api/watchdog/action" && body && body.action === "setTtlKeepalive") {
+          if (holdSetKaResolve === "WAIT") {
+            await new Promise((r) => {
+              holdSetKaResolve = r;
+            });
+          }
+          if (failSetKaOnce) {
+            failSetKaOnce = false;
+            return { ok: false, status: 500, json: async () => ({ ok: false }) };
+          }
+        }
+        if (url === "/api/watchdog/action" && body && body.action === "setGlobalTtlKeepalive" && failGlobalOnce) {
+          failGlobalOnce = false;
+          return { ok: false, status: 500, json: async () => ({ ok: false }) };
+        }
+        return origSidecarFetch(url, opts);
+      };
+
+      // 4a. In-flight `changeTtlKeepaliveMax("8")` immediately sets `本窗续温：2/8`, `dataset.custom="1"`, visible `随全局`, and `snapshotKeepaliveUiState().isCustomOverride === true`
+      holdSetKaResolve = "WAIT";
+      const pOptMax = vmHostRace.changeTtlKeepaliveMax("8");
+      assert.equal(elR("kv-keepalive-btn").innerText, "本窗续温：2/8", "changeTtlKeepaliveMax must optimistically render 本窗续温 before server responds");
+      assert.equal(elR("kv-keepalive-btn").dataset.custom, "1");
+      assert.equal(elR("kv-keepalive-follow-btn").className, "keepalive-follow-btn", "#kv-keepalive-follow-btn must appear optimistically without waiting for server");
+      assert.equal(vmHostRace.snapshotKeepaliveUiState().isCustomOverride, true, "snapshotKeepaliveUiState().isCustomOverride must be true during in-flight edit");
+      holdSetKaResolve();
+      holdSetKaResolve = null;
+      await pOptMax;
+      assert.equal(elR("kv-keepalive-btn").innerText, "本窗续温：2/8");
+
+      // Reset back to follow global (`自动续温：2/11`), then verify non-numeric guard, overlapping double-failure reconciliation, and in-flight `toggleTtlKeepalive()`
+      await vmHostRace.resetTtlKeepaliveOverride();
+      assert.equal(elR("kv-keepalive-btn").innerText, "自动续温：2/11");
+      assert.equal(elR("kv-keepalive-btn").dataset.custom, "0");
+
+      await vmHostRace.changeTtlKeepaliveMax("abc");
+      assert.equal(elR("kv-keepalive-btn").innerText, "自动续温：2/11", "Non-numeric input must NOT convert uncustomized window into custom override");
+      assert.equal(elR("kv-keepalive-btn").dataset.custom, "0");
+      assert.equal(elR("kv-keepalive-max").value, "11");
+
+      failSetKaOnce = true;
+      await vmHostRace.changeTtlKeepaliveMax("15");
+      assert.equal(elR("kv-keepalive-btn").innerText, "自动续温：2/11", "Failed changeTtlKeepaliveMax must roll back optimistic custom label");
+      assert.equal(elR("kv-keepalive-btn").dataset.custom, "0");
+      assert.equal(elR("kv-keepalive-max").value, "11", "Failed changeTtlKeepaliveMax must roll back input value");
+      assert.equal(elR("kv-keepalive-follow-btn").className, "keepalive-follow-btn hidden");
+
+      // Overlapping double HTTP 500 failure: `changeTtlKeepaliveMax("8")` (held) + `changeGlobalTtlKeepaliveMax("14")` (fails 500) -> `changeTtlKeepaliveMax("8")` (fails 500)
+      // Must reconcile back to 2/11 AND clear `pendingCustomOverrideConvId` so subsequent global edits still update the uncustomized window!
+      holdSetKaResolve = "WAIT";
+      failSetKaOnce = true;
+      failGlobalOnce = true;
+      const pDoubleWin = vmHostRace.changeTtlKeepaliveMax("8");
+      const pDoubleGlobal = vmHostRace.changeGlobalTtlKeepaliveMax("14");
+      await pDoubleGlobal;
+      holdSetKaResolve();
+      holdSetKaResolve = null;
+      await pDoubleWin;
+      await flushMicrotasks();
+      await flushMicrotasks();
+      assert.equal(elR("kv-keepalive-btn").innerText, "自动续温：2/11", "Overlapping double HTTP 500 failure must reconcile window back to server 2/11");
+      assert.equal(elR("kv-keepalive-btn").dataset.custom, "0");
+      assert.equal(elR("kv-keepalive-max").value, "11");
+      await vmHostRace.changeGlobalTtlKeepaliveMax("13");
+      assert.equal(elR("kv-keepalive-btn").innerText, "自动续温：2/13", "pendingCustomOverrideConvId must be cleared after overlapping failure so window follows global 13");
+
+      // Focused `#kv-global-keepalive-max` spinner edit while `AGY_DART_TTL_KEEPALIVE_MAX_COUNT=5` is pinned via env snaps input.value back to "5"!
+      const prevSpinMaxEnv = process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT;
+      process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT = "5";
+      resetConfigCache();
+      vmHostRace.document.activeElement = elR("kv-global-keepalive-max");
+      try {
+        await vmHostRace.changeGlobalTtlKeepaliveMax("16");
+        assert.equal(elR("kv-global-keepalive-max").value, "5", "Focused global max input must snap back to env-pinned value 5");
+      } finally {
+        vmHostRace.document.activeElement = null;
+        if (prevSpinMaxEnv === undefined) delete process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT;
+        else process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT = prevSpinMaxEnv;
+        resetConfigCache();
+      }
+      await vmHostRace.changeGlobalTtlKeepaliveMax("11");
+
+      holdSetKaResolve = "WAIT";
+      const pOptToggle = vmHostRace.toggleTtlKeepalive();
+      assert.equal(elR("kv-keepalive-btn").innerText, "本窗续温：关", "toggleTtlKeepalive must optimistically render 本窗续温：关 before server responds");
+      assert.equal(elR("kv-keepalive-btn").dataset.custom, "1");
+      assert.equal(elR("kv-keepalive-follow-btn").className, "keepalive-follow-btn");
+      assert.equal(vmHostRace.snapshotKeepaliveUiState().isCustomOverride, true);
+      holdSetKaResolve();
+      holdSetKaResolve = null;
+      await pOptToggle;
+      vmHostRace.window.sidecar.fetch = origSidecarFetch;
+    }
+
+    // 5. Env `AGY_DART_TTL_KEEPALIVE_MAX_COUNT` (`0` and `5`) vs per-window overrides & hard kill-switches across Store, WatchdogMonitor & Hooks
+    if (srv) {
+      await new Promise((resolve) => srv.close(resolve));
+      srv = null;
+    }
+    closeRuntimeStore();
+
+    const prevMaxEnv = process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT;
+    const prevKaEnv = process.env.AGY_DART_TTL_KEEPALIVE;
+    const prevDisKaEnv = process.env.AGY_DART_DISABLE_TTL_KEEPALIVE;
+    try {
+      const envTxPath = path.join(tmpDir, "env-precedence-transcript.jsonl");
+      fs.writeFileSync(
+        envTxPath,
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          model: "claude-opus-4-6-thinking",
+          input_tokens: 90_000,
+          cache_read_tokens: 80_000,
+          output_tokens: 200,
+          created_at: new Date(Date.now() - 10_000).toISOString()
+        }) + "\n",
+        "utf8"
+      );
+
+      // 5a. `AGY_DART_TTL_KEEPALIVE_MAX_COUNT=0`: global default is OFF, but per-window `enabled=true` (uses fallback 5) & `maxCount=4` override cleanly!
+      {
+        const stSeed = new ContextModeStore({ dbPath });
+        stSeed.setTtlDesktopNotifyEnabled(false); // isolate ttlKeepaliveExplicit from earlier toggleTtlNotify()
+        stSeed.setGlobalTtlKeepaliveMaxCount(5); // remembers last_nonzero_max = 5
+        stSeed.setTtlKeepaliveEnabled(true, "conv-env0-win-on");
+        stSeed.setTtlKeepaliveMaxCount(4, "conv-env0-win-max4");
+        stSeed.close();
+      }
+      process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT = "0";
+      delete process.env.AGY_DART_TTL_KEEPALIVE;
+      delete process.env.AGY_DART_DISABLE_TTL_KEEPALIVE;
+      resetConfigCache();
+
+      const hookEnvZero = {
+        ...process.env,
+        AGY_DART_DB_PATH: dbPath,
+        AGY_DART_CONFIG_PATH: cfgPath,
+        AGY_DART_DISABLE_STALL_WATCHDOG: "1",
+        AGY_DART_TTL_KEEPALIVE_MAX_COUNT: "0"
+      };
+      for (const cid of ["conv-env0-uncust", "conv-env0-win-on", "conv-env0-win-max4"]) {
+        const rPre = spawnSync(process.execPath, [path.join(ROOT, "hooks", "pre-invocation.mjs")], {
+          input: JSON.stringify({ conversationId: cid, transcriptPath: envTxPath, invocationNum: 0, lastUserInput: "ping" }),
+          encoding: "utf8",
+          windowsHide: true,
+          env: hookEnvZero
+        });
+        assert.equal(rPre.status, 0);
+        assert.equal(rPre.stderr, "");
+        const rStop = spawnSync(process.execPath, [path.join(ROOT, "hooks", "stop.mjs")], {
+          input: JSON.stringify({ conversationId: cid, terminationReason: "NO_TOOL_CALL" }),
+          encoding: "utf8",
+          windowsHide: true,
+          env: hookEnvZero
+        });
+        assert.equal(rStop.status, 0);
+        assert.equal(rStop.stderr, "");
+      }
+
+      {
+        const stEnv0 = new ContextModeStore({ dbPath });
+        try {
+          assert.equal(stEnv0.getGlobalTtlKeepaliveMaxCount(), 0);
+          assert.equal(stEnv0.isTtlKeepaliveEnabled("conv-env0-uncust"), false, "Uncustomized window must stay OFF under AGY_DART_TTL_KEEPALIVE_MAX_COUNT=0");
+          assert.equal(stEnv0.isTtlKeepaliveEnabled("conv-env0-win-on"), true, "Per-window enabled=true must override AGY_DART_TTL_KEEPALIVE_MAX_COUNT=0");
+          assert.equal(stEnv0.getTtlKeepaliveMaxCount("conv-env0-win-on"), 5, "Per-window enabled=true under env MAX_COUNT=0 must inherit fallback 5");
+          assert.equal(stEnv0.isTtlKeepaliveEnabled("conv-env0-win-max4"), true, "Per-window maxCount=4 must override AGY_DART_TTL_KEEPALIVE_MAX_COUNT=0");
+          assert.equal(stEnv0.getTtlKeepaliveMaxCount("conv-env0-win-max4"), 4);
+
+          assert.equal(
+            readWatchdogLease(stEnv0, "conv-env0-uncust"),
+            null,
+            "Decoupled hooks must NOT create lease for uncustomized window when AGY_DART_TTL_KEEPALIVE_MAX_COUNT=0"
+          );
+          const leaseOn = readWatchdogLease(stEnv0, "conv-env0-win-on");
+          const leaseMax4 = readWatchdogLease(stEnv0, "conv-env0-win-max4");
+          assert.equal(leaseOn?.subphase, "stopped", "Decoupled hooks MUST record lease for per-window enabled=true override under env MAX_COUNT=0");
+          assert.equal(leaseMax4?.subphase, "stopped", "Decoupled hooks MUST record lease for per-window maxCount=4 override under env MAX_COUNT=0");
+
+          const firedEnv0 = [];
+          const simNow = Math.max(leaseOn.idleAnchorTs, leaseMax4.idleAnchorTs) + 280_000;
+          const monEnv0 = new WatchdogMonitor({
+            getStore: () => stEnv0,
+            getConfig: () => ({ stallWatchdog: false, ttlDesktopNotify: false }),
+            nowFn: () => simNow,
+            monoNsFn: () => 20_000_000_000n,
+            keepaliveSendFn: async (p) => {
+              firedEnv0.push(p.conversationId);
+              return { ok: true };
+            }
+          });
+          assert.equal(monEnv0._resolveTtlKeepaliveEnabled(stEnv0, {}, "conv-env0-uncust"), false);
+          assert.equal(monEnv0._resolveTtlKeepaliveEnabled(stEnv0, {}, "conv-env0-win-on"), true);
+          assert.equal(monEnv0._resolveTtlKeepaliveMaxCount(stEnv0, {}, "conv-env0-win-on"), 5);
+          assert.equal(monEnv0._resolveTtlKeepaliveMaxCount(stEnv0, {}, "conv-env0-win-max4"), 4);
+          monEnv0.tick();
+          await flushMicrotasks();
+          assert.deepEqual(
+            firedEnv0.filter((id) => id.startsWith("conv-env0-")).sort(),
+            ["conv-env0-win-max4", "conv-env0-win-on"],
+            "WatchdogMonitor must fire keepalive for per-window overrides even when AGY_DART_TTL_KEEPALIVE_MAX_COUNT=0"
+          );
+
+          // 5b. `AGY_DART_TTL_KEEPALIVE_MAX_COUNT=5`: uncustomized window gets 5, per-window `maxCount=9` keeps 9, per-window `enabled=false` stays OFF
+          process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT = "5";
+          resetConfigCache();
+          stEnv0.setTtlKeepaliveMaxCount(9, "conv-env5-win-max9");
+          stEnv0.setTtlKeepaliveEnabled(false, "conv-env5-win-off");
+          assert.equal(stEnv0.getGlobalTtlKeepaliveMaxCount(), 5);
+          assert.equal(stEnv0.getTtlKeepaliveMaxCount("conv-env5-uncust"), 5);
+          assert.equal(stEnv0.getTtlKeepaliveMaxCount("conv-env5-win-max9"), 9, "Per-window maxCount=9 must NOT be clobbered by AGY_DART_TTL_KEEPALIVE_MAX_COUNT=5");
+          assert.equal(monEnv0._resolveTtlKeepaliveMaxCount(stEnv0, {}, "conv-env5-win-max9"), 9);
+          assert.equal(stEnv0.isTtlKeepaliveEnabled("conv-env5-win-off"), false, "Per-window enabled=false must override AGY_DART_TTL_KEEPALIVE_MAX_COUNT=5");
+          assert.equal(monEnv0._resolveTtlKeepaliveEnabled(stEnv0, {}, "conv-env5-win-off"), false);
+
+          const hookEnvFive = {
+            ...process.env,
+            AGY_DART_DB_PATH: dbPath,
+            AGY_DART_CONFIG_PATH: cfgPath,
+            AGY_DART_DISABLE_STALL_WATCHDOG: "1",
+            AGY_DART_TTL_KEEPALIVE_MAX_COUNT: "5"
+          };
+          for (const cid of ["conv-env5-uncust", "conv-env5-win-off"]) {
+            spawnSync(process.execPath, [path.join(ROOT, "hooks", "pre-invocation.mjs")], {
+              input: JSON.stringify({ conversationId: cid, transcriptPath: envTxPath, invocationNum: 0, lastUserInput: "ping" }),
+              encoding: "utf8",
+              windowsHide: true,
+              env: hookEnvFive
+            });
+            spawnSync(process.execPath, [path.join(ROOT, "hooks", "stop.mjs")], {
+              input: JSON.stringify({ conversationId: cid, terminationReason: "NO_TOOL_CALL" }),
+              encoding: "utf8",
+              windowsHide: true,
+              env: hookEnvFive
+            });
+          }
+          assert.equal(readWatchdogLease(stEnv0, "conv-env5-uncust")?.subphase, "stopped", "AGY_DART_TTL_KEEPALIVE_MAX_COUNT=5 must enable decoupled hook lease recording");
+          assert.equal(readWatchdogLease(stEnv0, "conv-env5-win-off"), null, "Per-window enabled=false must suppress decoupled hook lease even when env MAX_COUNT=5");
+
+          // 5c. Hard kill-switches (`AGY_DART_DISABLE_TTL_KEEPALIVE=1` & `AGY_DART_TTL_KEEPALIVE=false`) override per-window `enabled=true`
+          process.env.AGY_DART_DISABLE_TTL_KEEPALIVE = "1";
+          resetConfigCache();
+          assert.equal(stEnv0.isTtlKeepaliveEnabled("conv-env0-win-on"), false, "AGY_DART_DISABLE_TTL_KEEPALIVE=1 must kill-switch per-window enabled=true");
+          assert.equal(monEnv0._resolveTtlKeepaliveEnabled(stEnv0, {}, "conv-env0-win-on"), false);
+
+          delete process.env.AGY_DART_DISABLE_TTL_KEEPALIVE;
+          process.env.AGY_DART_TTL_KEEPALIVE = "false";
+          resetConfigCache();
+          assert.equal(stEnv0.isTtlKeepaliveEnabled("conv-env0-win-on"), false, "AGY_DART_TTL_KEEPALIVE=false must kill-switch per-window enabled=true");
+          assert.equal(monEnv0._resolveTtlKeepaliveEnabled(stEnv0, {}, "conv-env0-win-on"), false);
+        } finally {
+          stEnv0.close();
+        }
+      }
+    } finally {
+      if (prevMaxEnv === undefined) delete process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT;
+      else process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT = prevMaxEnv;
+      if (prevKaEnv === undefined) delete process.env.AGY_DART_TTL_KEEPALIVE;
+      else process.env.AGY_DART_TTL_KEEPALIVE = prevKaEnv;
+      if (prevDisKaEnv === undefined) delete process.env.AGY_DART_DISABLE_TTL_KEEPALIVE;
+      else process.env.AGY_DART_DISABLE_TTL_KEEPALIVE = prevDisKaEnv;
+      resetConfigCache();
+    }
+  } finally {
+    if (srv) await new Promise((resolve) => srv.close(resolve));
+    closeRuntimeStore();
+    if (prevDbEnv === undefined) delete process.env.AGY_DART_DB_PATH;
+    else process.env.AGY_DART_DB_PATH = prevDbEnv;
+    if (prevCfgEnv === undefined) delete process.env.AGY_DART_CONFIG_PATH;
+    else process.env.AGY_DART_CONFIG_PATH = prevCfgEnv;
+    resetConfigCache();
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });

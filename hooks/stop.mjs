@@ -188,15 +188,30 @@ export async function handleStopPayload(payload = {}, options = {}) {
     }
     let ttlKeepaliveExplicit = false;
     if (!detectedSubagent) {
-      if (cfgSnap.sources.ttlKeepalive === "env") {
-        ttlKeepaliveExplicit = Boolean(cfgSnap.values.ttlKeepalive);
+      if (cfgSnap.sources.ttlKeepalive === "env" && cfgSnap.values.ttlKeepalive === false) {
+        ttlKeepaliveExplicit = false;
       } else {
         const convKaState =
           typeof store.getTtlKeepaliveState === "function" ? store.getTtlKeepaliveState(directConvId) : null;
         if (convKaState && typeof convKaState.enabled === "boolean") {
           ttlKeepaliveExplicit = convKaState.enabled;
-        } else if (cfgSnap.sources.ttlKeepalive !== "default") {
+        } else if (convKaState && typeof convKaState.maxCount === "number" && convKaState.maxCount >= 1) {
+          ttlKeepaliveExplicit = true;
+        } else if (cfgSnap.sources.ttlKeepaliveMaxCount === "env") {
+          ttlKeepaliveExplicit = Number(cfgSnap.values.ttlKeepaliveMaxCount) >= 1;
+        } else if (cfgSnap.sources.ttlKeepalive === "env") {
           ttlKeepaliveExplicit = Boolean(cfgSnap.values.ttlKeepalive);
+        } else if (
+          typeof store.hasExplicitGlobalTtlKeepaliveMaxCount === "function" &&
+          store.hasExplicitGlobalTtlKeepaliveMaxCount()
+        ) {
+          ttlKeepaliveExplicit = store.getGlobalTtlKeepaliveMaxCount() >= 1;
+        } else if (
+          cfgSnap.sources.ttlKeepalive !== "default" ||
+          cfgSnap.sources.ttlKeepaliveMaxCount !== "default"
+        ) {
+          ttlKeepaliveExplicit =
+            Boolean(cfgSnap.values.ttlKeepalive) && Number(cfgSnap.values.ttlKeepaliveMaxCount ?? 3) >= 1;
         }
       }
     }

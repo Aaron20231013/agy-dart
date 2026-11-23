@@ -181,7 +181,10 @@ function formatChatWindowBadge(workspaceLabel = "", convTitle = "", isZh = false
   return "";
 }
 
-export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = null, lang = null }) {
+export function evaluateCacheAlerts(
+  diag,
+  { sessionId, store, invocationNum = null, lang = null, isBackgroundWakeup = false }
+) {
   const alerts = [];
   if (!diag || diag.turnsWithUsage === 0) return alerts;
   const resolvedLang =
@@ -245,8 +248,8 @@ export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = nu
       );
     }
   } else if (diag.watermark === "warn" && prevWm !== "warn" && prevWm !== "critical") {
-    if (diag.compactAdvice === "opportunistic_cold_compact" && isMidTurnContinuation) {
-      // Suppress cold-compact handoff banner during mid-turn tool execution loops (invocationNum >= 1)
+    if (diag.compactAdvice === "opportunistic_cold_compact" && (isMidTurnContinuation || isBackgroundWakeup)) {
+      // Suppress cold-compact handoff banner during mid-turn tool execution loops or background subagent wakeups
     } else {
       setAlertMeta(wmKey, "warn");
       const hitPct = (diag.weightedHitRate * 100).toFixed(0);
@@ -290,9 +293,9 @@ export function evaluateCacheAlerts(diag, { sessionId, store, invocationNum = nu
     }
   }
 
-  // 2. Idle Prompt-Cache TTL expiry & proactive expiring alerts (once per idle episode, turn entry only)
+  // 2. Idle Prompt-Cache TTL expiry & proactive expiring alerts (once per idle episode, human turn entry only)
   const ttlMinContext = Math.max(60000, diag.coldCompactTokens || 60000);
-  if (!isMidTurnContinuation) {
+  if (!isMidTurnContinuation && !isBackgroundWakeup) {
     if (diag.ttlStatus === "expired" && diag.currentContextTokens >= ttlMinContext && diag.lastPlannerAt) {
       const lastAlertedTurn = getAlertMeta(ttlKey, "");
       if (lastAlertedTurn !== diag.lastPlannerAt) {
@@ -404,7 +407,16 @@ async function main() {
   const resolvedDbPath = effectiveCfg.dbPath || path.join(os.homedir(), ".agy-dart", "context.db");
   const watchdogExplicit = effectiveCfg.stallWatchdog && cfgSnapshot.sources.stallWatchdog !== "default";
   const ttlNotifyExplicit = effectiveCfg.ttlDesktopNotify && cfgSnapshot.sources.ttlDesktopNotify !== "default";
-  const ttlKeepaliveCfgExplicit = effectiveCfg.ttlKeepalive && cfgSnapshot.sources.ttlKeepalive !== "default";
+  const ttlKeepaliveCfgExplicit =
+    !(cfgSnapshot.sources.ttlKeepalive === "env" && effectiveCfg.ttlKeepalive === false) &&
+    (cfgSnapshot.sources.ttlKeepaliveMaxCount === "env"
+      ? Number(effectiveCfg.ttlKeepaliveMaxCount) >= 1
+      : cfgSnapshot.sources.ttlKeepalive === "env"
+        ? Boolean(effectiveCfg.ttlKeepalive)
+        : (cfgSnapshot.sources.ttlKeepalive !== "default" ||
+            cfgSnapshot.sources.ttlKeepaliveMaxCount !== "default") &&
+          Boolean(effectiveCfg.ttlKeepalive) &&
+          Number(effectiveCfg.ttlKeepaliveMaxCount ?? 3) >= 1);
   const watermarkNotifyExplicit =
     effectiveCfg.watermarkDesktopNotify === true && cfgSnapshot.sources.watermarkDesktopNotify !== "default";
   const dbExists = fs.existsSync(resolvedDbPath);
@@ -459,6 +471,7 @@ async function main() {
       effectiveCfg.stallWatchdog ||
       effectiveCfg.ttlDesktopNotify ||
       effectiveCfg.ttlKeepalive ||
+      ttlKeepaliveCfgExplicit ||
       effectiveCfg.watermarkDesktopNotify === true ||
       dbExists
         ? import("../context/lib/watchdog-lease.js")
@@ -766,8 +779,8 @@ async function main() {
 
     let ttlKeepaliveExplicit = false;
     if (!detectedSubagent) {
-      if (cfgSnapshot.sources.ttlKeepalive === "env") {
-        ttlKeepaliveExplicit = Boolean(effectiveCfg.ttlKeepalive);
+      if (cfgSnapshot.sources.ttlKeepalive === "env" && effectiveCfg.ttlKeepalive === false) {
+        ttlKeepaliveExplicit = false;
       } else {
         const convKaState =
           (dbExists || store.db) &&
@@ -778,8 +791,24 @@ async function main() {
             : null;
         if (convKaState && typeof convKaState.enabled === "boolean") {
           ttlKeepaliveExplicit = convKaState.enabled;
-        } else if (cfgSnapshot.sources.ttlKeepalive !== "default") {
+        } else if (convKaState && typeof convKaState.maxCount === "number" && convKaState.maxCount >= 1) {
+          ttlKeepaliveExplicit = true;
+        } else if (cfgSnapshot.sources.ttlKeepaliveMaxCount === "env") {
+          ttlKeepaliveExplicit = Number(effectiveCfg.ttlKeepaliveMaxCount) >= 1;
+        } else if (cfgSnapshot.sources.ttlKeepalive === "env") {
           ttlKeepaliveExplicit = Boolean(effectiveCfg.ttlKeepalive);
+        } else if (
+          (dbExists || store.db) &&
+          typeof store.hasExplicitGlobalTtlKeepaliveMaxCount === "function" &&
+          store.hasExplicitGlobalTtlKeepaliveMaxCount()
+        ) {
+          ttlKeepaliveExplicit = store.getGlobalTtlKeepaliveMaxCount() >= 1;
+        } else if (
+          cfgSnapshot.sources.ttlKeepalive !== "default" ||
+          cfgSnapshot.sources.ttlKeepaliveMaxCount !== "default"
+        ) {
+          ttlKeepaliveExplicit =
+            Boolean(effectiveCfg.ttlKeepalive) && Number(effectiveCfg.ttlKeepaliveMaxCount ?? 3) >= 1;
         }
       }
     }
@@ -787,11 +816,12 @@ async function main() {
       effectiveCfg.watermarkDesktopNotify === true ||
       (effectiveCfg.watermarkDesktopNotify === null && (ttlNotifyActive || desktopStallNotifyActive));
 
-    // Detect auto-keepalive vs genuine user turn so real user messages reset keepalive count -> 0/N.
-    // Note: `agentapi send-message` injects a SYSTEM_MESSAGE step without clearing/replacing `payload.lastUserInput`
+    // Detect auto-keepalive & background subagent/task wakeup vs genuine user turn so real user messages reset keepalive count -> 0/N.
+    // Note: `agentapi send-message` and subagent `send_message` inject a SYSTEM_MESSAGE step without clearing/replacing `payload.lastUserInput`
     // (which still holds the PREVIOUS turn's user prompt), so we MUST always scan trailing steps after the last
     // PLANNER_RESPONSE first rather than skipping transcript inspection when `rawLastUserInput` is non-empty.
     let isKeepaliveTurn = false;
+    let isBackgroundWakeup = false;
     if (!detectedSubagent && targetConvId && targetConvId !== "default" && watchdogLeaseMod) {
       try {
         const checkKeepalive = watchdogLeaseMod.isTtlKeepalivePrompt;
@@ -799,6 +829,7 @@ async function main() {
         const matchedDirectKeepalive = Boolean(checkKeepalive && checkKeepalive(trimmedRawInput));
         let matchedKeepaliveInTrailingSteps = false;
         let sawUserStepAfterPlanner = false;
+        let sawSystemStepAfterPlanner = false;
         let priorCompletedUserText = "";
         if (loadedSteps.length > 0) {
           // Inspect steps after the last PLANNER_RESPONSE without breaking early so a real USER_INPUT
@@ -815,6 +846,11 @@ async function main() {
             }
             if (!passedLastPlanner) {
               if (!matchedDirectKeepalive && (stType === "USER_INPUT" || stType === "SYSTEM_MESSAGE")) {
+                const sysObj = stp.systemMessage || stp.system_message;
+                const isUiOnlySys = Boolean(
+                  sysObj && typeof sysObj === "object" && sysObj.systemMessage === "" && sysObj.metadata?.user_markdown
+                );
+                if (isUiOnlySys) continue;
                 const extracted = String(
                   extractStepText ? extractStepText(stp.user_input ?? stp.content ?? stp.text) : (stp.user_input ?? stp.content ?? "")
                 ).trim();
@@ -823,6 +859,8 @@ async function main() {
                   matchedKeepaliveInTrailingSteps = true;
                 } else if (stType === "USER_INPUT") {
                   sawUserStepAfterPlanner = true;
+                } else if (stType === "SYSTEM_MESSAGE") {
+                  sawSystemStepAfterPlanner = true;
                 }
               }
             } else if (stType === "USER_INPUT") {
@@ -870,7 +908,21 @@ async function main() {
           if (typeof store.setTtlKeepaliveState === "function") {
             store.setTtlKeepaliveState(targetConvId, { pendingAck: false, updatedTs: Date.now() });
           }
-        } else if (
+        }
+
+        if (
+          !isMidTurnContinuation &&
+          !isKeepaliveTurn &&
+          !sawUserStepAfterPlanner &&
+          isStaleCarryOverInput &&
+          (sawSystemStepAfterPlanner || existingLease?.subphase === "stopped_bg_pending")
+        ) {
+          isBackgroundWakeup = true;
+        }
+
+        if (
+          !isKeepaliveTurn &&
+          !isBackgroundWakeup &&
           !isMidTurnContinuation &&
           kaState &&
           (kaState.usedCount > 0 || kaState.pendingAck) &&
@@ -878,6 +930,7 @@ async function main() {
         ) {
           store.resetTtlKeepaliveState(targetConvId);
         } else if (
+          !isKeepaliveTurn &&
           !isMidTurnContinuation &&
           kaState &&
           (typeof kaState.enabled === "boolean" || typeof kaState.maxCount === "number") &&
@@ -890,9 +943,10 @@ async function main() {
     }
 
     // 2. Immediate `/compact` command detection via lastUserInput (idempotent via initialNumSteps;
-    //    skipped on SYSTEM_MESSAGE keepalive turns where `lastUserInput` may still hold a prior `/compact`).
+    //    skipped on SYSTEM_MESSAGE keepalive / background wakeup turns where `lastUserInput` may still hold a prior `/compact`).
     if (
       !isKeepaliveTurn &&
+      !isBackgroundWakeup &&
       typeof rawLastUserInput === "string" &&
       rawLastUserInput.trim() &&
       targetConvId &&
@@ -959,6 +1013,7 @@ async function main() {
           parentConversationId: resolvedParentConvId,
           isSubagent: detectedSubagent,
           isKeepaliveTurn,
+          isBackgroundWakeup,
           cwd: resolvedCwd || payload.cwd || "",
           workspaceLabel: resolvedWorkspaceLabel,
           convTitle: resolvedConvTitle,
@@ -993,7 +1048,8 @@ async function main() {
       sessionId: targetConvId,
       store,
       invocationNum: payload?.invocationNum ?? payload?.invocation_num ?? null,
-      lang: uiLang
+      lang: uiLang,
+      isBackgroundWakeup
     });
     store.close();
     store = null;

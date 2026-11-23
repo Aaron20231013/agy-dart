@@ -37,6 +37,7 @@ import {
   WATCHDOG_PHASES,
   KNOWN_MCP_TOOL_RE,
   LONG_MCP_TOOL_RE,
+  SLOW_GEN_TOOL_RE,
   classifyToolExecutionKind,
   classifyTranscriptGenesisFile,
   classifyTranscriptGenesisSteps,
@@ -49,6 +50,7 @@ import {
   getToolTimeoutTier,
   getWatchdogLeaseKey,
   isHeadlessWorkerPrompt,
+  isHighReasoningModel,
   isSameWorkspacePath,
   isSubagentLeasePayload,
   isSummaryMetadataSubagent,
@@ -76,12 +78,14 @@ export {
   classifyTranscriptGenesisFile,
   classifyTranscriptGenesisSteps,
   decodeFileUriOrPath,
+  deriveLlmSubphase,
   detectSubagentFromTranscriptFile,
   detectSubagentFromTranscriptSteps,
   formatWorkspaceWindowLabel,
   getToolTimeoutTier,
   getWatchdogLeaseKey,
   isHeadlessWorkerPrompt,
+  isHighReasoningModel,
   isSameWorkspacePath,
   isSubagentLeasePayload,
   isSummaryMetadataSubagent,
@@ -112,13 +116,146 @@ const TERMINAL_STOP_REASON_RE =
   /^(?:end_turn|stop|completed|finish|finished|max_tokens|cancelled|canceled|aborted|interrupted|error|failed)$/i;
 const ABORT_REASON_RE = /^(?:cancelled|canceled|aborted|interrupted)$/i;
 
+function isSameOrNestedWorkspacePath(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const norm = (p) => p.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  let na = norm(a);
+  let nb = norm(b);
+  if (!na || !nb) return false;
+  if (/^[a-zA-Z]:(?:\/|$)/.test(na) || /^[a-zA-Z]:(?:\/|$)/.test(nb) || process.platform === "win32") {
+    na = na.toLowerCase();
+    nb = nb.toLowerCase();
+  }
+  return na === nb || nb.startsWith(`${na}/`) || na.startsWith(`${nb}/`);
+}
+
+/**
+ * Pure in-memory (0 fs.statSync) parent-child subagent activity aggregator.
+ * Propagates child subagent heartbeats up multi-hop parent chains (plus same-CWD fallback
+ * for active `SUBAGENT_BG` / `stopped_bg_pending` parents when child lacks parentConversationId).
+ */
+export function collectChildSubagentActivity(
+  leases = [],
+  { extraGrowthByConv = null, nowMs = 0, maxAgeMs = DEFAULT_STALE_LEASE_MS } = {}
+) {
+  const childHeartbeatByParent = new Map();
+  const activeChildParents = new Set();
+  if (!Array.isArray(leases) || leases.length === 0) {
+    return { childHeartbeatByParent, activeChildParents };
+  }
+
+  const leaseById = new Map();
+  for (const l of leases) {
+    if (l && l.conversationId) {
+      leaseById.set(l.conversationId, l);
+    }
+  }
+
+  const isLeaseSubagent = (l) =>
+    Boolean(
+      l.isSubagent ||
+        (l.parentConversationId && l.parentConversationId !== l.conversationId) ||
+        (l.rootSessionId && l.rootSessionId !== l.conversationId) ||
+        (l.lastUserInput && isHeadlessWorkerPrompt(l.lastUserInput))
+    );
+
+  for (const child of leases) {
+    if (!child || !child.conversationId || !isLeaseSubagent(child)) continue;
+    const growthTs =
+      extraGrowthByConv instanceof Map ? Number(extraGrowthByConv.get(child.conversationId) || 0) : 0;
+    const hb = Math.max(
+      Number(child.lastHeartbeatTs || 0),
+      Number(child.updatedTs || 0),
+      Number(child.phaseChangedTs || 0),
+      growthTs
+    );
+    const isStaleChild =
+      nowMs > 0 && maxAgeMs > 0 && (hb <= 0 || nowMs - hb > maxAgeMs);
+    if (isStaleChild) continue;
+    const isOrphanPreToolOnlyLease =
+      child.invocationNum === null &&
+      !(Number(child.contextTokens || 0) > 0) &&
+      !child.transcriptPath &&
+      !child.lastUserInput;
+    const childIsActive =
+      !isOrphanPreToolOnlyLease &&
+      (child.phase !== WATCHDOG_PHASES.IDLE || child.subphase === "stopped_bg_pending");
+
+    const ancestors = new Set();
+    let cursor = child;
+    const visited = new Set([child.conversationId]);
+    for (let hop = 0; hop < 6 && cursor; hop += 1) {
+      const pId =
+        cursor.parentConversationId && cursor.parentConversationId !== cursor.conversationId
+          ? cursor.parentConversationId
+          : "";
+      const rId =
+        cursor.rootSessionId && cursor.rootSessionId !== cursor.conversationId
+          ? cursor.rootSessionId
+          : "";
+      if (pId && !visited.has(pId)) {
+        ancestors.add(pId);
+        visited.add(pId);
+      }
+      if (rId && rId !== pId) {
+        ancestors.add(rId);
+      }
+      const nextId = pId || (rId && !visited.has(rId) ? rId : "");
+      if (!nextId) break;
+      visited.add(nextId);
+      cursor = leaseById.get(nextId) || null;
+    }
+
+    if (ancestors.size > 0) {
+      for (const ancId of ancestors) {
+        if (hb > 0) {
+          childHeartbeatByParent.set(ancId, Math.max(childHeartbeatByParent.get(ancId) || 0, hb));
+        }
+        if (childIsActive) {
+          activeChildParents.add(ancId);
+        }
+      }
+    } else if (child.cwd) {
+      for (const candParent of leases) {
+        if (!candParent || candParent.conversationId === child.conversationId || isLeaseSubagent(candParent)) {
+          continue;
+        }
+        if (
+          candParent.phase !== WATCHDOG_PHASES.SUBAGENT_BG &&
+          candParent.subphase !== "stopped_bg_pending"
+        ) {
+          continue;
+        }
+        if (!candParent.cwd || !isSameOrNestedWorkspacePath(candParent.cwd, child.cwd)) {
+          continue;
+        }
+        const parentAnchor = candParent.phaseChangedTs || candParent.startedTs || 0;
+        if (hb > 0 && (childIsActive || hb >= parentAnchor)) {
+          childHeartbeatByParent.set(
+            candParent.conversationId,
+            Math.max(childHeartbeatByParent.get(candParent.conversationId) || 0, hb)
+          );
+        }
+        if (childIsActive) {
+          activeChildParents.add(candParent.conversationId);
+        }
+      }
+    }
+  }
+
+  return { childHeartbeatByParent, activeChildParents };
+}
+
 /**
  * State-aware dynamic timeout matrix (zero false positives).
  * Distinguishes:
  *   - IDLE
- *   - LLM_INFLIGHT: <120k normal, >=120k or /compact high_ctx, >=150k multimodal
- *   - TOOL_RUNNING: sync run_command / long MCP vs read_file / fast MCP
- *   - SUBAGENT_BG: async background tasks / subagents
+ *   - LLM_INFLIGHT:
+ *       * non-reasoning: <120k (120s), 120k-250k or /compact (240s), multimodal high-ctx (360s)
+ *       * single high-tier: high-reasoning model OR >=250k context (600s)
+ *       * compound / ultra: high-reasoning + (>=250k or >=100k+media), or any model >=500k (900s)
+ *   - TOOL_RUNNING: sync run_command / long MCP / apply_edits(verify) vs read_file / fast MCP
+ *   - SUBAGENT_BG: async background tasks / subagents / run_workflow (1200s default)
  */
 export function resolveDynamicThresholds(lease, cfg = getEffectiveConfig()) {
   if (!lease || lease.phase === WATCHDOG_PHASES.IDLE) {
@@ -137,14 +274,15 @@ export function resolveDynamicThresholds(lease, cfg = getEffectiveConfig()) {
   let bucket;
 
   if (lease.phase === WATCHDOG_PHASES.SUBAGENT_BG) {
-    stalledSec = Number(cfg?.watchdogSubagentSec) || 600;
+    stalledSec = Number(cfg?.watchdogSubagentSec) || 1200;
     bucket = "subagent_bg";
   } else if (lease.phase === WATCHDOG_PHASES.TOOL_RUNNING) {
     const isSlowCmd =
       lease.activeToolKind === "sync_cmd" ||
       lease.activeToolKind === "mcp_long" ||
       lease.activeTool === "run_command" ||
-      LONG_MCP_TOOL_RE.test(lease.activeTool || "");
+      LONG_MCP_TOOL_RE.test(lease.activeTool || "") ||
+      SLOW_GEN_TOOL_RE.test(lease.activeTool || "");
     if (isSlowCmd) {
       stalledSec = Number(cfg?.watchdogToolCmdSec) || 300;
       bucket = lease.activeToolKind === "mcp_long" ? "tool_mcp_long" : "tool_sync_cmd";
@@ -160,18 +298,45 @@ export function resolveDynamicThresholds(lease, cfg = getEffectiveConfig()) {
   } else {
     const ctx = Number(lease.contextTokens || 0);
     const media = Number(lease.mediaCount || 0);
-    if (ctx >= 150000 && media > 0) {
+    const highReasoning =
+      isHighReasoningModel(lease.model) ||
+      lease.subphase === "reasoning" ||
+      lease.subphase === "reasoning_compound";
+
+    if (
+      ctx >= 500000 ||
+      (highReasoning && (ctx >= 250000 || (ctx >= 100000 && media > 0))) ||
+      lease.subphase === "reasoning_compound"
+    ) {
+      stalledSec = Number(cfg?.watchdogLlmCompoundSec) || 900;
+      bucket = "llm_reasoning_compound";
+    } else if (highReasoning) {
+      stalledSec = Number(cfg?.watchdogLlmReasoningSec) || 600;
+      bucket = "llm_reasoning";
+    } else if (ctx >= 250000 || lease.subphase === "ultra_high_ctx") {
+      stalledSec = Number(cfg?.watchdogLlmReasoningSec) || 600;
+      bucket = "llm_ultra_high_ctx";
+    } else if (
+      (ctx >= 150000 && media > 0) ||
+      (ctx >= 100000 && media >= 3) ||
+      lease.subphase === "multimodal_high_ctx"
+    ) {
       stalledSec = Number(cfg?.watchdogLlmMultimodalSec) || 360;
       bucket = "llm_multimodal_high_ctx";
-    } else if (ctx >= 120000 || lease.isCompactCmd) {
+    } else if (
+      ctx >= 120000 ||
+      lease.isCompactCmd ||
+      lease.subphase === "high_ctx" ||
+      lease.subphase === "compact"
+    ) {
       stalledSec = Number(cfg?.watchdogLlmHighSec) || 240;
-      bucket = lease.isCompactCmd ? "llm_compact" : "llm_high_ctx";
+      bucket = lease.isCompactCmd || lease.subphase === "compact" ? "llm_compact" : "llm_high_ctx";
     } else {
       stalledSec = Number(cfg?.watchdogLlmLowSec) || 120;
       bucket = "llm_low_ctx";
     }
     if (lease.isSubagent) {
-      const subFloor = Number(cfg?.watchdogSubagentSec) || 600;
+      const subFloor = Number(cfg?.watchdogSubagentSec) || 1200;
       stalledSec = Math.max(stalledSec, subFloor);
       bucket = "subagent_llm";
     }
@@ -566,16 +731,23 @@ export function diagnoseStallCause(lease = {}, options = {}) {
     };
   }
 
-  const isExplicitNonMcp = activeToolKind === "read" || activeToolKind === "host" || activeToolKind === "sync_cmd";
+  const bareActiveTool = extractBareToolName(activeTool);
+  const isSlowHostGen = SLOW_GEN_TOOL_RE.test(bareActiveTool);
+  const isExplicitNonMcp =
+    activeToolKind === "read" ||
+    activeToolKind === "host" ||
+    activeToolKind === "sync_cmd" ||
+    isSlowHostGen;
   const colonIdx = activeTool.lastIndexOf(":");
   const colonPrefix = colonIdx > 0 ? activeTool.slice(0, colonIdx).trim() : "";
   const hasMcpName =
     /^(?:call_mcp_tool|mcp_|ctx_)/i.test(activeTool) ||
     (colonIdx > 0 && !/^(?:default_api|builtin|host|antigravity|core|native)$/i.test(colonPrefix)) ||
-    KNOWN_MCP_TOOL_RE.test(extractBareToolName(activeTool));
+    KNOWN_MCP_TOOL_RE.test(bareActiveTool);
   if (
     phase === WATCHDOG_PHASES.TOOL_RUNNING &&
-    (activeToolKind === "mcp" || activeToolKind === "mcp_long" || (!isExplicitNonMcp && hasMcpName))
+    (((activeToolKind === "mcp" || activeToolKind === "mcp_long") && !isSlowHostGen) ||
+      (!isExplicitNonMcp && hasMcpName))
   ) {
     return {
       causeId: "mcp_tool_blocked",
@@ -639,11 +811,61 @@ export function diagnoseStallCause(lease = {}, options = {}) {
     };
   }
 
+  const highReasoning =
+    isHighReasoningModel(safeLease.model) ||
+    safeLease.subphase === "reasoning" ||
+    safeLease.subphase === "reasoning_compound";
+  const isCompoundLlm =
+    ctx >= 500000 ||
+    safeLease.subphase === "reasoning_compound" ||
+    (highReasoning && (ctx >= 250000 || (ctx >= 100000 && media > 0)));
+  const isUltraHighCtx = ctx >= 250000 || safeLease.subphase === "ultra_high_ctx";
+
   if (
     phase === WATCHDOG_PHASES.LLM_INFLIGHT &&
-    (isCompact || ctx >= 120000 || safeLease.subphase === "high_ctx" || safeLease.subphase === "multimodal_high_ctx")
+    (isCompoundLlm ||
+      isUltraHighCtx ||
+      isCompact ||
+      (!highReasoning &&
+        (ctx >= 120000 ||
+          safeLease.subphase === "high_ctx" ||
+          safeLease.subphase === "multimodal_high_ctx")))
   ) {
-    const mediaNote = media > 0 && ctx >= 150000;
+    const mediaNote = media > 0 && (ctx >= 150000 || (ctx >= 100000 && (highReasoning || media >= 3)));
+    if (isCompoundLlm) {
+      return {
+        causeId: "auto_compact_deadlock",
+        label: "Deep Reasoning + Ultra-Long Context Stall",
+        labelZh: "深度推理叠加超长上下文无响应",
+        tips: [
+          "Copy the Rescue Handoff Brief below, cancel the hung turn, then run /compact or continue in a fresh session with ctx_resume({}).",
+          mediaNote
+            ? "High-reasoning + >=100k multimodal context amplifies TTFT & stream stalls; delegate screenshot/media steps to a subagent."
+            : "Delegate multi-file analysis to subagents or keep heavy outputs in agy-dart sandbox (ctx_execute / read_slices) to avoid >=250k cold re-prefill stalls."
+        ],
+        tipsZh: [
+          "先复制下方的抢救版 Handoff Brief，取消当前超时轮次，执行 /compact 或在新对话粘贴简报并调用 ctx_resume({}) 续接。",
+          mediaNote
+            ? "深度推理叠加 >=100k 多模态图片会显著放大首字与流式耗时，建议将看图/排查拆给独立子代理。"
+            : "建议将大体量改动拆给子代理，或用 ctx_execute / read_slices 控制上下文体积，避开超长窗口冷重填与自动压缩死锁。"
+        ]
+      };
+    }
+    if (isUltraHighCtx) {
+      return {
+        causeId: "auto_compact_deadlock",
+        label: "Ultra-Long Context / Compaction Stall",
+        labelZh: "超长上下文重填或后台压缩卡死",
+        tips: [
+          "Copy the Rescue Handoff Brief below, cancel the hung turn, then run /compact (or open a fresh session) and call ctx_resume({}).",
+          "Keep large logs/diffs in agy-dart sandbox (ctx_execute / read_slices) so context stays below >=250k re-prefill cliffs."
+        ],
+        tipsZh: [
+          "先复制下方的抢救版 Handoff Brief，取消当前卡死轮次，执行 /compact（或新开会话）并调用 ctx_resume({}) 无缝续接。",
+          "大日志与源码优先走 agy-dart 沙盒与切片（ctx_execute / read_slices），避免上下文跨入 >=250k 冷重填高延迟区间。"
+        ]
+      };
+    }
     return {
       causeId: "auto_compact_deadlock",
       label: mediaNote
@@ -661,6 +883,22 @@ export function diagnoseStallCause(lease = {}, options = {}) {
         mediaNote
           ? "当前会话 >=150k 且含多模态图片（TTFT 悬崖风险），建议改由独立文本子代理分流排查，避免主会话继续堆积图片。"
           : "大日志与源码优先走 agy-dart 沙盒与切片（ctx_execute / read_slices），避免上下文再次逼近后台自动压缩死锁区间。"
+      ]
+    };
+  }
+
+  if (phase === WATCHDOG_PHASES.LLM_INFLIGHT && highReasoning) {
+    return {
+      causeId: "deep_reasoning_stall",
+      label: "Deep Reasoning Stream / Upstream Timeout",
+      labelZh: "深度推理思维链阻塞或上游超时",
+      tips: [
+        "High-reasoning turn exceeded its 10m budget with zero disk output; check network/proxy stability or cancel and retry.",
+        "Copy the Rescue Handoff Brief below before cancelling or reloading so workspace progress and FTS5 handles are preserved."
+      ],
+      tipsZh: [
+        "高推理模型已超过 10 分钟无落盘输出，请检查代理/上游流式连接是否中断，或在宿主中取消本轮重试。",
+        "取消或重开前请先一键复制下方的抢救版 Handoff Brief，确保当前工作区进度与 FTS5 句柄零丢失。"
       ]
     };
   }
@@ -1288,18 +1526,31 @@ export class WatchdogMonitor {
 
     for (const lease of leases) {
       const ageMs = nowMs - (lease.updatedTs || 0);
+      const fromPriorApp = appStartTs > 0 && lease.updatedTs > 0 && lease.updatedTs < appStartTs - 5000;
+      const tooOld = ageMs > this.staleLeaseMs;
       if (lease.phase === WATCHDOG_PHASES.IDLE) {
         if (ageMs > MAX_IDLE_LEASE_RETENTION_MS || lease.updatedTs <= 0) {
           try {
             store.deleteMeta(getWatchdogLeaseKey(lease.conversationId));
             deleted += 1;
           } catch {}
+        } else if (lease.subphase === "stopped_bg_pending" && (fromPriorApp || tooOld)) {
+          try {
+            const cas = writeWatchdogLeaseIfUnchanged(store, lease.updatedTs, lease.phase, {
+              ...lease,
+              subphase: "stale_cleanup",
+              stopReason: fromPriorApp ? "stale_prior_app_restart" : "stale_bg_pending_expired",
+              phaseChangedTs: nowMs,
+              updatedTs: nowMs,
+              lastHeartbeatTs: nowMs,
+              hookEvent: "SidecarStartupCleanup"
+            });
+            if (cas.written) cleaned += 1;
+          } catch {}
         }
         continue;
       }
 
-      const fromPriorApp = appStartTs > 0 && lease.updatedTs > 0 && lease.updatedTs < appStartTs - 5000;
-      const tooOld = ageMs > this.staleLeaseMs;
       if (fromPriorApp || tooOld || lease.updatedTs <= 0) {
         try {
           const cas = writeWatchdogLeaseIfUnchanged(store, lease.updatedTs, lease.phase, {
@@ -1336,7 +1587,7 @@ export class WatchdogMonitor {
     const leases = listWatchdogLeases(store);
     let cleared = 0;
     for (const lease of leases) {
-      if (lease.phase === WATCHDOG_PHASES.IDLE) continue;
+      if (lease.phase === WATCHDOG_PHASES.IDLE && lease.subphase !== "stopped_bg_pending") continue;
       try {
         const cas = writeWatchdogLeaseIfUnchanged(store, lease.updatedTs, lease.phase, {
           ...lease,
@@ -1413,6 +1664,8 @@ export class WatchdogMonitor {
         lastInspectedMtimeMs: 0,
         lastInspectedSize: -1,
         lastTailInfo: null,
+        lastTailFreshForEnrich: false,
+        lastTailFreshForHeal: false,
         sleepGraceMs: 0,
         lastLeaseUpdatedTs: 0,
         rescueBriefKey: "",
@@ -1671,6 +1924,67 @@ export class WatchdogMonitor {
     return false;
   }
 
+  _resolveGlobalTtlKeepaliveMaxCount(store, cfg) {
+    if (this._isTtlKeepaliveForcedOffByEnv()) return 0;
+    const clampGlobal = (v) => Math.min(20, Math.max(0, Math.floor(Number(v))));
+    const envRaw = process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT;
+    if (typeof envRaw === "string" && envRaw.trim() !== "") {
+      const n = Number(envRaw.trim());
+      if (Number.isFinite(n) && n >= 0) return clampGlobal(n);
+    }
+    const kaEnvRaw = process.env.AGY_DART_TTL_KEEPALIVE;
+    const kaEnvOn =
+      typeof kaEnvRaw === "string" &&
+      /^(?:1|true|yes|on)$/i.test(kaEnvRaw.trim());
+    if (
+      store &&
+      typeof store.hasExplicitGlobalTtlKeepaliveMaxCount === "function" &&
+      store.hasExplicitGlobalTtlKeepaliveMaxCount()
+    ) {
+      const metaGlobal = store.getGlobalTtlKeepaliveMaxCount();
+      return metaGlobal === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : metaGlobal;
+    }
+    if (this._hasCustomConfig) {
+      if (cfg.ttlKeepalive === false && !kaEnvOn) return 0;
+      const rawCfgMax = cfg.ttlKeepaliveMaxCount;
+      if (
+        rawCfgMax !== undefined &&
+        rawCfgMax !== null &&
+        Number.isFinite(Number(rawCfgMax)) &&
+        Number(rawCfgMax) >= 0
+      ) {
+        const clampedCfg = clampGlobal(rawCfgMax);
+        return clampedCfg === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : clampedCfg;
+      }
+      return 3;
+    }
+    if (store && typeof store.getGlobalTtlKeepaliveMaxCount === "function") {
+      return store.getGlobalTtlKeepaliveMaxCount();
+    }
+    if (cfg.ttlKeepalive === false && !kaEnvOn) return 0;
+    const clampedDefault = clampGlobal(cfg.ttlKeepaliveMaxCount ?? 3);
+    return clampedDefault === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : clampedDefault;
+  }
+
+  _resolveFallbackTtlKeepaliveMaxCount(store, cfg) {
+    if (store && typeof store.getFallbackNonZeroKeepaliveMaxCount === "function") {
+      const fb = store.getFallbackNonZeroKeepaliveMaxCount();
+      if (Number.isFinite(fb) && fb >= 1) {
+        return Math.min(20, Math.max(1, Math.floor(fb)));
+      }
+    }
+    const rawCfgMax = cfg?.ttlKeepaliveMaxCount;
+    if (
+      rawCfgMax !== undefined &&
+      rawCfgMax !== null &&
+      Number.isFinite(Number(rawCfgMax)) &&
+      Number(rawCfgMax) >= 1
+    ) {
+      return Math.min(20, Math.max(1, Math.floor(Number(rawCfgMax))));
+    }
+    return 3;
+  }
+
   _resolveTtlKeepaliveEnabled(store, cfg, conversationId = "", lease = null) {
     if (
       conversationId &&
@@ -1679,11 +1993,29 @@ export class WatchdogMonitor {
     ) {
       return false;
     }
-    const disableRaw = process.env.AGY_DART_DISABLE_TTL_KEEPALIVE;
-    if (typeof disableRaw === "string" && disableRaw.trim() !== "") {
-      const d = disableRaw.trim().toLowerCase();
-      if (d === "1" || d === "true" || d === "yes" || d === "on") return false;
-      if (d === "0" || d === "false" || d === "no" || d === "off") return true;
+    if (this._isTtlKeepaliveForcedOffByEnv()) return false;
+    if (conversationId && store && typeof store.getTtlKeepaliveState === "function") {
+      try {
+        const kaState = store.getTtlKeepaliveState(conversationId);
+        if (kaState && typeof kaState.enabled === "boolean") {
+          return kaState.enabled;
+        }
+        if (
+          kaState &&
+          typeof kaState.maxCount === "number" &&
+          Number.isFinite(kaState.maxCount) &&
+          kaState.maxCount >= 1
+        ) {
+          return true;
+        }
+      } catch {}
+    }
+    const envMaxRaw = process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT;
+    if (typeof envMaxRaw === "string" && envMaxRaw.trim() !== "") {
+      const n = Number(envMaxRaw.trim());
+      if (Number.isFinite(n) && n >= 0) {
+        return Math.floor(n) >= 1;
+      }
     }
     const envRaw = process.env.AGY_DART_TTL_KEEPALIVE;
     if (typeof envRaw === "string" && envRaw.trim() !== "") {
@@ -1691,30 +2023,11 @@ export class WatchdogMonitor {
       if (s === "1" || s === "true" || s === "yes" || s === "on") return true;
       if (s === "0" || s === "false" || s === "no" || s === "off") return false;
     }
-    if (conversationId && store && typeof store.getTtlKeepaliveState === "function") {
-      try {
-        const kaState = store.getTtlKeepaliveState(conversationId);
-        if (kaState && typeof kaState.enabled === "boolean") {
-          return kaState.enabled;
-        }
-      } catch {}
-    }
-    if (this._hasCustomConfig) {
-      return cfg.ttlKeepalive !== undefined ? Boolean(cfg.ttlKeepalive) : true;
-    }
-    if (store && typeof store.isTtlKeepaliveEnabled === "function") {
-      return store.isTtlKeepaliveEnabled(conversationId || null);
-    }
-    return cfg.ttlKeepalive !== undefined ? Boolean(cfg.ttlKeepalive) : true;
+    return this._resolveGlobalTtlKeepaliveMaxCount(store, cfg) >= 1;
   }
 
   _resolveTtlKeepaliveMaxCount(store, cfg, conversationId = "") {
     const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 3)));
-    const envRaw = process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT;
-    if (typeof envRaw === "string" && envRaw.trim() !== "") {
-      const n = Number(envRaw.trim());
-      if (Number.isFinite(n) && n >= 1) return clampMax(n);
-    }
     if (conversationId && store && typeof store.getTtlKeepaliveState === "function") {
       try {
         const kaState = store.getTtlKeepaliveState(conversationId);
@@ -1723,13 +2036,17 @@ export class WatchdogMonitor {
         }
       } catch {}
     }
-    if (this._hasCustomConfig) {
-      return clampMax(cfg.ttlKeepaliveMaxCount ?? 3);
+    const envRaw = process.env.AGY_DART_TTL_KEEPALIVE_MAX_COUNT;
+    if (typeof envRaw === "string" && envRaw.trim() !== "") {
+      const n = Number(envRaw.trim());
+      if (Number.isFinite(n) && n >= 0) {
+        const floored = Math.floor(n);
+        return floored >= 1 ? clampMax(floored) : this._resolveFallbackTtlKeepaliveMaxCount(store, cfg);
+      }
     }
-    if (store && typeof store.getTtlKeepaliveMaxCount === "function") {
-      return store.getTtlKeepaliveMaxCount(conversationId || null);
-    }
-    return clampMax(cfg.ttlKeepaliveMaxCount ?? 3);
+    const globalMax = this._resolveGlobalTtlKeepaliveMaxCount(store, cfg);
+    if (globalMax >= 1) return clampMax(globalMax);
+    return this._resolveFallbackTtlKeepaliveMaxCount(store, cfg);
   }
 
   _resolveWatermarkDesktopNotifyEnabled(store, cfg, { desktopNotifyEnabled = false, ttlDesktopNotifyEnabled = false } = {}) {
@@ -2056,7 +2373,8 @@ export class WatchdogMonitor {
       uiLang = "en",
       sleepJumpMs,
       coveredConvIds = null,
-      exhaustedConvMap = null
+      exhaustedConvMap = null,
+      activeChildParents = null
     }
   ) {
     const envNotifyRaw = process.env.AGY_DART_TTL_DESKTOP_NOTIFY;
@@ -2098,7 +2416,8 @@ export class WatchdogMonitor {
         continue;
       }
       if (coveredConvIds && coveredConvIds.has(lease.conversationId)) continue;
-      if (lease.subphase !== "stopped" && lease.subphase !== "stopped_bg_pending") continue;
+      if (activeChildParents && activeChildParents.has(lease.conversationId)) continue;
+      if (lease.subphase !== "stopped") continue;
       const stopReason = String(lease.stopReason || "").trim();
       if (/^(?:EXECUTOR_TERMINATION_REASON_)?(?:USER_CANCELED|USER_CANCELLED|CANCELED|CANCELLED|ABORTED|ERROR)\b/i.test(stopReason)) {
         continue;
@@ -2324,12 +2643,14 @@ export class WatchdogMonitor {
     const enabled = this._resolveWatchdogEnabled(store, cfg);
     const desktopNotifyEnabled = this._resolveDesktopNotifyEnabled(store, cfg);
     const ttlDesktopNotifyEnabled = this._resolveTtlDesktopNotifyEnabled(store, cfg);
+    const globalTtlKeepaliveMaxCount = this._resolveGlobalTtlKeepaliveMaxCount(store, cfg);
+    const fallbackTtlKeepaliveMaxCount = this._resolveFallbackTtlKeepaliveMaxCount(store, cfg);
     const ttlKeepaliveEnabled = this._resolveTtlKeepaliveEnabled(store, cfg);
     const ttlKeepaliveMaxCount = this._resolveTtlKeepaliveMaxCount(store, cfg);
     const ttlKeepaliveActive = Boolean(
       typeof this.keepaliveSendFn === "function" &&
         !this._isTtlKeepaliveForcedOffByEnv() &&
-        (ttlKeepaliveEnabled || Boolean(store?.hasAnyExplicitTtlKeepaliveEnabled?.()))
+        (ttlKeepaliveEnabled || Boolean(store?.hasAnyExplicitTtlKeepaliveEnabled?.({ globalOff: true })))
     );
     const watermarkDesktopNotifyEnabled = this._resolveWatermarkDesktopNotifyEnabled(store, cfg, {
       desktopNotifyEnabled: enabled && desktopNotifyEnabled,
@@ -2348,6 +2669,8 @@ export class WatchdogMonitor {
         ttlDesktopNotifyEnabled,
         ttlKeepaliveEnabled,
         ttlKeepaliveMaxCount,
+        globalTtlKeepaliveMaxCount,
+        fallbackTtlKeepaliveMaxCount,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -2356,7 +2679,35 @@ export class WatchdogMonitor {
       };
     }
 
-    const leases = listWatchdogLeases(store);
+    const rawLeases = listWatchdogLeases(store);
+    const leases = rawLeases.map((lease) => {
+      if (
+        lease &&
+        lease.phase === WATCHDOG_PHASES.IDLE &&
+        lease.subphase === "stopped_bg_pending" &&
+        this.staleLeaseMs > 0 &&
+        nowWallMs - (lease.updatedTs || 0) >= this.staleLeaseMs
+      ) {
+        const retiredBg = {
+          ...lease,
+          subphase: "stale_cleanup",
+          stopReason: "stale_bg_pending_expired",
+          phaseChangedTs: nowWallMs,
+          updatedTs: nowWallMs,
+          lastHeartbeatTs: nowWallMs,
+          hookEvent: "SidecarHeal"
+        };
+        try {
+          const cas = writeWatchdogLeaseIfUnchanged(store, lease.updatedTs, lease.phase, retiredBg);
+          if (cas.written) return retiredBg;
+        } catch {}
+      }
+      return lease;
+    });
+    const initialChildActivity = collectChildSubagentActivity(leases, {
+      nowMs: nowWallMs,
+      maxAgeMs: this.staleLeaseMs
+    });
     if (!enabled) {
       this._convState.clear();
       this._lastEvaluated.clear();
@@ -2379,7 +2730,8 @@ export class WatchdogMonitor {
         uiLang,
         sleepJumpMs,
         coveredConvIds,
-        exhaustedConvMap
+        exhaustedConvMap,
+        activeChildParents: initialChildActivity.activeChildParents
       });
       this._evaluateWatermarkNotifications(store, leases, {
         nowWallMs,
@@ -2393,6 +2745,8 @@ export class WatchdogMonitor {
         ttlDesktopNotifyEnabled,
         ttlKeepaliveEnabled,
         ttlKeepaliveMaxCount,
+        globalTtlKeepaliveMaxCount,
+        fallbackTtlKeepaliveMaxCount,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -2421,6 +2775,9 @@ export class WatchdogMonitor {
         } else {
           st.sleepGraceMs = 0;
           st.lastTranscriptGrowthTs = 0;
+          st.lastTailInfo = null;
+          st.lastTailFreshForEnrich = false;
+          st.lastTailFreshForHeal = false;
           st.rescueBriefKey = "";
           st.rescueBrief = null;
         }
@@ -2443,7 +2800,8 @@ export class WatchdogMonitor {
         uiLang,
         sleepJumpMs,
         coveredConvIds,
-        exhaustedConvMap
+        exhaustedConvMap,
+        activeChildParents: initialChildActivity.activeChildParents
       });
       this._evaluateWatermarkNotifications(store, leases, {
         nowWallMs,
@@ -2457,6 +2815,8 @@ export class WatchdogMonitor {
         ttlDesktopNotifyEnabled,
         ttlKeepaliveEnabled,
         ttlKeepaliveMaxCount,
+        globalTtlKeepaliveMaxCount,
+        fallbackTtlKeepaliveMaxCount,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -2465,8 +2825,10 @@ export class WatchdogMonitor {
       };
     }
 
-    const evaluated = [];
+    const evaluatedById = new Map();
     const seenIds = new Set();
+    const subagentPass = [];
+    const primaryPass = [];
 
     for (const lease of leases) {
       seenIds.add(lease.conversationId);
@@ -2475,6 +2837,9 @@ export class WatchdogMonitor {
         if (st) {
           st.sleepGraceMs = 0;
           st.lastTranscriptGrowthTs = 0;
+          st.lastTailInfo = null;
+          st.lastTailFreshForEnrich = false;
+          st.lastTailFreshForHeal = false;
           st.rescueBriefKey = "";
           st.rescueBrief = null;
         }
@@ -2482,20 +2847,87 @@ export class WatchdogMonitor {
           !lease.isSubagent && this._isConversationSubagent(store, lease.conversationId, lease)
             ? { ...lease, isSubagent: true }
             : lease;
-        evaluated.push(this._buildIdleEvaluation(effectiveIdleLease, nowWallMs));
+        evaluatedById.set(lease.conversationId, this._buildIdleEvaluation(effectiveIdleLease, nowWallMs));
         continue;
       }
+      const isSub = Boolean(
+        lease.isSubagent ||
+          (lease.parentConversationId && lease.parentConversationId !== lease.conversationId) ||
+          (lease.rootSessionId && lease.rootSessionId !== lease.conversationId) ||
+          (lease.lastUserInput && isHeadlessWorkerPrompt(lease.lastUserInput)) ||
+          this._isConversationSubagent(store, lease.conversationId, lease)
+      );
+      if (isSub) {
+        const effectiveSubLease =
+          !lease.isSubagent && store
+            ? readWatchdogLease(store, lease.conversationId) || { ...lease, isSubagent: true }
+            : lease;
+        subagentPass.push(effectiveSubLease);
+      } else {
+        primaryPass.push(lease);
+      }
+    }
 
-      evaluated.push(
+    // Evaluate active subagents first so any live subagent transcript growth & discovered parent links feed parent heartbeat
+    for (const lease of subagentPass) {
+      evaluatedById.set(
+        lease.conversationId,
         this._evaluateActiveLease(store, lease, {
           nowWallMs,
           cfg,
           desktopNotifyEnabled,
           uiLang,
-          sleepJumpMs
+          sleepJumpMs,
+          childHeartbeatTs: initialChildActivity.childHeartbeatByParent.get(lease.conversationId) || 0
         })
       );
     }
+
+    const extraGrowthByConv = new Map();
+    for (const [cid, st] of this._convState.entries()) {
+      if (st?.lastTranscriptGrowthTs > 0) {
+        extraGrowthByConv.set(cid, st.lastTranscriptGrowthTs);
+      }
+    }
+    const postSubagentLeases = leases.map((l) => {
+      const ev = evaluatedById.get(l.conversationId);
+      if (!ev || !ev.isSubagent) return l;
+      const refreshed = store ? readWatchdogLease(store, l.conversationId) : null;
+      return {
+        ...l,
+        ...(refreshed || {}),
+        isSubagent: true,
+        parentConversationId: refreshed?.parentConversationId || ev.parentConversationId || l.parentConversationId || "",
+        rootSessionId: refreshed?.rootSessionId || ev.rootSessionId || l.rootSessionId || l.conversationId,
+        lastHeartbeatTs: Math.max(l.lastHeartbeatTs || 0, refreshed?.lastHeartbeatTs || 0, ev.lastActivityTs || 0),
+        updatedTs: Math.max(l.updatedTs || 0, refreshed?.updatedTs || 0),
+        phase: ev.phase || l.phase,
+        subphase: ev.subphase || l.subphase
+      };
+    });
+    const mergedChildActivity = collectChildSubagentActivity(postSubagentLeases, {
+      extraGrowthByConv,
+      nowMs: nowWallMs,
+      maxAgeMs: this.staleLeaseMs
+    });
+
+    for (const lease of primaryPass) {
+      evaluatedById.set(
+        lease.conversationId,
+        this._evaluateActiveLease(store, lease, {
+          nowWallMs,
+          cfg,
+          desktopNotifyEnabled,
+          uiLang,
+          sleepJumpMs,
+          childHeartbeatTs: mergedChildActivity.childHeartbeatByParent.get(lease.conversationId) || 0
+        })
+      );
+    }
+
+    const evaluated = leases
+      .map((l) => evaluatedById.get(l.conversationId))
+      .filter(Boolean);
 
     for (const id of this._convState.keys()) {
       if (!seenIds.has(id)) this._convState.delete(id);
@@ -2520,7 +2952,8 @@ export class WatchdogMonitor {
       uiLang,
       sleepJumpMs,
       coveredConvIds,
-      exhaustedConvMap
+      exhaustedConvMap,
+      activeChildParents: mergedChildActivity.activeChildParents
     });
     this._evaluateWatermarkNotifications(store, leases, {
       nowWallMs,
@@ -2540,12 +2973,45 @@ export class WatchdogMonitor {
       ttlDesktopNotifyEnabled,
       ttlKeepaliveEnabled,
       ttlKeepaliveMaxCount,
+      globalTtlKeepaliveMaxCount,
+      fallbackTtlKeepaliveMaxCount,
       watermarkDesktopNotifyEnabled,
       uiLang,
       uiLangSource: langInfo.source,
       serverNowMs: nowWallMs,
       evaluated
     };
+  }
+
+  _queryRecentStoreActivityTs(store, conversationId, nowWallMs) {
+    if (!store || !store.db || typeof store.db.prepare !== "function" || !conversationId) return 0;
+    let maxTs = 0;
+    try {
+      const cpRow = store.db
+        .prepare("SELECT updated_ts FROM session_checkpoints WHERE session_id = ? LIMIT 1")
+        .get(conversationId);
+      if (cpRow && Number.isFinite(Number(cpRow.updated_ts))) {
+        maxTs = Math.max(maxTs, Math.floor(Number(cpRow.updated_ts)));
+      }
+    } catch {}
+    try {
+      const srcRow = store.db
+        .prepare("SELECT MAX(created_ts) AS ts FROM sources WHERE session_id = ?")
+        .get(conversationId);
+      if (srcRow && Number.isFinite(Number(srcRow.ts))) {
+        maxTs = Math.max(maxTs, Math.floor(Number(srcRow.ts)));
+      }
+    } catch {}
+    try {
+      const evRow = store.db
+        .prepare("SELECT created_at FROM events WHERE session_id = ? ORDER BY seq DESC LIMIT 1")
+        .get(conversationId);
+      if (evRow && typeof evRow.created_at === "string" && evRow.created_at) {
+        const parsed = Date.parse(evRow.created_at);
+        if (Number.isFinite(parsed) && parsed > maxTs) maxTs = parsed;
+      }
+    } catch {}
+    return maxTs > 0 ? Math.min(maxTs, nowWallMs) : 0;
   }
 
   _buildIdleEvaluation(lease, nowWallMs) {
@@ -2599,7 +3065,7 @@ export class WatchdogMonitor {
     if (tailInfo.mediaCount > 0) {
       lease.mediaCount = Math.max(lease.mediaCount || 0, tailInfo.mediaCount);
     }
-    if (tailInfo.model && !lease.model) lease.model = tailInfo.model;
+    if (tailInfo.model && (tailIsFresh || !lease.model)) lease.model = tailInfo.model;
     if (tailInfo.latestUserInput && !lease.lastUserInput) {
       lease.lastUserInput = tailInfo.latestUserInput;
       lease.isCompactCmd = lease.isCompactCmd || tailInfo.isCompactCmd;
@@ -2636,7 +3102,9 @@ export class WatchdogMonitor {
     } else if (
       tailInfo.inferredPhase === WATCHDOG_PHASES.LLM_INFLIGHT &&
       lease.phase === WATCHDOG_PHASES.TOOL_RUNNING &&
-      (lease.activeToolKind === "read" || lease.activeToolKind === "host")
+      (lease.activeToolKind === "read" ||
+        lease.activeToolKind === "host" ||
+        SLOW_GEN_TOOL_RE.test(extractBareToolName(lease.activeTool || "")))
     ) {
       // read_file/view_file and non-PostToolUse native host tools do not register PostToolUse; once
       // the transcript confirms all tool calls have results (GENERIC / TOOL_RESULT), return to LLM_INFLIGHT.
@@ -2649,7 +3117,11 @@ export class WatchdogMonitor {
     }
   }
 
-  _evaluateActiveLease(store, leaseInput, { nowWallMs, cfg, desktopNotifyEnabled, uiLang = "en", sleepJumpMs, _retryDepth = 0 }) {
+  _evaluateActiveLease(
+    store,
+    leaseInput,
+    { nowWallMs, cfg, desktopNotifyEnabled, uiLang = "en", sleepJumpMs, childHeartbeatTs = 0, _retryDepth = 0 }
+  ) {
     let lease = { ...leaseInput };
     if (!lease.isSubagent && this._isConversationSubagent(store, lease.conversationId, lease)) {
       lease.isSubagent = true;
@@ -2667,12 +3139,13 @@ export class WatchdogMonitor {
         st.sleepGraceMs = 0;
       }
       st.lastTranscriptGrowthTs = 0;
-      st.lastTailInfo = null;
-      st.lastTailFresh = false;
+      st.lastTailFreshForHeal = false;
       st.rescueBriefKey = "";
       st.rescueBrief = null;
       if (lease.hookEvent === "PreInvocation") {
         // Fresh PreInvocation stat baseline (handles /compact transcript shrinkage cleanly)
+        st.lastTailInfo = null;
+        st.lastTailFreshForEnrich = false;
         st.lastStatSize = lease.transcriptSize > 0 ? lease.transcriptSize : -1;
         st.lastStatMtimeMs = lease.transcriptSize > 0 ? lease.transcriptMtimeMs || 0 : 0;
       } else if (lease.transcriptSize > 0 && st.lastStatSize < 0) {
@@ -2727,12 +3200,22 @@ export class WatchdogMonitor {
       }
     }
 
-    const preActivityTs = Math.max(
+    const safeChildHb = Number.isFinite(childHeartbeatTs) && childHeartbeatTs > 0 ? Math.min(nowWallMs, childHeartbeatTs) : 0;
+    let preActivityTs = Math.max(
       lease.lastHeartbeatTs || lease.updatedTs || nowWallMs,
-      st.lastTranscriptGrowthTs || 0
+      st.lastTranscriptGrowthTs || 0,
+      safeChildHb
     );
     const preThresholds = resolveDynamicThresholds(lease, cfg);
-    const preSilentSec = Math.max(0, Math.round((nowWallMs - preActivityTs - (st.sleepGraceMs || 0)) / 1000));
+    let preSilentSec = Math.max(0, Math.round((nowWallMs - preActivityTs - (st.sleepGraceMs || 0)) / 1000));
+    let storeActivityTs = 0;
+    if (preSilentSec >= 30) {
+      storeActivityTs = this._queryRecentStoreActivityTs(store, lease.conversationId, nowWallMs);
+      if (storeActivityTs > preActivityTs) {
+        preActivityTs = storeActivityTs;
+        preSilentSec = Math.max(0, Math.round((nowWallMs - preActivityTs - (st.sleepGraceMs || 0)) / 1000));
+      }
+    }
 
     const transcriptChangedSinceInspect =
       statOk && (curSize !== st.lastInspectedSize || curMtimeMs !== st.lastInspectedMtimeMs);
@@ -2749,26 +3232,43 @@ export class WatchdogMonitor {
         st.lastTailInfo = tailInfo;
 
         const hasLeaseBaseline = lease.transcriptSize > 0 || lease.transcriptMtimeMs > 0;
-        let tailIsFresh = false;
+        const turnAnchorTs =
+          lease.startedTs > 0
+            ? Math.min(lease.startedTs, lease.updatedTs || lease.startedTs)
+            : lease.updatedTs || 0;
+        let tailIsFreshForHeal = false;
+        let tailIsFreshForEnrich = false;
         if (hasLeaseBaseline) {
           // Hard veto: if the file neither grew nor advanced mtime since the hook snapshotted it,
           // any terminal step at the tail belongs to a PRIOR turn (even if <2s earlier!).
           const fileGrew = lease.transcriptSize > 0 && curSize > lease.transcriptSize;
           const fileMtimeAdvanced = lease.transcriptMtimeMs > 0 && curMtimeMs > lease.transcriptMtimeMs + 50;
-          const stepNotOlder = tailInfo.lastStepTs === null || tailInfo.lastStepTs >= (lease.updatedTs || 0) - 2000;
-          tailIsFresh = Boolean((fileGrew || fileMtimeAdvanced) && stepNotOlder);
+          const stepNotOlderForHeal =
+            tailInfo.lastStepTs === null || tailInfo.lastStepTs >= (lease.updatedTs || 0) - 2000;
+          const stepNotOlderForEnrich =
+            tailInfo.lastStepTs === null || tailInfo.lastStepTs >= turnAnchorTs - 2000;
+          tailIsFreshForHeal = Boolean((fileGrew || fileMtimeAdvanced) && stepNotOlderForHeal);
+          tailIsFreshForEnrich = Boolean((fileGrew || fileMtimeAdvanced) && stepNotOlderForEnrich);
         } else {
           const mtimeAfterLease = curMtimeMs > (lease.updatedTs || 0) + 250;
           const stepStrictlyAfter =
             tailInfo.lastStepTs !== null && tailInfo.lastStepTs >= (lease.updatedTs || 0) + 250;
           const stepNotStale = tailInfo.lastStepTs === null || tailInfo.lastStepTs >= (lease.updatedTs || 0) - 1000;
-          tailIsFresh = Boolean((mtimeAfterLease || stepStrictlyAfter) && stepNotStale);
+          tailIsFreshForHeal = Boolean((mtimeAfterLease || stepStrictlyAfter) && stepNotStale);
+
+          const mtimeAfterTurnAnchor = curMtimeMs > turnAnchorTs + 250;
+          const stepAfterTurnAnchor =
+            tailInfo.lastStepTs !== null && tailInfo.lastStepTs >= turnAnchorTs + 250;
+          const stepNotStaleForTurn =
+            tailInfo.lastStepTs === null || tailInfo.lastStepTs >= turnAnchorTs - 2000;
+          tailIsFreshForEnrich = Boolean((mtimeAfterTurnAnchor || stepAfterTurnAnchor) && stepNotStaleForTurn);
         }
-        st.lastTailFresh = tailIsFresh;
+        st.lastTailFreshForHeal = tailIsFreshForHeal;
+        st.lastTailFreshForEnrich = tailIsFreshForEnrich;
 
-        this._applyTailEnrichment(lease, tailInfo, tailIsFresh);
+        this._applyTailEnrichment(lease, tailInfo, tailIsFreshForEnrich);
 
-        if (tailInfo.isTerminal && tailIsFresh) {
+        if (tailInfo.isTerminal && tailIsFreshForHeal) {
           const healedLease = {
             ...lease,
             phase: WATCHDOG_PHASES.IDLE,
@@ -2798,7 +3298,9 @@ export class WatchdogMonitor {
               nowWallMs,
               cfg,
               desktopNotifyEnabled,
+              uiLang,
               sleepJumpMs: 0,
+              childHeartbeatTs,
               _retryDepth: _retryDepth + 1
             });
           }
@@ -2818,20 +3320,23 @@ export class WatchdogMonitor {
         // Fail-open on unreadable transcript
       }
     } else if (st.lastTailInfo) {
-      this._applyTailEnrichment(lease, st.lastTailInfo, Boolean(st.lastTailFresh));
+      this._applyTailEnrichment(lease, st.lastTailInfo, Boolean(st.lastTailFreshForEnrich));
     }
 
     if (lease.phase === WATCHDOG_PHASES.LLM_INFLIGHT) {
       lease.subphase = deriveLlmSubphase({
         contextTokens: lease.contextTokens,
         mediaCount: lease.mediaCount,
-        isCompactCmd: lease.isCompactCmd
+        isCompactCmd: lease.isCompactCmd,
+        model: lease.model
       });
     }
     const thresholds = resolveDynamicThresholds(lease, cfg);
     const lastActivityTs = Math.max(
       lease.lastHeartbeatTs || lease.updatedTs || nowWallMs,
-      st.lastTranscriptGrowthTs || 0
+      st.lastTranscriptGrowthTs || 0,
+      safeChildHb,
+      storeActivityTs
     );
     const activeSilentMs = Math.max(0, nowWallMs - lastActivityTs - (st.sleepGraceMs || 0));
     const silentSec = Math.max(0, Math.round(activeSilentMs / 1000));
@@ -2884,6 +3389,7 @@ export class WatchdogMonitor {
           desktopNotifyEnabled,
           uiLang,
           sleepJumpMs: 0,
+          childHeartbeatTs,
           _retryDepth: _retryDepth + 1
         });
       }
@@ -3067,6 +3573,12 @@ export class WatchdogMonitor {
     const ttlDesktopNotifyEnabled = tickRes
       ? tickRes.ttlDesktopNotifyEnabled
       : this._resolveTtlDesktopNotifyEnabled(store, cfg);
+    const globalTtlKeepaliveMaxCount = tickRes
+      ? tickRes.globalTtlKeepaliveMaxCount
+      : this._resolveGlobalTtlKeepaliveMaxCount(store, cfg);
+    const fallbackTtlKeepaliveMaxCount = tickRes
+      ? tickRes.fallbackTtlKeepaliveMaxCount
+      : this._resolveFallbackTtlKeepaliveMaxCount(store, cfg);
     const ttlKeepaliveEnabled = tickRes
       ? tickRes.ttlKeepaliveEnabled
       : this._resolveTtlKeepaliveEnabled(store, cfg);
@@ -3170,6 +3682,13 @@ export class WatchdogMonitor {
     const convKeepaliveMaxCount = kaTargetConvId
       ? this._resolveTtlKeepaliveMaxCount(store, cfg, kaTargetConvId)
       : ttlKeepaliveMaxCount;
+    const isCustomOverride = Boolean(
+      !isKaTargetSubagent &&
+        kaTargetConvId &&
+        store &&
+        typeof store.hasCustomTtlKeepaliveOverride === "function" &&
+        store.hasCustomTtlKeepaliveOverride(kaTargetConvId)
+    );
 
     const alertingSessions = sessions.filter((s) => s.severity === "stalled" || s.severity === "suspect");
     const activeCount = sessions.filter((s) => s.phase !== WATCHDOG_PHASES.IDLE).length;
@@ -3182,12 +3701,17 @@ export class WatchdogMonitor {
       enabled,
       desktopNotifyEnabled,
       ttlDesktopNotifyEnabled,
+      globalTtlKeepaliveMaxCount,
+      fallbackTtlKeepaliveMaxCount,
       ttlKeepalive: {
         conversationId: kaTargetConvId,
         enabled: convKeepaliveEnabled,
         supported: typeof this.keepaliveSendFn === "function" && !isKaTargetSubagent,
         isSubagent: isKaTargetSubagent,
         maxCount: convKeepaliveMaxCount,
+        globalMaxCount: globalTtlKeepaliveMaxCount,
+        fallbackMaxCount: fallbackTtlKeepaliveMaxCount,
+        isCustomOverride,
         usedCount: kaState.usedCount,
         leadSec: ttlKeepaliveLeadSec,
         lastSentTs: kaState.lastSentTs || 0,
@@ -3205,9 +3729,11 @@ export class WatchdogMonitor {
         llmLowSec: cfg.watchdogLlmLowSec ?? 120,
         llmHighSec: cfg.watchdogLlmHighSec ?? 240,
         llmMultimodalSec: cfg.watchdogLlmMultimodalSec ?? 360,
+        llmReasoningSec: cfg.watchdogLlmReasoningSec ?? 600,
+        llmCompoundSec: cfg.watchdogLlmCompoundSec ?? 900,
         toolFastSec: cfg.watchdogToolFastSec ?? 90,
         toolCmdSec: cfg.watchdogToolCmdSec ?? 300,
-        subagentSec: cfg.watchdogSubagentSec ?? 600
+        subagentSec: cfg.watchdogSubagentSec ?? 1200
       },
       sleepGuard: {
         triggeredCount: this._sleepGuardCount,
