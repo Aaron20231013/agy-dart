@@ -8,8 +8,8 @@
     "name": "zou172866",
     "url": "https://github.com/zou172866"
   },
-  "homepage": "https://github.com/zou172866/antigravity-agy-dart",
-  "repository": "https://github.com/zou172866/antigravity-agy-dart",
+  "homepage": "https://github.com/zou172866/Antigravity-agy-dart",
+  "repository": "https://github.com/zou172866/Antigravity-agy-dart",
   "suggestedPrompts": [
     "Search symbols across the codebase, outline large files, and apply multi-file edits with inline verification",
     "Analyze a large build or server log in the sandbox and summarize only the root causes",

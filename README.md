@@ -73,13 +73,13 @@ Use **Node.js 22.16.0 or later in the 22.x line, or Node.js 24 or later**. The i
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/antigravity-agy-dart/v1.7.0/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.0/install.ps1 | iex
 ```
 
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/antigravity-agy-dart/v1.7.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.0/install.sh | sh
 ```
 
 ### Option 2: Let Antigravity install it
@@ -87,14 +87,14 @@ curl -fsSL https://raw.githubusercontent.com/zou172866/antigravity-agy-dart/v1.7
 Send this to Antigravity:
 
 ```text
-Clone tag v1.7.0 of https://github.com/zou172866/antigravity-agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
+Clone tag v1.7.0 of https://github.com/zou172866/Antigravity-agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
 ```
 
 ### Option 3: Clone & install with custom flags
 
 ```powershell
-git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/antigravity-agy-dart.git
-cd antigravity-agy-dart
+git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
+cd Antigravity-agy-dart
 
 # Windows PowerShell (optional -InstallRg auto-installs ripgrep)
 .\install.ps1 -InstallRg
@@ -217,8 +217,8 @@ Install for Antigravity by default. Select Claude Code or Codex explicitly with 
 For Claude Code and Codex, the installer keeps hashes and undo metadata in `~/.agy-dart/<host>-install.json` to restore the plugin's configuration changes. Reinstalling replaces an older full-config record. Uninstalling removes that host's record.
 
 ```sh
-git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/antigravity-agy-dart.git
-cd antigravity-agy-dart
+git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
+cd Antigravity-agy-dart
 node bin/agy-dart.mjs install
 node bin/agy-dart.mjs doctor
 ```

@@ -5,13 +5,13 @@
   "description": "All-in-one Antigravity plugin uniting agy-fast latency batching, transparent CLI output filtering, KV-cache diagnostics, SQLite FTS5 context-window protection, and a live Sidecar dashboard with Stall Watchdog.",
   "license": "MIT",
   "author": "zou172866 <https://github.com/zou172866>",
-  "homepage": "https://github.com/zou172866/antigravity-agy-dart#readme",
+  "homepage": "https://github.com/zou172866/Antigravity-agy-dart#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zou172866/antigravity-agy-dart.git"
+    "url": "git+https://github.com/zou172866/Antigravity-agy-dart.git"
   },
   "bugs": {
-    "url": "https://github.com/zou172866/antigravity-agy-dart/issues"
+    "url": "https://github.com/zou172866/Antigravity-agy-dart/issues"
   },
   "engines": {
     "node": "^22.16.0 || >=24.0.0"

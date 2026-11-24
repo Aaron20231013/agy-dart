@@ -927,9 +927,9 @@ test("v1.4.1-5: Non-interactive install/doctor tail hints, <=1.5s gh resilience,
       const tools = createTools({ store: toolStore });
       const mcpDoctor = JSON.stringify(await tools.ctx_doctor({ cwd: ROOT }));
       const mcpStats = JSON.stringify(await tools.ctx_stats({ sessionId: "all" }));
-      assert.equal(mcpDoctor.includes("zou172866/antigravity-agy-dart"), false);
+      assert.equal(mcpDoctor.includes("zou172866/Antigravity-agy-dart"), false);
       assert.equal(mcpDoctor.includes("gh api"), false);
-      assert.equal(mcpStats.includes("zou172866/antigravity-agy-dart"), false);
+      assert.equal(mcpStats.includes("zou172866/Antigravity-agy-dart"), false);
       assert.equal(mcpStats.includes("gh api"), false);
     } finally {
       toolStore.close();
