@@ -88,6 +88,14 @@ Project-specific CLI output filters live in `<workspace>/.agy-dart/filters.json`
 - **`stablePrefixOnly` vs keepalive**:
   - Enable `stablePrefixOnly: true` in `~/.agy-dart/config.json` to strip volatile Git status lines from `SessionStart` for higher cross-session prefix stability.
   - Automatic cache keepalive (`ttlKeepalive`) is **off by default** and opt-in per window in the **agy-dart Context** panel (each keepalive consumes model input; use only when intentionally preserving a warm large prompt across short idle gaps).
+- **Unattributed busts (`prefix_drift`) — reading `zero-read` / `partial hit` / `unreported` and `priorContextMatch`**:
+  - `agy-dart` stabilizes controllable client-side prefixes and reduces duplicate reads, while actual cache hits still depend on how the host assembles requests and on backend caching behavior.
+  - `unreported` means no valid cache-read count was present in the transcript step (do not treat a fallback `0` as a confirmed zero hit). `zero-read` means an explicit `0` cached tokens without an identified model switch, compaction, TTL expiry, media, or recognized system injection. `partial hit` means a positive cached token count that fell below the 70% retention threshold.
+  - On `gemini-4-512k`, an optional `priorContextMatch` observation marks a clean zero-read bust whose subsequent warm turn read back a cache count matching the preceding reference turn's context length (`P` or `P + 1`). Replica routing, eviction, or a transient prefix change that reverted on the next turn can all produce this reading; treat it as a diagnostic signal rather than proof of backend internals.
+  - If you suspect a dynamic proxy group (`url-test`, `load-balance`, or fallback switching) is disrupting cache affinity, pin a single exit node as a controlled A/B troubleshooting experiment and compare hit rates across similar turns.
+- **Full-file reviews of huge files without inflating main context**:
+  - Keep targeted ranged `read_file` slices (`<= 45 KiB / 800 lines`) for localized edits, and use `ctx_index` + `ctx_search` to locate relevant passages in long documents or logs.
+  - When you genuinely need full-file coverage of a multi-thousand-line file (e.g., auditing a large prototype or monolith), prefer delegating to a read-only subagent that reads contiguous line ranges end-to-end and returns structured evidence (line citations and findings) to the main conversation, instead of issuing dozens of parallel `read_file` slices directly into main context. Keeping main context leaner lowers the re-prefill token loss whenever a full-zero cache miss occurs (for example, a full-zero miss on a 300k reusable prefix loses 3x as many tokens as on a 100k prefix).
 
 ---
 

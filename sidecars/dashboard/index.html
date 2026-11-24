@@ -2660,6 +2660,13 @@
         topGrowth: 'Top growth:',
         turnBarTip: 'Turn #{turn}: {pct}% hit | {ctx}k tok ({delta}){tool}{bust}',
         turnBustTag: ' | BUST: {cause}',
+        turnBustCauseWithDetail: '{cause} ({detail})',
+        turnBustDetailSep: '; ',
+        turnRefNum: 'T{turn}',
+        stepRefNum: 'step {step}',
+        priorContextMatchNote: 'subsequent cache read near {ref}',
+        priorContextMatchChip: 'Prior-ctx read',
+        priorContextMatchTipItem: '{bust}: subsequent cache read near {ref} (recovered at {rec})',
         turnDeltaTip: 'Turn #{turn}: +{delta} tokens',
         bustsLabel: 'Busts:',
         bustTtl: 'TTL',
@@ -2667,7 +2674,13 @@
         bustModel: 'Model',
         bustSysMsg: 'SysMsg',
         bustMedia: 'Media',
-        bustDrift: 'Drift',
+        bustDrift: 'Unattributed',
+        bustReadZero: 'Zero-read',
+        bustReadPartial: 'Partial hit',
+        bustReadUnreported: 'Unreported',
+        bustDriftBreakdown: 'Zero-read {zero} / Partial hit {partial} / Unreported {unreported}',
+        bustDriftInline: ' ({detail})',
+        bustDriftTip: 'Unattributed: {detail}',
         bustDupReads: 'DupReads:',
         bustWrites: 'Writes:',
         bustThink: 'Think:',
@@ -2994,6 +3007,13 @@
         topGrowth: '增长 Top：',
         turnBarTip: '第 {turn} 轮：命中 {pct}% | 上下文 {ctx}k tok（{delta}）{tool}{bust}',
         turnBustTag: ' | 失效：{cause}',
+        turnBustCauseWithDetail: '{cause}（{detail}）',
+        turnBustDetailSep: '；',
+        turnRefNum: 'T{turn}',
+        stepRefNum: 'step {step}',
+        priorContextMatchNote: '后续缓存读取量接近 {ref}',
+        priorContextMatchChip: '前序回读观察',
+        priorContextMatchTipItem: '{bust}：后续缓存读取量接近 {ref}（恢复于 {rec}）',
         turnDeltaTip: '第 {turn} 轮：+{delta} tokens',
         bustsLabel: '失效归因：',
         bustTtl: 'TTL过期',
@@ -3001,7 +3021,13 @@
         bustModel: '切模型',
         bustSysMsg: '系统注入',
         bustMedia: '多模态',
-        bustDrift: '前缀漂移',
+        bustDrift: '原因未定',
+        bustReadZero: '全零',
+        bustReadPartial: '部分命中',
+        bustReadUnreported: '未上报',
+        bustDriftBreakdown: '全零 {zero} / 部分命中 {partial} / 未上报 {unreported}',
+        bustDriftInline: '（{detail}）',
+        bustDriftTip: '原因未定：{detail}',
         bustDupReads: '重复读：',
         bustWrites: '缓存写入：',
         bustThink: '思考：',
@@ -3146,6 +3172,12 @@
       system_injection: 'bustSysMsg',
       multimodal_media: 'bustMedia',
       prefix_drift: 'bustDrift'
+    };
+
+    const BUST_READ_STATE_I18N_KEYS = {
+      zero: 'bustReadZero',
+      partial: 'bustReadPartial',
+      unreported: 'bustReadUnreported'
     };
 
     function detectInitialLang() {
@@ -3429,9 +3461,69 @@
     function fmtBustCause(cause) {
       const raw = String(cause || '').trim();
       if (!raw) return '';
-      if (currentLang !== 'zh') return raw;
-      const k = BUST_CAUSE_I18N_KEYS[raw];
+      const k = Object.prototype.hasOwnProperty.call(BUST_CAUSE_I18N_KEYS, raw) ? BUST_CAUSE_I18N_KEYS[raw] : null;
       return k ? t(k) : raw;
+    }
+
+    function fmtBustReadState(state) {
+      const raw = String(state || '').trim();
+      if (!raw) return '';
+      const k = Object.prototype.hasOwnProperty.call(BUST_READ_STATE_I18N_KEYS, raw) ? BUST_READ_STATE_I18N_KEYS[raw] : null;
+      return k ? t(k) : '';
+    }
+
+    function isNonNegFiniteCount(val) {
+      return typeof val === 'number' && Number.isFinite(val) && val >= 0;
+    }
+
+    function hasValidDriftBreakdown(db, expectedTotal = null) {
+      if (
+        !db ||
+        typeof db !== 'object' ||
+        !isNonNegFiniteCount(db.zeroRead) ||
+        !isNonNegFiniteCount(db.partialRead) ||
+        !isNonNegFiniteCount(db.unreportedRead)
+      ) {
+        return false;
+      }
+      if (expectedTotal !== null) {
+        return db.zeroRead + db.partialRead + db.unreportedRead === expectedTotal;
+      }
+      return true;
+    }
+
+    function hasValidPriorContextMatch(pm) {
+      return Boolean(
+        pm &&
+        typeof pm === 'object' &&
+        isNonNegFiniteCount(pm.referenceStepIndex) &&
+        isNonNegFiniteCount(pm.recoveryStepIndex)
+      );
+    }
+
+    function fmtTurnBustDetail(turnItem, turns, turnIdx, isMultiSession = false) {
+      if (!turnItem || !turnItem.isBust) return '';
+      const causeLabel = fmtBustCause(turnItem.bustCause);
+      const parts = [];
+      if (turnItem.bustCause === 'prefix_drift') {
+        const rsLabel = fmtBustReadState(turnItem.bustReadState);
+        if (rsLabel) parts.push(rsLabel);
+      }
+      const pm = turnItem.priorContextMatch;
+      if (hasValidPriorContextMatch(pm)) {
+        const refStep = pm.referenceStepIndex;
+        const prevTurn = !isMultiSession && turnIdx > 0 ? turns[turnIdx - 1] : null;
+        const refLabel =
+          prevTurn && isNonNegFiniteCount(prevTurn.stepIndex) && prevTurn.stepIndex === refStep && isNonNegFiniteCount(prevTurn.turn)
+            ? t('turnRefNum', { turn: prevTurn.turn })
+            : t('stepRefNum', { step: refStep });
+        parts.push(t('priorContextMatchNote', { ref: refLabel }));
+      }
+      const causeWithDetail =
+        parts.length > 0
+          ? t('turnBustCauseWithDetail', { cause: causeLabel, detail: parts.join(t('turnBustDetailSep')) })
+          : causeLabel;
+      return t('turnBustTag', { cause: causeWithDetail });
     }
 
     function updateLangButtons() {
@@ -5581,12 +5673,13 @@
         if (loopRowEl) loopRowEl.classList.add('hidden');
       }
 
+      const isMultiSessionKv = Number(kv.sessions) > 1;
       const turns = Array.isArray(kv.recentTurns) ? kv.recentTurns : [];
       if (turnsRowEl && turnsBarsEl) {
         if (turns.length > 0) {
           turnsRowEl.classList.remove('hidden');
           if (turnsLabelEl) turnsLabelEl.innerText = t('recentTurnsLabel', { n: turns.length });
-          turnsBarsEl.innerHTML = turns.map((turnItem) => {
+          turnsBarsEl.innerHTML = turns.map((turnItem, turnIdx) => {
             const pctVal = Math.max(0, Math.min(100, Math.round(Number(turnItem.hitRate || 0) * 100)));
             const hPct = Math.max(10, pctVal);
             const cls = turnItem.isBust
@@ -5604,7 +5697,7 @@
                 ctx: Math.round((turnItem.ctxTokens || 0) / 1000),
                 delta: deltaStr,
                 tool: turnItem.triggerTool ? ` | ${turnItem.triggerTool}` : '',
-                bust: turnItem.isBust ? t('turnBustTag', { cause: fmtBustCause(turnItem.bustCause) }) : ''
+                bust: fmtTurnBustDetail(turnItem, turns, turnIdx, isMultiSessionKv)
               })
             );
             return `<div class="turn-bar-col" title="${tip}"><div class="turn-bar ${cls}" style="height:${hPct}%"></div></div>`;
@@ -5635,6 +5728,72 @@
       if (causesEl) {
         const c = kv.bustsByCause || {};
         const dupCnt = Number(kv.duplicateReadCount) || 0;
+        const driftCnt = Number(c.prefix_drift) || 0;
+        const db = kv.driftBreakdown;
+        let driftSpanHtml = `<span>${escapeHtml(t('bustDrift'))} <strong>${driftCnt}</strong></span>`;
+        if (hasValidDriftBreakdown(db, driftCnt)) {
+          const detailText = t('bustDriftBreakdown', {
+            zero: Number(db.zeroRead),
+            partial: Number(db.partialRead),
+            unreported: Number(db.unreportedRead)
+          });
+          const driftTip = escapeHtml(t('bustDriftTip', { detail: detailText }));
+          const inlineDetail = driftCnt > 0 ? `<span class="muted-note">${escapeHtml(t('bustDriftInline', { detail: detailText }))}</span>` : '';
+          driftSpanHtml = `<span title="${driftTip}">${escapeHtml(t('bustDrift'))} <strong>${driftCnt}</strong>${inlineDetail}</span>`;
+        }
+        const turnNumByStep = new Map();
+        if (!isMultiSessionKv) {
+          for (const item of turns) {
+            if (item && isNonNegFiniteCount(item.stepIndex) && isNonNegFiniteCount(item.turn)) {
+              if (turnNumByStep.has(item.stepIndex)) {
+                turnNumByStep.set(item.stepIndex, null);
+              } else {
+                turnNumByStep.set(item.stepIndex, item.turn);
+              }
+            }
+          }
+        }
+        const fmtStepOrTurn = (stepVal) => {
+          const mapped = turnNumByStep.get(stepVal);
+          if (isNonNegFiniteCount(mapped)) return t('turnRefNum', { turn: mapped });
+          return t('stepRefNum', { step: stepVal });
+        };
+        const priorKeyOf = (b) =>
+          `${b.at ?? ''}|${isNonNegFiniteCount(b.stepIndex) ? b.stepIndex : '?'}|${b.priorContextMatch.referenceStepIndex}|${b.priorContextMatch.recoveryStepIndex}`;
+        const bustPriors = Array.isArray(kv.recentBusts)
+          ? kv.recentBusts.filter((b) => b && hasValidPriorContextMatch(b.priorContextMatch))
+          : [];
+        const bustPriorCounts = new Map();
+        for (const b of bustPriors) {
+          const k = priorKeyOf(b);
+          bustPriorCounts.set(k, (bustPriorCounts.get(k) || 0) + 1);
+        }
+        const extraTurnPriors = [];
+        for (const item of turns) {
+          if (!item || !hasValidPriorContextMatch(item.priorContextMatch)) continue;
+          const k = priorKeyOf(item);
+          const rem = bustPriorCounts.get(k) || 0;
+          if (rem > 0) {
+            bustPriorCounts.set(k, rem - 1);
+          } else {
+            extraTurnPriors.push(item);
+          }
+        }
+        const priorMatches = [...extraTurnPriors, ...bustPriors];
+        const priorChipHtml =
+          priorMatches.length > 0
+            ? `<span title="${escapeHtml(
+                priorMatches
+                  .map((b) =>
+                    t('priorContextMatchTipItem', {
+                      bust: isNonNegFiniteCount(b.stepIndex) ? fmtStepOrTurn(b.stepIndex) : t('stepRefNum', { step: '?' }),
+                      ref: fmtStepOrTurn(b.priorContextMatch.referenceStepIndex),
+                      rec: fmtStepOrTurn(b.priorContextMatch.recoveryStepIndex)
+                    })
+                  )
+                  .join(t('turnBustDetailSep'))
+              )}">${escapeHtml(t('priorContextMatchChip'))} <strong>${priorMatches.length}</strong></span>`
+            : '';
         causesEl.innerHTML = [
           `<span class="muted-note">${escapeHtml(t('bustsLabel'))}</span>`,
           `<span>${escapeHtml(t('bustTtl'))} <strong>${Number(c.ttl_idle_expiry) || 0}</strong></span>`,
@@ -5642,7 +5801,8 @@
           `<span>${escapeHtml(t('bustModel'))} <strong>${Number(c.model_switch) || 0}</strong></span>`,
           `<span>${escapeHtml(t('bustSysMsg'))} <strong>${Number(c.system_injection) || 0}</strong></span>`,
           `<span>${escapeHtml(t('bustMedia'))} <strong>${Number(c.multimodal_media) || 0}</strong></span>`,
-          `<span>${escapeHtml(t('bustDrift'))} <strong>${Number(c.prefix_drift) || 0}</strong></span>`,
+          driftSpanHtml,
+          priorChipHtml,
           dupCnt > 0 ? `<span class="val-warn">${escapeHtml(t('bustDupReads'))} <strong>${dupCnt}</strong></span>` : '',
           kv.cacheCreationTokensTotal ? `<span title="${escapeHtml(t('bustWritesTip', { mult: writeMult.toFixed(2) }))}">${escapeHtml(t('bustWrites'))} <strong>${Math.round(kv.cacheCreationTokensTotal / 1000)}k</strong></span>` : '',
           kv.thinkingTokensTotal ? `<span title="${escapeHtml(t('bustThinkTip'))}">${escapeHtml(t('bustThink'))} <strong>${Math.round(kv.thinkingTokensTotal / 1000)}k</strong></span>` : ''

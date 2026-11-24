@@ -71,6 +71,10 @@ const TTL_SAMPLE_MAX_SEC = 14400;
 const TTL_PURE_COLD_MAX_CACHE_RATIO = 0.25;
 const TTL_IMPLICIT_MAX_CAP_SEC = 3600;
 const TTL_KEEPALIVE_STEP_RE = /\[agy-dart TTL(?:保活| Keepalive)(?:\s|\])/i;
+const PRIOR_CONTEXT_MATCH_ENABLED_PROFILES = new Set(["gemini-4-512k"]);
+const PRIOR_CONTEXT_MATCH_TAIL_SLACK = 2049;
+const TAIL_TRUNCATED_STEP_ARRAYS = new WeakSet();
+const SUBAGENT_STEP_TYPE_RE = /^SUBAGENT(?:_|$)/i;
 
 
 function toNonNegNum(val) {
@@ -141,6 +145,7 @@ export function extractStepTokenUsage(step) {
     return {
       inputTokens: 0,
       cacheReadTokens: 0,
+      cacheReadReported: false,
       cacheCreationTokens: 0,
       cacheCreation1hTokens: 0,
       outputTokens: 0,
@@ -175,18 +180,19 @@ export function extractStepTokenUsage(step) {
       toNonNegNum(usage.prompt_cache_hit_tokens) !== null
     );
 
-  const cacheReadTokens =
-    firstPosOrNonNeg(
-      step.cache_read_tokens,
-      step.cache_read_input_tokens,
-      usage.cache_read_tokens,
-      usage.cache_read_input_tokens,
-      usage.cachedContentTokenCount,
-      usage.cached_content_token_count,
-      usage.prompt_tokens_details?.cached_tokens,
-      usage.input_tokens_details?.cached_tokens,
-      usage.prompt_cache_hit_tokens
-    ) ?? 0;
+  const rawCacheRead = firstPosOrNonNeg(
+    step.cache_read_tokens,
+    step.cache_read_input_tokens,
+    usage.cache_read_tokens,
+    usage.cache_read_input_tokens,
+    usage.cachedContentTokenCount,
+    usage.cached_content_token_count,
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.input_tokens_details?.cached_tokens,
+    usage.prompt_cache_hit_tokens
+  );
+  const cacheReadReported = rawCacheRead !== null;
+  const cacheReadTokens = rawCacheRead === null || rawCacheRead === 0 ? 0 : rawCacheRead;
 
   const cacheCreation1hTokens =
     firstPosOrNonNeg(
@@ -252,6 +258,7 @@ export function extractStepTokenUsage(step) {
   return {
     inputTokens,
     cacheReadTokens,
+    cacheReadReported,
     cacheCreationTokens,
     cacheCreation1hTokens,
     outputTokens,
@@ -698,6 +705,9 @@ export function readTranscriptTail(filePath, maxBytes = 131072, options = {}) {
           ? totalUsageSteps >= 1
           : primaryCtxSteps >= minUsageSteps || (primaryCtxSteps === 0 && totalUsageSteps >= minUsageSteps);
       if (hasEnoughUsage || offset === 0 || windowBytes >= HARD_CAP_BYTES) {
+        if (offset > 0) {
+          TAIL_TRUNCATED_STEP_ARRAYS.add(steps);
+        }
         return steps;
       }
       windowBytes = Math.min(stat.size, Math.min(HARD_CAP_BYTES, windowBytes * 4));
@@ -1207,6 +1217,15 @@ export function createEmptySubagentBreakdown() {
   return finalizeSubagentBreakdown(createRawSubagentCounters(), 0);
 }
 
+/** Return a clean zero-initialized driftBreakdown structure for prefix_drift read states */
+export function createEmptyDriftBreakdown() {
+  return {
+    zeroRead: 0,
+    partialRead: 0,
+    unreportedRead: 0
+  };
+}
+
 const MILD_PRUNE_MIN_PREV_TOKENS = 12000;
 const MILD_PRUNE_KEEP_RATIO = 0.85;
 const MILD_PRUNE_MIN_DROP_TOKENS = 8000;
@@ -1452,8 +1471,10 @@ export function analyzeTranscriptCache(steps, options = {}) {
     multimodal_media: 0,
     prefix_drift: 0
   };
+  const driftBreakdown = createEmptyDriftBreakdown();
   const recentBusts = [];
   const allTurns = [];
+  const turnMeta = [];
   const turnBillingItems = [];
   const deltaAttributions = [];
 
@@ -1497,6 +1518,9 @@ export function analyzeTranscriptCache(steps, options = {}) {
   let prevPlannerMs = null;
   let mediaLoadedSincePrev = false;
   let systemMsgSincePrev = false;
+  let subagentSincePrevUsage = false;
+  let missingUsagePlannerSincePrev = false;
+  let compactionSincePrevUsage = false;
   let hasSeenPlanner = false;
   let inToolLoop = false;
   let prevTurnTools = [];
@@ -1534,6 +1558,10 @@ export function analyzeTranscriptCache(steps, options = {}) {
     }
 
     const stepIsSubagent = isSubagentStep(step);
+    const stepIsSubagentType = SUBAGENT_STEP_TYPE_RE.test(String(step.type || ""));
+    if ((stepIsSubagent || stepIsSubagentType) && turnMeta.length > 0 && step.type !== "PLANNER_RESPONSE") {
+      subagentSincePrevUsage = true;
+    }
 
     let stepMediaBytes = 0;
     let stepMediaEstTokens = 0;
@@ -1583,6 +1611,9 @@ export function analyzeTranscriptCache(steps, options = {}) {
       if (!stepIsSubagent) {
         inToolLoop = false;
       }
+      if (turnMeta.length > 0 && isSlashCompactText(userText)) {
+        compactionSincePrevUsage = true;
+      }
       if ((!stepIsSubagent || !seenPrimaryCompactTurn) && isSlashCompactText(userText)) {
         const refPrevUserCompact = stepIsSubagent ? prevCompactSubCtx : prevCompactPrimaryCtx;
         seenReadSignatures.clear();
@@ -1602,6 +1633,9 @@ export function analyzeTranscriptCache(steps, options = {}) {
     }
 
     const isExplicitCompactStep = detectExplicitCompactionStep(step);
+    if (turnMeta.length > 0 && isExplicitCompactStep) {
+      compactionSincePrevUsage = true;
+    }
     if (isExplicitCompactStep && (!stepIsSubagent || !seenPrimaryCompactTurn)) {
       const refPrevCompactCtx = stepIsSubagent ? prevCompactSubCtx : prevCompactPrimaryCtx;
       const explicitUsage = step.type === "PLANNER_RESPONSE" ? extractStepTokenUsage(step) : null;
@@ -2052,6 +2086,9 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
       let turnWasBust = false;
       let turnBustCause = null;
+      let turnBustReadState = null;
+      let turnBustEntry = null;
+      let turnWasWarmHit = false;
       let turnWastedTokens = 0;
       let turnWastedRewritten = 0;
 
@@ -2067,6 +2104,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
         const sameModel = !prevModel || !model || prevModel === model;
 
         if (!isBust) {
+          if (safeCache > 0) turnWasWarmHit = true;
           if (retainedRatio >= BUST_DROP_RATIO && safeCache > 0 && gapSec !== null && sameModel) {
             if (maxWarmHitGapSec === null || gapSec > maxWarmHitGapSec) {
               maxWarmHitGapSec = gapSec;
@@ -2135,6 +2173,18 @@ export function analyzeTranscriptCache(steps, options = {}) {
           }
 
           turnBustCause = cause;
+          if (cause === "prefix_drift") {
+            if (!turnUsage.cacheReadReported) {
+              turnBustReadState = "unreported";
+              driftBreakdown.unreportedRead += 1;
+            } else if (safeCache === 0) {
+              turnBustReadState = "zero";
+              driftBreakdown.zeroRead += 1;
+            } else {
+              turnBustReadState = "partial";
+              driftBreakdown.partialRead += 1;
+            }
+          }
           const expectedReusable = Math.min(prevCtxTokens, ctxTok);
           const wastedTokens = Math.max(0, expectedReusable - safeCache);
           turnWastedTokens = wastedTokens;
@@ -2143,18 +2193,20 @@ export function analyzeTranscriptCache(steps, options = {}) {
           wastedTokensTotal += wastedTokens;
           wastedRewrittenTokens += turnWastedRewritten;
 
-          recentBusts.push({
+          turnBustEntry = {
             stepIndex: step.step_index ?? i,
             hasExplicitStepIndex: step.step_index !== undefined && step.step_index !== null,
             at: step.created_at || null,
             cause,
+            bustReadState: turnBustReadState,
             prevCtxTokens,
             currCtxTokens: ctxTok,
             cacheReadTokens: safeCache,
             wastedTokens,
             gapSec,
             model: model || prevModel || null
-          });
+          };
+          recentBusts.push(turnBustEntry);
         }
       }
 
@@ -2181,7 +2233,31 @@ export function analyzeTranscriptCache(steps, options = {}) {
         deltaTokens,
         isBust: turnWasBust,
         bustCause: turnBustCause,
+        bustReadState: turnBustReadState,
         triggerTool: dominantTrigger ? dominantTrigger.label : null
+      });
+
+      const hadCompactionOrShrink =
+        compactionSincePrevUsage ||
+        turnShrink.shrunk ||
+        (hasSeenPlanner && prevCtxTokens > 0 && ctxTok < prevCtxTokens * BUST_DROP_RATIO);
+      turnMeta.push({
+        turnIndex: allTurns.length - 1,
+        stepIndex: step.step_index ?? i,
+        rawModel: model.trim(),
+        ctxTokens: ctxTok,
+        cacheReadTokens: safeCache,
+        cacheReadReported: turnUsage.cacheReadReported,
+        isBust: turnWasBust,
+        bustCause: turnBustCause,
+        wasWarmHit: turnWasWarmHit,
+        isSubagent: stepIsSubagent,
+        subagentSincePrev: subagentSincePrevUsage,
+        missingUsagePlannerSincePrev,
+        compactionInSegment: hadCompactionOrShrink,
+        mediaInSegment: mediaLoadedSincePrev,
+        systemMsgInSegment: systemMsgSincePrev,
+        bustEntry: turnBustEntry
       });
 
       if (turnShrink.shrunk) {
@@ -2216,12 +2292,98 @@ export function analyzeTranscriptCache(steps, options = {}) {
       hasSeenPlanner = true;
       mediaLoadedSincePrev = false;
       systemMsgSincePrev = false;
-    } else if (tMs !== null) {
-      lastPlannerMs = tMs;
-      if (!hasSeenPlanner) hasSeenPlanner = true;
+      subagentSincePrevUsage = false;
+      missingUsagePlannerSincePrev = false;
+      compactionSincePrevUsage = false;
+    } else {
+      if (turnMeta.length > 0) {
+        missingUsagePlannerSincePrev = true;
+        if (stepIsSubagent) subagentSincePrevUsage = true;
+      }
+      if (tMs !== null) {
+        lastPlannerMs = tMs;
+        if (!hasSeenPlanner) hasSeenPlanner = true;
+      }
     }
 
     prevTurnTools = currTurnTools;
+  }
+
+  // Optional cross-turn observation (display-only; never alters primary causes, waste, or TTL calibration).
+  // Enabled only on validated gemini-4-512k profile in v1; basic read-state breakdown applies to all backends.
+  const isTailTruncated =
+    Boolean(options.isTailSlice) || (Array.isArray(steps) && TAIL_TRUNCATED_STEP_ARRAYS.has(steps));
+  const isEligiblePriorMatchCold = (m) =>
+    Boolean(
+      m &&
+      !m.isSubagent &&
+      m.isBust &&
+      m.cacheReadReported &&
+      m.cacheReadTokens === 0 &&
+      (m.bustCause === "prefix_drift" || m.bustCause === "ttl_idle_expiry")
+    );
+  const isPriorMatchSegmentClean = (m) =>
+    Boolean(
+      m &&
+      !m.isSubagent &&
+      !m.subagentSincePrev &&
+      !m.missingUsagePlannerSincePrev &&
+      !m.compactionInSegment &&
+      !m.mediaInSegment &&
+      !m.systemMsgInSegment
+    );
+  for (let idx = 0; idx < turnMeta.length; ) {
+    if (!isEligiblePriorMatchCold(turnMeta[idx])) {
+      idx += 1;
+      continue;
+    }
+    let runEnd = idx;
+    while (runEnd + 1 < turnMeta.length && isEligiblePriorMatchCold(turnMeta[runEnd + 1])) {
+      runEnd += 1;
+    }
+    const runLen = runEnd - idx + 1;
+    const refIdx = idx - 1;
+    const recIdx = runEnd + 1;
+    if (runLen >= 1 && runLen <= 2 && refIdx >= 0 && recIdx < turnMeta.length) {
+      const ref = turnMeta[refIdx];
+      const colds = runLen === 1 ? [turnMeta[idx]] : [turnMeta[idx], turnMeta[idx + 1]];
+      const rec = turnMeta[recIdx];
+      const refModel = ref.rawModel;
+      const isEnabledProfile =
+        Boolean(refModel) && PRIOR_CONTEXT_MATCH_ENABLED_PROFILES.has(resolveModelProfile(refModel).id);
+      const refIsValid =
+        !ref.isSubagent &&
+        !(ref.isBust && !ref.cacheReadReported) &&
+        !(isTailTruncated && refIdx === 0 && ref.cacheReadTokens === 0);
+      if (
+        isEnabledProfile &&
+        refIsValid &&
+        colds.every((c) => isPriorMatchSegmentClean(c) && c.rawModel === refModel) &&
+        isPriorMatchSegmentClean(rec) &&
+        rec.rawModel === refModel &&
+        rec.cacheReadReported &&
+        rec.cacheReadTokens > 0 &&
+        rec.wasWarmHit
+      ) {
+        const P = ref.ctxTokens;
+        const R = rec.cacheReadTokens;
+        if (
+          (R === P || R === P + 1) &&
+          colds.every((c) => R < c.ctxTokens - PRIOR_CONTEXT_MATCH_TAIL_SLACK)
+        ) {
+          const match = {
+            referenceStepIndex: ref.stepIndex,
+            recoveryStepIndex: rec.stepIndex
+          };
+          const firstCold = turnMeta[idx];
+          allTurns[firstCold.turnIndex].priorContextMatch = match;
+          if (firstCold.bustEntry) {
+            firstCold.bustEntry.priorContextMatch = { ...match };
+          }
+        }
+      }
+    }
+    idx = runEnd + 1;
   }
 
   // Resolve model-aware profile, per-conversation maxTokenLimit, empirical TTL, and API cost model
@@ -2503,6 +2665,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
     estimatedWastedUsd,
     bustCount,
     bustsByCause,
+    driftBreakdown,
     wastedTokensTotal,
     totalMediaCount,
     multimodalHighCtxTurns,
@@ -2527,6 +2690,7 @@ export function analyzeMultipleSessionsCache(sessions, options = {}) {
     multimodal_media: 0,
     prefix_drift: 0
   };
+  const driftBreakdown = createEmptyDriftBreakdown();
   let sessionCount = 0;
   let turnsWithUsage = 0;
   let warmTurns = 0;
@@ -2634,6 +2798,11 @@ export function analyzeMultipleSessionsCache(sessions, options = {}) {
     for (const k of Object.keys(bustsByCause)) {
       bustsByCause[k] += res.bustsByCause[k] || 0;
     }
+    if (res.driftBreakdown) {
+      driftBreakdown.zeroRead += res.driftBreakdown.zeroRead || 0;
+      driftBreakdown.partialRead += res.driftBreakdown.partialRead || 0;
+      driftBreakdown.unreportedRead += res.driftBreakdown.unreportedRead || 0;
+    }
     for (const b of res.recentBusts) {
       allRecentBusts.push({ item: b, ts: parseTimeMs(b?.at), ord: allRecentBusts.length });
     }
@@ -2713,6 +2882,7 @@ export function analyzeMultipleSessionsCache(sessions, options = {}) {
     peakContextTokens,
     bustCount,
     bustsByCause,
+    driftBreakdown,
     wastedTokensTotal,
     multimodalHighCtxTurns,
     duplicateReadCount,
@@ -2964,6 +3134,20 @@ export function formatCacheDiagMarkdown(diag) {
     diag.estimatedWastedUsd > 0
       ? `${(diag.wastedTokensTotal || 0).toLocaleString("en-US")} (~${formatUsdReport(diag.estimatedWastedUsd)})`
       : `${(diag.wastedTokensTotal || 0).toLocaleString("en-US")}`;
+  const driftCount = c.prefix_drift || 0;
+  const db = diag.driftBreakdown && typeof diag.driftBreakdown === "object" ? diag.driftBreakdown : null;
+  const isNonNegFinite = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+  const hasDriftBreakdown = Boolean(
+    db &&
+    isNonNegFinite(db.zeroRead) &&
+    isNonNegFinite(db.partialRead) &&
+    isNonNegFinite(db.unreportedRead) &&
+    db.zeroRead + db.partialRead + db.unreportedRead === driftCount
+  );
+  const driftDetailVal =
+    driftCount > 0 && hasDriftBreakdown
+      ? `${driftCount} (zero-read: ${db.zeroRead}, partial hit: ${db.partialRead}, unreported: ${db.unreportedRead})`
+      : `${driftCount}`;
   lines.push(
     `| Total cache busts detected | ${diag.bustCount} |`,
     `| Wasted re-prefill tokens | ${wastedTokensStr} |`,
@@ -2972,9 +3156,45 @@ export function formatCacheDiagMarkdown(diag) {
     `| Bust cause: Model switch | ${c.model_switch || 0} |`,
     `| Bust cause: System injection | ${c.system_injection || 0} |`,
     `| Bust cause: Multimodal media | ${c.multimodal_media || 0} |`,
-    `| Bust cause: Prefix drift / eviction | ${c.prefix_drift || 0} |`,
+    `| Bust cause: Unattributed | ${driftDetailVal} |`,
     `| Duplicate identical read_file calls | ${diag.duplicateReadCount || 0} |`
   );
+  const isValidPriorMatchItem = (b) =>
+    Boolean(
+      b?.priorContextMatch &&
+      typeof b.priorContextMatch === "object" &&
+      isNonNegFinite(b.priorContextMatch.referenceStepIndex) &&
+      isNonNegFinite(b.priorContextMatch.recoveryStepIndex)
+    );
+  const priorKeyOf = (b) =>
+    `${b.at ?? ""}|${isNonNegFinite(b.stepIndex) ? b.stepIndex : "?"}|${b.priorContextMatch.referenceStepIndex}|${b.priorContextMatch.recoveryStepIndex}`;
+  const bustPriors = Array.isArray(diag.recentBusts) ? diag.recentBusts.filter(isValidPriorMatchItem) : [];
+  const bustPriorCounts = new Map();
+  for (const b of bustPriors) {
+    const k = priorKeyOf(b);
+    bustPriorCounts.set(k, (bustPriorCounts.get(k) || 0) + 1);
+  }
+  const extraTurnPriors = [];
+  if (Array.isArray(diag.recentTurns)) {
+    for (const t of diag.recentTurns) {
+      if (!isValidPriorMatchItem(t)) continue;
+      const k = priorKeyOf(t);
+      const rem = bustPriorCounts.get(k) || 0;
+      if (rem > 0) {
+        bustPriorCounts.set(k, rem - 1);
+      } else {
+        extraTurnPriors.push(t);
+      }
+    }
+  }
+  const priorMatches = [...extraTurnPriors, ...bustPriors];
+  if (priorMatches.length > 0) {
+    const notes = priorMatches.map(
+      (b) =>
+        `step ${isNonNegFinite(b.stepIndex) ? b.stepIndex : "?"}: subsequent cache read near step ${b.priorContextMatch.referenceStepIndex} (recovered at step ${b.priorContextMatch.recoveryStepIndex})`
+    );
+    lines.push(`| Prior-context read match (observation) | ${priorMatches.length} (${notes.join("; ")}) |`);
+  }
   if (diag.loopWatch && diag.loopWatch.status !== "ok") {
     lines.push(
       `| Convergence watch | ${diag.loopWatch.status.toUpperCase()} (${diag.loopWatch.reason}, osc=${diag.loopWatch.editFailOscillations}, maxRepeat=${diag.loopWatch.maxRepeatCount}) |`

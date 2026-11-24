@@ -33,6 +33,7 @@ import {
   CONTEXT_CRITICAL_TOKENS,
   CONTEXT_WARN_TOKENS,
   createEmptyContextComposition,
+  createEmptyDriftBreakdown,
   createEmptySubagentBreakdown,
   DEFAULT_CACHE_TTL_SEC,
   findTranscriptForConversation,
@@ -1027,6 +1028,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
         multimodal_media: 0,
         prefix_drift: 0
       },
+      driftBreakdown: createEmptyDriftBreakdown(),
       wastedTokensTotal: 0,
       duplicateReadCount: 0,
       loopWatch: {
@@ -1042,7 +1044,8 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       contextComposition: createEmptyContextComposition(),
       subagentBreakdown: createEmptySubagentBreakdown(),
       recentTurns: [],
-      topContextDeltas: []
+      topContextDeltas: [],
+      recentBusts: []
     };
   }
   try {
@@ -1235,6 +1238,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       globalTtlKeepaliveMinContextPct,
       ttlKeepalive: effectiveTtlKeepalive,
       ...diag,
+      driftBreakdown: diag.driftBreakdown ?? createEmptyDriftBreakdown(),
       contextComposition: diag.contextComposition ?? createEmptyContextComposition(),
       subagentBreakdown: diag.subagentBreakdown ?? createEmptySubagentBreakdown(),
       serverNowMs: diag.serverNowMs ?? Date.now()
@@ -1244,6 +1248,8 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       ok: false,
       transcriptFound: false,
       serverNowMs: Date.now(),
+      driftBreakdown: createEmptyDriftBreakdown(),
+      recentBusts: [],
       contextComposition: createEmptyContextComposition(),
       subagentBreakdown: createEmptySubagentBreakdown(),
       error: err?.message || String(err)

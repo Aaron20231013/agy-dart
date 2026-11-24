@@ -44,7 +44,7 @@ When the AI needs to search several terms, it runs them in one batch; when it ed
 If a test run prints 3,000 lines of logs, the plugin passes only the lines that matter to the AI (e.g., line 42 failed, the other 199 passed) and stores the full log locally for lookup. On multi-thousand-line code files, it pulls the outline first and reads only the target lines.
 
 ### 3. Cache monitoring and optional keepalive
-The plugin keeps prompt headers steady and avoids repeated reads of unchanged files. Automatic keepalive and desktop expiry alerts start off. If you enable keepalive, the initial limit is one ping per chat until your next message. You can change the limit in the panel.
+The plugin stabilizes controllable client-side prefixes and reduces repeated reads of unchanged files; actual cache hit rates still depend on how the host constructs requests and on backend caching behavior (if you use a dynamic proxy pool, pinning a single exit node can serve as a controlled troubleshooting experiment). Automatic keepalive and desktop expiry alerts start off. If you enable keepalive, the initial limit is one ping per chat until your next message. You can change the limit in the panel.
 
 ### 4. Side panel & crash/hang rescue
 The right-sidebar panel shows: remaining context space, minutes until cache expiry, and total noise blocked.

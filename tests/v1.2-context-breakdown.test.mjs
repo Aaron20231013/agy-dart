@@ -476,7 +476,7 @@ test("P2-9.3: analyzeMultipleSessionsCache aggregates contextComposition & subag
     "| Bust cause: Model switch |",
     "| Bust cause: System injection |",
     "| Bust cause: Multimodal media |",
-    "| Bust cause: Prefix drift / eviction |",
+    "| Bust cause: Unattributed |",
     "| Duplicate identical read_file calls |"
   ]) {
     assert.ok(mdAgg.includes(requiredExistingRow), `Missing preserved Markdown row: ${requiredExistingRow}`);
