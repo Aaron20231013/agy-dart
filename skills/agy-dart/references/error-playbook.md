@@ -49,6 +49,7 @@ Project-specific CLI output filters live in `<workspace>/.agy-dart/filters.json`
   - **Fix**: Replace nested or wildcard quantifiers with anchored literal prefixes, character classes (e.g., `[a-z0-9._-]+`), or simple non-overlapping alternations.
   - **Reference**: Copy and adapt a validated starter template from `examples/filters.json`.
 - **Failure safety**: On non-zero exit codes, stderr and error-anchor lines are preserved automatically (`preserveTailOnFail: true` by default) so custom `drop` rules do not hide crash diagnostics.
+- **Evaluation order (`keep` before `drop`)**: `keep` is evaluated before `drop` and skips `drop` when matched. Keep `keep` patterns narrow (warnings, errors, summaries) so noisy task lines intended for `drop` (such as Gradle `> Task :... UP-TO-DATE`) do not fill `maxLines` and crowd out trailing results.
 - **Precedence**: Built-in rules (`git`, `npm`/`vitest`/`pytest`/`go`/`cargo`/`dotnet`, `tsc`/`eslint`/`vite build`/`webpack`, `docker build`, `gh`, `kubectl`, `terraform`, `playwright`) run **before** `.agy-dart/filters.json`. Use `.agy-dart/filters.json` for project-specific CLIs not already covered by built-in rules.
 
 ---

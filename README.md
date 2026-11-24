@@ -74,13 +74,13 @@ Use **Node.js 22.16.0 or later in the 22.x line, or Node.js 24 or later**. The i
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.1/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.2/install.ps1 | iex
 ```
 
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.1/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.2/install.sh | sh
 ```
 
 ### Option 2: Let Antigravity install it
@@ -88,13 +88,13 @@ curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7
 Send this to Antigravity:
 
 ```text
-Clone tag v1.7.1 of https://github.com/zou172866/Antigravity-agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
+Clone tag v1.7.2 of https://github.com/zou172866/Antigravity-agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
 ```
 
 ### Option 3: Clone & install with custom flags
 
 ```powershell
-git clone --branch v1.7.1 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
+git clone --branch v1.7.2 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
 cd Antigravity-agy-dart
 
 # Windows PowerShell (optional -InstallRg auto-installs ripgrep)
@@ -142,6 +142,11 @@ node scripts/install.mjs tool-loading eager         # All 12 tools eager-loaded
 ---
 
 ## Changelog
+
+### v1.7.2
+- **Agent Skills progressive disclosure & prefix-tax audit**: Restructured `skills/agy-dart/` with on-demand `examples/` (`ctx_trace_summary.py`, `filters.json`) and `references/error-playbook.md` synced cleanly across Antigravity, Claude Code, and Codex; added `node bin/agy-dart.mjs audit skills` to inspect Turn-0 frontmatter tax and progressive-disclosure hygiene, and separated on-demand skill assets in `prefix:budget`.
+- **Scoped `dart-coder` / `dart-reviewer` check routing**: Guided built-in minimal agents to prefer `run_checks` for short checks (keeping `run_command` for `>60s` or async tasks) so command outputs stay within 8.8 KB without losing `inheritMcp: false` / `inheritCustomizations: false` isolation.
+- **Test & packaging hardening**: Isolated `AGY_DART_CONFIG_PATH` in `v1.2-persist-prefix.test.mjs` so local `~/.agy-dart/config.json` overrides (such as `stablePrefixOnly: true`) never interfere with unit tests, and excluded Python bytecode artifacts (`__pycache__`, `*.py[cod]`) from Git and package manifests.
 
 ### v1.7.1
 - **Accurate "Guard Saved" accounting for `agy-dart_fast` tools**: `read_slices`, `run_checks`, and `batch_search` now record strictly non-inflated byte savings (only when raw input/output genuinely exceeds returned bytes) and attribute anonymous shared MCP calls cleanly to the active conversation without cross-session stealing.
@@ -228,7 +233,7 @@ Install for Antigravity by default. Select Claude Code or Codex explicitly with 
 For Claude Code and Codex, the installer keeps hashes and undo metadata in `~/.agy-dart/<host>-install.json` to restore the plugin's configuration changes. Reinstalling replaces an older full-config record. Uninstalling removes that host's record.
 
 ```sh
-git clone --branch v1.7.1 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
+git clone --branch v1.7.2 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
 cd Antigravity-agy-dart
 node bin/agy-dart.mjs install
 node bin/agy-dart.mjs doctor

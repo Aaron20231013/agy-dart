@@ -74,13 +74,13 @@ AI 要搜好几个词时一次同时搜完，要改多个文件时一次改完�
 **Windows（PowerShell）：**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.1/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.2/install.ps1 | iex
 ```
 
 **macOS / Linux：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.1/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.2/install.sh | sh
 ```
 
 ### 方法二：直接发给 Antigravity 装
@@ -88,13 +88,13 @@ curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7
 复制这句发给 Antigravity：
 
 ```text
-请将 https://github.com/zou172866/Antigravity-agy-dart.git 的 v1.7.1 标签克隆到临时目录，运行其中的 scripts/install.mjs install 完成全局安装并跑 doctor 自检（Windows 如未安装 rg 请同时传 --install-rg）。
+请将 https://github.com/zou172866/Antigravity-agy-dart.git 的 v1.7.2 标签克隆到临时目录，运行其中的 scripts/install.mjs install 完成全局安装并跑 doctor 自检（Windows 如未安装 rg 请同时传 --install-rg）。
 ```
 
 ### 方法三：克隆仓库自定义安装
 
 ```powershell
-git clone --branch v1.7.1 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
+git clone --branch v1.7.2 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
 cd Antigravity-agy-dart
 
 # Windows PowerShell（加 -InstallRg 可顺手自动安装快速搜索工具 rg）
@@ -142,6 +142,11 @@ node scripts/install.mjs tool-loading eager         # 12 个工具全部预载
 ---
 
 ## 更新日志
+
+### v1.7.2
+- **Agent Skills 渐进披露结构与首轮前缀税审计**：为 `skills/agy-dart/` 拆分按需加载的 `examples/`（`ctx_trace_summary.py`、`filters.json`）与 `references/error-playbook.md` 并同步适配 Antigravity、Claude Code 与 Codex；新增 `node bin/agy-dart.mjs audit skills` 审计已装 Skills 的首轮 frontmatter 开销与渐进披露结构，并在 `prefix:budget` 中分离统计按需附件体积。
+- **内置净身角色 `dart-coder` / `dart-reviewer` 短检查引导**：在保持 `inheritMcp: false` 与 `inheritCustomizations: false` 零外部前缀税的前提下，明确短检查优先走 `run_checks`（长耗时/异步任务仍用 `run_command`），减少原生终端输出超 10 KB 落盘。
+- **测试隔离与打包卫生加固**：修复 `v1.2-persist-prefix.test.mjs` 对本机 `~/.agy-dart/config.json`（如 `stablePrefixOnly: true`）的读取隔离，并在 `.gitignore` 与 `package.json` 中排除 `__pycache__` / `*.py[cod]` 产物。
 
 ### v1.7.1
 - **修好侧边栏「已挡冗余」长期显示 0 的问题（补齐 `agy-dart_fast` 真实埋点）**：`read_slices`、`run_checks`、`batch_search` 现按真实裁剪/压缩字节差值记账（绝不虚报），并在匿名共享 MCP 下精准归属到当前对话，不串会话、不重复计数。
@@ -232,7 +237,7 @@ npm run cache:simulate
 Claude Code 和 Codex 的安装器会在 `~/.agy-dart/<host>-install.json` 中保存哈希及撤销插件改动所需的信息。重装会替换旧版的整份配置备份，卸载会移除该宿主的安装记录。
 
 ```sh
-git clone --branch v1.7.1 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
+git clone --branch v1.7.2 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
 cd Antigravity-agy-dart
 node bin/agy-dart.mjs install
 node bin/agy-dart.mjs doctor

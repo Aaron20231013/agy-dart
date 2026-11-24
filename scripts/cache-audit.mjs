@@ -204,18 +204,364 @@ function measureTextStats(text) {
   };
 }
 
-function splitFrontmatter(markdown) {
+const SKILL_FRONTMATTER_REQUIRED_ANY_KEYS = new Set(["name", "description"]);
+const UNQUOTED_YAML_KEY_RE = /^[A-Za-z0-9_.-]+$/;
+const BLOCK_SCALAR_HEADER_RE = /^[|>](?:[-+]|[1-9]|[-+][1-9]|[1-9][-+])?(?:[ \t]+#.*)?$/;
+const FORBIDDEN_PLAIN_SCALAR_START_RE = /^[\]\},@`]/;
+
+function scanQuotedScalar(text, startIdx, quote) {
+  let i = startIdx;
+  while (i < text.length) {
+    const ch = text[i];
+    if (quote === '"') {
+      if (ch === "\\") {
+        if (i + 1 >= text.length) {
+          return { closed: false, endIdx: text.length };
+        }
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        return { closed: true, endIdx: i + 1 };
+      }
+    } else if (ch === "'") {
+      if (text[i + 1] === "'") {
+        i += 2;
+        continue;
+      }
+      return { closed: true, endIdx: i + 1 };
+    }
+    i += 1;
+  }
+  return { closed: false, endIdx: text.length };
+}
+
+function isEmptyOrComment(tail) {
+  return /^[ \t]*(?:#.*)?$/.test(tail);
+}
+
+function stripPlainInlineComment(val) {
+  const idx = val.search(/[ \t]+#/);
+  return idx === -1 ? val.trimEnd() : val.slice(0, idx).trimEnd();
+}
+
+function isValidPlainScalarText(rawText) {
+  const cleaned = stripPlainInlineComment(rawText);
+  if (!cleaned) return true;
+  if (FORBIDDEN_PLAIN_SCALAR_START_RE.test(cleaned)) return false;
+  if (/:(?:[ \t]|$)/.test(cleaned)) return false;
+  return true;
+}
+
+function scanFlowCollection(text, startIdx, state) {
+  let i = startIdx;
+  while (i < text.length) {
+    const ch = text[i];
+    if (state.quote) {
+      const res = scanQuotedScalar(text, i, state.quote);
+      if (!res.closed) return { ok: true, closed: false };
+      state.quote = null;
+      const top = state.stack[state.stack.length - 1];
+      if (top) top.hasContent = true;
+      i = res.endIdx;
+      continue;
+    }
+    if (ch === "#" && (i === 0 || text[i - 1] === " " || text[i - 1] === "\t")) {
+      return { ok: true, closed: false };
+    }
+    if (ch === '"' || ch === "'") {
+      state.quote = ch;
+      i += 1;
+      continue;
+    }
+    if (ch === "[" || ch === "{") {
+      const parent = state.stack[state.stack.length - 1];
+      if (parent) parent.hasContent = true;
+      state.stack.push({ kind: ch, hasColon: false, hasContent: false });
+      i += 1;
+      continue;
+    }
+    if (ch === "]" || ch === "}") {
+      const top = state.stack[state.stack.length - 1];
+      const expected = ch === "]" ? "[" : "{";
+      if (!top || top.kind !== expected) return { ok: false, closed: false };
+      if (top.kind === "{" && top.hasContent && !top.hasColon) return { ok: false, closed: false };
+      state.stack.pop();
+      i += 1;
+      if (state.stack.length === 0) {
+        return { ok: isEmptyOrComment(text.slice(i)), closed: true };
+      }
+      continue;
+    }
+    const top = state.stack[state.stack.length - 1];
+    if (!top) return { ok: false, closed: false };
+    if (ch === "," && top.kind === "{") {
+      if (top.hasContent && !top.hasColon) return { ok: false, closed: false };
+      top.hasColon = false;
+      top.hasContent = false;
+      i += 1;
+      continue;
+    }
+    if (ch === ":" && top.kind === "{") {
+      const next = text[i + 1];
+      const prev = i > 0 ? text[i - 1] : "";
+      if (
+        next === undefined ||
+        next === " " ||
+        next === "\t" ||
+        next === "," ||
+        next === "}" ||
+        prev === '"' ||
+        prev === "'"
+      ) {
+        top.hasColon = true;
+      }
+      top.hasContent = true;
+      i += 1;
+      continue;
+    }
+    if (ch !== " " && ch !== "\t") {
+      top.hasContent = true;
+    }
+    i += 1;
+  }
+  return { ok: true, closed: false };
+}
+
+function parseMappingEntry(trimmed) {
+  if (!trimmed) return null;
+  if (trimmed[0] === '"' || trimmed[0] === "'") {
+    const res = scanQuotedScalar(trimmed, 1, trimmed[0]);
+    if (!res.closed) return null;
+    const key = trimmed.slice(1, res.endIdx - 1);
+    const afterQuote = trimmed.slice(res.endIdx);
+    const colonMatch = afterQuote.match(/^[ \t]*:(?:[ \t]+([\s\S]*)|[ \t]*)$/);
+    if (!colonMatch || !key) return null;
+    return { key, rawVal: (colonMatch[1] || "").trimStart() };
+  }
+  if (/^[-?:,\[\]{}#&*!|>'"%@`]/.test(trimmed)) return null;
+  let colonIdx = -1;
+  for (let i = 0; i < trimmed.length; i += 1) {
+    const ch = trimmed[i];
+    if (ch === "#" && i > 0 && (trimmed[i - 1] === " " || trimmed[i - 1] === "\t")) break;
+    if (ch === ":") {
+      const next = trimmed[i + 1];
+      if (next === undefined || next === " " || next === "\t") {
+        colonIdx = i;
+        break;
+      }
+    }
+  }
+  if (colonIdx <= 0) return null;
+  const key = trimmed.slice(0, colonIdx).trimEnd();
+  if (!UNQUOTED_YAML_KEY_RE.test(key)) return null;
+  const rawVal = trimmed.slice(colonIdx + 1).trimStart();
+  return { key, rawVal };
+}
+
+function validateYamlFrontmatter(inner) {
+  const lines = String(inner || "").split(/\r?\n/);
+  const topLevelKeys = new Set();
+  const containerStack = [{ kind: "mapping", indent: 0, keys: topLevelKeys }];
+  let blockScalar = null;
+  let quotedScalar = null;
+  let flowState = null;
+  let activePlainScalar = null;
+
+  const parseValueExpr = (rawVal, ownerIndent, pushExpectValue) => {
+    if (!rawVal || rawVal.startsWith("#")) {
+      if (pushExpectValue) {
+        containerStack.push({ kind: "expect_value", keyIndent: ownerIndent });
+      }
+      return true;
+    }
+    if (rawVal[0] === "|" || rawVal[0] === ">") {
+      if (!BLOCK_SCALAR_HEADER_RE.test(rawVal)) return false;
+      const digitMatch = rawVal.match(/^[|>][+-]?([1-9])/);
+      const explicitIndent = digitMatch ? ownerIndent + Number(digitMatch[1]) : null;
+      blockScalar = { keyIndent: ownerIndent, explicitIndent, contentIndent: null };
+      return true;
+    }
+    if (rawVal[0] === '"' || rawVal[0] === "'") {
+      const res = scanQuotedScalar(rawVal, 1, rawVal[0]);
+      if (res.closed) {
+        return isEmptyOrComment(rawVal.slice(res.endIdx));
+      }
+      quotedScalar = { quote: rawVal[0], keyIndent: ownerIndent };
+      return true;
+    }
+    if (rawVal[0] === "[" || rawVal[0] === "{") {
+      const st = { stack: [], quote: null, keyIndent: ownerIndent };
+      const res = scanFlowCollection(rawVal, 0, st);
+      if (!res.ok) return false;
+      if (!res.closed) flowState = st;
+      return true;
+    }
+    if (!isValidPlainScalarText(rawVal)) return false;
+    activePlainScalar = { keyIndent: ownerIndent };
+    return true;
+  };
+
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const line = lines[idx];
+
+    if (blockScalar) {
+      if (/^[ \t]*$/.test(line)) continue;
+      let leadingSpaces = 0;
+      while (leadingSpaces < line.length && line[leadingSpaces] === " ") leadingSpaces += 1;
+      if (leadingSpaces > blockScalar.keyIndent) {
+        if (blockScalar.explicitIndent !== null) {
+          if (leadingSpaces < blockScalar.explicitIndent) return { ok: false, topLevelKeys };
+        } else if (blockScalar.contentIndent === null) {
+          blockScalar.contentIndent = leadingSpaces;
+        } else if (leadingSpaces < blockScalar.contentIndent) {
+          return { ok: false, topLevelKeys };
+        }
+        continue;
+      }
+      blockScalar = null;
+    }
+
+    if (/^[ \t]*$/.test(line)) continue;
+    if (/^ *\t/.test(line)) return { ok: false, topLevelKeys };
+
+    let indent = 0;
+    while (indent < line.length && line[indent] === " ") indent += 1;
+    const trimmed = line.slice(indent);
+
+    if (quotedScalar) {
+      if (indent <= quotedScalar.keyIndent) return { ok: false, topLevelKeys };
+      const res = scanQuotedScalar(trimmed, 0, quotedScalar.quote);
+      if (res.closed) {
+        if (!isEmptyOrComment(trimmed.slice(res.endIdx))) return { ok: false, topLevelKeys };
+        quotedScalar = null;
+      }
+      continue;
+    }
+
+    if (flowState) {
+      if (indent <= flowState.keyIndent) return { ok: false, topLevelKeys };
+      const res = scanFlowCollection(trimmed, 0, flowState);
+      if (!res.ok) return { ok: false, topLevelKeys };
+      if (res.closed) flowState = null;
+      continue;
+    }
+
+    if (trimmed.startsWith("#")) continue;
+
+    if (activePlainScalar) {
+      if (indent > activePlainScalar.keyIndent) {
+        if (!isValidPlainScalarText(trimmed)) return { ok: false, topLevelKeys };
+        continue;
+      }
+      activePlainScalar = null;
+    }
+
+    const isSeqItem = trimmed === "-" || /^-[ \t]/.test(trimmed);
+
+    while (containerStack.length > 1) {
+      const top = containerStack[containerStack.length - 1];
+      if (top.kind === "expect_value") {
+        if (indent > top.keyIndent || (indent === top.keyIndent && isSeqItem)) break;
+        containerStack.pop();
+        continue;
+      }
+      if (top.kind === "sequence") {
+        if (indent > top.indent || (indent === top.indent && isSeqItem)) break;
+        containerStack.pop();
+        continue;
+      }
+      if (top.kind === "mapping") {
+        if (indent >= top.indent) break;
+        containerStack.pop();
+        continue;
+      }
+      break;
+    }
+
+    const top = containerStack[containerStack.length - 1];
+
+    if (isSeqItem) {
+      if (top.kind === "expect_value") {
+        if (indent < top.keyIndent) return { ok: false, topLevelKeys };
+        containerStack.pop();
+        containerStack.push({ kind: "sequence", indent });
+      } else if (top.kind !== "sequence" || indent !== top.indent) {
+        return { ok: false, topLevelKeys };
+      }
+
+      const afterDash = trimmed.slice(1);
+      const wsMatch = afterDash.match(/^[ \t]*/);
+      const itemRest = afterDash.slice(wsMatch[0].length);
+      if (!itemRest || itemRest.startsWith("#")) {
+        containerStack.push({ kind: "expect_value", keyIndent: indent });
+        continue;
+      }
+      const itemIndent = indent + 1 + wsMatch[0].length;
+      const itemMap = parseMappingEntry(itemRest);
+      if (itemMap) {
+        const nestedKeys = new Set([itemMap.key]);
+        containerStack.push({ kind: "mapping", indent: itemIndent, keys: nestedKeys });
+        if (!parseValueExpr(itemMap.rawVal, itemIndent, true)) return { ok: false, topLevelKeys };
+      } else {
+        if (!parseValueExpr(itemRest, indent, false)) return { ok: false, topLevelKeys };
+      }
+      continue;
+    }
+
+    const entry = parseMappingEntry(trimmed);
+    if (entry) {
+      if (top.kind === "expect_value") {
+        if (indent <= top.keyIndent) return { ok: false, topLevelKeys };
+        containerStack.pop();
+        const nestedKeys = new Set([entry.key]);
+        containerStack.push({ kind: "mapping", indent, keys: nestedKeys });
+      } else if (top.kind === "mapping" && indent === top.indent) {
+        if (top.keys.has(entry.key)) return { ok: false, topLevelKeys };
+        top.keys.add(entry.key);
+      } else {
+        return { ok: false, topLevelKeys };
+      }
+      if (!parseValueExpr(entry.rawVal, indent, true)) return { ok: false, topLevelKeys };
+      continue;
+    }
+
+    if (top.kind === "expect_value" && indent > top.keyIndent) {
+      const ownerIndent = top.keyIndent;
+      containerStack.pop();
+      if (!parseValueExpr(trimmed, ownerIndent, false)) return { ok: false, topLevelKeys };
+      continue;
+    }
+
+    return { ok: false, topLevelKeys };
+  }
+
+  if (quotedScalar !== null || flowState !== null) {
+    return { ok: false, topLevelKeys };
+  }
+  if (topLevelKeys.size === 0) {
+    return { ok: false, topLevelKeys };
+  }
+  const hasSkillMetaKey = [...topLevelKeys].some((k) => SKILL_FRONTMATTER_REQUIRED_ANY_KEYS.has(k));
+  if (!hasSkillMetaKey) {
+    return { ok: false, topLevelKeys };
+  }
+  return { ok: true, topLevelKeys };
+}
+
+export function splitFrontmatter(markdown) {
   const raw = String(markdown || "");
   const normalized = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
-  const match = normalized.match(/^---[ \t]*\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/);
-  if (!match) {
+  const match = normalized.match(
+    /^---[ \t]*\r?\n(?:(?:---|\.\.\.)[ \t]*(?:\r?\n|$)|([\s\S]*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$))/
+  );
+  if (!match || match[1] === undefined) {
     return { frontmatter: "", body: normalized, hasFrontmatter: false };
   }
   const frontmatter = match[0];
-  const inner = String(match[1] || "").trim();
-  const hasYamlKey = Boolean(inner && /^\s*["']?[A-Za-z0-9_.-]+["']?\s*:/m.test(inner));
-  if (!hasYamlKey) {
-    return { frontmatter: "", body: normalized.slice(frontmatter.length), hasFrontmatter: false };
+  const validation = validateYamlFrontmatter(match[1]);
+  if (!validation.ok) {
+    return { frontmatter: "", body: normalized, hasFrontmatter: false };
   }
   return {
     frontmatter,

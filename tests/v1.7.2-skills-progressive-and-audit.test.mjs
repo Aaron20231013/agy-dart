@@ -11,7 +11,8 @@ import { auditPrefixBudget } from "../scripts/prefix-budget.mjs";
 import {
   auditEnvironmentCache,
   auditSkillsOnly,
-  formatSkillsAuditMarkdown
+  formatSkillsAuditMarkdown,
+  splitFrontmatter
 } from "../scripts/cache-audit.mjs";
 import { RUNTIME_FILES } from "../scripts/install.mjs";
 import { verifyPackageManifest } from "../scripts/verify-package-graph.mjs";
@@ -74,6 +75,55 @@ test("1. skills/agy-dart/examples/filters.json passes inspectProjectFilterRules 
     assert.equal(cmakeHit?.rule?.id, "custom:cmake-ninja-bazel-build");
     const dockerTransferHit = matchFilterRule("docker compose pull", { cwd: tmp.dir });
     assert.equal(dockerTransferHit?.rule?.id, "custom:docker-registry-transfer");
+
+    // Exercise Gradle rule with 120 noisy UP-TO-DATE/FROM-CACHE/NO-SOURCE/SKIPPED lines:
+    // noisy task lines MUST NOT crowd out trailing compiler warnings or BUILD SUCCESSFUL
+    const noisyGradleLines = [];
+    for (let i = 1; i <= 120; i++) {
+      const status = i % 4 === 0 ? "FROM-CACHE" : i % 4 === 1 ? "UP-TO-DATE" : i % 4 === 2 ? "NO-SOURCE" : "SKIPPED";
+      noisyGradleLines.push(`> Task :module-${i}:compileJava ${status}`);
+    }
+    noisyGradleLines.push(
+      "src/Main.java:14: warning: [deprecation] oldApi() has been deprecated",
+      "w: file:///src/App.kt:8:5: Parameter 'unused' is never used",
+      "BUILD SUCCESSFUL in 4s",
+      "122 actionable tasks: 2 executed, 120 up-to-date"
+    );
+    const filteredGradleOk = gradleHit.rule.filter(noisyGradleLines.join("\n"), 0, {});
+    assert.ok(!filteredGradleOk.includes("UP-TO-DATE"), "Noisy UP-TO-DATE lines must be dropped, not kept");
+    assert.ok(!filteredGradleOk.includes("FROM-CACHE"), "Noisy FROM-CACHE lines must be dropped");
+    assert.ok(!filteredGradleOk.includes("NO-SOURCE"), "Noisy NO-SOURCE lines must be dropped");
+    assert.ok(!filteredGradleOk.includes("SKIPPED"), "Noisy SKIPPED lines must be dropped");
+    assert.ok(filteredGradleOk.includes("warning: [deprecation] oldApi()"), filteredGradleOk);
+    assert.ok(filteredGradleOk.includes("w: file:///src/App.kt:8:5"), filteredGradleOk);
+    assert.ok(filteredGradleOk.includes("BUILD SUCCESSFUL in 4s"), filteredGradleOk);
+    assert.ok(filteredGradleOk.includes("122 actionable tasks:"), filteredGradleOk);
+
+    // Failing Gradle build with 100 UP-TO-DATE lines keeps FAILED task, error, and BUILD FAILED
+    const gradleFailLines = [];
+    for (let i = 1; i <= 100; i++) gradleFailLines.push(`> Task :mod${i}:classes UP-TO-DATE`);
+    gradleFailLines.push(
+      "> Task :app:compileJava FAILED",
+      "src/App.java:22: error: cannot find symbol",
+      "BUILD FAILED in 2s"
+    );
+    const filteredGradleFail = gradleHit.rule.filter(gradleFailLines.join("\n"), 1, {
+      cleanedStderr: "src/App.java:22: error: cannot find symbol"
+    });
+    assert.ok(!filteredGradleFail.includes("UP-TO-DATE"), filteredGradleFail);
+    assert.ok(filteredGradleFail.includes("> Task :app:compileJava FAILED"), filteredGradleFail);
+    assert.ok(filteredGradleFail.includes("error: cannot find symbol"), filteredGradleFail);
+    assert.ok(filteredGradleFail.includes("BUILD FAILED in 2s"), filteredGradleFail);
+
+    // Exercise Bazel build with 100 Target // lines: Build completed must NOT be crowded out
+    const bazelHit = matchFilterRule("bazel build //...", { cwd: tmp.dir });
+    assert.equal(bazelHit?.rule?.id, "custom:cmake-ninja-bazel-build");
+    const bazelLines = [];
+    for (let i = 1; i <= 100; i++) bazelLines.push(`Target //pkg/mod${i}:lib up-to-date:`);
+    bazelLines.push("INFO: Elapsed time: 3.142s", "INFO: Build completed successfully, 100 total actions");
+    const filteredBazel = bazelHit.rule.filter(bazelLines.join("\n"), 0, {});
+    assert.ok(filteredBazel.includes("INFO: Build completed successfully"), filteredBazel);
+    assert.ok(filteredBazel.includes("INFO: Elapsed time:"), filteredBazel);
 
     // Exercise cmake/ninja/bazel rule on realistic build output
     const sampleBuildOut = [
@@ -898,6 +948,105 @@ test("8. Aux walkers ignore __pycache__, node_modules, and *.pyc/*.pyo (case-ins
         `npm pack leaked ignored artifacts: ${JSON.stringify(packedPaths)}`
       );
     }
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("9. splitFrontmatter & cache-audit reject malformed YAML and preserve full body across Markdown horizontal rules", () => {
+  const longProse = "Detailed markdown workflow instructions and checklist guidance. ".repeat(260); // > 3,000 est. tokens
+
+  // 9a. Malformed YAML cases MUST fail validation AND return full body unmodified
+  const invalidCases = [
+    ["unquoted-colon-in-plain-value", "---\nname: bad\ndescription: Use when: user asks\n---\n# Body\n"],
+    ["trailing-colon-in-plain-value", "---\nname: bad\ndescription: see below:\n---\n# Body\n"],
+    ["unclosed-double-quote", '---\nname: bad\ndescription: "unterminated\n---\n# Body\n'],
+    ["unclosed-single-quote", "---\nname: bad\ndescription: 'unterminated\n---\n# Body\n"],
+    ["trailing-garbage-after-quote", '---\nname: "bad" trailing\ndescription: ok\n---\n# Body\n'],
+    ["unclosed-flow-array", "---\nname: bad\ndescription: ok\ntags: [a, b\n---\n# Body\n"],
+    ["malformed-flow-map", "---\nname: bad\ndescription: ok\nmeta: { a: 1, bad }\n---\n# Body\n"],
+    ["tab-indentation", "---\nname: bad\n\tdescription: tabbed\n---\n# Body\n"],
+    ["stray-top-level-prose", "---\nname: bad\nthis is stray markdown prose\n---\n# Body\n"],
+    ["missing-space-after-colon", "---\nname:bad\ndescription: ok\n---\n# Body\n"],
+    ["invalid-block-header", "---\nname: bad\ndescription: | invalid\n  line\n---\n# Body\n"],
+    ["zero-block-indent", "---\nname: bad\ndescription: |0\n  line\n---\n# Body\n"],
+    ["block-under-indented-line", "---\nname: bad\ndescription: |\n    four spaces\n  two spaces\n---\n# Body\n"],
+    ["duplicate-top-level-key", "---\nname: one\nname: two\ndescription: ok\n---\n# Body\n"],
+    ["nested-stray-line", "---\nname: bad\ndescription: ok\nmetadata:\n  author: a\n  not a mapping\n---\n# Body\n"],
+    ["top-level-sequence", "---\n- alpha\n- beta\n---\n# Body\n"],
+    ["non-skill-markdown-note-only", "---\n# Title\nNote: just a markdown note\n---\n# Body\n"],
+    ["empty-adjacent-fences", `---\n---\n${longProse}\n---\nFooter\n`],
+    ["markdown-hr-enclosing-long-body-no-colons", `---\n# Title\n\n${longProse}\n---\nFooter\n`],
+    ["markdown-hr-enclosing-long-body-with-note", `---\n# Title\n\nNote: remember this.\n\n${longProse}\n---\nFooter\n`],
+    ["unclosed-frontmatter-to-later-hr", `---\nname: unclosed\ndescription: forgot closing fence\n\n# Section\n${longProse}\n---\nFooter\n`]
+  ];
+
+  for (const [label, md] of invalidCases) {
+    const res = splitFrontmatter(md);
+    assert.equal(res.hasFrontmatter, false, `Expected invalid frontmatter for '${label}'`);
+    assert.equal(res.frontmatter, "", `Expected empty frontmatter for '${label}'`);
+    assert.equal(res.body, md, `Invalid frontmatter '${label}' MUST NOT slice body`);
+  }
+
+  // 9b. Valid rich YAML frontmatter constructs MUST pass cleanly
+  const validCases = [
+    [
+      "block-scalar-and-nested-map",
+      "---\nname: rich-skill\ndescription: >-\n  Multi-line description with: colon inside block,\n  # heading-looking line,\n  and indented --- divider.\nmetadata:\n  author: alice\n  url: https://example.com:8080/docs\n  tags:\n    - alpha\n    - beta\n---\n# Body\n"
+    ],
+    [
+      "quoted-multiline-and-flow",
+      '---\nname: "quoted-skill" # inline comment\ndescription: "Use when: user asks about \\"quotes\\"\n  across two lines"\ntags: [a, "b: c"]\nmeta: { v: 1, mode: "fast" }\n---\n# Body\n'
+    ],
+    [
+      "same-indent-seq-and-item-map",
+      "---\nname: seq-skill\ndescription: C# and F# helper at 09:30\nitems:\n- id: 1\n  label: first\n- id: 2\n  label: second\n...\n# Body\n"
+    ],
+    [
+      "description-only-skill",
+      "---\ndescription: Triggered when formatting SQL\n---\n# Body\n"
+    ]
+  ];
+
+  for (const [label, md] of validCases) {
+    const res = splitFrontmatter(md);
+    assert.equal(res.hasFrontmatter, true, `Expected valid frontmatter for '${label}'`);
+    assert.ok(res.frontmatter.length > 0, `Expected non-empty frontmatter for '${label}'`);
+    assert.equal(res.body, "# Body\n", `Expected clean body slice for '${label}'`);
+  }
+
+  // 9c. End-to-end auditSkillsOnly: Markdown dividers & unclosed frontmatter MUST NOT suppress oversized_skill_body
+  const tmp = makeTempDir("agy-yaml-hr-audit-");
+  try {
+    const ws = path.join(tmp.dir, "ws");
+    const cfg = path.join(tmp.dir, "cfg");
+    const fixtures = {
+      "hr-long-no-colons": `---\n# Skill Title\n\n${longProse}\n---\nShort footer.\n`,
+      "hr-long-with-note": `---\n# Skill Title\n\nNote: Important context.\n\n${longProse}\n---\nShort footer.\n`,
+      "unclosed-fm-long": `---\nname: unclosed-fm-long\ndescription: Missing closing fence\n\n# Real Body\n${longProse}\n---\nShort footer.\n`,
+      "malformed-colon-yaml": `---\nname: malformed-colon-yaml\ndescription: Use when: broken unquoted colon\n---\n# Short Body\n`
+    };
+    for (const [name, content] of Object.entries(fixtures)) {
+      const dir = path.join(ws, ".agents", "skills", name);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "SKILL.md"), content, "utf8");
+    }
+
+    const rep = auditSkillsOnly({ workspace: ws, configDir: cfg });
+    assert.equal(rep.summary.skillCount, 4);
+    assert.equal(rep.summary.missingFrontmatterCount, 4);
+    assert.equal(rep.findings.filter((f) => f.code === "missing_skill_frontmatter").length, 4);
+
+    // All 3 long-body skills MUST still trigger oversized_skill_body!
+    const oversizedTargets = rep.findings
+      .filter((f) => f.code === "oversized_skill_body")
+      .map((f) => f.target)
+      .sort();
+    assert.deepEqual(oversizedTargets, [
+      "workspace:skills/hr-long-no-colons/SKILL.md",
+      "workspace:skills/hr-long-with-note/SKILL.md",
+      "workspace:skills/unclosed-fm-long/SKILL.md"
+    ]);
   } finally {
     tmp.cleanup();
   }
