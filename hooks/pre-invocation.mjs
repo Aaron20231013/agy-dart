@@ -5,7 +5,7 @@
  * Uses Antigravity's zero-prefix-pollution UI-only `metadata.user_markdown`
  * (with empty `systemMessage: ""`) so alerts never mutate the model prompt prefix.
  */
-import { executionReceiptsFromSteps } from "../context/lib/execution-receipts.js";
+import { executionReceiptsFromSteps, fastToolClaimsFromSteps } from "../context/lib/execution-receipts.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -586,11 +586,6 @@ async function main() {
 
       const steps = readTranscriptTail(transcriptPath, 131072, { minUsageSteps: 2 });
       loadedSteps = steps;
-      if (dbExists) {
-        try {
-          store.claimExecutionReceipts(targetConvId, executionReceiptsFromSteps(steps));
-        } catch {} // A busy database can be retried on the next invocation.
-      }
       if (steps.length > 0) {
         const diagOpts = {
           conversationId: targetConvId && targetConvId !== "default" ? targetConvId : ""
@@ -747,6 +742,42 @@ async function main() {
           }
         } catch {}
       }
+    }
+
+    // Claim context receipts (ctx_execute/ctx_index/ctx_batch) & agy-dart_fast savings under unified rootSessionId
+    if ((dbExists || store.db) && loadedSteps.length > 0) {
+      try {
+        const rawRootCandidate =
+          sessionId && sessionId !== "default" && sessionId !== targetConvId
+            ? sessionId
+            : resolvedParentConvId || targetConvId;
+        const claimOwner =
+          typeof store.resolveRootSessionId === "function"
+            ? store.resolveRootSessionId(rawRootCandidate)
+            : rawRootCandidate;
+        store.claimExecutionReceipts(claimOwner, executionReceiptsFromSteps(loadedSteps));
+        const fastClaims = fastToolClaimsFromSteps(loadedSteps);
+        if (fastClaims.length > 0 && typeof store.claimFastToolClaims === "function") {
+          const isFullTranscript = txStatSize > 0 && txStatSize <= 131072;
+          let windowStartIso = "";
+          if (!isFullTranscript) {
+            let earliestMs = Infinity;
+            for (const c of fastClaims) {
+              if (Number.isFinite(c.completedAtMs) && c.completedAtMs < earliestMs) {
+                earliestMs = c.completedAtMs;
+              }
+            }
+            if (Number.isFinite(earliestMs)) {
+              windowStartIso = new Date(earliestMs - 120000).toISOString();
+            }
+          }
+          store.claimFastToolClaims(claimOwner, fastClaims, {
+            directConvId: targetConvId,
+            windowStartIso,
+            isFullTranscript
+          });
+        }
+      } catch {} // A busy database can be retried on the next invocation.
     }
 
     // Record Sidecar Stall Watchdog / Idle TTL / Watermark execution lease (isolated by direct conversationId)

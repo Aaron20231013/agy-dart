@@ -491,7 +491,7 @@ export function createTools({
           kind: "execution",
           label: resolvedIntent || `${effectiveLanguage} script (${elapsedMs}ms)`,
           content: fullOutput,
-          dedup: true
+          dedup: !isAnonymousSession(sessionId)
         });
         sourceId = indexed.sourceId;
         deduplicated = Boolean(indexed.deduplicated);
@@ -607,6 +607,7 @@ export function createTools({
         kind: "execution",
         tool: "ctx_execute",
         executionReceipt,
+        sourceId,
         key: effectiveLanguage,
         path: expandedFile || null,
         ok: result.ok ? 1 : 0,
@@ -644,6 +645,7 @@ export function createTools({
       const redactedBatch = redactSecrets(outputs.join("\n"));
       const combined = redactedBatch.text;
       totalRawBytes = Buffer.byteLength(combined, "utf8");
+      const executionReceipt = isAnonymousSession(sessionId) ? randomBytes(16).toString("hex") : null;
       const indexed = store.indexContent({
         sessionId,
         worktree: cwd,
@@ -651,7 +653,7 @@ export function createTools({
         kind: "batch",
         label: `batch: ${cmdList.length} commands`,
         content: combined,
-        dedup: true
+        dedup: !isAnonymousSession(sessionId)
       });
       const deduplicated = Boolean(indexed.deduplicated);
 
@@ -678,6 +680,7 @@ export function createTools({
 
       const batchSuffix = `\n\n... [truncated to stay <=8.8 KB inline; use ctx_search(queries: [...], sourceId: "${indexed.sourceId}")]`;
       const batchResp = {
+        ...(executionReceipt ? { executionReceipt } : {}),
         commandsRun: cmdList.length,
         sourceId: indexed.sourceId,
         deduplicated,
@@ -714,6 +717,8 @@ export function createTools({
         agent: "antigravity",
         kind: "batch",
         tool: "ctx_batch",
+        executionReceipt,
+        sourceId: indexed.sourceId,
         ok: 1,
         bytes: totalRawBytes,
         body: returnedContent,
@@ -797,6 +802,7 @@ export function createTools({
 
       const redacted = redactSecrets(rawText);
       const safeText = redacted.text;
+      const executionReceipt = isAnonymousSession(sessionId) ? randomBytes(16).toString("hex") : null;
 
       const indexed = store.indexContent({
         sessionId,
@@ -805,11 +811,12 @@ export function createTools({
         kind: url ? "web" : filePath ? "file" : "text",
         label: resolvedLabel || "manual_index",
         content: safeText,
-        dedup: true
+        dedup: !isAnonymousSession(sessionId)
       });
 
       const deduplicated = Boolean(indexed.deduplicated);
       const returnObj = {
+        ...(executionReceipt ? { executionReceipt } : {}),
         sourceId: indexed.sourceId,
         label: indexed.label,
         bytesTotal: indexed.bytesTotal,
@@ -830,6 +837,8 @@ export function createTools({
         agent: "antigravity",
         kind: "index",
         tool: "ctx_index",
+        executionReceipt,
+        sourceId: indexed.sourceId,
         path: filePath || safeUrlForMeta || null,
         ok: 1,
         bytes: deduplicated ? 0 : indexed.bytesTotal,
@@ -1054,7 +1063,7 @@ export function createTools({
         "────────────────────────────────────────────────────────────────────────────────",
         ` agy-dart context stats [session: ${sessionId}]`,
         "────────────────────────────────────────────────────────────────────────────────",
-        `  Total Operations:      ${s.calls} (exec:${bd.executions || 0}, idx:${bd.indexes || 0}, cli-filter:${bd.cliFilters || 0}, dedup:${bd.dedups || 0}, blocked:${bd.interceptions || 0})`,
+        `  Total Operations:      ${s.calls} (exec:${bd.executions || 0}, idx:${bd.indexes || 0}, fast:${bd.fastTools || 0}, cli-filter:${bd.cliFilters || 0}, dedup:${bd.dedups || 0}, blocked:${bd.interceptions || 0})`,
         `  Raw Data Handled:      ${formatBytes(s.totalRawBytes)}`,
         `  Data Fed into LLM:     ${formatBytes(s.totalReturnedBytes)}`,
         `  Tokens Kept Out:       ~${s.tokensKeptOut.toLocaleString()} tokens (${formatBytes(s.keptOutBytes)})`,

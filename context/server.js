@@ -180,7 +180,15 @@ const adoptedWorkspaces = new Set();
 
 function resolveSessionIdForCall(cwd, { optional = false } = {}) {
   const hostSessionId = resolveHostSessionId();
-  if (hostSessionId) return hostSessionId;
+  if (hostSessionId) {
+    try {
+      return typeof store.resolveRootSessionId === "function"
+        ? store.resolveRootSessionId(hostSessionId)
+        : hostSessionId;
+    } catch {
+      return hostSessionId;
+    }
+  }
   const located = explicitWorkspaceConfigured || cachedRootsDir || callContext.getStore()?.explicitPath;
   if (!located || !handoffMod.isSafeWorkspaceDir?.(cwd) || isInsideInstalledPluginDir(cwd)) {
     if (optional) return null;
@@ -552,10 +560,17 @@ rl.on("line", async (line) => {
         }
         // Strictly per-call session isolation via AsyncLocalStorage: never mutate process-global
         // session state across concurrent conversations sharing one long-lived MCP stdio server.
-        const hostIds = [params?._meta?.rootConversationId, params?._meta?.conversationId, params?._meta?.sessionId, params?.sessionId];
+        const hostIds = [
+          params?._meta?.rootConversationId,
+          params?._meta?.parentConversationId,
+          params?._meta?.conversationId,
+          params?._meta?.sessionId,
+          params?.sessionId
+        ];
         const argumentIds = [toolArgs.sessionId, toolArgs.conversationId];
-        // The host owns execution attribution. Other tools support explicit cross-session queries.
-        const candidates = toolName === "ctx_execute" ? [...hostIds, ...argumentIds] : [...argumentIds, ...hostIds];
+        // The host owns execution/index/batch attribution. Other tools support explicit cross-session queries.
+        const isHostAttributed = toolName === "ctx_execute" || toolName === "ctx_index" || toolName === "ctx_batch";
+        const candidates = isHostAttributed ? [...hostIds, ...argumentIds] : [...argumentIds, ...hostIds];
         const callSessionId = candidates.map(normalizeSessionId).find(Boolean) ?? null;
         const callDirectConvId =
           [

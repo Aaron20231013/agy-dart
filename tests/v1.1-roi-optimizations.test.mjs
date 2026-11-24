@@ -914,7 +914,7 @@ test("Opt 6: read_slices({ slices }) bounded 4MB/256KB cache + apply_edits inval
     fs.writeFileSync(smallPath, "alpha_0001\nbeta__0002\ngamma_0003\n", "utf8");
     fs.utimesSync(smallPath, fixedSec, fixedSec);
 
-    const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
+    const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"), { AGY_DART_DB_PATH: tmpDb });
     try {
       await client.request("initialize", {
         protocolVersion: "2024-11-05",
@@ -1517,7 +1517,11 @@ test("Hardening regressions: SSRF IPv6/dual-stack/slowloris, lowercase/URL secre
 
 test("run_checks keeps both ends of failed commands under character and JSON-RPC byte limits", async t => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "agy-failure-ends-"));
-  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  let client = null;
+  t.after(async () => {
+    if (client) await client.close();
+    fs.rmSync(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
   fs.writeFileSync(path.join(cwd, "fail.cjs"), [
     "const name = process.argv[2];",
     'console.error("setup begins " + name);',
@@ -1526,8 +1530,7 @@ test("run_checks keeps both ends of failed commands under character and JSON-RPC
     'console.error("final cause " + name);',
     "process.exitCode = 1;"
   ].join("\n"));
-  const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
-  t.after(() => client.close());
+  client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"), { AGY_DART_DB_PATH: path.join(cwd, "fast-test.db") });
   for (const outputMode of ["compact", "full"]) {
     for (const maxChars of [1000, 8800]) {
       const response = await client.request("tools/call", { name: "run_checks", arguments: {

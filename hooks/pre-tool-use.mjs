@@ -620,10 +620,16 @@ export function resolveSharedSessionId(payload = {}) {
   return (
     payload.rootConversationId ||
     payload.root_conversation_id ||
+    payload.common?.rootConversationId ||
+    payload.common?.root_conversation_id ||
     payload.parentConversationId ||
     payload.parent_conversation_id ||
+    payload.common?.parentConversationId ||
+    payload.common?.parent_conversation_id ||
     payload.conversationId ||
     payload.conversation_id ||
+    payload.common?.conversationId ||
+    payload.common?.conversation_id ||
     payload.sessionId ||
     payload.session_id ||
     process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID ||
@@ -637,6 +643,8 @@ export function resolveDirectConversationId(payload = {}, env = process.env) {
   return (
     payload.conversationId ||
     payload.conversation_id ||
+    payload.common?.conversationId ||
+    payload.common?.conversation_id ||
     payload.sessionId ||
     payload.session_id ||
     env?.ANTIGRAVITY_CONVERSATION_ID ||
@@ -648,6 +656,8 @@ export function hasExplicitConversationId(payload = {}, env = process.env) {
   const raw =
     payload.conversationId ||
     payload.conversation_id ||
+    payload.common?.conversationId ||
+    payload.common?.conversation_id ||
     payload.sessionId ||
     payload.session_id ||
     env?.ANTIGRAVITY_CONVERSATION_ID ||
@@ -829,8 +839,13 @@ function recordInterception({
   returnedBytes = 0
 }) {
   try {
-    getSharedStore().recordEvent({
-      sessionId: sessionId || "default",
+    const st = getSharedStore();
+    const effectiveSid =
+      typeof st.resolveRootSessionId === "function"
+        ? st.resolveRootSessionId(sessionId || "default")
+        : sessionId || "default";
+    st.recordEvent({
+      sessionId: effectiveSid,
       worktree: cwd || process.cwd(),
       agent: agent || "antigravity",
       kind,
@@ -3001,13 +3016,18 @@ async function main() {
       : undefined;
 
     let cliFilterEnabled = true;
+    let cliSessionId = sessionId;
     try {
-      cliFilterEnabled = getSharedStore().isCliFilterEnabled(sessionId);
+      const st = getSharedStore();
+      cliFilterEnabled = st.isCliFilterEnabled(sessionId);
+      if (typeof st.resolveRootSessionId === "function") {
+        cliSessionId = st.resolveRootSessionId(sessionId);
+      }
     } catch {}
 
     // 2a. Trusted built-in CLI filter rules
     if (cliFilterEnabled && !bypassCliFilter && trimmedCmd) {
-      const builtinRewrite = buildCliFilterRewrite(trimmedCmd, sessionId, cwd, { builtinOnly: true });
+      const builtinRewrite = buildCliFilterRewrite(trimmedCmd, cliSessionId, cwd, { builtinOnly: true });
       if (builtinRewrite) {
         await touchWatchdogPreTool("allow");
         closeSharedStore();
@@ -3061,7 +3081,7 @@ async function main() {
 
     // 2c. Project-level declarative CLI filter rules (only after hard-deny security checks pass)
     if (cliFilterEnabled && !bypassCliFilter && trimmedCmd) {
-      const customRewrite = buildCliFilterRewrite(trimmedCmd, sessionId, cwd, { customOnly: true });
+      const customRewrite = buildCliFilterRewrite(trimmedCmd, cliSessionId, cwd, { customOnly: true });
       if (customRewrite) {
         await touchWatchdogPreTool("allow");
         closeSharedStore();

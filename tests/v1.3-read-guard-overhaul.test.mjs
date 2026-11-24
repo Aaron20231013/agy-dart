@@ -663,7 +663,7 @@ test("v1.3-5: Native .patch/.diff outlines (fast MCP), 3-stage context-preservin
       "utf8"
     );
 
-    const client = createFramedMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
+    const client = createFramedMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"), { AGY_DART_DB_PATH: path.join(tmpDir, "diff-outline-1.db") });
     try {
       await client.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0" } });
       client.notify("notifications/initialized");
@@ -799,7 +799,7 @@ test("v1.3-5: Native .patch/.diff outlines (fast MCP), 3-stage context-preservin
       ].join("\n"),
       "utf8"
     );
-    const client2 = createFramedMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
+    const client2 = createFramedMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"), { AGY_DART_DB_PATH: path.join(tmpDir, "diff-outline-2.db") });
     try {
       await client2.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1.0" } });
       client2.notify("notifications/initialized");

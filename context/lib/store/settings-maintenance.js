@@ -274,13 +274,130 @@ export function normalizeStarPromptState(raw) {
   };
 }
 
+function isSpecialSessionScope(sid) {
+  if (typeof sid !== "string") return true;
+  const trimmed = sid.trim();
+  if (!trimmed) return true;
+  return /^(?:default|all|app|lifetime|__unbound__)$/i.test(trimmed) || /^workspace:/i.test(trimmed);
+}
+
+function sanitizeLeaseLinkId(raw) {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128 || /[\x00-\x1f\x7f\\/]/.test(trimmed) || isSpecialSessionScope(trimmed)) {
+    return "";
+  }
+  return trimmed;
+}
+
 export class SettingsMaintenanceMethods {
+  /** Resolve a conversationId to its top-level rootSessionId via watchdog_lease parent/root links */
+  resolveRootSessionId(sessionId) {
+    const raw = typeof sessionId === "string" ? sessionId.trim() : "";
+    if (!raw) return "default";
+    if (isSpecialSessionScope(raw)) return raw;
+    this.open();
+    let cur = raw;
+    const visited = new Set([cur]);
+    for (let depth = 0; depth < 12; depth++) {
+      let leaseRaw = null;
+      try {
+        leaseRaw = this.getMeta(`watchdog_lease:${cur}`, null);
+      } catch {
+        break;
+      }
+      if (!leaseRaw) break;
+      let lease = null;
+      try {
+        lease = JSON.parse(leaseRaw);
+      } catch {
+        break;
+      }
+      if (!lease || typeof lease !== "object") break;
+      const rootCand = sanitizeLeaseLinkId(lease.rootSessionId);
+      const parentCand = sanitizeLeaseLinkId(lease.parentConversationId);
+      const next =
+        rootCand && rootCand !== cur
+          ? rootCand
+          : parentCand && parentCand !== cur
+            ? parentCand
+            : "";
+      if (!next || visited.has(next)) break;
+      visited.add(next);
+      cur = next;
+    }
+    return cur;
+  }
+
+  /** Return [sessionId, ...descendantSubagentIds] for clean parent-level rollup without double-counting */
+  getSessionFamilyIds(sessionId) {
+    const raw = typeof sessionId === "string" ? sessionId.trim() : "";
+    if (!raw) return ["default"];
+    if (isSpecialSessionScope(raw)) return [raw];
+    this.open();
+    let rows = [];
+    try {
+      rows = this.listMetaByPrefix("watchdog_lease:");
+    } catch {
+      return [raw];
+    }
+    if (!rows || rows.length === 0) return [raw];
+
+    const links = new Map();
+    for (const row of rows) {
+      if (!row || typeof row.key !== "string" || typeof row.value !== "string") continue;
+      const cid = sanitizeLeaseLinkId(row.key.slice("watchdog_lease:".length));
+      if (!cid) continue;
+      try {
+        const lease = JSON.parse(row.value);
+        if (!lease || typeof lease !== "object") continue;
+        const rootCand = sanitizeLeaseLinkId(lease.rootSessionId);
+        const parentCand = sanitizeLeaseLinkId(lease.parentConversationId);
+        const ancestors = [];
+        if (parentCand && parentCand !== cid) ancestors.push(parentCand);
+        if (rootCand && rootCand !== cid && rootCand !== parentCand) ancestors.push(rootCand);
+        if (ancestors.length > 0) {
+          links.set(cid, ancestors);
+        }
+      } catch {}
+    }
+
+    const family = new Set([raw]);
+    for (const cid of links.keys()) {
+      if (family.has(cid)) continue;
+      const queue = [...(links.get(cid) || [])];
+      const seen = new Set([cid]);
+      while (queue.length > 0 && seen.size <= 32) {
+        const anc = queue.shift();
+        if (!anc || seen.has(anc)) continue;
+        if (anc === raw) {
+          family.add(cid);
+          break;
+        }
+        seen.add(anc);
+        const nextAncs = links.get(anc);
+        if (nextAncs) {
+          for (const na of nextAncs) {
+            if (!seen.has(na)) queue.push(na);
+          }
+        }
+      }
+      if (family.size >= 500) break;
+    }
+    return Array.from(family);
+  }
+
   /** Calculate token savings & statistics */
   getStats(sessionId, options = {}) {
     this.open();
     const sid = sessionId || "default";
     const sinceTs = options.sinceTs || null;
     const sinceIso = sinceTs ? new Date(sinceTs).toISOString() : null;
+    const isGlobalOrApp = sid === "all" || sid === "lifetime" || (sid === "app" && sinceIso);
+    const effectiveSid = isGlobalOrApp ? sid : this.resolveRootSessionId(sid);
+    const familyIds = isGlobalOrApp ? null : this.getSessionFamilyIds(effectiveSid);
+    const inClause = familyIds && familyIds.length > 1 ? `IN (${familyIds.map(() => "?").join(",")})` : "= ?";
+    const sidParams = familyIds && familyIds.length > 1 ? familyIds : [effectiveSid];
 
     let eventStats;
     let sourceStats;
@@ -312,7 +429,7 @@ export class SettingsMaintenanceMethods {
           AND NOT EXISTS (
             SELECT 1 FROM events e
             WHERE e.tool = 'ctx_index'
-              AND e.sandbox_bytes = s.bytes_total
+              AND (e.source_id = s.id OR e.sandbox_bytes = s.bytes_total)
           )
       `).get();
     } else if (sid === "app" && sinceIso) {
@@ -343,7 +460,7 @@ export class SettingsMaintenanceMethods {
           AND NOT EXISTS (
             SELECT 1 FROM events e
             WHERE e.tool = 'ctx_index'
-              AND e.sandbox_bytes = s.bytes_total
+              AND (e.source_id = s.id OR e.sandbox_bytes = s.bytes_total)
           )
       `).get(sinceIso, sinceTs);
     } else {
@@ -354,8 +471,8 @@ export class SettingsMaintenanceMethods {
           SUM(returned_bytes) AS total_returned_bytes,
           SUM(MAX(0, MAX(sandbox_bytes, bytes, returned_bytes) - returned_bytes)) AS total_kept_out_bytes
         FROM events
-        WHERE session_id = ? AND COALESCE(key, '') != 'dedup_bypass'
-      `).get(sid);
+        WHERE session_id ${inClause} AND COALESCE(key, '') != 'dedup_bypass'
+      `).get(...sidParams);
 
       sourceStats = this.db.prepare(`
         SELECT
@@ -363,21 +480,21 @@ export class SettingsMaintenanceMethods {
           SUM(bytes_total) AS total_source_bytes,
           SUM(chunk_count) AS total_chunks
         FROM sources
-        WHERE session_id = ?
-      `).get(sid);
+        WHERE session_id ${inClause}
+      `).get(...sidParams);
 
       unrecordedSources = this.db.prepare(`
         SELECT COALESCE(SUM(bytes_total), 0) AS unrecorded_source_bytes
         FROM sources s
-        WHERE s.session_id = ?
+        WHERE s.session_id ${inClause}
           AND s.kind NOT IN ('execution', 'batch', 'tool_output', 'exec')
           AND NOT EXISTS (
             SELECT 1 FROM events e
-            WHERE e.session_id = s.session_id
+            WHERE e.session_id ${inClause}
               AND e.tool = 'ctx_index'
-              AND e.sandbox_bytes = s.bytes_total
+              AND (e.source_id = s.id OR e.sandbox_bytes = s.bytes_total)
           )
-      `).get(sid);
+      `).get(...sidParams, ...sidParams);
     }
 
     const unrecordedBytes = unrecordedSources?.unrecorded_source_bytes || 0;
@@ -405,8 +522,8 @@ export class SettingsMaintenanceMethods {
         breakdownRows = this.db.prepare(`
           SELECT kind, COUNT(*) AS cnt,
             COALESCE(SUM(MAX(0, MAX(sandbox_bytes, bytes, returned_bytes) - returned_bytes)), 0) AS saved_bytes
-          FROM events WHERE session_id = ? AND COALESCE(key, '') != 'dedup_bypass' GROUP BY kind
-        `).all(sid);
+          FROM events WHERE session_id ${inClause} AND COALESCE(key, '') != 'dedup_bypass' GROUP BY kind
+        `).all(...sidParams);
       }
     } catch {}
 
@@ -416,8 +533,10 @@ export class SettingsMaintenanceMethods {
       dedups: 0,
       executions: 0,
       indexes: 0,
+      fastTools: 0,
       cliFilterSavedBytes: 0,
-      dedupSavedBytes: 0
+      dedupSavedBytes: 0,
+      fastToolSavedBytes: 0
     };
     for (const row of breakdownRows) {
       if (row.kind === "interception") breakdown.interceptions = row.cnt;
@@ -431,6 +550,9 @@ export class SettingsMaintenanceMethods {
         breakdown.executions += row.cnt;
       } else if (row.kind === "index") {
         breakdown.indexes = row.cnt;
+      } else if (row.kind === "fast_slice" || row.kind === "fast_check" || row.kind === "fast_search") {
+        breakdown.fastTools += row.cnt;
+        breakdown.fastToolSavedBytes += row.saved_bytes || 0;
       }
     }
 
@@ -472,7 +594,14 @@ export class SettingsMaintenanceMethods {
       } else if (sid === "app" && sinceIso) {
         rows = this.db.prepare(`${baseSql} WHERE created_at >= ? GROUP BY kind, COALESCE(key, '')`).all(sinceIso);
       } else {
-        rows = this.db.prepare(`${baseSql} WHERE session_id = ? GROUP BY kind, COALESCE(key, '')`).all(sid);
+        const effectiveSid = this.resolveRootSessionId(sid);
+        const familyIds = this.getSessionFamilyIds(effectiveSid);
+        if (familyIds.length > 1) {
+          const placeholders = familyIds.map(() => "?").join(",");
+          rows = this.db.prepare(`${baseSql} WHERE session_id IN (${placeholders}) GROUP BY kind, COALESCE(key, '')`).all(...familyIds);
+        } else {
+          rows = this.db.prepare(`${baseSql} WHERE session_id = ? GROUP BY kind, COALESCE(key, '')`).all(effectiveSid);
+        }
       }
     } catch {}
 
@@ -482,7 +611,8 @@ export class SettingsMaintenanceMethods {
       diff_read: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 },
       large_file_guard: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 },
       sandbox_execute: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 },
-      fts_index: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 }
+      fts_index: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 },
+      fast_tools: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 }
     };
 
     const add = (name, r) => {
@@ -502,6 +632,7 @@ export class SettingsMaintenanceMethods {
       else if (r.kind === "interception") add("large_file_guard", r);
       else if (r.kind === "execution" || r.kind === "batch") add("sandbox_execute", r);
       else if (r.kind === "index") add("fts_index", r);
+      else if (r.kind === "fast_slice" || r.kind === "fast_check" || r.kind === "fast_search") add("fast_tools", r);
     }
 
     const ghost =

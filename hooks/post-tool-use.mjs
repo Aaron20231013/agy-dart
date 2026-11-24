@@ -13,7 +13,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { enableVersionedCompileCache } from "./compile-cache.mjs";
 import { getEffectiveConfig } from "../context/lib/config.js";
-import { executionReceiptFromText, isContextExecution } from "../context/lib/execution-receipts.js";
+import {
+  executionReceiptFromText,
+  extractFastSavingsToolName,
+  fastToolFingerprint,
+  isContextExecution
+} from "../context/lib/execution-receipts.js";
 
 function readStdin(timeoutMs = 1500) {
   return new Promise((resolve) => {
@@ -48,8 +53,12 @@ function resolveSessionId(payload = {}) {
   return (
     payload.rootConversationId ||
     payload.root_conversation_id ||
+    payload.common?.rootConversationId ||
+    payload.common?.root_conversation_id ||
     payload.parentConversationId ||
     payload.parent_conversation_id ||
+    payload.common?.parentConversationId ||
+    payload.common?.parent_conversation_id ||
     payload.conversationId ||
     payload.conversation_id ||
     payload.common?.conversationId ||
@@ -611,6 +620,17 @@ function extractToolResponseText(payload = {}) {
           .join("\n");
         if (joined.trim()) return joined;
       }
+      if (typeof c.output === "string" && c.output.trim()) return c.output;
+      if (c.result && typeof c.result === "object") {
+        if (typeof c.result.text === "string" && c.result.text.trim()) return c.result.text;
+        if (Array.isArray(c.result.content)) {
+          const joined = c.result.content
+            .map((item) => (typeof item?.text === "string" ? item.text : ""))
+            .filter(Boolean)
+            .join("\n");
+          if (joined.trim()) return joined;
+        }
+      }
     }
   }
   return "";
@@ -738,6 +758,8 @@ async function main() {
   const { paths, clearAllSession } = extractInvalidationTargets(toolName, args, cwd);
   const responseText = extractToolResponseText(payload);
   const receipt = isContextExecution(toolCall) && executionReceiptFromText(responseText);
+  const fastToolName = extractFastSavingsToolName(toolCall);
+  const fastFingerprint = fastToolName ? fastToolFingerprint(fastToolName, responseText) : null;
   const responseIsError = extractResponseIsError(payload);
   const verifySignal = extractVerificationSignal(toolName, args, responseText);
 
@@ -748,7 +770,7 @@ async function main() {
     Boolean(directConvId && directConvId !== "default") &&
     (clearAllSession || paths.length > 0 || Boolean(verifySignal) || fs.existsSync(resolvedDbPath));
 
-  if (clearAllSession || paths.length > 0 || verifySignal || shouldTouchWatchdog || receipt) {
+  if (clearAllSession || paths.length > 0 || verifySignal || shouldTouchWatchdog || receipt || fastFingerprint) {
     let store = null;
     try {
       const [{ ContextModeStore }, { redactSecrets }, watchdogLeaseMod] = await Promise.all([
@@ -757,7 +779,20 @@ async function main() {
         shouldTouchWatchdog ? import("../context/lib/watchdog-lease.js") : Promise.resolve(null)
       ]);
       store = new ContextModeStore({ hookMode: true, maxBusyRetries: 4, maxRetryDeadlineMs: 800 });
-      if (receipt) store.claimExecutionReceipts(directConvId, [receipt]);
+      const rawClaimOwner = sessionId !== "default" ? sessionId : directConvId;
+      const effectiveRootSessionId =
+        typeof store.resolveRootSessionId === "function"
+          ? store.resolveRootSessionId(rawClaimOwner)
+          : rawClaimOwner;
+      if (receipt) store.claimExecutionReceipts(effectiveRootSessionId, [receipt]);
+      if (fastFingerprint && !responseIsError && typeof store.claimFastToolEvent === "function") {
+        store.claimFastToolEvent(effectiveRootSessionId, {
+          fingerprint: fastFingerprint,
+          tool: fastToolName,
+          worktree: cwd,
+          directConvId
+        });
+      }
       if (clearAllSession) {
         store.invalidateFileReads(sessionId, null);
         if (directConvId && directConvId !== sessionId) {
@@ -824,7 +859,7 @@ async function main() {
             });
           if (checkpointPaths.length > 0) {
             const realCwd = resolveRealPathBestEffort(cwd) || cwd;
-            store.recordModifiedFiles(sessionId, checkpointPaths, {
+            store.recordModifiedFiles(effectiveRootSessionId, checkpointPaths, {
               worktree: wsLogicalForm ? cwd : realCwd,
               tool: toolName
             });
@@ -834,7 +869,7 @@ async function main() {
       if (verifySignal) {
         const safeCommand = redactSecrets(verifySignal.command || "").text;
         const safeSummary = redactSecrets(verifySignal.summary || "").text;
-        store.recordVerificationResult(sessionId, {
+        store.recordVerificationResult(effectiveRootSessionId, {
           ...verifySignal,
           command: safeCommand,
           summary: safeSummary,
@@ -849,7 +884,7 @@ async function main() {
         try {
           watchdogLeaseMod.recordHookLeaseTransition(store, "PostToolUse", payload, {
             directConvId,
-            rootSessionId: sessionId,
+            rootSessionId: effectiveRootSessionId,
             cwd,
             toolName,
             toolArgs: args,

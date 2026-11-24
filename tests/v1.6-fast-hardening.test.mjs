@@ -408,6 +408,10 @@ test("v1.6-2: Dual MCP servers (fast + context) lazy roots/list, list_changed in
     const cleanEnv = {
       AGY_DART_DB_PATH: dbPath,
       AGY_DART_CONFIG_PATH: path.join(tmpDir, "cfg.json"),
+      ANTIGRAVITY_CONVERSATION_ID: "",
+      ANTIGRAVITY_PARENT_CONVERSATION_ID: "",
+      ANTIGRAVITY_ROOT_CONVERSATION_ID: "",
+      CONVERSATION_ID: "",
       ANTIGRAVITY_WORKSPACE_ROOT: "",
       VSCODE_CWD: "",
       PLUGIN_ROOT: installDir

@@ -73,13 +73,13 @@ Use **Node.js 22.16.0 or later in the 22.x line, or Node.js 24 or later**. The i
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.0/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.1/install.ps1 | iex
 ```
 
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.1/install.sh | sh
 ```
 
 ### Option 2: Let Antigravity install it
@@ -87,13 +87,13 @@ curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7
 Send this to Antigravity:
 
 ```text
-Clone tag v1.7.0 of https://github.com/zou172866/Antigravity-agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
+Clone tag v1.7.1 of https://github.com/zou172866/Antigravity-agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
 ```
 
 ### Option 3: Clone & install with custom flags
 
 ```powershell
-git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
+git clone --branch v1.7.1 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
 cd Antigravity-agy-dart
 
 # Windows PowerShell (optional -InstallRg auto-installs ripgrep)
@@ -141,6 +141,15 @@ node scripts/install.mjs tool-loading eager         # All 12 tools eager-loaded
 ---
 
 ## Changelog
+
+### v1.7.1
+- **Accurate "Guard Saved" accounting for `agy-dart_fast` tools**: `read_slices`, `run_checks`, and `batch_search` now record strictly non-inflated byte savings (only when raw input/output genuinely exceeds returned bytes) and attribute anonymous shared MCP calls cleanly to the active conversation without cross-session stealing.
+- **Expanded Windows / PowerShell CLI filtering**: `cli-filter` now recognizes leading package-manager flags (`npm --prefix`, `pnpm -C`, `yarn --cwd`, etc.) and safe `--` argument/path separators while preserving cross-shell safety guards.
+- **Complete MCP receipt claiming & subagent rollup**: Extended receipt claiming to `ctx_index` and `ctx_batch` alongside `ctx_execute`, synced `sources`/`chunks` ownership (`schema v155` + `idx_sources_origin_session`), and unified `rootSessionId` rollup so subagent savings roll up into parent conversation stats without double-counting.
+
+### v1.7.0
+- **Compact signature outlines & inline read-guard outlines**: Added compact function-signature outlines and inline line-number outlines when a large un-ranged file read is intercepted on first blind read.
+- **Multi-host CLI (`bin/agy-dart.mjs`) & scoped subagents**: Added `agy-dart` CLI with `--target claude|codex`, `outline`, `session`, and `compare` commands, shipped `dart-coder` / `dart-reviewer` role definitions, and hardened workspace isolation & Node.js 22.16+ / 24+ SQLite FTS5 checks.
 
 ### v1.6.0
 - **4 core fast tools preloaded directly, fixing occasional multi-file edit drops**: Batch search, outlines, multi-file edits, and concurrent checks now preload directly instead of going through the wrapper tool that occasionally emptied multi-file edit arrays; the other 8 large-log tools stay on-demand to save initial context (switchable via `tool-loading`).
@@ -217,7 +226,7 @@ Install for Antigravity by default. Select Claude Code or Codex explicitly with 
 For Claude Code and Codex, the installer keeps hashes and undo metadata in `~/.agy-dart/<host>-install.json` to restore the plugin's configuration changes. Reinstalling replaces an older full-config record. Uninstalling removes that host's record.
 
 ```sh
-git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
+git clone --branch v1.7.1 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
 cd Antigravity-agy-dart
 node bin/agy-dart.mjs install
 node bin/agy-dart.mjs doctor

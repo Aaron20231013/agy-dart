@@ -7,7 +7,7 @@ import os from "node:os";
 import { execFile, execSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { getEffectiveConfig } from "../../context/lib/config.js";
-import { executionReceiptsFromSteps } from "../../context/lib/execution-receipts.js";
+import { executionReceiptsFromSteps, fastToolClaimsFromSteps } from "../../context/lib/execution-receipts.js";
 import { buildHandoffBrief, inferWorkspaceFromStore } from "../../context/lib/handoff.js";
 import {
   DEFAULT_STALE_LEASE_MS,
@@ -270,6 +270,7 @@ export function getWatchdogMonitor(options = {}) {
 export function closeRuntimeStore() {
   stopWatchdogMonitor();
   _convProjectIdCache.clear();
+  claimedTranscriptStatCache.clear();
   if (_runtimeStore) {
     try {
       _runtimeStore.close();
@@ -546,19 +547,145 @@ function resolveTargetSession(data, defaultConvId = "default") {
   return { scope, convId, targetSid };
 }
 
+const claimedTranscriptStatCache = new Map(); // `${dbPath}|${txPath}` -> `${mtimeMs}:${size}`
+const MAX_CLAIMED_TX_CACHE_ENTRIES = 128;
+
+function setClaimedTranscriptCache(cacheKey, statSig) {
+  if (claimedTranscriptStatCache.has(cacheKey)) {
+    claimedTranscriptStatCache.delete(cacheKey);
+  } else if (claimedTranscriptStatCache.size >= MAX_CLAIMED_TX_CACHE_ENTRIES) {
+    const oldest = claimedTranscriptStatCache.keys().next().value;
+    if (oldest !== undefined) claimedTranscriptStatCache.delete(oldest);
+  }
+  claimedTranscriptStatCache.set(cacheKey, statSig);
+}
+
+function syncTranscriptClaimsForSteps(store, transcriptOwner, steps, { isFullTranscript = true } = {}) {
+  if (!store || !transcriptOwner || !Array.isArray(steps) || steps.length === 0) return true;
+  let rootOwner = transcriptOwner;
+  try {
+    if (typeof store.resolveRootSessionId === "function") {
+      rootOwner = store.resolveRootSessionId(transcriptOwner);
+    }
+  } catch {
+    return false;
+  }
+  let ok = true;
+  try {
+    store.claimExecutionReceipts(rootOwner, executionReceiptsFromSteps(steps));
+  } catch {
+    ok = false;
+  }
+  try {
+    const fastClaims = fastToolClaimsFromSteps(steps);
+    if (fastClaims.length > 0 && typeof store.claimFastToolClaims === "function") {
+      let windowStartIso = "";
+      if (!isFullTranscript) {
+        let earliestMs = Infinity;
+        for (const c of fastClaims) {
+          const t = Number.isFinite(c.createdAtMs) ? c.createdAtMs : c.completedAtMs;
+          if (Number.isFinite(t) && t < earliestMs) {
+            earliestMs = t;
+          }
+        }
+        if (Number.isFinite(earliestMs)) {
+          windowStartIso = new Date(earliestMs - 120000).toISOString();
+        }
+      }
+      store.claimFastToolClaims(rootOwner, fastClaims, {
+        directConvId: transcriptOwner,
+        windowStartIso,
+        isFullTranscript
+      });
+    }
+  } catch {
+    ok = false;
+  }
+  return ok;
+}
+
+function syncConversationFamilyTranscripts(store, convId) {
+  if (
+    !store ||
+    !convId ||
+    convId === "default" ||
+    convId === "all" ||
+    convId === "app" ||
+    convId === "lifetime" ||
+    convId === "__unbound__" ||
+    !isSafeConversationId(convId)
+  ) {
+    return;
+  }
+  try {
+    const rootId = typeof store.resolveRootSessionId === "function" ? store.resolveRootSessionId(convId) : convId;
+    const familySet = new Set(
+      typeof store.getSessionFamilyIds === "function" ? store.getSessionFamilyIds(rootId) : [rootId]
+    );
+    familySet.add(convId);
+    const leases = listWatchdogLeases(store);
+    const candidates = new Map(); // cid -> { txPath, updatedTs }
+    for (const lease of leases) {
+      if (!lease || !lease.conversationId) continue;
+      const cid = lease.conversationId;
+      const leaseRoot = lease.rootSessionId || lease.parentConversationId || cid;
+      if (!familySet.has(cid) && leaseRoot !== rootId && lease.parentConversationId !== rootId) continue;
+      if (lease.transcriptPath && typeof lease.transcriptPath === "string") {
+        candidates.set(cid, { txPath: lease.transcriptPath, updatedTs: Number(lease.updatedTs || 0) });
+      }
+    }
+    if (!candidates.has(rootId)) {
+      const rootTx =
+        resolveCandidateTranscriptPath(rootId, { allowDefaultDb: isDefaultRuntimeStoreDb(store) }) ||
+        findTranscriptForConversation(rootId, { exactOnly: true });
+      if (rootTx) candidates.set(rootId, { txPath: rootTx, updatedTs: Date.now() });
+    }
+    const sorted = Array.from(candidates.entries())
+      .sort((a, b) => b[1].updatedTs - a[1].updatedTs)
+      .slice(0, 12);
+    for (const [cid, info] of sorted) {
+      const txPath = info.txPath;
+      if (!txPath || !fs.existsSync(txPath)) continue;
+      let st;
+      try {
+        st = fs.statSync(txPath);
+        if (!st.isFile() || st.size <= 0) continue;
+      } catch {
+        continue;
+      }
+      const cacheKey = `${store.dbPath || ""}|${rootId}|${txPath}`;
+      const statSig = `${st.mtimeMs}:${st.size}`;
+      if (claimedTranscriptStatCache.get(cacheKey) === statSig) continue;
+      const isFull = st.size <= 2 * 1024 * 1024;
+      const steps = isFull
+        ? parseTranscriptLines(fs.readFileSync(txPath, "utf8"))
+        : readTranscriptTail(txPath, 524288);
+      if (syncTranscriptClaimsForSteps(store, cid, steps, { isFullTranscript: isFull })) {
+        setClaimedTranscriptCache(cacheKey, statSig);
+      }
+    }
+  } catch {}
+}
+
 function getStatsPayload(data, defaultConvId = "default") {
   const store = getRuntimeStore();
   const appStartTime = getAppStartTime();
   const { scope, convId, targetSid } = resolveTargetSession(data, defaultConvId);
   const isLifetimeScope = scope === "lifetime" || scope === "all";
   const isAppScope = scope === "app" || scope === "session";
+  const effectiveConvId =
+    !isLifetimeScope && !isAppScope && typeof store.resolveRootSessionId === "function"
+      ? store.resolveRootSessionId(convId)
+      : convId;
+  const statsTargetSid = isLifetimeScope ? "all" : isAppScope ? "app" : effectiveConvId;
   let stats;
   if (isLifetimeScope) {
     stats = store.getStats("all");
   } else if (isAppScope) {
     stats = store.getStats("app", { sinceTs: appStartTime });
   } else {
-    stats = store.getStats(convId);
+    syncConversationFamilyTranscripts(store, effectiveConvId);
+    stats = store.getStats(effectiveConvId);
   }
 
   stats.scope = scope;
@@ -615,8 +742,8 @@ function getStatsPayload(data, defaultConvId = "default") {
   stats.cliFilterEnabled = store.isCliFilterEnabled(targetSid);
   stats.readDedupEnabled = store.isReadDedupEnabled(targetSid);
   const sinceOpts = scope === "app" || scope === "session" ? { sinceTs: appStartTime } : {};
-  stats.ghost = store.getGhostStats(targetSid, sinceOpts);
-  stats.featureRoi = store.getFeatureRoi(targetSid, { ...sinceOpts, ghost: stats.ghost });
+  stats.ghost = store.getGhostStats(statsTargetSid, sinceOpts);
+  stats.featureRoi = store.getFeatureRoi(statsTargetSid, { ...sinceOpts, ghost: stats.ghost });
   try {
     stats.starPrompt = store.evaluateStarPrompt({ markTriggered: true });
   } catch {}
@@ -970,16 +1097,21 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
       diag = refreshWallClockTtl(cached.diag, explicitTtlSec);
     } else {
-      const steps =
-        st.size <= 2 * 1024 * 1024
-          ? parseTranscriptLines(fs.readFileSync(transcriptPath, "utf8"))
-          : readTranscriptTail(transcriptPath, 524288);
+      const isFullTranscript = st.size <= 2 * 1024 * 1024;
+      const steps = isFullTranscript
+        ? parseTranscriptLines(fs.readFileSync(transcriptPath, "utf8"))
+        : readTranscriptTail(transcriptPath, 524288);
       parsedSteps = steps;
       const transcriptOwner = inferConvIdFromTranscriptPath(transcriptPath);
       if (transcriptOwner && transcriptOwner === resolvedObsConvId) {
-        try {
-          store.claimExecutionReceipts(transcriptOwner, executionReceiptsFromSteps(steps));
-        } catch {} // The hook and the next transcript refresh can also settle the same receipts.
+        const rootOwner =
+          typeof store.resolveRootSessionId === "function"
+            ? store.resolveRootSessionId(transcriptOwner)
+            : transcriptOwner;
+        if (syncTranscriptClaimsForSteps(store, transcriptOwner, steps, { isFullTranscript })) {
+          setClaimedTranscriptCache(`${store.dbPath || ""}|${rootOwner}|${transcriptPath}`, `${st.mtimeMs}:${st.size}`);
+        }
+        syncConversationFamilyTranscripts(store, transcriptOwner);
       }
       const nowMs = Date.now();
       const obsConvId = resolvedObsConvId;

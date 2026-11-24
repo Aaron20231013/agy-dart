@@ -73,13 +73,13 @@ AI 要搜好几个词时一次同时搜完，要改多个文件时一次改完�
 **Windows（PowerShell）：**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.0/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.1/install.ps1 | iex
 ```
 
 **macOS / Linux：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.1/install.sh | sh
 ```
 
 ### 方法二：直接发给 Antigravity 装
@@ -87,13 +87,13 @@ curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7
 复制这句发给 Antigravity：
 
 ```text
-请将 https://github.com/zou172866/Antigravity-agy-dart.git 的 v1.7.0 标签克隆到临时目录，运行其中的 scripts/install.mjs install 完成全局安装并跑 doctor 自检（Windows 如未安装 rg 请同时传 --install-rg）。
+请将 https://github.com/zou172866/Antigravity-agy-dart.git 的 v1.7.1 标签克隆到临时目录，运行其中的 scripts/install.mjs install 完成全局安装并跑 doctor 自检（Windows 如未安装 rg 请同时传 --install-rg）。
 ```
 
 ### 方法三：克隆仓库自定义安装
 
 ```powershell
-git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
+git clone --branch v1.7.1 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
 cd Antigravity-agy-dart
 
 # Windows PowerShell（加 -InstallRg 可顺手自动安装快速搜索工具 rg）
@@ -141,6 +141,15 @@ node scripts/install.mjs tool-loading eager         # 12 个工具全部预载
 ---
 
 ## 更新日志
+
+### v1.7.1
+- **修好侧边栏「已挡冗余」长期显示 0 的问题（补齐 `agy-dart_fast` 真实埋点）**：`read_slices`、`run_checks`、`batch_search` 现按真实裁剪/压缩字节差值记账（绝不虚报），并在匿名共享 MCP 下精准归属到当前对话，不串会话、不重复计数。
+- **修复 Windows / PowerShell 终端过滤漏判**：`cli-filter` 支持跳过 `npm --prefix`、`pnpm -C`、`yarn --cwd` 等前置参数，并在确保跨 Shell 安全的前提下放行常见 `--` 路径/参数分隔符。
+- **补全 MCP 回执归属与子代理统计汇总**：将回执认领从 `ctx_execute` 扩展至 `ctx_index`、`ctx_batch` 并同步认领 `sources`/`chunks`（数据库 schema 升级至 `v155`）；全链路统一按主对话 `rootSessionId` 汇总子代理节省量。
+
+### v1.7.0
+- **紧凑函数签名大纲与首次盲读内联骨架**：新增紧凑函数签名大纲，拦截大文件首次整读时直接附带带行号的核心结构骨架。
+- **统一 CLI 与多宿主适配**：新增 `bin/agy-dart.mjs`（支持 Antigravity 及 `--target claude|codex`、大纲与会话用量对比命令）、内置 `dart-coder` / `dart-reviewer` 角色定义，并加固工作区隔离与 Node.js 22.16+ / 24+ SQLite FTS5 校验。
 
 ### v1.6.0
 - **常用 4 个工具改为默认直连，修好多文件修改偶发丢内容问题**：批量搜索、看目录、改文件、跑检查 4 个高频工具默认直接预载，避开中转层偶尔把多文件改动清空的问题；其余 8 个大日志工具保持按需加载省初始额度（可用 `tool-loading` 切换）。
@@ -221,7 +230,7 @@ npm run cache:simulate
 Claude Code 和 Codex 的安装器会在 `~/.agy-dart/<host>-install.json` 中保存哈希及撤销插件改动所需的信息。重装会替换旧版的整份配置备份，卸载会移除该宿主的安装记录。
 
 ```sh
-git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
+git clone --branch v1.7.1 --depth 1 https://github.com/zou172866/Antigravity-agy-dart.git
 cd Antigravity-agy-dart
 node bin/agy-dart.mjs install
 node bin/agy-dart.mjs doctor

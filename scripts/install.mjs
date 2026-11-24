@@ -512,7 +512,7 @@ async function applyMode(targetDir, modeKey, skipDb = false, { explicitMode = tr
       ],
       PostToolUse: [
         {
-          matcher: "run_command|edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|.*apply_edits|.*run_checks|.*ctx_resume|mcp_agy-dart_context_ctx_execute|call_mcp_tool",
+          matcher: "run_command|edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|.*apply_edits|.*run_checks|.*read_slices|.*batch_search|.*ctx_resume|.*ctx_execute|.*ctx_index|.*ctx_batch|call_mcp_tool",
           hooks: [
             {
               type: "command",

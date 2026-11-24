@@ -352,14 +352,18 @@ async function main() {
 
   let sourceId = null;
   let store = null;
+  let effectiveSessionId = sessionId;
   const effectiveCwd = res.execCwd || process.cwd();
 
   // Index full raw output (redacted) into SQLite FTS5 when non-trivial so filtered details stay searchable
   if (rawBytes >= 2048 || (res.exitCode !== 0 && rawBytes >= 1024)) {
     try {
       store = new ContextModeStore({ hookMode: true });
+      if (typeof store.resolveRootSessionId === "function") {
+        effectiveSessionId = store.resolveRootSessionId(sessionId);
+      }
       const indexed = store.indexContent({
-        sessionId,
+        sessionId: effectiveSessionId,
         worktree: effectiveCwd,
         agent: "antigravity",
         kind: "tool_output",
@@ -394,10 +398,15 @@ async function main() {
 
   // Record telemetry & session verification checkpoint for Sidecar dashboard, ctx_stats & ctx_resume
   try {
-    if (!store) store = new ContextModeStore({ hookMode: true });
+    if (!store) {
+      store = new ContextModeStore({ hookMode: true });
+      if (typeof store.resolveRootSessionId === "function") {
+        effectiveSessionId = store.resolveRootSessionId(sessionId);
+      }
+    }
     if (filtered.wasFiltered || rawBytes > 0) {
       store.recordEvent({
-        sessionId,
+        sessionId: effectiveSessionId,
         worktree: effectiveCwd,
         agent: "antigravity",
         kind: "cli_filter",
@@ -413,7 +422,7 @@ async function main() {
       });
     }
     if (ruleId === "test-runner" || ruleId === "playwright" || ruleId === "build-lint" || ruleId === "docker-build") {
-      store.recordVerificationResult(sessionId, {
+      store.recordVerificationResult(effectiveSessionId, {
         kind: ruleId === "test-runner" || ruleId === "playwright" ? "test" : "build",
         command: safeOriginalCommand,
         ruleId,

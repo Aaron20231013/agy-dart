@@ -1,4 +1,5 @@
 // agy-fast MCP Stdio Server (bundled zero-dependency ESM)
+import { createHash as createHashNode } from "node:crypto";
 import fsSyncNode from "node:fs";
 import pathNodeTop from "node:path";
 import { performance as perfNode } from "node:perf_hooks";
@@ -155,6 +156,7 @@ var McpStdioServer = class {
   stdinEnded = false;
   onDrainExit;
   initWorkspaceRoot = null;
+  initSessionId = null;
   clientSupportsRoots = false;
   cachedRootsDir = null;
   rootsQueried = false;
@@ -315,6 +317,8 @@ var McpStdioServer = class {
           break;
         }
       }
+      const initSid = normalizeFastSessionId(msg.params?.sessionId);
+      if (initSid) this.initSessionId = initSid;
       const requested = typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion.trim() : "";
       const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : DEFAULT_PROTOCOL_VERSION;
       return {
@@ -391,9 +395,47 @@ var McpStdioServer = class {
           };
         }
       }
+      const hostSessionId =
+        [
+          msg.params?._meta?.rootConversationId,
+          msg.params?._meta?.parentConversationId,
+          msg.params?._meta?.conversationId,
+          msg.params?._meta?.sessionId,
+          msg.params?.sessionId,
+          this.initSessionId,
+          process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID,
+          process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID,
+          process.env.ANTIGRAVITY_CONVERSATION_ID,
+          process.env.CONVERSATION_ID
+        ]
+          .map(normalizeFastSessionId)
+          .find(Boolean) ?? null;
+      const directConvId =
+        [
+          msg.params?._meta?.conversationId,
+          msg.params?._meta?.sessionId,
+          msg.params?.sessionId,
+          this.initSessionId,
+          process.env.ANTIGRAVITY_CONVERSATION_ID,
+          process.env.CONVERSATION_ID
+        ]
+          .map(normalizeFastSessionId)
+          .find(Boolean) ?? null;
       try {
         const res = await tool.handler(args, { server: this, rpcId: id });
-        return buildBoundedToolRpcResponse(id, res.text, Boolean(res.isError), DEFAULT_INLINE_MAX_BYTES - 1);
+        const rpcResp = buildBoundedToolRpcResponse(id, res.text, Boolean(res.isError), DEFAULT_INLINE_MAX_BYTES - 1);
+        if (!res.isError && res.telemetry && res.telemetry.rawBytes > 0) {
+          try {
+            await recordFastSavingsEvent({
+              toolName: name,
+              telemetry: res.telemetry,
+              finalText: rpcResp.result.content[0].text,
+              hostSessionId,
+              directConvId
+            });
+          } catch {}
+        }
+        return rpcResp;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return buildBoundedToolRpcResponse(id, `Tool error: ${message}`, true, DEFAULT_INLINE_MAX_BYTES - 1);
@@ -3385,7 +3427,7 @@ function buildGlobFallbackPlan(pattern) {
   }
   return null;
 }
-async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix) {
+async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix, statsCtx = null) {
   const relPrefix = toPosixPath(path3.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   if (sortBy === "mtime") {
@@ -3410,7 +3452,10 @@ async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sor
   }
   const omitted = sortedFiles.slice(maxResults);
   const dirCounts = /* @__PURE__ */ new Map();
+  let omittedBytes = 0;
+  const relBasePrefix = relPrefix && relPrefix !== "." ? `${relPrefix}/` : "";
   for (const f of omitted) {
+    omittedBytes += Buffer.byteLength(relBasePrefix ? `${relBasePrefix}${f}` : f, "utf8") + 1;
     const slash = f.indexOf("/");
     const bucket = slash === -1 ? "(root)" : `${f.slice(0, slash)}/`;
     dirCounts.set(bucket, (dirCounts.get(bucket) ?? 0) + 1);
@@ -3420,9 +3465,15 @@ async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sor
   const dirSummary = topDirs.length > 0 ? `; omitted dirs: ${topDirs.join(", ")}` : "";
   const suffix = `
 ... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}]`;
+  if (statsCtx && omitted.length > 0) {
+    const suffixBytes = Buffer.byteLength(suffix, "utf8");
+    if (omittedBytes > suffixBytes) {
+      statsCtx.extraCompactedBytes += omittedBytes - suffixBytes;
+    }
+  }
   return `${header}${items.join("\n")}${suffix}`;
 }
-async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget, trackCtx = null) {
+async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget, trackCtx = null, statsCtx = null) {
   const maxResults = clampInt(query.maxResults ?? 80, 1, 300);
   const pattern = (query.pattern.trim() || "**/*").replace(/\\/g, "/");
   const matcher = globToRegExp(pattern);
@@ -3473,7 +3524,7 @@ ${rel}`;
   });
   if (walked.files.length > 0) {
     recordGlobPaths(walked.files);
-    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, query.sortBy);
+    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, query.sortBy, void 0, statsCtx);
   }
   const fallback = buildGlobFallbackPlan(pattern);
   if (fallback) {
@@ -3493,7 +3544,8 @@ ${rel}`;
         baseCwd,
         maxResults,
         query.sortBy,
-        fallback.matchedNote
+        fallback.matchedNote,
+        statsCtx
       );
     }
     return fallback.emptyMessage;
@@ -3545,7 +3597,7 @@ function formatSearchLine({ text, isMatch, matchStart, matchEnd }) {
   return (start ? "..." : "") + snippet + (start + snippet.length < text.length ? "..." : "");
 }
 
-function formatFileMatches(files, totalMatches, truncated) {
+function formatFileMatches(files, totalMatches, truncated, statsCtx = null) {
   if (files.length === 0) {
     return "(no matches)";
   }
@@ -3553,7 +3605,15 @@ function formatFileMatches(files, totalMatches, truncated) {
   for (const fm of files) {
     const lines = fm.lines.map((l) => {
       const sep = l.isMatch ? ":" : "-";
-      return `  ${l.lineNumber}${sep} ${formatSearchLine(l)}`;
+      const formatted = formatSearchLine(l);
+      if (statsCtx && typeof l.text === "string" && l.text.length > SEARCH_LINE_CHARS) {
+        const rawLineBytes = Buffer.byteLength(l.text, "utf8");
+        const fmtLineBytes = Buffer.byteLength(formatted, "utf8");
+        if (rawLineBytes > fmtLineBytes) {
+          statsCtx.extraCompactedBytes += rawLineBytes - fmtLineBytes;
+        }
+      }
+      return `  ${l.lineNumber}${sep} ${formatted}`;
     });
     blocks.push(`${fm.file}
 ${lines.join("\n")}`);
@@ -3790,7 +3850,7 @@ async function snapshotTrackedFiles(absPathsSet, baseCwd = "") {
   );
   return results.filter(Boolean);
 }
-async function executeSingleQuery(query, index, baseCwd, useRg, trackCtx = null) {
+async function executeSingleQuery(query, index, baseCwd, useRg, trackCtx = null, statsCtx = null) {
   const header = `## Query ${index + 1} [${query.type}] ${query.pattern}${query.path ? ` (in ${query.path})` : ""}`;
   try {
     if (!query.pattern || typeof query.pattern !== "string") {
@@ -3824,7 +3884,7 @@ ${out}`;
       return `${header}\n${out}`;
     }
     if (query.type === "glob") {
-      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile(), trackCtx);
+      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile(), trackCtx, statsCtx);
       return `${header}
 ${out}`;
     }
@@ -3858,7 +3918,7 @@ ${out}`;
         return `${header}\n${lines.join("\n") || "(no matches)"}`;
       }
       return `${header}
-${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
+${formatFileMatches(res.files, res.totalMatches, res.truncated, statsCtx)}`;
     }
     throw new Error(`Unsupported query type: ${String(query.type)}`);
   } catch (err) {
@@ -3939,6 +3999,13 @@ async function runBatchSearch(input, options = {}) {
   const bypassCache = queriesList.some((q) => q?.type === "git" || q?.type === "fuzzy" || q?.sortBy === "mtime");
   const ttlMs = bypassCache ? 0 : getSearchCacheTtlMs();
   let cacheKey = null;
+  const queryTypesKey = [...new Set(queriesList.map((q) => String(q?.type || "text")))].sort().join(",");
+  const queryPathSummary = redactSecrets(
+    queriesList
+      .slice(0, 3)
+      .map((q) => `${q?.type || "text"}:${String(q?.pattern || "").slice(0, 32)}`)
+      .join(", ")
+  ).text.slice(0, 120);
   if (ttlMs > 0) {
     const worktreeFp = await computeWorktreeFingerprint(baseCwd, queriesList);
     const canonicalQueriesJson = JSON.stringify(stableSortObject(queriesList));
@@ -3951,7 +4018,15 @@ async function runBatchSearch(input, options = {}) {
         BATCH_SEARCH_CACHE.set(cacheKey, cached);
         return {
           text: cached.text,
-          isError: false
+          isError: false,
+          telemetry: {
+            kind: "fast_search",
+            key: queryTypesKey,
+            path: queryPathSummary,
+            worktree: baseCwd,
+            rawBytes: cached.rawBytes ?? Buffer.byteLength(cached.text, "utf8"),
+            ok: 1
+          }
         };
       }
       BATCH_SEARCH_CACHE.delete(cacheKey);
@@ -3962,9 +4037,12 @@ async function runBatchSearch(input, options = {}) {
   );
   const useRg = needsTextSearch && !options.forceNodeFallback && await isRipgrepAvailable();
   const trackCtx = ttlMs > 0 ? { matchedAbsPaths: /* @__PURE__ */ new Set(), hasError: false } : null;
+  const statsCtx = { extraCompactedBytes: 0 };
   const sections = await Promise.all(
-    queriesList.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, trackCtx))
+    queriesList.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, trackCtx, statsCtx))
   );
+  const rawJoinedSectionsBytes = Buffer.byteLength(sections.join("\n\n"), "utf8");
+  const rawSearchBytes = rawJoinedSectionsBytes + statsCtx.extraCompactedBytes;
   const resultText = fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n");
   if (cacheKey && trackCtx && !trackCtx.hasError) {
     try {
@@ -3983,6 +4061,7 @@ async function runBatchSearch(input, options = {}) {
         BATCH_SEARCH_CACHE.set(cacheKey, {
           createdAt: Date.now(),
           text: resultText,
+          rawBytes: rawSearchBytes,
           trackedFiles
         });
       }
@@ -3992,7 +4071,15 @@ async function runBatchSearch(input, options = {}) {
   }
   return {
     text: resultText,
-    isError: false
+    isError: false,
+    telemetry: {
+      kind: "fast_search",
+      key: queryTypesKey,
+      path: queryPathSummary,
+      worktree: baseCwd,
+      rawBytes: rawSearchBytes,
+      ok: 1
+    }
   };
 }
 function clampInt(val, min, max) {
@@ -4065,6 +4152,129 @@ async function getOutlineDbStore() {
     })();
   }
   return outlineDbInitPromise;
+}
+var fastTelemetryStore = null;
+var fastTelemetryDbPath = "";
+var fastTelemetryInitPromise = null;
+var fastReceiptsModPromise = null;
+function loadFastReceiptsMod() {
+  if (!fastReceiptsModPromise) {
+    fastReceiptsModPromise = import("../context/lib/execution-receipts.js").catch(() => null);
+  }
+  return fastReceiptsModPromise;
+}
+function normalizeFastSessionId(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (
+    !trimmed ||
+    trimmed.length > 128 ||
+    /[\x00-\x1f\x7f\\/]/.test(trimmed) ||
+    /^(?:default|all|app|lifetime|__unbound__)$/i.test(trimmed) ||
+    /^workspace:/i.test(trimmed)
+  ) {
+    return null;
+  }
+  return trimmed;
+}
+async function getFastTelemetryStore() {
+  const targetDbPath = resolveOutlineDbPath();
+  if (outlineDbStore && outlineDbStore.dbPath === targetDbPath) {
+    return outlineDbStore;
+  }
+  if (fastTelemetryStore && fastTelemetryDbPath === targetDbPath) {
+    return fastTelemetryStore;
+  }
+  if (fastTelemetryStore && fastTelemetryDbPath !== targetDbPath) {
+    closeFastTelemetryStore();
+  }
+  if (!fastTelemetryInitPromise) {
+    fastTelemetryInitPromise = (async () => {
+      installSqliteWarningFilter();
+      try {
+        const mod = await import("../context/lib/store.js");
+        const st = new mod.ContextModeStore({ dbPath: targetDbPath, hookMode: true, maxBusyRetries: 4, maxRetryDeadlineMs: 800 });
+        st.open();
+        fastTelemetryStore = st;
+        fastTelemetryDbPath = targetDbPath;
+        return st;
+      } catch {
+        return null;
+      } finally {
+        fastTelemetryInitPromise = null;
+      }
+    })();
+  }
+  return fastTelemetryInitPromise;
+}
+function closeFastTelemetryStore() {
+  if (fastTelemetryStore) {
+    try {
+      fastTelemetryStore.close();
+    } catch {}
+    fastTelemetryStore = null;
+  }
+  fastTelemetryDbPath = "";
+  fastTelemetryInitPromise = null;
+}
+async function recordFastSavingsEvent({ toolName, telemetry, finalText, hostSessionId = null, directConvId = null }) {
+  if (!telemetry || !Number.isFinite(telemetry.rawBytes) || telemetry.rawBytes <= 0) return;
+  const returnedBytes = Buffer.byteLength(typeof finalText === "string" ? finalText : "", "utf8");
+  // Strictly non-inflated: record only when raw input/output genuinely exceeded returned bytes.
+  if (telemetry.rawBytes <= returnedBytes) return;
+  const store = await getFastTelemetryStore();
+  if (!store) return;
+  const worktree = telemetry.worktree || process.cwd();
+  const receiptsMod = await loadFastReceiptsMod();
+  const claimFingerprint =
+    typeof receiptsMod?.fastToolFingerprint === "function"
+      ? receiptsMod.fastToolFingerprint(toolName, finalText)
+      : null;
+  if (hostSessionId) {
+    const rootSid =
+      typeof store.resolveRootSessionId === "function"
+        ? store.resolveRootSessionId(hostSessionId)
+        : hostSessionId;
+    store.recordEvent({
+      sessionId: rootSid,
+      worktree,
+      agent: "antigravity",
+      kind: telemetry.kind,
+      tool: toolName,
+      key: telemetry.key || null,
+      path: telemetry.path || null,
+      ok: telemetry.ok ?? 1,
+      bytes: telemetry.rawBytes,
+      body: "",
+      sandboxBytes: telemetry.rawBytes,
+      returnedBytes,
+      claimFingerprint,
+      claimedConv: directConvId || rootSid
+    });
+    return;
+  }
+  let anonSessionId = "default";
+  if (worktree) {
+    try {
+      const canonicalDir = fsSyncNode.realpathSync.native(worktree);
+      anonSessionId = "workspace:" + createHashNode("sha256").update(canonicalDir).digest("hex");
+    } catch {}
+  }
+  store.recordEvent({
+    sessionId: anonSessionId,
+    worktree,
+    agent: "antigravity",
+    kind: telemetry.kind,
+    tool: toolName,
+    key: telemetry.key || null,
+    path: telemetry.path || null,
+    ok: telemetry.ok ?? 1,
+    bytes: telemetry.rawBytes,
+    body: "",
+    sandboxBytes: telemetry.rawBytes,
+    returnedBytes,
+    claimFingerprint
+  });
 }
 function closeOutlineDbStore() {
   if (outlineDbStore) {
@@ -4279,6 +4489,17 @@ async function runReadSlices(input, options = {}) {
     return entry;
   }
   const sections = [];
+  const measuredFiles = /* @__PURE__ */ new Map();
+  const measuredRelPaths = [];
+  const recordMeasuredFile = (cacheKey, size, relPath) => {
+    if (!Number.isFinite(size) || size <= 0) return;
+    if (!measuredFiles.has(cacheKey)) {
+      measuredFiles.set(cacheKey, size);
+      if (relPath && measuredRelPaths.length < 4) measuredRelPaths.push(relPath);
+    } else if (size > measuredFiles.get(cacheKey)) {
+      measuredFiles.set(cacheKey, size);
+    }
+  };
   if (outlines.length > 0) {
     const outlineResults = await Promise.all(
       outlines.map(async (rawPath) => {
@@ -4346,6 +4567,7 @@ async function runReadSlices(input, options = {}) {
             }
           }
           const fullPreview = renderOutlineWithinBudget(relPath, lineCount, symbols, null, outlines.length);
+          recordMeasuredFile(cacheKey, stat.size, relPath);
           return { ok: true, relPath, lineCount, symbols, fullPreview };
         } catch (err) {
           if (err && err.code === "ENOENT") {
@@ -4400,9 +4622,10 @@ ERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`;
               `Blocked reading sensitive file '${path4.basename(absPath)}' (${sens.reason}) because sensitiveFileGuard is set to 'deny'.`
             );
           }
-          const { lines } = await loadLines(absPath, { useSliceCache: true });
+          const { lines, size } = await loadLines(absPath, { useSliceCache: true });
           const totalLines = lines.length;
           const blocks = [];
+          let validRanges = 0;
           for (const range of req.ranges) {
             if (!Array.isArray(range) || range.length < 2) {
               blocks.push("ERROR: each range must be [startLine, endLine]");
@@ -4435,6 +4658,10 @@ ERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`;
               snippet.push(`${num}: ${lines[ln - 1] ?? ""}`);
             }
             blocks.push(snippet.join("\n"));
+            validRanges += 1;
+          }
+          if (validRanges > 0) {
+            recordMeasuredFile(cacheKey, size, relPath);
           }
           return `## Slice: ${relPath} (${totalLines} lines)
 ${blocks.join("\n")}`;
@@ -4456,6 +4683,19 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
     );
     sections.push(...sliceResults);
   }
+  let fullFileRawBytes = 0;
+  for (const sz of measuredFiles.values()) {
+    fullFileRawBytes += sz;
+  }
+  const sliceModeKey = outlines.length > 0 && slices.length > 0 ? "outline+slice" : outlines.length > 0 ? "outline" : "slice";
+  const sliceTelemetry = {
+    kind: "fast_slice",
+    key: sliceModeKey,
+    path: redactSecrets(measuredRelPaths.join(", ")).text.slice(0, 120),
+    worktree: baseCwd,
+    rawBytes: fullFileRawBytes,
+    ok: 1
+  };
   const rawJoined = sections.join("\n\n");
   const rawBytes = Buffer.byteLength(rawJoined, "utf8");
   const isOverBudget = rawJoined.length > maxChars || rawBytes > maxBytes;
@@ -4470,12 +4710,14 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
     );
     return {
       text: `${body}${activeTip}`,
-      isError: false
+      isError: false,
+      telemetry: sliceTelemetry
     };
   }
   return {
     text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
-    isError: false
+    isError: false,
+    telemetry: sliceTelemetry
   };
 }
 
@@ -4715,8 +4957,33 @@ async function runChecks(input, options = {}) {
     }) : pre.rawBody;
     return prefix + fitCheckText(body, bodyCharLimit, bodyByteLimit, !pre.passed);
   });
+  let totalCheckRawBytes = 0;
+  for (const { skippedForBudget, result } of outcomes) {
+    if (skippedForBudget || result.error) continue;
+    const rawOut = (result.stdout || "").replace(/\r\n/g, "\n");
+    const rawErr = (result.stderr || "").replace(/\r\n/g, "\n");
+    const combinedRaw = rawOut + (rawErr ? (rawOut && !rawOut.endsWith("\n") ? "\n" : "") + rawErr : "");
+    totalCheckRawBytes += Buffer.byteLength(combinedRaw, "utf8");
+  }
+  const checkPathSummary = redactSecrets(
+    normalized
+      .slice(0, 3)
+      .map((s) => s.name || s.command)
+      .join(", ")
+  ).text.slice(0, 120);
   const text = [summaryHeader, ...blocks].join(separator);
-  return { text, isError: false };
+  return {
+    text,
+    isError: false,
+    telemetry: {
+      kind: "fast_check",
+      key: outputMode,
+      path: checkPathSummary,
+      worktree: baseCwd,
+      rawBytes: totalCheckRawBytes,
+      ok: failedCount === 0 ? 1 : 0
+    }
+  };
 }
 function clampInt2(val, min, max) {
   if (!Number.isFinite(val)) return min;
@@ -4904,6 +5171,7 @@ function main() {
   const server = createAgyFastServer();
   const exitImmediately = () => {
     closeOutlineDbStore();
+    closeFastTelemetryStore();
     process.exit(0);
   };
   let flushing = false;
@@ -4911,6 +5179,7 @@ function main() {
     if (flushing) return;
     flushing = true;
     closeOutlineDbStore();
+    closeFastTelemetryStore();
     const forceTimer = setTimeout(() => {
       process.exit(0);
     }, 150);
@@ -4931,6 +5200,7 @@ function main() {
   }
   process.on("exit", () => {
     closeOutlineDbStore();
+    closeFastTelemetryStore();
   });
   server.listen(process.stdin, process.stdout, flushAndExit);
 }

@@ -295,7 +295,7 @@ test("Audit P0/P1/P2 (C-1, H-11, H-12, M-15, M-16): fast/mcp-server apply_edits 
       }
     ];
 
-    const res = await mcpSession(fastServer, requests);
+    const res = await mcpSession(fastServer, requests, { AGY_DART_DB_PATH: path.join(tmpDir, "fast-audit.db") });
 
     // M-15 check
     const r2 = res.messages.find((m) => m.id === 2);
@@ -463,7 +463,7 @@ test("Audit P1/P2/P3 (H-1, H-7, M-9, M-10, M-11, M-12, M-13, M-14, P3-6, P3-7): 
     ];
 
     const t0 = Date.now();
-    const res = await mcpSession(fastServer, requests);
+    const res = await mcpSession(fastServer, requests, { AGY_DART_DB_PATH: path.join(tmpDir, "fast-search.db") });
     const elapsedMs = Date.now() - t0;
     assert.ok(elapsedMs < 8000, `H-7: MCP batch took suspiciously long (${elapsedMs}ms)`);
 
@@ -2075,7 +2075,7 @@ test("Audit Verification Follow-ups (H-2 runInstall ancestor/root/non-empty guar
       { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "batch_search", arguments: { cwd: gitRepo, maxChars: 8800, queries: rejectedTagBypasses.map((q) => ({ type: "git", pattern: q.pattern })) } } }
     ];
 
-    const mcpRes = await mcpSession(fastServer, mcpReqs);
+    const mcpRes = await mcpSession(fastServer, mcpReqs, { AGY_DART_DB_PATH: path.join(gitRepo, "fast-git.db") });
     const getResultText = (id) => mcpRes.messages.find((m) => m.id === id)?.result?.content?.[0]?.text || "";
     const splitQuerySections = (text) => text.split(/^## Query /m).slice(1);
 

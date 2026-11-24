@@ -562,6 +562,19 @@ export function tryParseSimpleCommand(cmd) {
   return { bin: tokens[0], args: tokens.slice(1) };
 }
 
+function hasSiblingPs1Script(exePath) {
+  if (!exePath || typeof exePath !== "string") return false;
+  const dir = path.dirname(exePath);
+  const stem = path.basename(exePath, path.extname(exePath));
+  if (!dir || !stem) return false;
+  const ps1Path = path.join(dir, `${stem}.ps1`);
+  try {
+    return fs.existsSync(ps1Path) && fs.statSync(ps1Path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function hasWindowsCrossShellHazard(innerCmd, targetCwd, env = process.env) {
   if (!innerCmd || typeof innerCmd !== "string") return false;
   let hasUnquotedComma = false;
@@ -596,9 +609,19 @@ function hasWindowsCrossShellHazard(innerCmd, targetCwd, env = process.env) {
         tokHasQuote = true;
         i++;
         while (i < len) {
-          if (innerCmd[i] === "\\" && i + 1 < len && innerCmd[i + 1] === '"' && innerCmd.indexOf('"', i + 2) !== -1) {
-            i += 2;
-            continue;
+          if (innerCmd[i] === "\\" && i + 1 < len) {
+            if (innerCmd[i + 1] === "\\" && i + 2 < len && innerCmd[i + 2] === '"') {
+              i += 3;
+              break;
+            }
+            if (innerCmd[i + 1] === '"') {
+              if (innerCmd.indexOf('"', i + 2) !== -1) {
+                i += 2;
+                continue;
+              }
+              i += 2;
+              break;
+            }
           }
           if (innerCmd[i] === '"') {
             i++;
@@ -617,12 +640,16 @@ function hasWindowsCrossShellHazard(innerCmd, targetCwd, env = process.env) {
     }
   }
 
-  if (hasUnquotedComma || hasStandaloneDoubleDash) {
+  if (hasUnquotedComma) {
     return true;
   }
-  if (hasSingleQuotedDoubleQuote) {
+  if (hasStandaloneDoubleDash || hasSingleQuotedDoubleQuote) {
     const parsed = tryParseSimpleCommand(innerCmd);
-    if (!parsed || !resolveWindowsExeOnPath(parsed.bin, targetCwd, env)) {
+    const exePath = parsed ? resolveWindowsExeOnPath(parsed.bin, targetCwd, env) : null;
+    if (!parsed || !exePath) {
+      return true;
+    }
+    if (hasStandaloneDoubleDash && !/\.exe$/i.test(parsed.bin) && hasSiblingPs1Script(exePath)) {
       return true;
     }
   }
@@ -732,6 +759,179 @@ export function parseGitSubcommand(cmd) {
   }
 
   return null;
+}
+
+const PKG_MANAGER_VALUE_FLAGS = new Set([
+  "--prefix",
+  "--cwd",
+  "--dir",
+  "--workspace",
+  "--filter",
+  "--loglevel"
+]);
+const PKG_MANAGER_BOOL_FLAGS = new Set([
+  "--silent",
+  "--workspaces",
+  "--ws",
+  "--workspace-root",
+  "--recursive",
+  "-r",
+  "--if-present",
+  "--no-audit",
+  "--no-fund"
+]);
+
+/**
+ * Linear O(N) tokenizer for `npm`/`pnpm`/`yarn`/`bun` invocations with safe leading options
+ * (e.g. `--prefix <dir>`, `-C <dir>`, `--cwd <dir>`, `--dir <dir>`, `--workspace <pkg>`, `--filter <pkg>`).
+ * Rejects unclosed quotes, unknown leading flags, missing option values, and shell operators before the subcommand.
+ */
+export function parsePkgManagerCommand(cmd) {
+  if (typeof cmd !== "string" || !cmd.trim()) return null;
+  const len = cmd.length;
+  let i = 0;
+
+  const readToken = () => {
+    while (i < len && /\s/.test(cmd[i])) i++;
+    if (i >= len) return null;
+    const start = i;
+    let unquoted = "";
+    let hasQuote = false;
+    while (i < len && !/\s/.test(cmd[i])) {
+      const ch = cmd[i];
+      if (ch === '"' || ch === "'") {
+        hasQuote = true;
+        const quote = ch;
+        i++;
+        let closed = false;
+        while (i < len) {
+          if (quote === "'" && cmd[i] === "'" && i + 1 < len && cmd[i + 1] === "'") {
+            unquoted += "'";
+            i += 2;
+            continue;
+          }
+          if (quote === '"' && cmd[i] === "\\" && i + 1 < len) {
+            if (cmd[i + 1] === "\\" && i + 2 < len && cmd[i + 2] === '"') {
+              unquoted += "\\";
+              i += 3;
+              closed = true;
+              break;
+            }
+            if (cmd[i + 1] === '"') {
+              if (cmd.indexOf('"', i + 2) !== -1) {
+                unquoted += '"';
+                i += 2;
+                continue;
+              }
+              unquoted += "\\";
+              i += 2;
+              closed = true;
+              break;
+            }
+          }
+          if (cmd[i] === quote) {
+            i++;
+            closed = true;
+            break;
+          }
+          unquoted += cmd[i];
+          i++;
+        }
+        if (!closed) return { invalid: true };
+      } else {
+        if (/[|;&<>`$()\r\n\0]/.test(ch)) {
+          if (i === start) return { operator: true };
+          break;
+        }
+        unquoted += ch;
+        i++;
+      }
+    }
+    return {
+      raw: cmd.slice(start, i),
+      value: unquoted,
+      hasQuote,
+      start,
+      end: i
+    };
+  };
+
+  const first = readToken();
+  if (!first || first.invalid || first.operator || first.hasQuote) return null;
+  const binMatch = /^(npm|pnpm|yarn|bun)(?:\.cmd|\.exe)?$/i.exec(first.value);
+  if (!binMatch) return null;
+  const manager = binMatch[1].toLowerCase();
+
+  const consumeSafeLeadingOpts = (maxOpts = 16) => {
+    for (let optCount = 0; optCount <= maxOpts; optCount++) {
+      const tok = readToken();
+      if (!tok || tok.invalid || tok.operator) return null;
+      if (!tok.hasQuote && PKG_MANAGER_BOOL_FLAGS.has(tok.value)) {
+        continue;
+      }
+      if (
+        !tok.hasQuote &&
+        (PKG_MANAGER_VALUE_FLAGS.has(tok.value) ||
+          tok.value === "-C" ||
+          ((manager === "pnpm" || manager === "bun") && tok.value === "-F"))
+      ) {
+        const arg = readToken();
+        if (!arg || arg.invalid || arg.operator || !arg.value) return null;
+        continue;
+      }
+      const startsQuoted = tok.raw.startsWith('"') || tok.raw.startsWith("'");
+      if (
+        !startsQuoted &&
+        (/^--(?:prefix|cwd|dir|workspace|filter|loglevel)=.+/.test(tok.value) ||
+          /^-C.+/.test(tok.value) ||
+          ((manager === "pnpm" || manager === "bun") && /^-F.+/.test(tok.value)))
+      ) {
+        continue;
+      }
+      if (tok.hasQuote || tok.value.startsWith("-")) {
+        return null;
+      }
+      return tok;
+    }
+    return null;
+  };
+
+  let tok = consumeSafeLeadingOpts(16);
+  if (!tok) return null;
+
+  // Support `yarn [--cwd dir] workspace <pkg> [run] <script>`
+  if (manager === "yarn" && tok.value.toLowerCase() === "workspace") {
+    const pkgTok = readToken();
+    if (!pkgTok || pkgTok.invalid || pkgTok.operator || !pkgTok.value || pkgTok.value.startsWith("-")) {
+      return null;
+    }
+    tok = consumeSafeLeadingOpts(8);
+    if (!tok) return null;
+  }
+
+  const action = tok.value.toLowerCase();
+  if (action === "run" || action === "run-script") {
+    const scriptTok = consumeSafeLeadingOpts(8);
+    if (!scriptTok || !/^[a-z0-9][a-z0-9:._-]*$/i.test(scriptTok.value)) return null;
+    return {
+      manager,
+      action: "run",
+      subcommand: scriptTok.value.toLowerCase(),
+      subcommandStart: scriptTok.start,
+      subcommandEnd: scriptTok.end,
+      rest: cmd.slice(scriptTok.end)
+    };
+  }
+
+  if (!/^[a-z0-9][a-z0-9:._-]*$/i.test(tok.value)) return null;
+  return {
+    manager,
+    action,
+    subcommand: action,
+    subcommandStart: tok.start,
+    subcommandEnd: tok.end,
+    rest: cmd.slice(tok.end)
+  };
 }
 
 /**
@@ -2813,6 +3013,13 @@ export const FILTER_RULES = [
     preserveTailOnFail: true,
     pattern:
       /^(?:(?:npm|pnpm|yarn|bun)(?:\.cmd|\.exe)?\s+(?:run\s+)?test(?:\s|$)|node(?:\.exe)?\s+--test(?:\s|$)|(?:npx(?:\.cmd)?\s+)?(?:vitest|jest|mocha|ava)(?:\s|$)|pytest(?:\s|$)|python(?:3)?(?:\.exe)?\s+-m\s+(?:pytest|unittest)(?:\s|$)|go(?:\.exe)?\s+test(?:\s|$)|cargo(?:\.exe)?\s+test(?:\s|$)|dotnet(?:\.exe)?\s+test(?:\s|$))/i,
+    match(cmd) {
+      const pm = parsePkgManagerCommand(cmd);
+      if (pm) {
+        return pm.subcommand === "test" ? { matched: true, skipTarget: pm.rest } : false;
+      }
+      return this.pattern.test(cmd);
+    },
     filter: filterTestRunner
   },
   {
@@ -2820,6 +3027,15 @@ export const FILTER_RULES = [
     preserveTailOnFail: true,
     pattern:
       /^(?:(?:npm|pnpm|yarn|bun)(?:\.cmd|\.exe)?\s+(?:run\s+)?(?:build|lint|typecheck|check)(?:\s|$)|(?:npx(?:\.cmd)?\s+)?(?:tsc|eslint|biome|vite\s+build|next\s+build|webpack)(?:\s|$)|ruff\s+check(?:\s|$)|mypy(?:\s|$)|flake8(?:\s|$)|cargo(?:\.exe)?\s+(?:build|check|clippy)(?:\s|$)|go(?:\.exe)?\s+(?:build|vet)(?:\s|$)|dotnet(?:\.exe)?\s+build(?:\s|$))/i,
+    match(cmd) {
+      const pm = parsePkgManagerCommand(cmd);
+      if (pm) {
+        return ["build", "lint", "typecheck", "check"].includes(pm.subcommand)
+          ? { matched: true, skipTarget: pm.rest }
+          : false;
+      }
+      return this.pattern.test(cmd);
+    },
     filter: filterBuildLint
   },
   {
@@ -2827,6 +3043,15 @@ export const FILTER_RULES = [
     preserveTailOnFail: true,
     pattern:
       /^(?:(?:npm|pnpm|yarn|bun)(?:\.cmd|\.exe)?\s+(?:install|i|ci|add|update)(?:\s|$)|(?:pip|pip3|uv\s+pip)(?:\.exe)?\s+install(?:\s|$))/i,
+    match(cmd) {
+      const pm = parsePkgManagerCommand(cmd);
+      if (pm) {
+        return pm.action !== "run" && ["install", "i", "ci", "add", "update"].includes(pm.subcommand)
+          ? { matched: true, skipTarget: pm.rest }
+          : false;
+      }
+      return this.pattern.test(cmd);
+    },
     filter: filterPkgInstall
   },
   {
@@ -2860,6 +3085,23 @@ export const FILTER_RULES = [
     id: "playwright",
     preserveTailOnFail: true,
     pattern: /^(?:(?:npx|pnpm|yarn|bunx)(?:\.cmd|\.exe)?\s+)?playwright(?:\.cmd|\.exe)?\s+test(?:\s|$)/i,
+    match(cmd) {
+      if (this.pattern.test(cmd)) return true;
+      const pm = parsePkgManagerCommand(cmd);
+      if (!pm) return false;
+      if (
+        pm.action !== "run" &&
+        pm.manager !== "npm" &&
+        pm.subcommand === "playwright" &&
+        /^\s+test(?:\s|$)/i.test(pm.rest)
+      ) {
+        return { matched: true, skipTarget: pm.rest };
+      }
+      if (pm.action === "exec" && /^\s+playwright(?:\.cmd|\.exe)?\s+test(?:\s|$)/i.test(pm.rest)) {
+        return { matched: true, skipTarget: pm.rest };
+      }
+      return false;
+    },
     filter: filterPlaywright
   }
 ];
