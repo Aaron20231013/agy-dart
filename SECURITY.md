@@ -12,7 +12,7 @@
 
 Please **do not** open a public GitHub issue for security vulnerabilities.
 
-Instead, report vulnerabilities privately through [GitHub Security Advisories](https://github.com/zou172866/agy-dart/security/advisories/new). Include reproduction steps, affected operating system / Antigravity host version, and impact assessment. You can expect an initial response within 72 hours.
+Instead, report vulnerabilities privately through [GitHub Security Advisories](https://github.com/zou172866/antigravity-agy-dart/security/advisories/new). Include reproduction steps, affected operating system / Antigravity host version, and impact assessment. You can expect an initial response within 72 hours.
 
 ## Enforced Security Boundaries
 

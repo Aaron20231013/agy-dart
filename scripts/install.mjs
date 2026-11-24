@@ -13,8 +13,8 @@ const __dirname = path.dirname(__selfPath);
 const REPO_ROOT = path.resolve(__dirname, "..");
 const PLUGIN_NAME = "agy-dart";
 
-export const GITHUB_REPO_URL = "https://github.com/zou172866/agy-dart";
-export const GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/agy-dart";
+export const GITHUB_REPO_URL = "https://github.com/zou172866/antigravity-agy-dart";
+export const GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/antigravity-agy-dart";
 export const GH_AUTH_CHECK_TIMEOUT_MS = 1500;
 
 export function isGhCliAuthenticated({

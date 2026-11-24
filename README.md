@@ -4,9 +4,9 @@
 
 # agy-dart
 
-**Save tokens · Improve cache hits · Keep cache warm automatically · Protect context quota · Rescue crashed sessions**
+**Google Antigravity plugin — Save tokens · Improve KV-cache hits · Keep cache warm automatically · Protect context quota · Rescue crashed sessions**
 
-No extra dependencies · Works automatically in the background · Built-in side panel
+No extra dependencies · Works automatically in the background · Built-in Sidecar dashboard
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-10b981.svg)](LICENSE)
 [![Node.js 22.16+ (22.x) or 24+](https://img.shields.io/badge/Node.js-22.16%2B_(22.x)_or_24%2B-38bdf8.svg)](package.json)
@@ -31,9 +31,9 @@ No extra dependencies · Works automatically in the background · Built-in side 
 
 ---
 
-## What does this plugin do?
+## What does this Google Antigravity plugin do?
 
-Reduces repeated reads and large tool results, shows prompt-cache usage, and helps you resume work in a new chat when a session fills up or stalls.
+`agy-dart` is a performance, KV-cache, and context-window plugin for **Google Antigravity** (also supports Claude Code and Codex via `--target`). It reduces repeated reads and large tool results, shows prompt-cache usage, and helps you resume work in a new chat when a session fills up or stalls.
 
 Once installed, it runs automatically in the background — no new commands to learn, just chat and code as usual:
 
@@ -73,13 +73,13 @@ Use **Node.js 22.16.0 or later in the 22.x line, or Node.js 24 or later**. The i
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/agy-dart/v1.7.0/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/antigravity-agy-dart/v1.7.0/install.ps1 | iex
 ```
 
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/agy-dart/v1.7.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/antigravity-agy-dart/v1.7.0/install.sh | sh
 ```
 
 ### Option 2: Let Antigravity install it
@@ -87,14 +87,14 @@ curl -fsSL https://raw.githubusercontent.com/zou172866/agy-dart/v1.7.0/install.s
 Send this to Antigravity:
 
 ```text
-Clone tag v1.7.0 of https://github.com/zou172866/agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
+Clone tag v1.7.0 of https://github.com/zou172866/antigravity-agy-dart.git to a temp folder, run `node scripts/install.mjs install` (add `--install-rg` on Windows if `rg` is missing), and confirm `doctor` passes.
 ```
 
 ### Option 3: Clone & install with custom flags
 
 ```powershell
-git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/agy-dart.git
-cd agy-dart
+git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/antigravity-agy-dart.git
+cd antigravity-agy-dart
 
 # Windows PowerShell (optional -InstallRg auto-installs ripgrep)
 .\install.ps1 -InstallRg
@@ -217,8 +217,8 @@ Install for Antigravity by default. Select Claude Code or Codex explicitly with 
 For Claude Code and Codex, the installer keeps hashes and undo metadata in `~/.agy-dart/<host>-install.json` to restore the plugin's configuration changes. Reinstalling replaces an older full-config record. Uninstalling removes that host's record.
 
 ```sh
-git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/agy-dart.git
-cd agy-dart
+git clone --branch v1.7.0 --depth 1 https://github.com/zou172866/antigravity-agy-dart.git
+cd antigravity-agy-dart
 node bin/agy-dart.mjs install
 node bin/agy-dart.mjs doctor
 ```

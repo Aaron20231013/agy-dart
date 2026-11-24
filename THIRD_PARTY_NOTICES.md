@@ -111,7 +111,7 @@ The following MIT-licensed open-source projects served as design pattern referen
 
 ### Additional design references
 
-- **daoif/tokless** informed five v1.7 features: compact function-signature outlines, an inline outline when a large unrestricted read is intercepted, coder and reviewer agents with scoped tools, short session IDs for token-usage comparisons, and one CLI with host-specific installation adapters. [Upstream project](https://github.com/daoif/tokless) · [Local integration commit](https://github.com/zou172866/agy-dart/commit/24551b9)
+- **daoif/tokless** informed five v1.7 features: compact function-signature outlines, an inline outline when a large unrestricted read is intercepted, coder and reviewer agents with scoped tools, short session IDs for token-usage comparisons, and one CLI with host-specific installation adapters. [Upstream project](https://github.com/daoif/tokless) · [Local integration commit](https://github.com/zou172866/antigravity-agy-dart/commit/24551b9)
 - **headroomlabs-ai/headroom** provided the SmartCrusher design reference for compacting structured tool output. The local JSON/JSONL implementation returns the schema, head and tail samples, and indexed error or anomaly records within a byte budget. [Upstream SmartCrusher](https://github.com/headroomlabs-ai/headroom/blob/main/headroom/transforms/smart_crusher.py) · [Local implementation](context/lib/json-crusher.js)
 - **antigravity-panel** is credited in the local storage code for the idea of periodically cleaning up cached data. In `agy-dart`, `pruneByTtl` removes expired records and optionally runs SQLite `VACUUM`. [Local attribution and implementation](context/lib/store/settings-maintenance.js#L2402)
 
