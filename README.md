@@ -59,6 +59,7 @@ With multiple project windows open, if a background window is nearly out of cont
 6. **Secret masking & sensitive-file blocking**: Masks API keys and tokens in logs or fetched pages, blocks accidental reads of `.env` files when configured, and sandboxes read-only `git` queries against untrusted `.git/config` hooks.
 7. **Hard 8.8 KB response cap with dynamic quota**: Antigravity spills tool outputs above ~10 KB into a temp file that costs an extra read turn; all plugin responses stay within 8.8 KB, dynamically giving short passing checks' unused space to failing stack traces.
 8. **Detailed panel breakdown & offline simulation**: Inspect context usage across file reads, terminal output, and subagents, check 15-turn cache hit trends and miss causes, optionally read only changed lines after edits (off by default), or replay past chat history via CLI to measure cache hit rates and keepalive cost.
+9. **Complements Agent Skills & audits Skills prefix tax**: Works orthogonally alongside domain Agent Skills in Antigravity, Claude Code, and Codex — Skills guide task workflows while `agy-dart` handles low-level read guards, log filtering, and KV-cache hygiene underneath; run `node bin/agy-dart.mjs audit skills` to inspect Turn-0 frontmatter overhead and progressive-disclosure structure across installed skills.
 
 > Antigravity updates frequently — click **Star** at the top right to follow compatibility updates.
 
@@ -210,6 +211,7 @@ npm test                                    # Run full test suite
 npm run verify:pkg                          # Verify installer file list
 npm run prefix:budget                       # Estimate configured Antigravity startup and full-catalog token usage
 node scripts/cache-audit.mjs --workspace . --no-live
+node bin/agy-dart.mjs audit skills --workspace .   # Audit Skills Turn-0 frontmatter tax & progressive disclosure
 npm run cache:simulate
 ```
 

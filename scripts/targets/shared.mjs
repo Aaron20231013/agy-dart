@@ -72,21 +72,50 @@ function beforeInstall(spec, current, previous) {
   return spec.remove(current, previous.undo);
 }
 
+const normPathKey = p => {
+  const resolved = path.resolve(p);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+};
+
+function findManagedSkillRoot(file, home) {
+  const resolvedHome = path.resolve(home);
+  const resolvedFile = path.resolve(file);
+  const rel = path.relative(resolvedHome, resolvedFile);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  const parts = rel.split(path.sep);
+  if (parts.length < 4 || parts[1] !== "skills" || parts[2] !== "agy-dart") return null;
+  return path.join(resolvedHome, parts[0], "skills", "agy-dart");
+}
+
 export function manageFiles(home, host, specs, action) {
   const stateFile = path.join(home, ".agy-dart", host + "-install.json");
   const oldState = JSON.parse(read(stateFile) ?? "{}");
   const records = oldState.version === 2 ? oldState.files : oldState;
+  const recordByKey = new Map();
+  for (const [k, v] of Object.entries(records)) recordByKey.set(normPathKey(k), v);
+  const specKeys = new Set(specs.map(s => normPathKey(s.file)));
   const files = {};
   const pending = {};
   const changes = [];
   for (const spec of specs) {
     const file = spec.file;
     const current = read(file);
-    let previous = records[file];
+    let previous = records[file] ?? recordByKey.get(normPathKey(file));
     const currentHash = digest(current);
     if (previous?.transition?.from === currentHash) previous = previous.transition.record;
     if (action === "uninstall" && !previous) continue;
-    const original = beforeInstall(spec, current, previous);
+    let original = beforeInstall(spec, current, previous);
+    if (action === "install" && !previous && current !== null) {
+      const skillRoot = findManagedSkillRoot(file, home);
+      if (skillRoot) {
+        const skillEntry = path.join(skillRoot, "SKILL.md");
+        const skillRec = normPathKey(skillEntry) !== normPathKey(file) ? recordByKey.get(normPathKey(skillEntry)) : null;
+        const ownsSkillDir = Boolean(
+          skillRec && (Object.hasOwn(skillRec, "installed") ? skillRec.original === null : skillRec.before === null)
+        );
+        if (ownsSkillDir && spec.verify(current)) original = null;
+      }
+    }
     let next = original;
     const legacy = previous && Object.hasOwn(previous, "installed");
     if (action === "install") {
@@ -100,12 +129,41 @@ export function manageFiles(home, host, specs, action) {
     }
     if (next !== current) changes.push({ file, next, current, legacy });
   }
+  for (const [oldFile, rawOldRec] of Object.entries(records)) {
+    if (specKeys.has(normPathKey(oldFile))) continue;
+    const skillRoot = findManagedSkillRoot(oldFile, home);
+    if (!skillRoot) continue;
+    const current = read(oldFile);
+    if (current === null) continue;
+    let oldRec = rawOldRec;
+    const currentHash = digest(current);
+    if (oldRec?.transition?.from === currentHash) oldRec = oldRec.transition.record;
+    const isLegacy = Object.hasOwn(oldRec, "installed");
+    const createdByUs = isLegacy ? oldRec.original === null : oldRec.before === null;
+    if (!createdByUs) continue;
+    const expectedHash = isLegacy ? digest(oldRec.installed) : oldRec.after;
+    if (currentHash !== expectedHash) {
+      const relLabel = path.relative(path.resolve(home), path.resolve(oldFile)).replaceAll("\\", "/");
+      throw Error("Locally modified skill: " + relLabel);
+    }
+    changes.push({ file: oldFile, next: null, current, legacy: false });
+    if (action === "install") {
+      pending[oldFile] = { before: null, after: expectedHash, undo: oldRec.undo ?? { offset: 0, length: current.length } };
+    }
+  }
   function apply({file, next, current}) {
     if (read(file) !== current) throw Error("Configuration changed during installation: " + file);
     if (next === null) {
       fs.unlinkSync(file);
-      if (file.endsWith(path.join("skills","agy-dart","SKILL.md")) && !fs.readdirSync(path.dirname(file)).length)
-        fs.rmdirSync(path.dirname(file));
+      const skillRoot = findManagedSkillRoot(file, home);
+      if (skillRoot) {
+        const rootKey = normPathKey(skillRoot);
+        for (let dir = path.dirname(path.resolve(file)); ; dir = path.dirname(dir)) {
+          if (!fs.existsSync(dir) || fs.readdirSync(dir).length) break;
+          fs.rmdirSync(dir);
+          if (normPathKey(dir) === rootKey || path.dirname(dir) === dir) break;
+        }
+      }
     } else writeFileAtomicSync(file, next);
   }
   if (action === "install") {
@@ -119,14 +177,53 @@ export function manageFiles(home, host, specs, action) {
     if (read(stateFile) !== null) fs.unlinkSync(stateFile);
   }
 }
-export function skillSpec(home, dir, src) {
-  const body = fs.readFileSync(path.join(src,"skills/agy-dart/SKILL.md"),"utf8");
-  return { file:path.join(home,dir,"skills/agy-dart/SKILL.md"),
+function skillFileSpec(home, dir, src, relPosix) {
+  const parts = relPosix.split("/");
+  const body = fs.readFileSync(path.join(src, "skills", "agy-dart", ...parts), "utf8");
+  const label = relPosix === "SKILL.md" ? dir : `${dir} (${relPosix})`;
+  return {
+    file: path.join(home, dir, "skills", "agy-dart", ...parts),
     install(current) {
-      if (current !== null) throw Error("Skill already exists: " + dir);
+      if (current !== null) throw Error("Skill already exists: " + label);
       return insertConfig("", 0, body);
-    }, verify(current) { return current === body; },
-    remove() { throw Error("Locally modified skill: " + dir); } };
+    },
+    verify(current) { return current === body; },
+    remove() { throw Error("Locally modified skill: " + label); }
+  };
+}
+export function skillSpec(home, dir, src) {
+  return skillFileSpec(home, dir, src, "SKILL.md");
+}
+const IGNORED_SKILL_AUX_DIRS = new Set(["__pycache__", "node_modules"]);
+const IGNORED_SKILL_AUX_FILE_RE = /\.py[co]$/i;
+
+export function skillSpecs(home, dir, src) {
+  const skillRoot = path.join(src, "skills", "agy-dart");
+  const relFiles = ["SKILL.md"];
+  const walk = (subRel, depth = 1) => {
+    if (depth > 6) return;
+    const absDir = path.join(skillRoot, ...subRel.split("/"));
+    if (!fs.existsSync(absDir)) return;
+    const st = fs.lstatSync(absDir);
+    if (st.isSymbolicLink() || !st.isDirectory()) return;
+    const entries = fs.readdirSync(absDir, { withFileTypes: true })
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const ent of entries) {
+      const lowerName = ent.name.toLowerCase();
+      if (ent.name.startsWith(".") || IGNORED_SKILL_AUX_DIRS.has(lowerName)) continue;
+      const nextRel = `${subRel}/${ent.name}`;
+      const absEntry = path.join(absDir, ent.name);
+      const est = fs.lstatSync(absEntry);
+      if (est.isSymbolicLink()) continue;
+      if (est.isDirectory()) walk(nextRel, depth + 1);
+      else if (est.isFile()) {
+        if (IGNORED_SKILL_AUX_FILE_RE.test(ent.name)) continue;
+        relFiles.push(nextRel);
+      }
+    }
+  };
+  for (const auxDir of ["references", "examples", "scripts", "resources"]) walk(auxDir, 1);
+  return relFiles.map((rel) => skillFileSpec(home, dir, src, rel));
 }
 export function cleanupRuntime(home) {
   const base = path.join(home,".agy-dart");

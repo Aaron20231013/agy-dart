@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import { isDeepStrictEqual as equal } from "node:util";
-import { insertConfig, serverCommands, skillSpec } from "./shared.mjs";
+import { insertConfig, serverCommands, skillSpecs } from "./shared.mjs";
 
 export const detect = home => [".claude", ".claude.json"].some(file => fs.existsSync(path.join(home, file)));
 const object = value => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -142,6 +142,6 @@ export function specs(home, src, runtime) {
       Object.fromEntries(Object.entries(serverCommands(runtime, executable)).map(([key, value]) => ["agy-dart_" + key, value]))),
     jsonSpec(path.join(home, ".claude/settings.json"), ["hooks", "PreToolUse"], executable =>
       [{ matcher: "Read|Bash", hooks: [{ type: "command", command: quote(executable) + " " + quote(path.join(runtime, "hooks/pre-tool-use.mjs")) }] }]),
-    skillSpec(home, ".claude", src)
+    ...skillSpecs(home, ".claude", src)
   ];
 }

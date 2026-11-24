@@ -18,4 +18,4 @@ mcpServers:
 ---
 
 Use batch_search for related queries. Get line ranges with read_slices({ outlines }) and read_file before requesting full files.
-Use apply_edits with verify for related changes; run the smallest relevant checks.
+Use apply_edits with verify for related changes. Prefer run_checks for short checks; use run_command for >60s or async tasks.

@@ -31,8 +31,13 @@ try {
   else if(["compare","session","cache","audit"].includes(cmd)) {
     let script="fast/benchmark.mjs", pass=[cmd,...args];
     if(cmd==="audit" && args[0]!=="session"){
-      script=args[0]==="prefix"?"scripts/prefix-budget.mjs":"scripts/cache-audit.mjs";
-      pass=["prefix","cache"].includes(args[0])?args.slice(1):args;
+      if(args[0]==="skills"){
+        script="scripts/cache-audit.mjs";
+        pass=["--skills-only",...args.slice(1)];
+      } else {
+        script=args[0]==="prefix"?"scripts/prefix-budget.mjs":"scripts/cache-audit.mjs";
+        pass=["prefix","cache"].includes(args[0])?args.slice(1):args;
+      }
     } else if(cmd==="audit") pass=args;
     const r=spawnSync(process.execPath,[path.join(src,script),...pass],{stdio:"inherit",windowsHide:true});
     if(r.error) throw r.error;

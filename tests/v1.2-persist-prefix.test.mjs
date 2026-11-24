@@ -40,6 +40,7 @@ function runSessionStart(payload, dbPath, extraEnv = {}) {
     env: {
       ...cleanEnv,
       AGY_DART_DB_PATH: dbPath,
+      AGY_DART_CONFIG_PATH: path.join(path.dirname(dbPath), "nonexistent-config.json"),
       AGY_DART_DISABLE_COMPILE_CACHE: "1",
       ...extraEnv
     }
@@ -361,7 +362,11 @@ test("P1-5B: SessionStart stable-prefix-only & subagent payloads stay byte-ident
 });
 
 test("P1-5C: prefix-budget.mjs --stable-only --json reports volatileBytes===0 & stablePct===100 with intact schema", async () => {
-  const cleanEnv = { ...process.env, AGY_DART_DISABLE_COMPILE_CACHE: "1" };
+  const cleanEnv = {
+    ...process.env,
+    AGY_DART_CONFIG_PATH: path.join(os.tmpdir(), `agy-dart-nonexistent-config-${process.pid}.json`),
+    AGY_DART_DISABLE_COMPILE_CACHE: "1"
+  };
   delete cleanEnv.AGY_DART_STABLE_PREFIX_ONLY;
 
   const defCli = spawnSync(process.execPath, [path.join(ROOT, "scripts", "prefix-budget.mjs"), "--json"], {

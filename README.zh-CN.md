@@ -59,6 +59,7 @@ AI 要搜好几个词时一次同时搜完，要改多个文件时一次改完�
 6. **密钥打码、敏感文件与 Git 沙盒防护**：日志或网页里的 API Key、口令自动打码；可拦截 AI 误读 `.env` 等配置文件，并封堵陌生仓库 `.git/config` 挂载外部命令的入口。
 7. **单次返回卡在 8.8 KB 以内（智能匀配额）**：Antigravity 工具单次返回超过约 10 KB 会自动落成临时文件让 AI 多读一轮；插件把返回内容控制在 8.8 KB 内，并自动把短检查省下的空间让给真正报错的长堆栈。
 8. **面板细分统计与离线测算**：右侧面板能查看上下文花在读文件、终端输出还是子智能体上，以及最近 15 轮缓存命中走势和失效原因；可选开启大文件修改后只读改动行（默认关闭）；命令行支持拿历史记录测算缓存命中与自动续期账本。
+9. **与 Agent Skills 生态正交互补，支持全环境 Skills 体检**：可与 Antigravity / Claude Code / Codex 各类业务 Skill 无缝叠加——业务 Skill 负责工作流编排，插件在底层兜底拦截盲读大文件、裁剪刷屏输出并守护缓存；运行 `node bin/agy-dart.mjs audit skills` 可一键审计所有已安装 Skills 的 Turn-0 前缀税与渐进式披露结构。
 
 > Antigravity 官方更新很勤，可以点一下右上角 **Star** 方便跟进后续兼容更新。
 
@@ -210,6 +211,7 @@ npm test                                    # 跑全套测试
 npm run verify:pkg                          # 检查安装包文件完整性
 npm run prefix:budget                       # 分别估算 Antigravity 配置的首轮占用和全部工具加载后的占用
 node scripts/cache-audit.mjs --workspace . --no-live
+node bin/agy-dart.mjs audit skills --workspace .   # 审计全环境 Skills 的 Turn-0 前缀税与渐进式披露结构
 npm run cache:simulate
 ```
 

@@ -17,7 +17,11 @@ import { sha256Hex, stableSortObject, stableStringify } from "../context/lib/sta
 const DEFAULT_TIMEOUT_MS = 4000;
 const SINGLE_RULE_WARN_TOKENS = 1500;
 const TOTAL_PREFIX_WARN_TOKENS = 6000;
+const SINGLE_SKILL_FRONTMATTER_WARN_TOKENS = 250;
+const SINGLE_SKILL_BODY_WARN_TOKENS = 3000;
+const TOTAL_SKILLS_FRONTMATTER_WARN_TOKENS = 2000;
 const MCP_SCHEMA_WARN_TOKENS = 3000;
+const SKILL_AUX_DIR_NAMES = Object.freeze(["examples", "references", "resources", "scripts"]);
 
 const PENALTY_WEIGHTS = Object.freeze({
   critical: 20,
@@ -100,6 +104,15 @@ function getHomeDir() {
 function normalizePathKey(p) {
   const resolved = path.resolve(p);
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function canonicalPathKey(p) {
+  const resolved = path.resolve(p);
+  let canonical = resolved;
+  try {
+    canonical = fs.realpathSync(resolved);
+  } catch {}
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
 }
 
 function toPosixDisplay(p, baseDir = "") {
@@ -192,16 +205,88 @@ function measureTextStats(text) {
 }
 
 function splitFrontmatter(markdown) {
-  const normalized = String(markdown || "");
-  const match = normalized.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
+  const raw = String(markdown || "");
+  const normalized = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  const match = normalized.match(/^---[ \t]*\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/);
   if (!match) {
-    return { frontmatter: "", body: normalized };
+    return { frontmatter: "", body: normalized, hasFrontmatter: false };
   }
   const frontmatter = match[0];
+  const inner = String(match[1] || "").trim();
+  const hasYamlKey = Boolean(inner && /^\s*["']?[A-Za-z0-9_.-]+["']?\s*:/m.test(inner));
+  if (!hasYamlKey) {
+    return { frontmatter: "", body: normalized.slice(frontmatter.length), hasFrontmatter: false };
+  }
   return {
     frontmatter,
-    body: normalized.slice(frontmatter.length)
+    body: normalized.slice(frontmatter.length),
+    hasFrontmatter: true
   };
+}
+
+const IGNORED_SKILL_AUX_DIRS = new Set(["__pycache__", "node_modules"]);
+const IGNORED_SKILL_AUX_FILE_RE = /\.py[co]$/i;
+
+function inspectSkillAuxAssets(skillDir) {
+  const auxDirSet = new Set();
+  const recognizedSet = new Set(SKILL_AUX_DIR_NAMES);
+  let auxFileCount = 0;
+  let auxBytes = 0;
+  let auxTokens = 0;
+
+  if (!isDir(skillDir)) {
+    return { auxDirs: [], auxFileCount, auxBytes, auxTokens };
+  }
+
+  const walk = (curDir, depth, topDirName) => {
+    if (depth > 6) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(curDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => compareAscii(a.name, b.name));
+    for (const ent of entries) {
+      const lowerName = ent.name.toLowerCase();
+      if (ent.name.startsWith(".") || IGNORED_SKILL_AUX_DIRS.has(lowerName)) continue;
+      if (depth === 0 && lowerName === "skill.md") continue;
+      const full = path.join(curDir, ent.name);
+      let st;
+      try {
+        st = fs.lstatSync(full);
+      } catch {
+        continue;
+      }
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) {
+        const nextTop = depth === 0 ? ent.name : topDirName;
+        walk(full, depth + 1, nextTop);
+      } else if (st.isFile()) {
+        if (IGNORED_SKILL_AUX_FILE_RE.test(ent.name)) continue;
+        auxFileCount += 1;
+        if (topDirName && recognizedSet.has(topDirName)) {
+          auxDirSet.add(topDirName);
+        }
+        if (st.size <= 2 * 1024 * 1024) {
+          try {
+            const buf = fs.readFileSync(full);
+            auxBytes += buf.length;
+            const probeLen = Math.min(buf.length, 4096);
+            const isBinary = buf.subarray(0, probeLen).includes(0);
+            auxTokens += isBinary ? estimateTokens(buf.length) : estimateTokens(buf.toString("utf8"));
+            continue;
+          } catch {}
+        }
+        auxBytes += st.size;
+        auxTokens += estimateTokens(st.size);
+      }
+    }
+  };
+
+  walk(skillDir, 0, null);
+  const auxDirs = SKILL_AUX_DIR_NAMES.filter((name) => auxDirSet.has(name));
+  return { auxDirs, auxFileCount, auxBytes, auxTokens };
 }
 
 function safeReadJson(filePath) {
@@ -242,7 +327,7 @@ function listMarkdownFiles(dir, maxDepth = 2) {
     }
     entries.sort((a, b) => compareAscii(a.name, b.name));
     for (const ent of entries) {
-      if (ent.name.startsWith(".") || ent.name === "node_modules") continue;
+      if (ent.name.startsWith(".") || IGNORED_SKILL_AUX_DIRS.has(ent.name.toLowerCase())) continue;
       const full = path.join(cur, ent.name);
       if (ent.isFile() && /\.md$/i.test(ent.name)) {
         out.push(full);
@@ -266,8 +351,9 @@ function listSkillFiles(skillsRoot) {
   entries.sort((a, b) => compareAscii(a.name, b.name));
   const out = [];
   for (const ent of entries) {
-    if (!ent.isDirectory() || ent.name.startsWith(".")) continue;
+    if (ent.name.startsWith(".") || IGNORED_SKILL_AUX_DIRS.has(ent.name.toLowerCase())) continue;
     const subDir = path.join(skillsRoot, ent.name);
+    if (!ent.isDirectory() && !(ent.isSymbolicLink() && isDir(subDir))) continue;
     const exact = path.join(subDir, "SKILL.md");
     if (isFile(exact)) {
       out.push({ skillName: ent.name, path: exact });
@@ -347,9 +433,219 @@ function discoverPlugins(configDir, workspaceDir) {
  * Check 1: Turn-0 Rules & Skill YAML Frontmatter Prefix Audit
  * ========================================================================== */
 
+function scanAndAuditSkills(configDir, workspaceDir, activePlugins, findings, seen = new Set()) {
+  const skillItems = [];
+
+  const addSkillFile = ({ skillName, path: filePath }, scope, { legacyPath = false } = {}) => {
+    if (!isFile(filePath)) return null;
+    const key = canonicalPathKey(filePath);
+    if (seen.has(key)) return null;
+    seen.add(key);
+
+    let text;
+    try {
+      text = fs.readFileSync(filePath, "utf8");
+    } catch {
+      return null;
+    }
+    const { frontmatter, body, hasFrontmatter } = splitFrontmatter(text);
+    const fmStats = measureTextStats(frontmatter);
+    const bodyStats = measureTextStats(body);
+    const aux = inspectSkillAuxAssets(path.dirname(filePath));
+    const entry = {
+      kind: "skill_frontmatter",
+      scope,
+      skillName,
+      name: `skills/${skillName}/${path.basename(filePath)}`,
+      path: path.resolve(filePath),
+      bytes: fmStats.bytes,
+      chars: fmStats.chars,
+      cjkChars: fmStats.cjkChars,
+      tokens: fmStats.tokens,
+      sha256: fmStats.sha256,
+      hasFrontmatter,
+      bodyBytes: bodyStats.bytes,
+      bodyTokens: bodyStats.tokens,
+      auxDirs: aux.auxDirs,
+      auxFileCount: aux.auxFileCount,
+      auxBytes: aux.auxBytes,
+      auxTokens: aux.auxTokens,
+      legacyPath: Boolean(legacyPath)
+    };
+    skillItems.push(entry);
+    return entry;
+  };
+
+  // Global configDir skills
+  for (const s of listSkillFiles(path.join(configDir, "skills"))) {
+    addSkillFile(s, "global");
+  }
+
+  // Active plugin skills (both global & workspace plugins)
+  for (const plugin of activePlugins) {
+    for (const s of listSkillFiles(path.join(plugin.dir, "skills"))) {
+      addSkillFile(s, plugin.scope);
+    }
+  }
+
+  // Workspace skills (support .agents/skills, .gemini/skills, and skills/)
+  for (const skillsSub of [
+    path.join(workspaceDir, ".agents", "skills"),
+    path.join(workspaceDir, ".gemini", "skills"),
+    path.join(workspaceDir, "skills")
+  ]) {
+    for (const s of listSkillFiles(skillsSub)) {
+      addSkillFile(s, "workspace");
+    }
+  }
+
+  // Legacy skill paths: <workspace>/.agent/skills/ and (when configDir basename === "config") <dirname(configDir)>/antigravity/skills/
+  const scanLegacySkillsRoot = (legacyRoot, scope, target, legacyDisplay, modernTarget) => {
+    const found = [];
+    for (const s of listSkillFiles(legacyRoot)) {
+      const added = addSkillFile(s, scope, { legacyPath: true });
+      if (added) found.push(added);
+    }
+    if (found.length > 0) {
+      const preview = found
+        .slice(0, 5)
+        .map((i) => i.skillName)
+        .join(", ");
+      const more = found.length > 5 ? `, +${found.length - 5} more` : "";
+      findings.push({
+        severity: "info",
+        code: "legacy_skill_path",
+        category: "prefix",
+        target,
+        message: `Found ${found.length} skill(s) in legacy path '${legacyDisplay}' (${preview}${more}).`,
+        recommendation: `Migrate skills from '${legacyDisplay}' to '${modernTarget}' so current host versions discover them consistently.`
+      });
+    }
+  };
+
+  scanLegacySkillsRoot(
+    path.join(workspaceDir, ".agent", "skills"),
+    "workspace-legacy",
+    "workspace:.agent/skills",
+    ".agent/skills/",
+    ".agents/skills/"
+  );
+
+  const cfgBase = path.basename(configDir);
+  const isStandardConfigDir = process.platform === "win32" ? cfgBase.toLowerCase() === "config" : cfgBase === "config";
+  if (isStandardConfigDir) {
+    scanLegacySkillsRoot(
+      path.join(path.dirname(configDir), "antigravity", "skills"),
+      "global-legacy",
+      "global:antigravity/skills",
+      "antigravity/skills/",
+      "~/.gemini/config/skills/"
+    );
+  }
+
+  // Rank descending by Turn-0 frontmatter tokens, then bodyTokens desc, then deterministic path tie-break
+  skillItems.sort((a, b) =>
+    b.tokens !== a.tokens
+      ? b.tokens - a.tokens
+      : b.bodyTokens !== a.bodyTokens
+        ? b.bodyTokens - a.bodyTokens
+        : compareAscii(a.path, b.path)
+  );
+
+  let skillFrontmatterBytes = 0;
+  let skillFrontmatterChars = 0;
+  let skillFrontmatterTokens = 0;
+  let skillBodyBytes = 0;
+  let skillBodyTokens = 0;
+  let skillAuxFileCount = 0;
+  let skillAuxBytes = 0;
+  let skillAuxTokens = 0;
+  let progressiveSkillCount = 0;
+  let missingFrontmatterCount = 0;
+  let legacySkillCount = 0;
+
+  for (const item of skillItems) {
+    skillFrontmatterBytes += item.bytes;
+    skillFrontmatterChars += item.chars;
+    skillFrontmatterTokens += item.tokens;
+    skillBodyBytes += item.bodyBytes;
+    skillBodyTokens += item.bodyTokens;
+    skillAuxFileCount += item.auxFileCount;
+    skillAuxBytes += item.auxBytes;
+    skillAuxTokens += item.auxTokens;
+    if (item.auxDirs.length > 0) progressiveSkillCount += 1;
+    if (item.legacyPath) legacySkillCount += 1;
+
+    const target = `${item.scope}:${item.name}`;
+    if (!item.hasFrontmatter) {
+      missingFrontmatterCount += 1;
+      findings.push({
+        severity: "warn",
+        code: "missing_skill_frontmatter",
+        category: "prefix",
+        target,
+        message: `Skill '${item.name}' is missing a valid YAML frontmatter block (\`--- ... ---\`).`,
+        recommendation: `Add a concise YAML frontmatter header (\`name\` + 1-2 sentence \`description\`) at the top of '${item.name}' so hosts index it cleanly at Turn 0.`
+      });
+    } else if (item.tokens > SINGLE_SKILL_FRONTMATTER_WARN_TOKENS) {
+      const cjkNote = item.cjkChars > 0 ? ` (${item.cjkChars} CJK chars)` : "";
+      findings.push({
+        severity: "warn",
+        code: "oversized_skill_frontmatter",
+        category: "prefix",
+        target,
+        message: `Skill frontmatter '${item.name}' is ~${item.tokens} est. tokens${cjkNote}, exceeding the ${SINGLE_SKILL_FRONTMATTER_WARN_TOKENS}-token single-skill Turn-0 recommendation.`,
+        recommendation: `Compress the YAML \`description\` in '${item.name}' to a brief trigger summary and move usage details into the on-demand \`SKILL.md\` body.`
+      });
+    }
+
+    if (item.bodyTokens > SINGLE_SKILL_BODY_WARN_TOKENS) {
+      findings.push({
+        severity: "info",
+        code: "oversized_skill_body",
+        category: "prefix",
+        target,
+        message: `Skill body '${item.name}' is ~${item.bodyTokens} est. tokens (>${SINGLE_SKILL_BODY_WARN_TOKENS} recommendation), loading heavy context whenever invoked.`,
+        recommendation: `Split detailed playbooks, sample payloads, or deterministic helpers from '${item.name}' into on-demand \`references/\`, \`examples/\`, or \`scripts/\` subdirectories.`
+      });
+    }
+  }
+
+  if (skillFrontmatterTokens > TOTAL_SKILLS_FRONTMATTER_WARN_TOKENS) {
+    const topSkills = skillItems
+      .slice(0, 3)
+      .map((i) => `${i.name} (${i.tokens} tok)`)
+      .join(", ");
+    findings.push({
+      severity: "warn",
+      code: "excessive_skills_frontmatter",
+      category: "prefix",
+      target: "turn0-skills-frontmatter",
+      message: `Combined Turn-0 skill YAML frontmatter across ${skillItems.length} skill(s) is ~${skillFrontmatterTokens} est. tokens (>${TOTAL_SKILLS_FRONTMATTER_WARN_TOKENS} recommendation). Top contributors: ${topSkills}.`,
+      recommendation: "Shorten verbose YAML descriptions in top-contributing skills or disable/uninstall unused skills to lower Turn-0 prefix tax."
+    });
+  }
+
+  return {
+    skillItems,
+    skillCount: skillItems.length,
+    progressiveSkillCount,
+    missingFrontmatterCount,
+    legacySkillCount,
+    skillFrontmatterBytes,
+    skillFrontmatterChars,
+    skillFrontmatterTokens,
+    skillBodyBytes,
+    skillBodyTokens,
+    skillAuxFileCount,
+    skillAuxBytes,
+    skillAuxTokens
+  };
+}
+
 function auditTurn0Prefix(configDir, workspaceDir, activePlugins, findings) {
   const seen = new Set();
-  const items = [];
+  const ruleItems = [];
 
   const addRuleFile = (filePath, scope, baseDir) => {
     if (!isFile(filePath)) return;
@@ -365,7 +661,7 @@ function auditTurn0Prefix(configDir, workspaceDir, activePlugins, findings) {
     }
     const stats = measureTextStats(text);
     const displayName = toPosixDisplay(filePath, baseDir);
-    items.push({
+    ruleItems.push({
       kind: "rule",
       scope,
       name: displayName,
@@ -378,51 +674,15 @@ function auditTurn0Prefix(configDir, workspaceDir, activePlugins, findings) {
     });
   };
 
-  const addSkillFile = ({ skillName, path: filePath }, scope) => {
-    if (!isFile(filePath)) return;
-    const key = normalizePathKey(filePath);
-    if (seen.has(key)) return;
-    seen.add(key);
-
-    let text;
-    try {
-      text = fs.readFileSync(filePath, "utf8");
-    } catch {
-      return;
-    }
-    const { frontmatter, body } = splitFrontmatter(text);
-    const fmStats = measureTextStats(frontmatter);
-    const bodyStats = measureTextStats(body);
-    items.push({
-      kind: "skill_frontmatter",
-      scope,
-      name: `skills/${skillName}/SKILL.md`,
-      path: path.resolve(filePath),
-      bytes: fmStats.bytes,
-      chars: fmStats.chars,
-      cjkChars: fmStats.cjkChars,
-      tokens: fmStats.tokens,
-      sha256: fmStats.sha256,
-      bodyBytes: bodyStats.bytes,
-      bodyTokens: bodyStats.tokens
-    });
-  };
-
-  // Global configDir rules & skills
+  // Global configDir rules
   for (const f of listMarkdownFiles(path.join(configDir, "rules"))) {
     addRuleFile(f, "global", configDir);
   }
-  for (const s of listSkillFiles(path.join(configDir, "skills"))) {
-    addSkillFile(s, "global");
-  }
 
-  // Active plugin rules & skills (both global & workspace plugins)
+  // Active plugin rules (both global & workspace plugins)
   for (const plugin of activePlugins) {
     for (const f of listMarkdownFiles(path.join(plugin.dir, "rules"))) {
       addRuleFile(f, plugin.scope, plugin.dir);
-    }
-    for (const s of listSkillFiles(path.join(plugin.dir, "skills"))) {
-      addSkillFile(s, plugin.scope);
     }
   }
 
@@ -440,24 +700,15 @@ function auditTurn0Prefix(configDir, workspaceDir, activePlugins, findings) {
     addRuleFile(f, "workspace", workspaceDir);
   }
 
-  // Workspace skills (support .agents/skills, .gemini/skills, and skills/)
-  for (const skillsSub of [
-    path.join(workspaceDir, ".agents", "skills"),
-    path.join(workspaceDir, ".gemini", "skills"),
-    path.join(workspaceDir, "skills")
-  ]) {
-    for (const s of listSkillFiles(skillsSub)) {
-      addSkillFile(s, "workspace");
-    }
-  }
+  // Scan and audit skills across global, plugin, workspace, and legacy paths
+  const skillAudit = scanAndAuditSkills(configDir, workspaceDir, activePlugins, findings, seen);
+  const items = [...ruleItems, ...skillAudit.skillItems];
 
   // Rank descending by estimated tokens (deterministic path tie-break)
   items.sort((a, b) => (b.tokens !== a.tokens ? b.tokens - a.tokens : compareAscii(a.path, b.path)));
 
   let ruleCount = 0;
-  let skillCount = 0;
   let ruleTokens = 0;
-  let skillFrontmatterTokens = 0;
   let totalBytes = 0;
   let totalChars = 0;
 
@@ -478,13 +729,10 @@ function auditTurn0Prefix(configDir, workspaceDir, activePlugins, findings) {
           recommendation: `Trim '${item.name}' to crisp routing/constraint bullets and move lengthy examples or playbooks into an on-demand SKILL.md body (only YAML frontmatter loads at Turn 0).`
         });
       }
-    } else {
-      skillCount += 1;
-      skillFrontmatterTokens += item.tokens;
     }
   }
 
-  const totalTokens = ruleTokens + skillFrontmatterTokens;
+  const totalTokens = ruleTokens + skillAudit.skillFrontmatterTokens;
   if (totalTokens > TOTAL_PREFIX_WARN_TOKENS) {
     const topNames = items
       .slice(0, 3)
@@ -503,12 +751,21 @@ function auditTurn0Prefix(configDir, workspaceDir, activePlugins, findings) {
   return {
     thresholds: {
       singleRuleWarnTokens: SINGLE_RULE_WARN_TOKENS,
-      totalPrefixWarnTokens: TOTAL_PREFIX_WARN_TOKENS
+      totalPrefixWarnTokens: TOTAL_PREFIX_WARN_TOKENS,
+      singleSkillFrontmatterWarnTokens: SINGLE_SKILL_FRONTMATTER_WARN_TOKENS,
+      singleSkillBodyWarnTokens: SINGLE_SKILL_BODY_WARN_TOKENS,
+      totalSkillsFrontmatterWarnTokens: TOTAL_SKILLS_FRONTMATTER_WARN_TOKENS
     },
     ruleCount,
-    skillCount,
+    skillCount: skillAudit.skillCount,
+    progressiveSkillCount: skillAudit.progressiveSkillCount,
+    legacySkillCount: skillAudit.legacySkillCount,
     ruleTokens,
-    skillFrontmatterTokens,
+    skillFrontmatterTokens: skillAudit.skillFrontmatterTokens,
+    skillBodyTokens: skillAudit.skillBodyTokens,
+    skillAuxFileCount: skillAudit.skillAuxFileCount,
+    skillAuxBytes: skillAudit.skillAuxBytes,
+    skillAuxTokens: skillAudit.skillAuxTokens,
     totalTokens,
     totalBytes,
     totalChars,
@@ -2554,6 +2811,124 @@ function mdCell(text) {
     .replace(/\r?\n/g, " ");
 }
 
+function formatBytesCompact(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+export function auditSkillsOnly(options = {}) {
+  const workspace = path.resolve(options.workspace || process.cwd());
+  const configDir = path.resolve(options.configDir || path.join(getHomeDir(), ".gemini", "config"));
+  const findings = [];
+  const { activePlugins } = discoverPlugins(configDir, workspace);
+  const skillAudit = scanAndAuditSkills(configDir, workspace, activePlugins, findings);
+
+  const sortedFindings = sortFindings(findings);
+  const { score, grade, scoreBreakdown } = computeHealthScore(sortedFindings);
+
+  return stableSortObject({
+    schemaVersion: "1.2",
+    mode: "skills-only",
+    options: {
+      workspace,
+      configDir,
+      skillsOnly: true
+    },
+    score,
+    grade,
+    scoreBreakdown,
+    thresholds: {
+      singleSkillFrontmatterWarnTokens: SINGLE_SKILL_FRONTMATTER_WARN_TOKENS,
+      singleSkillBodyWarnTokens: SINGLE_SKILL_BODY_WARN_TOKENS,
+      totalSkillsFrontmatterWarnTokens: TOTAL_SKILLS_FRONTMATTER_WARN_TOKENS
+    },
+    summary: {
+      skillCount: skillAudit.skillCount,
+      progressiveSkillCount: skillAudit.progressiveSkillCount,
+      missingFrontmatterCount: skillAudit.missingFrontmatterCount,
+      legacySkillCount: skillAudit.legacySkillCount,
+      totalFrontmatterBytes: skillAudit.skillFrontmatterBytes,
+      totalFrontmatterTokens: skillAudit.skillFrontmatterTokens,
+      totalBodyBytes: skillAudit.skillBodyBytes,
+      totalBodyTokens: skillAudit.skillBodyTokens,
+      totalAuxFileCount: skillAudit.skillAuxFileCount,
+      totalAuxBytes: skillAudit.skillAuxBytes,
+      totalAuxTokens: skillAudit.skillAuxTokens
+    },
+    skills: skillAudit.skillItems,
+    findings: sortedFindings
+  });
+}
+
+export function formatSkillsAuditMarkdown(report) {
+  const sb = report.scoreBreakdown;
+  const s = report.summary;
+  const t = report.thresholds;
+  const lines = [
+    "# Skills Turn-0 Tax & Progressive Disclosure Report",
+    "",
+    `- **Skills Health Score**: **${report.score}/100 (Grade ${report.grade})**`,
+    `- **Findings**: ${sb.criticalCount} critical, ${sb.warnCount} warn, ${sb.infoCount} info`,
+    `- **Turn-0 Resident Frontmatter**: **~${s.totalFrontmatterTokens.toLocaleString("en-US")} tokens** across **${s.skillCount} skill(s)** (budget <= ${t.totalSkillsFrontmatterWarnTokens.toLocaleString("en-US")} tok; single skill <= ${t.singleSkillFrontmatterWarnTokens} tok)`,
+    `- **On-Demand Payload (0 Turn-0 tax)**: body ~${s.totalBodyTokens.toLocaleString("en-US")} tok · progressive aux **${s.totalAuxFileCount} file(s)** (${formatBytesCompact(s.totalAuxBytes)}, ~${s.totalAuxTokens.toLocaleString("en-US")} tok, excluded from Turn 0)`,
+    `- **Progressive Disclosure Adoption**: ${s.progressiveSkillCount}/${s.skillCount} skill(s) using \`references/\`, \`examples/\`, \`scripts/\`, or \`resources/\``,
+    `- **Scope**: workspace=\`${toPosixDisplay(report.options.workspace)}\` · configDir=\`${toPosixDisplay(report.options.configDir)}\``,
+    ""
+  ];
+
+  lines.push("## 1. Installed Skills Inventory", "");
+  if (report.skills.length === 0) {
+    lines.push("_No skills discovered in global config, active plugins, workspace, or legacy skill directories._", "");
+  } else {
+    const MAX_SKILL_ROWS = 50;
+    const shown = report.skills.slice(0, MAX_SKILL_ROWS);
+    const hidden = report.skills.slice(MAX_SKILL_ROWS);
+    lines.push("| Scope | Skill | FM | Frontmatter Tok | Body Tok | Aux Dirs | Aux Payload (On-Demand) |");
+    lines.push("| :--- | :--- | :---: | ---: | ---: | :--- | :--- |");
+    for (const item of shown) {
+      const fmLabel = item.hasFrontmatter ? "YES" : "MISSING";
+      const auxDirsLabel = item.auxDirs.length > 0 ? `\`${mdCell(item.auxDirs.join(", "))}\`` : "—";
+      const auxPayload =
+        item.auxFileCount > 0
+          ? `${item.auxFileCount} file(s) (${formatBytesCompact(item.auxBytes)}, ~${item.auxTokens} tok)`
+          : "—";
+      const scopeLabel = item.legacyPath && !item.scope.endsWith("-legacy") ? `${item.scope} [legacy]` : item.scope;
+      lines.push(
+        `| \`${mdCell(scopeLabel)}\` | \`${mdCell(item.name)}\` | ${fmLabel} | ${item.tokens} | ${item.bodyTokens} | ${auxDirsLabel} | ${auxPayload} |`
+      );
+    }
+    if (hidden.length > 0) {
+      const restFm = hidden.reduce((acc, i) => acc + i.tokens, 0);
+      const restBody = hidden.reduce((acc, i) => acc + i.bodyTokens, 0);
+      const restAuxFiles = hidden.reduce((acc, i) => acc + i.auxFileCount, 0);
+      const restAuxBytes = hidden.reduce((acc, i) => acc + i.auxBytes, 0);
+      const restAuxTok = hidden.reduce((acc, i) => acc + i.auxTokens, 0);
+      lines.push(
+        `| _..._ | _+${hidden.length} more (see \`--json\`)_ | — | ${restFm} | ${restBody} | — | ${restAuxFiles} file(s) (${formatBytesCompact(restAuxBytes)}, ~${restAuxTok} tok) |`
+      );
+    }
+    lines.push(
+      `| **TOTAL** | **${s.skillCount} skill(s)** | — | **${s.totalFrontmatterTokens}** | **${s.totalBodyTokens}** | **${s.progressiveSkillCount} progressive** | **${s.totalAuxFileCount} file(s) (${formatBytesCompact(s.totalAuxBytes)}, ~${s.totalAuxTokens} tok)** |`
+    );
+    lines.push("");
+  }
+
+  lines.push("## 2. Findings & Actionable Fixes", "");
+  if (report.findings.length === 0) {
+    lines.push("All Skills Turn-0 prefix & progressive-disclosure checks passed with zero findings.");
+  } else {
+    for (const f of report.findings) {
+      const tag = f.severity.toUpperCase();
+      lines.push(`- **[${tag}]** \`${f.code}\` (\`${mdCell(f.target)}\`): ${f.message}`);
+      lines.push(`  - **Fix**: ${f.recommendation}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 export async function auditEnvironmentCache(options = {}) {
   const workspace = path.resolve(options.workspace || process.cwd());
   const configDir = path.resolve(options.configDir || path.join(getHomeDir(), ".gemini", "config"));
@@ -2704,6 +3079,7 @@ export function parseCliArgs(argv) {
     configDir: path.join(getHomeDir(), ".gemini", "config"),
     live: true,
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    skillsOnly: false,
     json: false,
     help: false
   };
@@ -2714,17 +3090,19 @@ export function parseCliArgs(argv) {
       opts.help = true;
     } else if (a === "--json") {
       opts.json = true;
+    } else if (a === "--skills-only") {
+      opts.skillsOnly = true;
     } else if (a === "--live") {
       opts.live = true;
     } else if (a === "--no-live") {
       opts.live = false;
     } else if (a === "--workspace" || a.startsWith("--workspace=")) {
       const next = a.includes("=") ? a.slice("--workspace=".length) : args[++i];
-      if (!next) throw new Error("Missing path after --workspace");
+      if (!next || (!a.includes("=") && next.startsWith("-"))) throw new Error("Missing path after --workspace");
       opts.workspace = path.resolve(next);
     } else if (a === "--config-dir" || a.startsWith("--config-dir=")) {
       const next = a.includes("=") ? a.slice("--config-dir=".length) : args[++i];
-      if (!next) throw new Error("Missing path after --config-dir");
+      if (!next || (!a.includes("=") && next.startsWith("-"))) throw new Error("Missing path after --config-dir");
       opts.configDir = path.resolve(next);
     } else if (a === "--timeout" || a.startsWith("--timeout=")) {
       const next = a.includes("=") ? a.slice("--timeout=".length) : args[++i];
@@ -2750,6 +3128,7 @@ Usage:
 Options:
   --workspace <dir>    Workspace root to audit (default: current working directory)
   --config-dir <dir>   Antigravity config root (default: ~/.gemini/config)
+  --skills-only        Offline fast view: audit Skills Turn-0 tax & progressive disclosure only
   --live               Probe configured stdio MCP servers live twice (default)
   --no-live            Skip live MCP server probing
   --timeout <ms>       Per-server MCP probe timeout in ms (default: ${DEFAULT_TIMEOUT_MS})
@@ -2762,6 +3141,15 @@ async function main() {
   const opts = parseCliArgs(process.argv);
   if (opts.help) {
     printHelp();
+    return;
+  }
+  if (opts.skillsOnly) {
+    const report = auditSkillsOnly(opts);
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+    } else {
+      process.stdout.write(formatSkillsAuditMarkdown(report) + "\n");
+    }
     return;
   }
   const report = await auditEnvironmentCache(opts);

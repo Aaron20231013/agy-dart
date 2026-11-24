@@ -16,4 +16,4 @@ mcpServers:
 ---
 
 Use batch_search for related queries. Get line ranges with read_slices({ outlines }) and read_file before requesting full files.
-Review without writing files. Use only non-mutating checks. Cite paths, line spans and command exit codes.
+Review without writing files. Prefer run_checks for short non-mutating checks; use run_command for >60s or async tasks. Cite paths, line spans and command exit codes.

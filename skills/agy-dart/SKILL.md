@@ -33,7 +33,7 @@ For longer scripts, use `write_file` with `<Artifact Directory Path>/scratch/agy
 }
 ```
 
-Return only the computed counts, examples or error lines needed. Supported foreground shell commands are filtered to 8.8 KB inline with original exit codes and searchable redacted output. Project filters live in `.agy-dart/filters.json`.
+Return only the computed counts, examples or error lines needed. Supported foreground shell commands are filtered to 8.8 KB inline with original exit codes and searchable redacted output. Project filters live in `.agy-dart/filters.json`. When authoring custom filters or external `ctx_execute` scripts, read `examples/filters.json` or `examples/ctx_trace_summary.py` on demand.
 
 ## Indexed retrieval and recovery
 
@@ -43,4 +43,4 @@ Index Markdown or URLs once with `ctx_index({path, label})` or `ctx_index({url, 
 
 Open the **agy-dart Context** panel for prompt cache hits, context usage and handoff. Use `ctx_stats` for savings and `ctx_doctor` for effective settings. Configure read guards and optional diff reads in `~/.agy-dart/config.json`. Environment variables override the file. To prune old records use `ctx_purge({scope: "stale", olderThanDays: 14, vacuum: true})`.
 
-From the source checkout run `npm run prefix:budget`, `npm run cache:audit -- --workspace . --no-live` or `npm run cache:simulate`. Offline tools are also available when installed with `--with-devtools`.
+From the source checkout run `npm run prefix:budget`, `npm run cache:audit -- --workspace . --no-live`, `node bin/agy-dart.mjs audit skills --workspace .` or `npm run cache:simulate`. Offline tools are also available when installed with `--with-devtools`. For read-guard blocks, `apply_edits` mismatches/rollbacks, rejected `.agy-dart/filters.json` rules, or KV-cache hit drops, consult `references/error-playbook.md` on demand.

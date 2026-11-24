@@ -1,6 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
-import { insertConfig, serverCommands, skillSpec } from "./shared.mjs";
+import { insertConfig, serverCommands, skillSpecs } from "./shared.mjs";
 
 export const detect = home => fs.existsSync(path.join(home, ".codex"));
 
@@ -63,5 +63,5 @@ export function specs(home, src, runtime) {
       return { addedNewline: Boolean(original && !original.endsWith("\n")), executable: command && JSON.parse(command[1]) || process.execPath };
     },
     remove
-  }, skillSpec(home, ".codex", src)];
+  }, ...skillSpecs(home, ".codex", src)];
 }
