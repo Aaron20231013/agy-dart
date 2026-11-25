@@ -5,7 +5,8 @@
  * Zero modifications to index.html — injected by sidecars/dashboard/server.mjs
  */
 
-:root {
+:root,
+body {
   /* Warm paper neutral ramp sampled from active Antigravity theme */
   --bg-canvas: #faf4e4;
   --bg-panel: #faf4e4;
@@ -38,10 +39,10 @@
   --ok-soft: rgba(46, 125, 82, 0.09);
   --ok-border: rgba(46, 125, 82, 0.26);
 
-  --warn: #b4691e;
+  --warn: #c47b1e;
   --warn-text: #854a10;
-  --warn-soft: rgba(180, 105, 30, 0.10);
-  --warn-border: rgba(180, 105, 30, 0.28);
+  --warn-soft: rgba(196, 123, 30, 0.10);
+  --warn-border: rgba(196, 123, 30, 0.28);
 
   --danger: #b83b36;
   --danger-text: #8f2925;
@@ -395,15 +396,11 @@ code {
   transition: background-color 180ms var(--ease-ui), border-color 180ms var(--ease-ui);
 }
 
-.ctx-overview-box.is-warn {
-  background: rgba(180, 105, 30, 0.06);
-  border-color: var(--warn-border);
-  box-shadow: none;
-}
-
+/* Keep outer frame and spotlight card calm across warn/critical — only the usage bar changes color */
+.ctx-overview-box.is-warn,
 .ctx-overview-box.is-critical {
-  background: rgba(184, 59, 54, 0.06);
-  border-color: var(--danger-border);
+  background: transparent;
+  border-color: transparent;
   box-shadow: none;
 }
 
@@ -494,14 +491,15 @@ code {
   gap: 8px;
 }
 
-.ctx-overview-box.is-warn .ctx-spotlight-box {
-  background: var(--bg-card);
-  border-color: var(--warn-border);
-}
-
+.ctx-overview-box.is-warn .ctx-spotlight-box,
 .ctx-overview-box.is-critical .ctx-spotlight-box {
   background: var(--bg-card);
-  border-color: var(--danger-border);
+  border-color: var(--border-strong);
+}
+
+.ctx-overview-box.is-warn .ctx-hero-tokens,
+.ctx-overview-box.is-critical .ctx-hero-tokens {
+  color: var(--text-primary);
 }
 
 .ctx-hero-top {
@@ -560,7 +558,7 @@ code {
 
 .ctx-usage-fill {
   border-radius: 3px;
-  background: var(--accent);
+  background: var(--ok);
   transition: width 260ms var(--ease-ui), background-color 200ms var(--ease-ui);
 }
 
@@ -1077,14 +1075,10 @@ details.accordion-band > summary.accordion-summary:hover {
     margin-left: 0;
   }
 
-  .ctx-overview-box.is-warn {
-    background: rgba(180, 105, 30, 0.08);
-    border-color: var(--warn-border);
-  }
-
+  .ctx-overview-box.is-warn,
   .ctx-overview-box.is-critical {
-    background: rgba(184, 59, 54, 0.08);
-    border-color: var(--danger-border);
+    background: var(--bg-surface-raised);
+    border-color: var(--border);
   }
 
   .ctx-spotlight-box {
