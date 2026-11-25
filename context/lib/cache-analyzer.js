@@ -946,17 +946,23 @@ function normPath(raw, baseCwd = "") {
   return p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
 }
 
-function shortTargetLabel(rawPath, maxLen = 42) {
+export function shortTargetLabel(rawPath, maxLen = 42) {
   if (!rawPath) return "";
   const cleaned = String(rawPath).trim().replace(/\\/g, "/");
   if (!cleaned) return "";
   if (cleaned.length <= maxLen) return cleaned;
   const parts = cleaned.split("/").filter(Boolean);
-  if (parts.length >= 2) {
+  const looksLikePath =
+    parts.length >= 2 &&
+    (!/\s/.test(cleaned) || /^(?:[a-zA-Z]:\/|\/|\.\.?\/)/.test(cleaned));
+  if (looksLikePath) {
     const tail = `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
     if (tail.length <= maxLen) return tail;
+    const base = parts[parts.length - 1];
+    if (base.length <= maxLen) return base;
+    return maxLen > 3 ? `...${base.slice(-(maxLen - 3))}` : base.slice(-Math.max(1, maxLen));
   }
-  return cleaned.slice(0, maxLen - 3) + "...";
+  return maxLen > 3 ? cleaned.slice(0, maxLen - 3) + "..." : cleaned.slice(0, Math.max(1, maxLen));
 }
 
 function unwrapQuotedWrapperArg(val) {
@@ -1093,8 +1099,100 @@ const READ_ONLY_INSPECT_TOOLS = new Set([
   "list_dir"
 ]);
 
+const STEP_CANCELED_TEXT_RE =
+  /(?:tool execution was cancel(?:ed|led)|user cancel(?:ed|led)|operation (?:was )?cancel(?:ed|led)|command (?:was )?cancel(?:ed|led)|request (?:was )?(?:cancel(?:ed|led)|aborted)|execution (?:was )?(?:cancel(?:ed|led)|aborted))/i;
+
+const STEP_PURE_TIMEOUT_TEXT_RE =
+  /(?:^|\n)\s*(?:command|execution|operation|process|request)\s+timed\s*out\b|(?:^|\n)\s*TIMED\s*OUT\b/i;
+
+const REAL_CODE_ERROR_TEXT_RE =
+  /(?:Encountered error in step execution|Atomic edit aborted|Partial edit applied|Tool error \(|Verify \[FAIL|## \[FAIL|## \[ERROR|(?:^|\n)\s*(?:AssertionError|TypeError|SyntaxError|ReferenceError|ImportError|ModuleNotFoundError|ValueError|NameError|AttributeError|KeyError|IndexError|FileNotFoundError|RuntimeError|IndentationError|ZeroDivisionError|ZodError|✖\s+|not ok\s+\d+|FAIL\s+\S))/m;
+
+const SPECIFIC_ERROR_KIND_RE =
+  /\b(ModuleNotFoundError|ImportError|SyntaxError|IndentationError|NameError|AttributeError|TypeError|ValueError|KeyError|IndexError|ReferenceError|RangeError|AssertionError|FileNotFoundError|PermissionError|ZeroDivisionError|RuntimeError|ZodError|ValidationError|TS\d{4}|error\[E\d{4}\])\b/i;
+
+function isStepCanceledResult(step) {
+  if (!step || typeof step !== "object") return false;
+  if (step.aborted === true || step.cancelled === true || step.canceled === true) return true;
+  if (
+    /^(?:cancelled|canceled|aborted|interrupted)$/i.test(
+      String(step.status ?? step.stop_reason ?? step.stopReason ?? "")
+    )
+  ) {
+    return true;
+  }
+  const text = typeof step.content === "string" ? step.content : "";
+  return Boolean(text && STEP_CANCELED_TEXT_RE.test(text));
+}
+
+function isStepTimeoutOnlyResult(step, bareTool = "") {
+  if (!step || typeof step !== "object") return false;
+  const text = typeof step.content === "string" ? step.content : "";
+  // Never mask atomic/edit errors or explicit FAIL/ERROR banners as timeout-only
+  if (
+    text &&
+    (text.includes("Atomic edit aborted") ||
+      text.includes("Partial edit applied") ||
+      text.includes("Tool error (") ||
+      text.includes("Verify [FAIL") ||
+      text.includes("## [FAIL") ||
+      text.includes("## [ERROR"))
+  ) {
+    return false;
+  }
+  if (text && (text.includes("Verify [TIMEOUT") || text.includes("Verify [NOT RUN:"))) {
+    return true;
+  }
+  if (text && (text.includes("## [TIMEOUT") || text.includes("## [SKIPPED]"))) {
+    return true;
+  }
+  if (step.timed_out === true || step.timedOut === true) {
+    return !(text && REAL_CODE_ERROR_TEXT_RE.test(text));
+  }
+  if (text && STEP_PURE_TIMEOUT_TEXT_RE.test(text) && !REAL_CODE_ERROR_TEXT_RE.test(text)) {
+    if (!bareTool || !READ_ONLY_INSPECT_TOOLS.has(bareTool)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function extractFailureProfile(failedResults) {
+  let errorKind = "generic";
+  let passedCount = null;
+  for (const r of failedResults) {
+    const text = typeof r?.content === "string" ? r.content : "";
+    if (!text) continue;
+    const passMatches = [
+      ...text.matchAll(/\b(\d+)\s+passed\b/gi),
+      ...text.matchAll(/(?:^|\n)\s*pass\s+(\d+)\b/gim)
+    ];
+    for (const m of passMatches) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n >= 0 && (passedCount === null || n > passedCount)) {
+        passedCount = n;
+      }
+    }
+    if (errorKind === "generic") {
+      if (text.includes("Atomic edit aborted") || text.includes("Partial edit applied")) {
+        errorKind = "edit_error";
+      } else {
+        const m = text.match(SPECIFIC_ERROR_KIND_RE);
+        if (m && m[1]) {
+          errorKind = m[1].toLowerCase().replace(/^error\[|\]$/g, "");
+        } else if (/(?:^|\n)\s*E\s+assert\b/m.test(text) || /\bAssertionError\b/i.test(text)) {
+          errorKind = "assertionerror";
+        }
+      }
+    }
+  }
+  return { errorKind, passedCount };
+}
+
 function isStepFailureResult(step, bareTool = "") {
   if (!step || typeof step !== "object") return false;
+  if (isStepCanceledResult(step)) return false;
+  if (isStepTimeoutOnlyResult(step, bareTool)) return false;
   if (step.status === "ERROR" || step.is_error === true || step.isError === true) return true;
   const code = step.exit_code ?? step.exitCode;
   if (typeof code === "number" && code !== 0) return true;
@@ -1106,10 +1204,8 @@ function isStepFailureResult(step, bareTool = "") {
     text.includes("Partial edit applied") ||
     text.includes("Tool error (") ||
     text.includes("Verify [FAIL") ||
-    text.includes("Verify [TIMEOUT") ||
     text.includes("## [FAIL") ||
-    text.includes("## [ERROR") ||
-    text.includes("## [TIMEOUT")
+    text.includes("## [ERROR")
   ) {
     return true;
   }
@@ -1120,7 +1216,11 @@ function isStepFailureResult(step, bareTool = "") {
   if (/(?:exit(?:ed)?(?:\s+with)?\s+code|FAIL\s*\(exit)\s*:?\s*[1-9]\d*/i.test(text)) {
     return true;
   }
-  if (/(?:^|\n)\s*(?:AssertionError|TypeError|SyntaxError|ReferenceError|✖\s+|not ok\s+\d+|FAIL\s+\S)/m.test(text)) {
+  if (
+    /(?:^|\n)\s*(?:AssertionError|TypeError|SyntaxError|ReferenceError|ImportError|ModuleNotFoundError|ValueError|NameError|AttributeError|KeyError|IndexError|FileNotFoundError|RuntimeError|IndentationError|ZeroDivisionError|ZodError|✖\s+|not ok\s+\d+|FAIL\s+\S)/m.test(
+      text
+    )
+  ) {
     return true;
   }
   const failCountMatch = text.match(/\b(\d+)\s+failed\b/i);
@@ -1735,8 +1835,43 @@ export function analyzeTranscriptCache(steps, options = {}) {
   let editEpoch = 0;
   const lastPassCheckEpoch = new Map();
   let pendingEditFiles = new Set();
-  let editFailOscillations = 0;
-  const oscillatingFilesCount = new Map();
+  const fileOscState = new Map(); // normPath -> { label, failCycles, oscCount, seenErrorKinds, bestPassedCount }
+
+  const recordFileFailureCycle = (filesIterable, failedResults) => {
+    const uniqueFiles = Array.from(new Set(filesIterable)).filter(Boolean);
+    if (uniqueFiles.length === 0) return;
+    const { errorKind, passedCount } = extractFailureProfile(failedResults);
+    for (const f of uniqueFiles) {
+      let st = fileOscState.get(f);
+      if (!st) {
+        st = {
+          label: shortTargetLabel(f, 36),
+          failCycles: 1,
+          oscCount: 1,
+          seenErrorKinds: new Set(errorKind !== "generic" ? [errorKind] : []),
+          bestPassedCount: passedCount !== null ? passedCount : 0
+        };
+        fileOscState.set(f, st);
+        continue;
+      }
+      st.failCycles += 1;
+      const passedImproved = passedCount !== null && passedCount > st.bestPassedCount;
+      const isNewSpecificError = errorKind !== "generic" && !st.seenErrorKinds.has(errorKind);
+      if (passedCount !== null && passedCount > st.bestPassedCount) {
+        st.bestPassedCount = passedCount;
+      }
+      if (errorKind !== "generic") {
+        st.seenErrorKinds.add(errorKind);
+      }
+      if (passedImproved) {
+        // Test pass count strictly improved -> forward convergence
+      } else if (isNewSpecificError && st.failCycles < 4) {
+        // Progressed past prior error class into a distinct new failure stage
+      } else {
+        st.oscCount += 1;
+      }
+    }
+  };
 
   // Context composition & primary vs subagent attribution accumulators
   const compRaw = createRawCompositionBuckets();
@@ -2001,6 +2136,16 @@ export function analyzeTranscriptCache(steps, options = {}) {
         resultByCallId.set(String(rid), r);
       }
     }
+    const isStepLevelAborted =
+      step.aborted === true ||
+      step.cancelled === true ||
+      step.canceled === true ||
+      /^(?:cancelled|canceled|aborted|interrupted)$/i.test(
+        String(step.stop_reason ?? step.stopReason ?? step.status ?? "")
+      );
+    const allFollowingCanceled =
+      followingResults.length > 0 && followingResults.every((r) => isStepCanceledResult(r));
+    const isTurnAborted = isStepLevelAborted || allFollowingCanceled;
 
     // Track duplicate read_file / view_file calls, edit invalidations, loop fingerprints & edit<->fail oscillations
     if (Array.isArray(step.tool_calls)) {
@@ -2062,6 +2207,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
           bareToolByCallId.set(callIdKey, desc.bareTool);
         }
         const matchedResult = (callIdKey && resultByCallId.get(callIdKey)) || followingResults[callIdx];
+        const callCanceled = matchedResult ? isStepCanceledResult(matchedResult) : false;
         const callFailed = matchedResult ? isStepFailureResult(matchedResult, desc.bareTool) : false;
         const resultBytes =
           matchedResult && typeof matchedResult.content === "string"
@@ -2079,13 +2225,13 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
         const edited = extractCallEditPaths(call);
         const isCheckCall = isCheckOrVerifyCall(call);
-        if (!stepIsSubagent) {
+        if (!stepIsSubagent && !isTurnAborted && !callCanceled) {
           for (const ep of edited) turnEditedFiles.push(ep);
           if (edited.length > 0 && !callFailed) editEpoch += 1;
           if (isCheckCall) turnRanCheck = true;
         }
 
-        if (!stepIsSubagent && !IGNORED_LOOP_TOOLS.has(desc.bareTool)) {
+        if (!stepIsSubagent && !isTurnAborted && !callCanceled && !IGNORED_LOOP_TOOLS.has(desc.bareTool)) {
           let effectiveFp = desc.fingerprint;
           // Passing verification after a fresh edit is healthy TDD progress, not a doom loop
           if (
@@ -2158,47 +2304,46 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
     // Update edit<->fail oscillation state and active tool-loop state from primary conversation turns only
     if (!stepIsSubagent) {
-      const isTurnAborted =
-        step.aborted === true ||
-        step.cancelled === true ||
-        step.canceled === true ||
-        /^(?:cancelled|canceled|aborted|interrupted)$/i.test(
-          String(step.stop_reason ?? step.stopReason ?? step.status ?? "")
-        );
       const hasActiveToolCalls = callBareTools.some((t) => t && t !== "finish");
       inToolLoop = !isTurnAborted && (hasActiveToolCalls || followingResults.length > 0);
-      const turnFailed = followingResults.some((r, rIdx) => {
-        const rid = r?.tool_call_id ?? r?.call_id ?? r?.toolCallId ?? null;
-        const bareTool =
-          (rid !== null && rid !== undefined && bareToolByCallId.get(String(rid))) || callBareTools[rIdx] || "";
-        return isStepFailureResult(r, bareTool);
-      });
-      if (turnEditedFiles.length > 0 && turnFailed) {
-        editFailOscillations += 1;
-        for (const f of turnEditedFiles) {
-          const shortF = shortTargetLabel(f, 36);
-          oscillatingFilesCount.set(shortF, (oscillatingFilesCount.get(shortF) || 0) + 1);
-        }
-        pendingEditFiles.clear();
-      } else if (turnEditedFiles.length > 0 && turnRanCheck && !turnFailed && followingResults.length > 0) {
-        editFailOscillations = 0;
-        pendingEditFiles.clear();
-        oscillatingFilesCount.clear();
-      } else if (turnEditedFiles.length > 0) {
-        for (const f of turnEditedFiles) pendingEditFiles.add(f);
-      } else if (turnRanCheck && turnFailed) {
-        if (pendingEditFiles.size > 0) {
-          editFailOscillations += 1;
-          for (const f of pendingEditFiles) {
-            const shortF = shortTargetLabel(f, 36);
-            oscillatingFilesCount.set(shortF, (oscillatingFilesCount.get(shortF) || 0) + 1);
+      if (!isTurnAborted) {
+        const failedResults = [];
+        let turnTimedOutOnly = false;
+        for (let rIdx = 0; rIdx < followingResults.length; rIdx++) {
+          const r = followingResults[rIdx];
+          const rid = r?.tool_call_id ?? r?.call_id ?? r?.toolCallId ?? null;
+          const bareTool =
+            (rid !== null && rid !== undefined && bareToolByCallId.get(String(rid))) || callBareTools[rIdx] || "";
+          if (isStepFailureResult(r, bareTool)) {
+            failedResults.push(r);
+          } else if (isStepTimeoutOnlyResult(r, bareTool)) {
+            turnTimedOutOnly = true;
           }
+        }
+        const turnFailed = failedResults.length > 0;
+        if (turnEditedFiles.length > 0 && turnFailed) {
+          recordFileFailureCycle(turnEditedFiles, failedResults);
+          pendingEditFiles.clear();
+        } else if (
+          turnEditedFiles.length > 0 &&
+          turnRanCheck &&
+          !turnFailed &&
+          !turnTimedOutOnly &&
+          followingResults.length > 0
+        ) {
+          fileOscState.clear();
+          pendingEditFiles.clear();
+        } else if (turnEditedFiles.length > 0) {
+          for (const f of turnEditedFiles) pendingEditFiles.add(f);
+        } else if (turnRanCheck && turnFailed) {
+          if (pendingEditFiles.size > 0) {
+            recordFileFailureCycle(pendingEditFiles, failedResults);
+            pendingEditFiles.clear();
+          }
+        } else if (turnRanCheck && !turnFailed && !turnTimedOutOnly && followingResults.length > 0) {
+          fileOscState.clear();
           pendingEditFiles.clear();
         }
-      } else if (turnRanCheck && !turnFailed && followingResults.length > 0) {
-        editFailOscillations = 0;
-        pendingEditFiles.clear();
-        oscillatingFilesCount.clear();
       }
     }
 
@@ -2261,23 +2406,47 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
       const deltaTokens = hasSeenPlanner ? ctxTok - prevCtxTokens : 0;
       let dominantTrigger = null;
+      let triggerDisplayLabel = null;
       if (prevTurnTools.length > 0) {
         dominantTrigger = prevTurnTools[0];
+        let totalTurnResultBytes = 0;
         for (const item of prevTurnTools) {
+          totalTurnResultBytes += item.resultBytes || 0;
           if (item.resultBytes > dominantTrigger.resultBytes) {
             dominantTrigger = item;
           }
         }
+        const toolCount = prevTurnTools.length;
+        triggerDisplayLabel =
+          toolCount > 1 ? `${dominantTrigger.label} +${toolCount - 1}` : dominantTrigger.label;
         if (deltaTokens > 0) {
-          deltaAttributions.push({
+          const entry = {
             stepIndex: step.step_index ?? i,
             turn: turnsWithUsage,
             deltaTokens,
             ctxTokens: ctxTok,
             tool: dominantTrigger.tool,
             target: dominantTrigger.target,
-            label: dominantTrigger.label
-          });
+            label: triggerDisplayLabel,
+            toolCount
+          };
+          if (toolCount > 1) {
+            entry.parallelTools = prevTurnTools
+              .slice()
+              .sort((a, b) => (b.resultBytes || 0) - (a.resultBytes || 0))
+              .slice(0, 6)
+              .map((item) => ({
+                tool: item.tool,
+                target: item.target,
+                label: item.label,
+                resultBytes: item.resultBytes || 0,
+                sharePct:
+                  totalTurnResultBytes > 0
+                    ? Math.round(((item.resultBytes || 0) / totalTurnResultBytes) * 100)
+                    : Math.round(100 / toolCount)
+              }));
+          }
+          deltaAttributions.push(entry);
         }
       }
 
@@ -2431,7 +2600,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
         isBust: turnWasBust,
         bustCause: turnBustCause,
         bustReadState: turnBustReadState,
-        triggerTool: dominantTrigger ? dominantTrigger.label : null
+        triggerTool: triggerDisplayLabel
       });
 
       const hadCompactionOrShrink =
@@ -2783,6 +2952,10 @@ export function analyzeTranscriptCache(steps, options = {}) {
   const repeatRate = windowSize > 0 ? Number(((windowSize - fpCounts.size) / windowSize).toFixed(4)) : 0;
   const repeatCritical = maxRepeatCount >= 4 || (windowSize >= 6 && repeatRate >= 0.5 && maxRepeatCount >= 3);
   const repeatWarn = !repeatCritical && maxRepeatCount >= 3;
+  let editFailOscillations = 0;
+  for (const st of fileOscState.values()) {
+    if (st.oscCount > editFailOscillations) editFailOscillations = st.oscCount;
+  }
   const oscCritical = editFailOscillations >= 3;
   const oscWarn = !oscCritical && editFailOscillations >= 2;
   const hasRepeat = repeatCritical || repeatWarn;
@@ -2796,10 +2969,11 @@ export function analyzeTranscriptCache(steps, options = {}) {
         : hasRepeat
           ? "repeat_loop"
           : null;
-  const oscillatingFiles = Array.from(oscillatingFilesCount.entries())
-    .sort((a, b) => b[1] - a[1])
+  const oscillatingFiles = Array.from(fileOscState.values())
+    .filter((st) => st.oscCount >= 2)
+    .sort((a, b) => b.oscCount - a.oscCount || b.failCycles - a.failCycles)
     .slice(0, 3)
-    .map(([file]) => file);
+    .map((st) => st.label);
 
   const loopWatch = {
     status: loopStatus,

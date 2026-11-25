@@ -1681,12 +1681,16 @@ test("v1.7.3-5: Git states (untracked dir/file, clean commit, detached HEAD, unb
       const btPrompt = vm.runInContext(
         `buildSemanticHandoffPrompt({
            confirmedConversation: true,
+           secretRedactionEnabled: true,
            anchors: {
              confirmed: true,
              conversationId: ${JSON.stringify(sid)},
              branch: "feat/handoff",
              nextTasks: ["[/] Check \`\`\`fence\`\`\` safely"],
+             modifiedFiles: ["src/a.js", "src/path-with-\`tick\`-AKIA0123456789ABCDEF.js"],
+             modifiedFileCount: 5,
              failingChecks: [{ kind: "test", command: 'node -e "console.log(\`hi\`)"', firstErrorLine: "err \`\`\`js", sourceId: "src_1" }],
+             passingChecks: [{ kind: "build", command: 'npm run build -- \`fast\`', summary: "ok \`\`\`pass", sourceId: "src_ok_2" }],
              recentSources: [{ id: "src_1", label: "log \`\`\`\`quad\`\`\`\` label" }],
              resumeSameWindow: "ctx_resume({})",
              resumeCrossWindow: ""
@@ -1697,6 +1701,12 @@ test("v1.7.3-5: Git states (untracked dir/file, clean commit, detached HEAD, unb
       assert.ok(btPrompt.includes('``node -e "console.log(`hi`)"``'), `(${lang}) Backtick inside command must use dynamic inline code delimiters`);
       assert.ok(btPrompt.includes("````[/] Check ```fence``` safely````"), `(${lang}) Task with triple backticks must be losslessly quoted with 4-backtick inline span`);
       assert.ok(btPrompt.includes("````err ```js````"), `(${lang}) Error with triple backticks must be losslessly quoted`);
+      assert.ok(btPrompt.includes("``npm run build -- `fast` ``") || btPrompt.includes("`` npm run build -- `fast` ``"), `(${lang}) Passing check command with backticks must use dynamic inline code delimiters`);
+      assert.ok(btPrompt.includes("````ok ```pass````"), `(${lang}) Passing check summary with triple backticks must be losslessly quoted`);
+      assert.ok(btPrompt.includes("src_ok_2"), `(${lang}) Passing check sourceId must be preserved`);
+      assert.ok(btPrompt.includes(lang === "zh" ? "本轮已改文件（5 个）" : "Modified Files (5)"), `(${lang}) Modified files count must be rendered`);
+      assert.ok(btPrompt.includes(lang === "zh" ? "另 3 个" : "+3 more"), `(${lang}) Overflow modified files count must be rendered`);
+      assert.ok(!btPrompt.includes("AKIA0123456789ABCDEF"), `(${lang}) Modified files in semantic prompt must redact secrets when redaction ON`);
       assert.ok(btPrompt.includes("`````log ````quad```` label`````"), `(${lang}) Source label with 4 backticks must be losslessly quoted with 5-backtick inline span`);
       assert.ok(!btPrompt.includes("'''"), `(${lang}) Must not corrupt backticks into single quotes`);
       assert.equal(hasUnclosedFence(btPrompt), false, `(${lang}) Prompt must keep valid Markdown structure without unclosed fences`);
@@ -4934,9 +4944,9 @@ test("v1.7.3-12: Enhancements 9 (Git snapshot state/drift/rescue/isolation/budge
   fs.writeFileSync(path.join(brainRoot, convId, "task.md"), "- [/] Finish Items 9-11\n", "utf8");
 
   const store = new ContextModeStore({ dbPath: tmpDb });
-  const fixedTs1 = Date.parse("2026-11-25T12:00:00.000Z");
-  const fixedTs2 = Date.parse("2026-11-25T12:05:00.000Z");
-  const fixedIso1 = "2026-11-25T12:00:00.000Z";
+  const fixedTs1 = Math.max(Date.parse("2026-11-25T12:00:00.000Z"), Date.now() + 3_600_000);
+  const fixedTs2 = fixedTs1 + 300_000;
+  const fixedIso1 = new Date(fixedTs1).toISOString();
 
   try {
     // 1. Clean Git repo
@@ -5453,6 +5463,32 @@ test("v1.7.3-12: Enhancements 9 (Git snapshot state/drift/rescue/isolation/budge
       "Item 10 Window B: completed TODO_A1_PARSER must be removed from open nextTasks while TODO_A2_PROMPT remains"
     );
     assert.ok(winBBrief.markdown.includes("12 passed (porcelain parser verified)"), "Item 10 Window B: new verification evidence must appear in brief");
+    assert.equal(winBBrief.anchors.modifiedFileCount, 1, "Window B: anchors must record modifiedFileCount");
+    assert.ok(
+      Array.isArray(winBBrief.anchors.modifiedFiles) && winBBrief.anchors.modifiedFiles.some((f) => f.includes("a.js")),
+      "Window B: anchors.modifiedFiles must include modified file"
+    );
+    assert.ok(
+      Array.isArray(winBBrief.anchors.passingChecks) &&
+        winBBrief.anchors.passingChecks.some(
+          (pc) => pc.kind === "test" && pc.command === "node --test porcelain.test.mjs" && pc.summary.includes("12 passed")
+        ),
+      "Window B: anchors.passingChecks must carry passing verification command & summary"
+    );
+    const overviewNoLeak = buildHandoffBrief({
+      store,
+      mode: "agent",
+      scope: "app",
+      conversationId: convWinB,
+      conversationConfirmed: false,
+      sessionId: convWinB,
+      cwd: repoDir,
+      brainRoots: [brainRoot],
+      nowFn: () => fixedTs2
+    });
+    assert.deepEqual(overviewNoLeak.anchors.modifiedFiles, [], "Overview mode must not expose session modifiedFiles in anchors");
+    assert.equal(overviewNoLeak.anchors.modifiedFileCount, 0);
+    assert.deepEqual(overviewNoLeak.anchors.passingChecks, [], "Overview mode must not expose session passingChecks in anchors");
     const winBZh = vm.runInContext(`buildSemanticHandoffPrompt(${JSON.stringify(winBBrief)}, "zh");`, ctx);
     const winBEn = vm.runInContext(`buildSemanticHandoffPrompt(${JSON.stringify(winBBrief)}, "en");`, ctx);
     assert.ok(
@@ -5461,6 +5497,16 @@ test("v1.7.3-12: Enhancements 9 (Git snapshot state/drift/rescue/isolation/budge
         winBZh.includes("已否决方案与理由") &&
         winBZh.includes("合并本轮新证据") &&
         winBZh.includes("移除已闭环待办") &&
+        winBZh.includes("仅输出交接单正文（不要寒暄或解释）") &&
+        winBZh.includes("非目标边界") &&
+        winBZh.includes("已改关键文件/符号") &&
+        winBZh.includes("精确验收命令") &&
+        winBZh.includes("复述计划") &&
+        winBZh.includes("本轮已改文件（1 个）") &&
+        winBZh.includes("a.js") &&
+        winBZh.includes("测试通过") &&
+        winBZh.includes("node --test porcelain.test.mjs") &&
+        winBZh.includes("12 passed (porcelain parser verified)") &&
         winBZh.includes("TODO_A2_PROMPT") &&
         !winBZh.includes("TODO_A1_PARSER")
     );
@@ -5470,6 +5516,16 @@ test("v1.7.3-12: Enhancements 9 (Git snapshot state/drift/rescue/isolation/budge
         winBEn.includes("rejected approaches with their reasons") &&
         winBEn.includes("merge new evidence") &&
         winBEn.includes("remove completed todos") &&
+        winBEn.includes("Output only the handoff brief itself") &&
+        winBEn.includes("out-of-scope boundaries") &&
+        winBEn.includes("key modified files/symbols") &&
+        winBEn.includes("exact verification commands") &&
+        winBEn.includes("restate the plan") &&
+        winBEn.includes("Modified Files (1)") &&
+        winBEn.includes("a.js") &&
+        winBEn.includes("Test PASS") &&
+        winBEn.includes("node --test porcelain.test.mjs") &&
+        winBEn.includes("12 passed (porcelain parser verified)") &&
         winBEn.includes("TODO_A2_PROMPT") &&
         !winBEn.includes("TODO_A1_PARSER")
     );
@@ -5851,7 +5907,7 @@ test("v1.7.3-13: Review fixes Item 1 (Git env isolation across normal + rescue s
     process.env.GIT_CONFIG_VALUE_0 = ignoreAllFile;
     process.env.GIT_CONFIG_PARAMETERS = `'core.excludesFile=${ignoreAllFile.replace(/\\/g, "/")}'`;
 
-    const fixedNow = Date.parse("2026-11-25T15:00:00.000Z");
+    const fixedNow = Math.max(Date.parse("2026-11-25T15:00:00.000Z"), Date.now() + 3_600_000);
     const convB = "conv-item1-repo-b";
     const convNonGit = "conv-item1-nongit";
 

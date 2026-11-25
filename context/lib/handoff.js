@@ -1688,6 +1688,7 @@ function buildAgentHandoffBrief({
 
   // 4. Verification & Checkpoint (NEVER calls store.getSourceChunks())
   const failingAnchors = [];
+  const passingAnchors = [];
   const pushVerification = (label, rec, isTest) => {
     const line = formatVerificationLineSafe(label, rec, { allowRawSummary: confirmedConversation });
     if (!line) return;
@@ -1713,11 +1714,21 @@ function buildAgentHandoffBrief({
         sourceId: srcIdClean,
         firstErrorLine: pickFirstErrorLineFromExcerpt(excerpt)
       });
+    } else if (confirmedConversation && !isFail) {
+      passingAnchors.push({
+        kind: isTest ? "test" : "build",
+        command: redactAndFlatten(rec.command || "", 120),
+        summary: redactAndFlatten(rec.summary || "", 160),
+        sourceId: rec.sourceId ? redactAndFlatten(rec.sourceId, 64) : ""
+      });
     }
   };
   pushVerification("Last Test", lastTest, true);
   pushVerification("Last Build", lastBuild, false);
 
+  const modifiedFileAnchors = confirmedConversation
+    ? modifiedFiles.slice(0, 8).map((f) => redactAndFlatten(f, 160)).filter(Boolean)
+    : [];
   if (modifiedFiles.length > 0) {
     const shown = modifiedFiles.slice(0, 12).map((f) => wrapInlineCode(redactAndFlatten(f, 160)));
     const extra = modifiedFileCount > shown.length ? ` (+${modifiedFileCount - shown.length} more)` : "";
@@ -1924,7 +1935,10 @@ function buildAgentHandoffBrief({
           mtime: a.mtime
         })),
         nextTasks: openTasks.slice(0, 3).map((t) => `[${t.marker}] ${t.text}`),
+        modifiedFiles: modifiedFileAnchors,
+        modifiedFileCount: modifiedFileAnchors.length > 0 ? Math.max(modifiedFileCount, modifiedFileAnchors.length) : 0,
         failingChecks: failingAnchors,
+        passingChecks: passingAnchors,
         recentSources: recentSources.slice(0, 3).map((s) => ({
           id: redactAndFlatten(s?.id ?? s?.sourceId ?? "", 80),
           label: redactAndFlatten(s?.label || "untitled", 120)
@@ -1945,7 +1959,10 @@ function buildAgentHandoffBrief({
         gitDirtyEntries: null,
         artifacts: [],
         nextTasks: [],
+        modifiedFiles: [],
+        modifiedFileCount: 0,
         failingChecks: [],
+        passingChecks: [],
         recentSources: [],
         stallSummary: "",
         resumeSameWindow,
