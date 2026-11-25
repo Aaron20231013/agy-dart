@@ -12,7 +12,7 @@ export const MAX_OUTLINE_CACHE_DB_ENTRIES = 512;
 export const MAX_OUTLINE_JSON_BYTES = 128 * 1024;
 export const DEFAULT_FILE_READ_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_CUTOFF_BYTES = 46080; // 45 KiB — aligns with Antigravity read_file host return cap
-export const CURRENT_SCHEMA_USER_VERSION = 152;
+export const CURRENT_SCHEMA_USER_VERSION = 155;
 const REQUIRED_CORE_TABLES = Object.freeze([
   "meta",
   "sources",
@@ -139,8 +139,9 @@ export class SchemaMethods {
             FROM sqlite_master
             WHERE type = 'table'
               AND (
-                name IN ('meta', 'events', 'repo_cache', 'session_checkpoints', 'outline_cache', 'chunks', 'chunks_tri')
-                OR (name = 'sources' AND sql LIKE '%content_hash%')
+                name IN ('meta', 'repo_cache', 'session_checkpoints', 'outline_cache', 'chunks', 'chunks_tri')
+                OR (name = 'events' AND sql LIKE '%execution_receipt%' AND sql LIKE '%source_id%' AND sql LIKE '%claim_fingerprint%' AND sql LIKE '%claimed_conv%')
+                OR (name = 'sources' AND sql LIKE '%content_hash%' AND sql LIKE '%origin_session_id%')
                 OR (name = 'file_reads' AND sql LIKE '%ctime_ms%' AND sql LIKE '%ino%' AND sql LIKE '%read_step%' AND sql LIKE '%read_turn_seq%')
                 OR (name = 'file_snapshots' AND sql LIKE '%full_read_ts%' AND sql LIKE '%full_read_seq%' AND sql LIKE '%ino%' AND sql LIKE '%read_step%')
                 OR (name = 'ghost_interceptions' AND sql LIKE '%recall_closed%')
@@ -175,7 +176,8 @@ export class SchemaMethods {
         created_ts INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         accessed_ts INTEGER NOT NULL,
-        content_hash TEXT
+        content_hash TEXT,
+        origin_session_id TEXT
       );
 
       CREATE INDEX IF NOT EXISTS idx_sources_session ON sources(session_id);
@@ -197,6 +199,10 @@ export class SchemaMethods {
         turn INTEGER NOT NULL DEFAULT 0,
         sandbox_bytes INTEGER NOT NULL DEFAULT 0,
         returned_bytes INTEGER NOT NULL DEFAULT 0,
+        execution_receipt TEXT,
+        source_id TEXT,
+        claim_fingerprint TEXT,
+        claimed_conv TEXT,
         created_at TEXT NOT NULL,
         accessed_at TEXT
       );
@@ -292,16 +298,42 @@ export class SchemaMethods {
       CREATE INDEX IF NOT EXISTS idx_outline_cache_updated ON outline_cache(updated_ts);
     `);
 
-      // Idempotent schema upgrade: ensure sources.content_hash exists on legacy v2/v3 databases
+      // Idempotent schema upgrade: ensure sources.content_hash & origin_session_id exist on legacy databases
       const sourceCols = this.db.prepare("PRAGMA table_info(sources)").all();
-      if (!sourceCols.some((c) => c.name === "content_hash")) {
-        try {
-          this.db.exec("ALTER TABLE sources ADD COLUMN content_hash TEXT;");
-        } catch (err) {
-          if (!/duplicate column name/i.test(String(err?.message || ""))) throw err;
+      for (const colDef of [
+        { name: "content_hash", sql: "ALTER TABLE sources ADD COLUMN content_hash TEXT;" },
+        { name: "origin_session_id", sql: "ALTER TABLE sources ADD COLUMN origin_session_id TEXT;" }
+      ]) {
+        if (!sourceCols.some((c) => c.name === colDef.name)) {
+          try {
+            this.db.exec(colDef.sql);
+          } catch (err) {
+            if (!/duplicate column name/i.test(String(err?.message || ""))) throw err;
+          }
         }
       }
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_sources_session_hash ON sources(session_id, content_hash);");
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_sources_origin_session ON sources(origin_session_id) WHERE origin_session_id IS NOT NULL;"
+      );
+
+      const eventCols = this.db.prepare("PRAGMA table_info(events)").all();
+      for (const colDef of [
+        { name: "execution_receipt", sql: "ALTER TABLE events ADD COLUMN execution_receipt TEXT" },
+        { name: "source_id", sql: "ALTER TABLE events ADD COLUMN source_id TEXT" },
+        { name: "claim_fingerprint", sql: "ALTER TABLE events ADD COLUMN claim_fingerprint TEXT" },
+        { name: "claimed_conv", sql: "ALTER TABLE events ADD COLUMN claimed_conv TEXT" }
+      ]) {
+        if (!eventCols.some((c) => c.name === colDef.name)) {
+          try {
+            this.db.exec(colDef.sql);
+          } catch (err) {
+            if (!/duplicate column name/i.test(String(err?.message || ""))) throw err;
+          }
+        }
+      }
+      this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_receipt ON events(execution_receipt) WHERE execution_receipt IS NOT NULL");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_events_claim_fp ON events(claim_fingerprint) WHERE claim_fingerprint IS NOT NULL");
 
       // Idempotent schema upgrade: ensure file_reads tracks ctime_ms & ino to catch atomic replace / preserved-mtime edits
       const readCols = this.db.prepare("PRAGMA table_info(file_reads)").all();

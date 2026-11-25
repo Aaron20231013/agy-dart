@@ -1146,7 +1146,7 @@ test("P1-Hardening 3: Static import-graph verification proves RUNTIME_FILES comp
       'test.skip("case 3", () => {});'
     ].join("\n");
     assert.equal(countTestCasesInSource(briefCounterSample), 3, "countTestCasesInSource must ignore regex quotes/`/*`/templates/comments/function* decls and count top-level tests + modifiers accurately");
-    assert.equal(computeBriefMetrics(ROOT).testCases, 202, "computeBriefMetrics(ROOT).testCases must match the exact 202 tests executed by npm test");
+    assert.equal(computeBriefMetrics(ROOT).testCases, 284, "computeBriefMetrics(ROOT).testCases must match the 284 tests executed by npm test");
 
     // P0-3: syncBriefFile normalizes CRLF checkouts on Windows CI and .gitattributes enforces LF/CRLF policy
     const gitAttrsPath = path.join(ROOT, ".gitattributes");
@@ -1642,6 +1642,7 @@ test("P1-Hardening 7: Token estimator empirical calibration + per-feature ROI te
       "fast/mcp-server.mjs",
       "fast/session-start.mjs",
       "context/server.js",
+      "context/lib/code-outline.js",
       "context/lib/config.js",
       "context/lib/store.js",
       "context/lib/store/schema.js",
@@ -1649,6 +1650,7 @@ test("P1-Hardening 7: Token estimator empirical calibration + per-feature ROI te
       "context/lib/store/checkpoints.js",
       "context/lib/store/reads.js",
       "context/lib/store/settings-maintenance.js",
+      "context/lib/watchdog-lease.js",
       "context/lib/executor.js",
       "context/lib/tools.js",
       "context/lib/repo-skeleton.js",
@@ -1664,7 +1666,7 @@ test("P1-Hardening 7: Token estimator empirical calibration + per-feature ROI te
 
     // (a) Bloated AGENTS.md exceeds upper bound -> CLI MUST exit 1
     const origAgents = fs.readFileSync(path.join(fakeRoot, "rules", "AGENTS.md"), "utf8");
-    fs.writeFileSync(path.join(fakeRoot, "rules", "AGENTS.md"), origAgents + "\n" + "规则测试内容说明".repeat(220) + "\n", "utf8");
+    fs.writeFileSync(path.join(fakeRoot, "rules", "AGENTS.md"), origAgents + "\n" + "中".repeat(4000) + "\n", "utf8");
     const overBudgetCli = spawnSync(
       process.execPath,
       [path.join(ROOT, "scripts", "prefix-budget.mjs"), "--target", fakeRoot, "--json"],
@@ -1674,9 +1676,16 @@ test("P1-Hardening 7: Token estimator empirical calibration + per-feature ROI te
     const overBudgetReport = JSON.parse(overBudgetCli.stdout);
     assert.ok(overBudgetReport.exceedsBudget || overBudgetReport.exceedsUpperBound);
     assert.ok(overBudgetReport.warning);
+    assert.equal(overBudgetReport.configuredStartup, null, "A missing manifest has no configured estimate");
 
     // (b) Restore AGENTS.md but inject unsorted tools/list into fake fast/mcp-server.mjs -> CLI MUST exit 1
     fs.writeFileSync(path.join(fakeRoot, "rules", "AGENTS.md"), origAgents, "utf8");
+    for (const eager of [false, true]) {
+      fs.writeFileSync(path.join(fakeRoot, "mcp_config.json"), JSON.stringify({ mcpServers: { fast: { eager }, context: { eager } } }));
+      const audit = await auditPrefixBudget(fakeRoot);
+      assert.equal(audit.configuredStartup.toolCount, eager ? 12 : 0);
+      assert.equal(audit.configuredStartup.schemaTokens, eager ? audit.blocks.tools.tokens : 0);
+    }
     const stubFast = `
 import readline from "node:readline";
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });

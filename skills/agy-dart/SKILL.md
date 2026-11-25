@@ -1,50 +1,46 @@
 ---
 name: agy-dart
-description: >-
-  Workflow playbook for agy-dart dual-engine acceleration, transparent CLI filtering,
-  KV-cache diagnostics, read deduplication, and SQLite FTS5 context protection.
+description: Batch code work, filter logs, search indexed docs and diagnose context or cache usage.
 ---
 
-# agy-dart Playbook
+# agy-dart
 
-`agy-dart` unites two zero-dependency engines plus five lifecycle hooks inside one Antigravity plugin:
-1. **`agy-dart_fast`** — batched search/outlines/edits/checks (`<= 8.8 KB` inline).
-2. **`agy-dart_context`** — local sandbox filtering & heading-aware SQLite FTS5 (`~/.agy-dart/context.db`).
-3. **Lifecycle Guards** — prefix-stable `SessionStart` (with `git HEAD`-cached repo hubs), `PreToolUse` (transparent `overwrite` CLI filtering with 3-stage context-preserving `git diff` + 4-tier read guard: 45 KiB / 800-line source 2-strike, 16 KB noise/minified, 128 KB `.patch`/`.diff` + 2-strike unchanged read dedup + independent 16 KB shell dump guard), `PostToolUse` (edit/compaction dedup invalidation & watchdog heartbeat), `PreInvocation` (zero-prefix-pollution UI-only KV-cache watermark/TTL alerts & watchdog lease), and `Stop` (marks per-conversation watchdog lease `IDLE`).
+## Search, read, edit and verify
 
-## 1. Thinking in Code (`ctx_execute`)
+Use these tools within the selected workflow. During plan review, use search and reads for discovery. In Antigravity's `call_mcp_tool`, set `ServerName` to `agy-dart_fast` for these operations.
 
-For logs, test dumps, CSV/JSON files, or API responses larger than 16 KB, extract only the computed facts in the sandbox (`timeoutSec`: 1–300, default 120s; pass `cwd` when targeting a specific workspace directory; supports both CommonJS `require` and top-level ESM `import`):
+| Tool | Arguments for common tasks |
+| --- | --- |
+| `batch_search` | Pass `queries` with `type` (`text`, `regex`, `glob`, `fuzzy` path or read-only `git`) and `pattern`. For text/regex, use `outputMode` (`content`, `files_with_matches` or `count`) and optional `multiline`. Counts are matching lines or, in multiline mode, occurrences. Use `fileType` on text/regex/fuzzy, and `sortBy: "mtime"` for newest-first globs. Limit scope with `path`, `glob`, `contextLines` or `maxResults`. |
+| `read_slices` | Pass `outlines` for symbols or patch hunks, preferably 10–20 files per batch. For 1-based inclusive ranges use `slices: [{path, ranges: [[start, end]]}]` or `lineRanges: ["file:start-end"]`. |
+| `apply_edits` | Pass `edits: [{path, hunks: [{target, replacement}]}]` or use `create` for a new file. Use `dryRun` to preview and `verify` to check after writing. Use `bestEffort` only when committing valid files independently is acceptable. |
+| `run_checks` | Pass `commands: [{name, command}]`, with optional per-command `cwd` and `timeoutSec`. For long builds or async jobs (`WaitMsBeforeAsync <= 2000`, `IsDaemon: true`), use native `run_command` and monitor with `manage_task`. |
+
+Use `cwd` to select the workspace. The default read guard allows 45 KiB for source, 128 KiB for patches and 16 KB for noisy or minified files. Soft mode offers a one-time retry. Prefer ranged reads for larger files.
+
+## Filter large output
+
+On `agy-dart_context`, call `ctx_execute` with a short `intent` first. For inline scripts up to five lines (~400 characters), pass `code` and `language` (JavaScript/Node.js, Python, shell, PowerShell or cmd). JavaScript accepts CommonJS and top-level ESM imports. Set `cwd` and `timeoutSec` as needed (1–300 seconds, default 120).
+
+For longer scripts, use `write_file` with `<Artifact Directory Path>/scratch/agy_ctx_trace.py` (`<appDataDir>/brain/<conversation-id>/scratch/agy_ctx_trace.py` in Antigravity). On other hosts use a resolved absolute OS temp path outside the repo, such as `"file": "/tmp/agy_ctx_trace.py"` or the user's Windows temp directory. Pass the saved file to `ctx_execute`.
 
 ```json
 {
-  "language": "javascript",
-  "code": "const fs = require('fs'); const lines = fs.readFileSync('build.log', 'utf8').split(/\\r?\\n/); const errs = lines.filter(l => /error|exception/i.test(l)); console.log(JSON.stringify({ totalLines: lines.length, errorCount: errs.length, sample: errs.slice(0, 20) }, null, 2));",
-  "intent": "Count and sample errors from build.log",
-  "timeoutSec": 120
+  "intent": "Analyze slow queries in trace.json",
+  "language": "python",
+  "file": "/home/<user>/.gemini/antigravity/brain/<conversation-id>/scratch/agy_ctx_trace.py",
+  "args": ["trace.json"]
 }
 ```
 
-## 2. Heading-Aware Docs & URLs (`ctx_index` + `ctx_search`)
+Return only the computed counts, examples or error lines needed. Supported foreground shell commands are filtered to 8.8 KB inline with original exit codes and searchable redacted output. Project filters live in `.agy-dart/filters.json`. When authoring custom filters or external `ctx_execute` scripts, read `examples/filters.json` or `examples/ctx_trace_summary.py` on demand.
 
-1. Index once: `ctx_index({ path: "docs/spec.md", label: "Spec" })` or `ctx_index({ url: "https://..." })`. Markdown documents preserve heading breadcrumbs (`H1 > H2 > H3`) and fenced code blocks.
-2. Search repeatedly via Porter BM25 + Trigram RRF: `ctx_search({ queries: ["rate limit", "OAuthError"], limit: 5 })`.
-3. After `/compact`, call `ctx_resume({})` to recover recent indexed `sourceId` handles plus the structured `sessionCheckpoint` (modified files + latest test/build status) while clearing session read-dedup entries.
+## Indexed retrieval and recovery
 
-## 3. Transparent CLI Filtering, SmartCrusher, Config & Read Dedup
+Index Markdown or URLs once with `ctx_index({path, label})` or `ctx_index({url, label})`. For repeated questions use `ctx_search({queries, sourceId, limit, offset})`. Use `ctx_batch({commands, queries})` to search a group of command results. After user compaction, `ctx_resume({})` restores recent source IDs and the last checkpoint. On shared hosts pass the conversation ID as `sessionId` to resume, statistics or purge operations.
 
-- Single noisy commands (`git status/diff/log`, `npm/pnpm/yarn/node/pytest/cargo/go` tests, builds, linters, installs, `docker build`, `gh`, `kubectl`, `terraform`, `playwright`) and safe `cd <dir> && <cmd> 2>&1` wrappers are transparently compacted `<= 8.8 KB` via `PreToolUse.overwrite` + `hooks/cli-filter.mjs` (preserving exact exit codes, extracting mid-log error anchors with ±3 lines on failures via `compactFailureWithErrorAnchors`, applying project `.agy-dart/filters.json`, structurally compacting large JSON/JSONL via SmartCrusher, and indexing redacted raw output into FTS5). Background streaming tasks (`WaitMsBeforeAsync <= 2000` or `IsDaemon: true`) and long `>60s` builds bypass `cli-filter.mjs` automatically so `manage_task(status)` receives live streaming logs.
-- `ctx_index({ url })` enforces SSRF protection (`http:`/`https:` only, max 5 redirects, per-hop DNS private/loopback/IPv6-mapped blocking with IP pinning), and common credentials are redacted before indexing/returning.
-- Redundant unchanged `read_file` calls (`>= readDedupMinBytes`, default 4 KB actual requested slice) in the same direct conversation are caught on strike 1 (retry once to bypass), automatically invalidate on `/compact`, rollbacks, or first-turn silent auto-compaction, and decay after `readDedupMaxSteps` (default 40 steps) or `readDedupMaxTurns` (default 12 LLM turns) so deep long-horizon tasks never waste invocations re-verifying earlier files. Opt-in modified-file compact diff-read (`diffRead: true` in `~/.agy-dart/config.json` or `AGY_DART_ENABLE_DIFF_READ=1`) is OFF by default and strictly scoped to the same direct conversation within recent turns/age.
-- Unified config: configure persistent toggles in `~/.agy-dart/config.json` (overridable via `AGY_DART_*` env vars, including `readGuardMode: "soft"|"strict"|"off"`, `readDedupMinBytes`, `readDedupMaxSteps`, `readDedupMaxTurns`, `noiseMaxReadBytes`, `reviewMaxReadBytes`, `shellDumpMaxBytes`, `exemptPaths`, `exemptExtensions`); run `node scripts/install.mjs doctor` or `ctx_doctor` to inspect effective settings and cutoff provenance.
+## Diagnostics
 
-## 4. KV-Cache Diagnostics, Audit, Simulation & DB Maintenance
+Open the **agy-dart Context** panel for prompt cache hits, context usage and handoff. Use `ctx_stats` for savings and `ctx_doctor` for effective settings. Configure read guards and optional diff reads in `~/.agy-dart/config.json`. Environment variables override the file. To prune old records use `ctx_purge({scope: "stale", olderThanDays: 14, vacuum: true})`.
 
-- Check live Prompt Cache hit rate, 1s TTL countdown, 7-bucket context composition, subagent breakdown, feature ROI (`featureRoi`), **Stall Watchdog** (dual-source execution state machine, dynamic silence thresholds, root-cause troubleshooting, opt-in desktop notifications), and one-click **Handoff / Rescue Brief** in the **agy-dart Context** Aux Pane Sidecar dashboard (or run `ctx_stats` / `ctx_doctor`).
-- Prune stale entries (>14 days) and reclaim disk space: `ctx_purge({ scope: "stale", olderThanDays: 14, vacuum: true })`.
-- Run offline cache audit, policy replay, prefix budget & transcript benchmarks (install with `--with-devtools` or run from source repo):
-  ```bash
-  npm run prefix:budget
-  npm run cache:audit -- --workspace . --no-live
-  npm run cache:simulate
-  ```
+From the source checkout run `npm run prefix:budget`, `npm run cache:audit -- --workspace . --no-live`, `node bin/agy-dart.mjs audit skills --workspace .` or `npm run cache:simulate`. Offline tools are also available when installed with `--with-devtools`. For read-guard blocks, `apply_edits` mismatches/rollbacks, rejected `.agy-dart/filters.json` rules, or KV-cache hit drops, consult `references/error-playbook.md` on demand.

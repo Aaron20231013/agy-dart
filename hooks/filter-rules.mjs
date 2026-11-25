@@ -27,16 +27,411 @@ const MAX_CUSTOM_MATCH_CMD_CHARS = 2048;
 const MAX_CUSTOM_FILTER_MS = 150;
 const CUSTOM_RULE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,47}$/;
 const FAIL_ERROR_LINE_RE =
-  /(?:(?:^|\b)(?:error|err!|fail(?:ed|ure)?|fatal|panic|exception|traceback|assertionerror|syntaxerror|typeerror|referenceerror|rangeerror|enoent|eacces|econnrefused|not ok|segmentation fault|segfault)(?:\b|:|$)|(?:^|\s)[✖✗](?:\s|$)|\bERR_[A-Z0-9_]{3,}\b)/i;
+  /(?:(?:^|\b)(?:error|err!|fail(?:ed|ure)?|fatal|panic|exception|traceback|assertionerror|syntaxerror|typeerror|referenceerror|rangeerror|enoent|eacces|econnrefused|not\s+ok|segmentation fault|segfault)(?:\b|:|$)|(?:^|\s)[✖✗](?:\s|$)|\bERR_[A-Z0-9_]{3,}\b)/i;
 const PASCAL_ERROR_CLASS_RE = /\b[A-Z][A-Za-z0-9_]*(?:Error|Exception)\b(?:\s*[:\[(]|$)/;
 const ZERO_ERROR_CLAUSE_RE =
-  /\b(?:0\s+(?:errors?|fail(?:ed|ures?)?)|(?:errors?|fail(?:ed|ures?)?)\s*[:=]?\s*0)\b/gi;
+  /\b(?:0\s+(?:errors?|fail(?:ed|ures?)?)\b|(?:errors?|fail(?:ed|ures?)?)\s*[:=]?\s*0(?=$|\.(?=\s|$)|\s*[,;)\]\}|/(]|\s+(?:pass(?:ed)?|fail(?:ed|ures?)?|errors?|warnings?|skipped?|ignored|todo|total|ok|tests?|suites?|assertions?|duration)\b|\s*$))/gi;
+const FAILURE_EXCERPT_TIMEOUT_RE = /\btimed\s+out\b/i;
 
-function isFailureAnchorLine(line) {
-  if (!line || !line.trim()) return false;
+export function isFailureAnchorLine(line, { includeTimeout = false } = {}) {
+  if (typeof line !== "string" || !line.trim()) return false;
   const cleaned = line.replace(ZERO_ERROR_CLAUSE_RE, " ");
   if (!cleaned.trim()) return false;
-  return FAIL_ERROR_LINE_RE.test(cleaned) || PASCAL_ERROR_CLASS_RE.test(cleaned);
+  return (
+    FAIL_ERROR_LINE_RE.test(cleaned) ||
+    PASCAL_ERROR_CLASS_RE.test(cleaned) ||
+    Boolean(includeTimeout && FAILURE_EXCERPT_TIMEOUT_RE.test(cleaned))
+  );
+}
+
+const FAILURE_EXCERPT_PASS_NOISE_RE =
+  /^\s*(?:PASS\b|---\s*PASS\b|ok(?:\s+\d+\b|\s+-)|[✓✔](?:\s|$)|-\s*\[PASS\b|##\s*\[PASS\b|\[PASS\b|\$\s+)/i;
+const FAILURE_EXCERPT_PASS_LINE_TAIL_RE = /(?:\bPASSED\b(?:\s*\[[^\]]*\])?|\.\.\.\s*ok)\s*$/i;
+const FAILURE_EXCERPT_NON_ANCHOR_RE = /^\s*#\s*Subtest\s*:/i;
+const FAILURE_EXCERPT_SUITE_START_RE = /^\s*▶(?:\s|$)/;
+const FAILURE_EXCERPT_TAP_META_NOISE_RE =
+  /^\s*(?:---|\.\.\.|duration_ms\s*:.*|type\s*:\s*['"]?(?:test|suite)['"]?|location\s*:.*|failureType\s*:.*|operator\s*:.*|stack\s*:\s*(?:[|>][+-]?\d*|[|>]\d*[+-]?)?)\s*$/i;
+const TAP_NOT_OK_RE = /^\s*not\s+ok\b/i;
+const TAP_OK_RE = /^\s*ok(?:\s+\d+\b|\s+-|\s*#\s*(?:SKIP|TODO)\b|\s*$)/i;
+const TAP_DIRECTIVE_PREFIX_RE = /^\s*(?:not\s+ok(?=\s|#)|ok(?=\s+(?:\d+\b|-(?:\s|$)|[^:=,\s])|\s*#))/i;
+const TAP_DIRECTIVE_TAG_RE = /^#\s*(?:TODO|SKIP)\b/i;
+const TAP_STRUCTURAL_BOUNDARY_RE =
+  /^(?:(?:not\s+)?ok(?:\s|#|$)|\d+\.\.\d+$|#\s*Subtest\s*:|TAP\s+version\s+\d+$|Bail\s+out!)/i;
+const TAP_YAML_BLOCK_SCALAR_RE = /^(?:[|>][+-]?\d*|[|>]\d*[+-]?)$/;
+const TAP_YAML_SKIP_KEYS = new Set(["duration_ms", "type", "location", "failuretype", "operator"]);
+const TAP_YAML_SUPPLEMENT_KEYS = new Set(["code", "name", "expected", "actual"]);
+
+export function isTapDirectiveResultLine(line) {
+  if (typeof line !== "string" || !line) return false;
+  const prefixMatch = line.match(TAP_DIRECTIVE_PREFIX_RE);
+  if (!prefixMatch) return false;
+  const rest = line.slice(prefixMatch[0].length);
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] !== "#") continue;
+    let backslashes = 0;
+    for (let p = i - 1; p >= 0 && rest[p] === "\\"; p--) {
+      backslashes += 1;
+    }
+    if (backslashes % 2 === 1) continue; // Escaped literal `\#` in TAP description
+    if (TAP_DIRECTIVE_TAG_RE.test(rest.slice(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function skipTapYamlBlock(entries, resultIdx) {
+  const result = entries[resultIdx];
+  if (!result) return resultIdx;
+  const yamlStartIdx = resultIdx + 1;
+  if (yamlStartIdx >= entries.length) return resultIdx;
+  const yamlStart = entries[yamlStartIdx];
+  if (yamlStart.text !== "---" || yamlStart.indent < result.indent) {
+    return resultIdx;
+  }
+  const yamlIndent = yamlStart.indent;
+  let j = yamlStartIdx + 1;
+  while (j < entries.length) {
+    const entry = entries[j];
+    if (entry.indent < yamlIndent) {
+      return j - 1;
+    }
+    if (entry.text === "..." && entry.indent <= yamlIndent) {
+      return j;
+    }
+    if (entry.indent === yamlIndent && TAP_STRUCTURAL_BOUNDARY_RE.test(entry.text)) {
+      return j - 1;
+    }
+    j += 1;
+  }
+  return entries.length - 1;
+}
+
+export function stripTapDirectiveBlocks(text) {
+  if (!text || typeof text !== "string") return "";
+  const rawLines = text.split(/\r?\n/);
+  const entries = [];
+  for (const rawLine of rawLines) {
+    const leadMatch = rawLine.match(/^([ \t]*)/);
+    const indent = leadMatch ? leadMatch[1].replace(/\t/g, "  ").length : 0;
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    entries.push({ text: trimmed, raw: rawLine, indent });
+  }
+  if (entries.length === 0) return "";
+  const kept = [];
+  for (let i = 0; i < entries.length; i++) {
+    if (isTapDirectiveResultLine(entries[i].text)) {
+      i = skipTapYamlBlock(entries, i);
+      continue;
+    }
+    kept.push(entries[i].raw);
+  }
+  return kept.join("\n");
+}
+
+function unquoteSimpleYamlScalar(val) {
+  const s = typeof val === "string" ? val.trim() : "";
+  if (s.length >= 2 && s.startsWith("'") && s.endsWith("'")) {
+    return s.slice(1, -1).replace(/''/g, "'");
+  }
+  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+    return s.slice(1, -1).replace(/\\"/g, '"');
+  }
+  return s;
+}
+
+function extractTapYamlDiagnosticLines(entries, anchorIdx, lineCap) {
+  const anchor = entries[anchorIdx];
+  if (!anchor || !TAP_NOT_OK_RE.test(anchor.text) || isTapDirectiveResultLine(anchor.text)) return null;
+  const yamlStartIdx = anchorIdx + 1;
+  if (yamlStartIdx >= entries.length || entries[yamlStartIdx].text !== "---") return null;
+  const yamlIndent = entries[yamlStartIdx].indent;
+  if (yamlIndent < anchor.indent) return null;
+
+  const diagLines = [];
+  const supplementLines = [];
+  const fallbackStackLines = [];
+  const otherLines = [];
+
+  for (let j = yamlStartIdx + 1; j < entries.length; j++) {
+    const entry = entries[j];
+    if (entry.indent < yamlIndent) break;
+    if (entry.text === "..." && entry.indent <= yamlIndent) break;
+    if (entry.indent === yamlIndent && TAP_STRUCTURAL_BOUNDARY_RE.test(entry.text)) break;
+    if (entry.indent !== yamlIndent) continue;
+
+    const kvMatch = entry.text.match(/^([A-Za-z0-9_.-]+)\s*:\s*(.*)$/);
+    if (!kvMatch) {
+      otherLines.push(entry.text);
+      continue;
+    }
+    const rawKey = kvMatch[1];
+    const key = rawKey.toLowerCase();
+    const val = kvMatch[2].trim();
+
+    if (TAP_YAML_BLOCK_SCALAR_RE.test(val)) {
+      const blockLines = [];
+      let k = j + 1;
+      while (k < entries.length && entries[k].indent > yamlIndent) {
+        blockLines.push(entries[k].text);
+        k += 1;
+      }
+      j = k - 1;
+      if (blockLines.length === 0) continue;
+      if (key === "error" || key === "message") {
+        diagLines.push(`${rawKey}: ${blockLines[0]}`);
+        for (let b = 1; b < blockLines.length; b++) {
+          diagLines.push(blockLines[b]);
+        }
+      } else if (TAP_YAML_SUPPLEMENT_KEYS.has(key)) {
+        supplementLines.push(`${rawKey}: ${blockLines[0]}`);
+      } else if (key === "stack") {
+        const userFrame = blockLines.find((l) => !/\(node:/.test(l)) || blockLines[0];
+        if (userFrame) fallbackStackLines.push(userFrame);
+      }
+      continue;
+    }
+
+    if (TAP_YAML_SKIP_KEYS.has(key)) {
+      continue;
+    }
+    if (key === "stack") {
+      const cleanedStack = unquoteSimpleYamlScalar(val);
+      if (cleanedStack) {
+        if (!/\(node:/.test(cleanedStack)) {
+          fallbackStackLines.unshift(cleanedStack);
+        } else {
+          fallbackStackLines.push(cleanedStack);
+        }
+      }
+      continue;
+    }
+    if (key === "error" || key === "message") {
+      const quoteChar = val.startsWith("'") ? "'" : val.startsWith('"') ? '"' : "";
+      const isClosedQuote = (seg, isFirst) => {
+        const body = isFirst ? seg.slice(1) : seg;
+        if (!body.endsWith(quoteChar)) return false;
+        if (quoteChar === "'") {
+          let trailing = 0;
+          for (let p = body.length - 1; p >= 0 && body[p] === "'"; p--) trailing += 1;
+          return trailing % 2 === 1;
+        }
+        let bs = 0;
+        for (let p = body.length - 2; p >= 0 && body[p] === "\\"; p--) bs += 1;
+        return bs % 2 === 0;
+      };
+      if (quoteChar && !isClosedQuote(val, true)) {
+        const quotedLines = [val.slice(1)];
+        let k = j + 1;
+        while (k < entries.length && entries[k].indent > yamlIndent) {
+          const seg = entries[k].text;
+          quotedLines.push(seg);
+          k += 1;
+          if (isClosedQuote(seg, false)) {
+            break;
+          }
+        }
+        j = k - 1;
+        const lastIdx = quotedLines.length - 1;
+        if (lastIdx >= 0 && quotedLines[lastIdx].endsWith(quoteChar)) {
+          quotedLines[lastIdx] = quotedLines[lastIdx].slice(0, -1);
+        }
+        const cleanedQuoted = quotedLines
+          .map((l) => (quoteChar === "'" ? l.replace(/''/g, "'") : l.replace(/\\"/g, '"')).trim())
+          .filter(Boolean);
+        if (cleanedQuoted.length > 0) {
+          diagLines.push(`${rawKey}: ${cleanedQuoted[0]}`);
+          for (let q = 1; q < cleanedQuoted.length; q++) {
+            diagLines.push(cleanedQuoted[q]);
+          }
+        }
+        continue;
+      }
+      const cleanedVal = unquoteSimpleYamlScalar(val);
+      if (cleanedVal) {
+        diagLines.push(`${rawKey}: ${cleanedVal}`);
+      }
+    } else if (TAP_YAML_SUPPLEMENT_KEYS.has(key)) {
+      if (val) {
+        supplementLines.push(`${rawKey}: ${val}`);
+      }
+    } else if (val) {
+      otherLines.push(entry.text);
+    }
+  }
+
+  const chosen = [anchor.text];
+  const pushUnique = (list) => {
+    for (const line of list) {
+      if (chosen.length >= lineCap) break;
+      if (!line || chosen.includes(line)) continue;
+      chosen.push(line);
+    }
+  };
+  pushUnique(diagLines);
+  pushUnique(supplementLines);
+  if (chosen.length === 1) {
+    pushUnique(otherLines);
+    pushUnique(fallbackStackLines);
+  }
+  return chosen;
+}
+const FAILURE_EXCERPT_CASE_HEADER_RE =
+  /^\s*(?:●|❯|▶|×|✖|---\s*FAIL\b|FAIL(?:ED)?\b|not ok\b|File\s+"|In file\b|Test\s+\S|Suite\s+\S)/i;
+const FAILURE_EXCERPT_DETAIL_ANCHOR_RE =
+  /^\s*(?:AssertionError|TypeError|SyntaxError|ReferenceError|RangeError|Error\s*:|Expected\s*:|Actual\s*:|E\s{2,})/i;
+
+export function isPassingNoiseLine(line) {
+  if (!line) return false;
+  if (isTapDirectiveResultLine(line)) return true;
+  if (TAP_NOT_OK_RE.test(line)) return false;
+  if (TAP_OK_RE.test(line)) return true;
+  return FAILURE_EXCERPT_PASS_NOISE_RE.test(line) || FAILURE_EXCERPT_PASS_LINE_TAIL_RE.test(line);
+}
+
+/**
+ * Extract a concise, bounded failure excerpt (case name, first real error, and immediate context)
+ * from failed test/build output. Reuses `isFailureAnchorLine()` (so `0 failed` / `0 errors` are
+ * ignored), skips passing-test lines (e.g. `✔ handles error cases`, `PASS ...`, `... PASSED`,
+ * `--- PASS:`, `... ok`), and returns `""` when no real error anchor exists so callers clear
+ * stale excerpts.
+ */
+export function extractFailureExcerpt(text, { maxLines = 5, maxBytes = 500 } = {}) {
+  if (!text || typeof text !== "string") return "";
+  const lineCap = Number.isFinite(Number(maxLines)) && Number(maxLines) > 0 ? Math.floor(Number(maxLines)) : 5;
+  const byteCap = Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0 ? Math.floor(Number(maxBytes)) : 500;
+  const cleanedText = stripAnsiAndProgress(text);
+  const rawLines = cleanedText.split("\n");
+  const entries = [];
+  for (const rawLine of rawLines) {
+    const cleanedRaw = rawLine.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, " ");
+    const leadMatch = cleanedRaw.match(/^([ \t]*)/);
+    const indent = leadMatch ? leadMatch[1].replace(/\t/g, "  ").length : 0;
+    let line = cleanedRaw.replace(/\t+/g, " ").trim();
+    if (typeof line.toWellFormed === "function") {
+      line = line.toWellFormed();
+    }
+    if (!line) continue;
+    if (line.startsWith("[agy-dart cli-filter:")) continue;
+    entries.push({ text: line, indent });
+  }
+  if (entries.length === 0) return "";
+  const lines = entries.map((e) => e.text);
+
+  const skippedTapIndices = new Set();
+  let firstAnchorIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (isTapDirectiveResultLine(line)) {
+      const skipEnd = skipTapYamlBlock(entries, i);
+      for (let s = i; s <= skipEnd; s++) skippedTapIndices.add(s);
+      i = skipEnd;
+      continue;
+    }
+    if (
+      isPassingNoiseLine(line) ||
+      FAILURE_EXCERPT_NON_ANCHOR_RE.test(line) ||
+      FAILURE_EXCERPT_SUITE_START_RE.test(line)
+    ) {
+      continue;
+    }
+    if (isFailureAnchorLine(line, { includeTimeout: true })) {
+      firstAnchorIdx = i;
+      break;
+    }
+  }
+  if (firstAnchorIdx < 0) return "";
+
+  let selectedLines = extractTapYamlDiagnosticLines(entries, firstAnchorIdx, lineCap);
+  let anchorPosInSelected = 0;
+
+  if (!selectedLines) {
+    const chosenIndices = [];
+    const prevIdx = firstAnchorIdx - 1;
+    const prevLine = prevIdx >= 0 ? lines[prevIdx] : "";
+    const shouldIncludePrev =
+      prevIdx >= 0 &&
+      !skippedTapIndices.has(prevIdx) &&
+      !isPassingNoiseLine(prevLine) &&
+      !FAILURE_EXCERPT_NON_ANCHOR_RE.test(prevLine) &&
+      !FAILURE_EXCERPT_TAP_META_NOISE_RE.test(prevLine) &&
+      (FAILURE_EXCERPT_CASE_HEADER_RE.test(prevLine) ||
+        FAILURE_EXCERPT_DETAIL_ANCHOR_RE.test(lines[firstAnchorIdx]) ||
+        firstAnchorIdx === lines.length - 1);
+
+    if (shouldIncludePrev && lineCap > 1) {
+      chosenIndices.push(prevIdx);
+      anchorPosInSelected = 1;
+    }
+    chosenIndices.push(firstAnchorIdx);
+    for (let i = firstAnchorIdx + 1; i < lines.length && chosenIndices.length < lineCap; i++) {
+      if (isTapDirectiveResultLine(lines[i])) {
+        i = skipTapYamlBlock(entries, i);
+        continue;
+      }
+      if (
+        isPassingNoiseLine(lines[i]) ||
+        FAILURE_EXCERPT_NON_ANCHOR_RE.test(lines[i]) ||
+        FAILURE_EXCERPT_TAP_META_NOISE_RE.test(lines[i])
+      ) {
+        continue;
+      }
+      chosenIndices.push(i);
+    }
+    selectedLines = chosenIndices.map((idx) => lines[idx]);
+  }
+
+  const clipSafe = (str, cap) => {
+    if (cap <= 0) return "";
+    if (Buffer.byteLength(str, "utf8") <= cap) return str;
+    const suffix = cap >= 24 ? "..." : "";
+    const innerCap = Math.max(0, cap - Buffer.byteLength(suffix, "utf8"));
+    let cut = truncateUtf8Safe(str, innerCap);
+    if (cut.length > 0) {
+      const lastCode = cut.charCodeAt(cut.length - 1);
+      if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+        cut = cut.slice(0, -1);
+      }
+    }
+    return suffix && cut ? `${cut}${suffix}` : cut;
+  };
+
+  const fullJoined = selectedLines.join("\n");
+  if (Buffer.byteLength(fullJoined, "utf8") <= byteCap) {
+    return fullJoined;
+  }
+
+  const out = [];
+  let usedBytes = 0;
+  const perLineSoftCap =
+    selectedLines.length > 1 ? Math.min(byteCap, Math.max(120, Math.floor(byteCap * 0.6))) : byteCap;
+
+  for (let i = 0; i < selectedLines.length; i++) {
+    const sepBytes = out.length > 0 ? 1 : 0;
+    const rem = byteCap - usedBytes - sepBytes;
+    if (rem <= 0) break;
+    const isAnchorPos = i === anchorPosInSelected;
+    const lineBudget = Math.min(rem, isAnchorPos && out.length === 0 ? Math.max(perLineSoftCap, Math.floor(byteCap * 0.7)) : perLineSoftCap);
+    const rawLine = selectedLines[i];
+    if (Buffer.byteLength(rawLine, "utf8") <= lineBudget) {
+      out.push(rawLine);
+      usedBytes += sepBytes + Buffer.byteLength(rawLine, "utf8");
+    } else if (rem >= 24 || out.length === 0) {
+      const clipped = clipSafe(rawLine, Math.min(rem, lineBudget));
+      if (!clipped) break;
+      out.push(clipped);
+      usedBytes += sepBytes + Buffer.byteLength(clipped, "utf8");
+    } else {
+      break;
+    }
+  }
+
+  let result = out.join("\n");
+  if (Buffer.byteLength(result, "utf8") > byteCap) {
+    result = clipSafe(result, byteCap);
+  }
+  return result;
 }
 
 const projectRulesCache = new Map();
@@ -51,39 +446,83 @@ export function resolveCdTargetCwd(baseCwd, cdPath) {
   return path.resolve(baseCwd || process.cwd(), expanded);
 }
 
-/** Truncate string strictly by UTF-8 byte length without breaking multi-byte characters */
+/** Truncate string strictly by UTF-8 byte length without breaking multi-byte characters or stripping legitimate U+FFFD */
 export function truncateUtf8Safe(text, maxBytes) {
   if (!text) return "";
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  const sliced = Buffer.from(text, "utf8").subarray(0, Math.max(0, maxBytes)).toString("utf8");
-  return sliced.replace(/\uFFFD+$/, "");
+  const limit = Number.isFinite(Number(maxBytes)) ? Math.max(0, Math.floor(Number(maxBytes))) : 0;
+  if (limit === 0) return "";
+  const str = String(text);
+  const buf = Buffer.from(str, "utf8");
+  if (buf.length <= limit) return str;
+  let cut = limit;
+  while (cut > 0 && (buf[cut] & 0xc0) === 0x80) {
+    cut -= 1;
+  }
+  if (cut > 0) {
+    let lastLead = cut - 1;
+    while (lastLead > 0 && (buf[lastLead] & 0xc0) === 0x80) {
+      lastLead -= 1;
+    }
+    const lead = buf[lastLead];
+    let expectedLen = 1;
+    if ((lead & 0xe0) === 0xc0) expectedLen = 2;
+    else if ((lead & 0xf0) === 0xe0) expectedLen = 3;
+    else if ((lead & 0xf8) === 0xf0) expectedLen = 4;
+    if (cut - lastLead < expectedLen) {
+      cut = lastLead;
+    }
+  }
+  let out = buf.subarray(0, cut).toString("utf8");
+  if (out.length > 0) {
+    const lastCode = out.charCodeAt(out.length - 1);
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+      out = out.slice(0, -1);
+    }
+  }
+  return out;
 }
 
-/** Take strictly the last <= maxBytes UTF-8 bytes without splitting a leading multi-byte character */
+/** Take strictly the last <= maxBytes UTF-8 bytes without splitting a leading multi-byte character or stripping legitimate U+FFFD */
 export function truncateTailUtf8Safe(text, maxBytes) {
   if (!text) return "";
-  const buf = Buffer.from(text, "utf8");
-  if (buf.length <= maxBytes) return text;
-  let start = Math.max(0, buf.length - Math.max(0, maxBytes));
-  // Advance past any UTF-8 continuation bytes (10xxxxxx)
+  const limit = Number.isFinite(Number(maxBytes)) ? Math.max(0, Math.floor(Number(maxBytes))) : 0;
+  if (limit === 0) return "";
+  const str = String(text);
+  const buf = Buffer.from(str, "utf8");
+  if (buf.length <= limit) return str;
+  let start = Math.max(0, buf.length - limit);
+  // Advance past any UTF-8 continuation bytes (10xxxxxx) to land strictly on a UTF-8 lead byte
   while (start < buf.length && (buf[start] & 0xc0) === 0x80) {
     start += 1;
   }
-  return buf.subarray(start).toString("utf8").replace(/^\uFFFD+/, "");
+  let out = buf.subarray(start).toString("utf8");
+  if (out.length > 0) {
+    const firstCode = out.charCodeAt(0);
+    if (firstCode >= 0xdc00 && firstCode <= 0xdfff) {
+      out = out.slice(1);
+    }
+  }
+  return out;
 }
 
 /** Preserve both head context (~35%) and failure tail/summary (~65%) within <= maxBytes UTF-8 */
-export function truncateHeadTailUtf8Safe(text, maxBytes) {
-  if (!text) return "";
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  const marker = "\n... [middle omitted to stay <=8.8KB; tail failure/summary preserved] ...\n";
+export function truncateHeadTailUtf8Safe(
+  text, maxBytes,
+  marker = "\n... [middle omitted to stay <=8.8KB; tail failure/summary preserved] ...\n",
+  maxChars = Number.MAX_SAFE_INTEGER
+) {
+  if (!text || maxBytes <= 0 || maxChars <= 0) return "";
+  if (text.length <= maxChars && Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   const markerBytes = Buffer.byteLength(marker, "utf8");
   const avail = maxBytes - markerBytes;
-  if (avail < 200) return truncateTailUtf8Safe(text, maxBytes);
+  const availChars = maxChars - marker.length;
+  const tailWithin = (bytes, chars) => truncateTailUtf8Safe(text.slice(-chars).replace(/^[\uDC00-\uDFFF]/, ""), bytes);
+  if (avail < 200 || availChars < 64) return tailWithin(maxBytes, maxChars);
   const headBudget = Math.floor(avail * 0.35);
   const tailBudget = avail - headBudget;
-  const head = truncateUtf8Safe(text, headBudget).replace(/\s+$/, "");
-  const tail = truncateTailUtf8Safe(text, tailBudget).replace(/^\s+/, "");
+  const headChars = Math.floor(availChars * 0.35);
+  const head = truncateUtf8Safe(text.slice(0, headChars).replace(/[\uD800-\uDBFF]$/, ""), headBudget).trimEnd();
+  const tail = tailWithin(tailBudget, availChars - headChars).trimStart();
   return `${head}${marker}${tail}`;
 }
 
@@ -556,6 +995,19 @@ export function tryParseSimpleCommand(cmd) {
   return { bin: tokens[0], args: tokens.slice(1) };
 }
 
+function hasSiblingPs1Script(exePath) {
+  if (!exePath || typeof exePath !== "string") return false;
+  const dir = path.dirname(exePath);
+  const stem = path.basename(exePath, path.extname(exePath));
+  if (!dir || !stem) return false;
+  const ps1Path = path.join(dir, `${stem}.ps1`);
+  try {
+    return fs.existsSync(ps1Path) && fs.statSync(ps1Path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function hasWindowsCrossShellHazard(innerCmd, targetCwd, env = process.env) {
   if (!innerCmd || typeof innerCmd !== "string") return false;
   let hasUnquotedComma = false;
@@ -590,9 +1042,19 @@ function hasWindowsCrossShellHazard(innerCmd, targetCwd, env = process.env) {
         tokHasQuote = true;
         i++;
         while (i < len) {
-          if (innerCmd[i] === "\\" && i + 1 < len && innerCmd[i + 1] === '"' && innerCmd.indexOf('"', i + 2) !== -1) {
-            i += 2;
-            continue;
+          if (innerCmd[i] === "\\" && i + 1 < len) {
+            if (innerCmd[i + 1] === "\\" && i + 2 < len && innerCmd[i + 2] === '"') {
+              i += 3;
+              break;
+            }
+            if (innerCmd[i + 1] === '"') {
+              if (innerCmd.indexOf('"', i + 2) !== -1) {
+                i += 2;
+                continue;
+              }
+              i += 2;
+              break;
+            }
           }
           if (innerCmd[i] === '"') {
             i++;
@@ -611,12 +1073,16 @@ function hasWindowsCrossShellHazard(innerCmd, targetCwd, env = process.env) {
     }
   }
 
-  if (hasUnquotedComma || hasStandaloneDoubleDash) {
+  if (hasUnquotedComma) {
     return true;
   }
-  if (hasSingleQuotedDoubleQuote) {
+  if (hasStandaloneDoubleDash || hasSingleQuotedDoubleQuote) {
     const parsed = tryParseSimpleCommand(innerCmd);
-    if (!parsed || !resolveWindowsExeOnPath(parsed.bin, targetCwd, env)) {
+    const exePath = parsed ? resolveWindowsExeOnPath(parsed.bin, targetCwd, env) : null;
+    if (!parsed || !exePath) {
+      return true;
+    }
+    if (hasStandaloneDoubleDash && !/\.exe$/i.test(parsed.bin) && hasSiblingPs1Script(exePath)) {
       return true;
     }
   }
@@ -726,6 +1192,179 @@ export function parseGitSubcommand(cmd) {
   }
 
   return null;
+}
+
+const PKG_MANAGER_VALUE_FLAGS = new Set([
+  "--prefix",
+  "--cwd",
+  "--dir",
+  "--workspace",
+  "--filter",
+  "--loglevel"
+]);
+const PKG_MANAGER_BOOL_FLAGS = new Set([
+  "--silent",
+  "--workspaces",
+  "--ws",
+  "--workspace-root",
+  "--recursive",
+  "-r",
+  "--if-present",
+  "--no-audit",
+  "--no-fund"
+]);
+
+/**
+ * Linear O(N) tokenizer for `npm`/`pnpm`/`yarn`/`bun` invocations with safe leading options
+ * (e.g. `--prefix <dir>`, `-C <dir>`, `--cwd <dir>`, `--dir <dir>`, `--workspace <pkg>`, `--filter <pkg>`).
+ * Rejects unclosed quotes, unknown leading flags, missing option values, and shell operators before the subcommand.
+ */
+export function parsePkgManagerCommand(cmd) {
+  if (typeof cmd !== "string" || !cmd.trim()) return null;
+  const len = cmd.length;
+  let i = 0;
+
+  const readToken = () => {
+    while (i < len && /\s/.test(cmd[i])) i++;
+    if (i >= len) return null;
+    const start = i;
+    let unquoted = "";
+    let hasQuote = false;
+    while (i < len && !/\s/.test(cmd[i])) {
+      const ch = cmd[i];
+      if (ch === '"' || ch === "'") {
+        hasQuote = true;
+        const quote = ch;
+        i++;
+        let closed = false;
+        while (i < len) {
+          if (quote === "'" && cmd[i] === "'" && i + 1 < len && cmd[i + 1] === "'") {
+            unquoted += "'";
+            i += 2;
+            continue;
+          }
+          if (quote === '"' && cmd[i] === "\\" && i + 1 < len) {
+            if (cmd[i + 1] === "\\" && i + 2 < len && cmd[i + 2] === '"') {
+              unquoted += "\\";
+              i += 3;
+              closed = true;
+              break;
+            }
+            if (cmd[i + 1] === '"') {
+              if (cmd.indexOf('"', i + 2) !== -1) {
+                unquoted += '"';
+                i += 2;
+                continue;
+              }
+              unquoted += "\\";
+              i += 2;
+              closed = true;
+              break;
+            }
+          }
+          if (cmd[i] === quote) {
+            i++;
+            closed = true;
+            break;
+          }
+          unquoted += cmd[i];
+          i++;
+        }
+        if (!closed) return { invalid: true };
+      } else {
+        if (/[|;&<>`$()\r\n\0]/.test(ch)) {
+          if (i === start) return { operator: true };
+          break;
+        }
+        unquoted += ch;
+        i++;
+      }
+    }
+    return {
+      raw: cmd.slice(start, i),
+      value: unquoted,
+      hasQuote,
+      start,
+      end: i
+    };
+  };
+
+  const first = readToken();
+  if (!first || first.invalid || first.operator || first.hasQuote) return null;
+  const binMatch = /^(npm|pnpm|yarn|bun)(?:\.cmd|\.exe)?$/i.exec(first.value);
+  if (!binMatch) return null;
+  const manager = binMatch[1].toLowerCase();
+
+  const consumeSafeLeadingOpts = (maxOpts = 16) => {
+    for (let optCount = 0; optCount <= maxOpts; optCount++) {
+      const tok = readToken();
+      if (!tok || tok.invalid || tok.operator) return null;
+      if (!tok.hasQuote && PKG_MANAGER_BOOL_FLAGS.has(tok.value)) {
+        continue;
+      }
+      if (
+        !tok.hasQuote &&
+        (PKG_MANAGER_VALUE_FLAGS.has(tok.value) ||
+          tok.value === "-C" ||
+          ((manager === "pnpm" || manager === "bun") && tok.value === "-F"))
+      ) {
+        const arg = readToken();
+        if (!arg || arg.invalid || arg.operator || !arg.value) return null;
+        continue;
+      }
+      const startsQuoted = tok.raw.startsWith('"') || tok.raw.startsWith("'");
+      if (
+        !startsQuoted &&
+        (/^--(?:prefix|cwd|dir|workspace|filter|loglevel)=.+/.test(tok.value) ||
+          /^-C.+/.test(tok.value) ||
+          ((manager === "pnpm" || manager === "bun") && /^-F.+/.test(tok.value)))
+      ) {
+        continue;
+      }
+      if (tok.hasQuote || tok.value.startsWith("-")) {
+        return null;
+      }
+      return tok;
+    }
+    return null;
+  };
+
+  let tok = consumeSafeLeadingOpts(16);
+  if (!tok) return null;
+
+  // Support `yarn [--cwd dir] workspace <pkg> [run] <script>`
+  if (manager === "yarn" && tok.value.toLowerCase() === "workspace") {
+    const pkgTok = readToken();
+    if (!pkgTok || pkgTok.invalid || pkgTok.operator || !pkgTok.value || pkgTok.value.startsWith("-")) {
+      return null;
+    }
+    tok = consumeSafeLeadingOpts(8);
+    if (!tok) return null;
+  }
+
+  const action = tok.value.toLowerCase();
+  if (action === "run" || action === "run-script") {
+    const scriptTok = consumeSafeLeadingOpts(8);
+    if (!scriptTok || !/^[a-z0-9][a-z0-9:._-]*$/i.test(scriptTok.value)) return null;
+    return {
+      manager,
+      action: "run",
+      subcommand: scriptTok.value.toLowerCase(),
+      subcommandStart: scriptTok.start,
+      subcommandEnd: scriptTok.end,
+      rest: cmd.slice(scriptTok.end)
+    };
+  }
+
+  if (!/^[a-z0-9][a-z0-9:._-]*$/i.test(tok.value)) return null;
+  return {
+    manager,
+    action,
+    subcommand: action,
+    subcommandStart: tok.start,
+    subcommandEnd: tok.end,
+    rest: cmd.slice(tok.end)
+  };
 }
 
 /**
@@ -2162,36 +2801,92 @@ function filterGitLog(combined, exitCode) {
   return shownLines.join("\n");
 }
 
-/** Rule 4: test runners (node --test, npm/pnpm/yarn test, vitest, jest, pytest, go test, cargo test) */
-function filterTestRunner(combined, exitCode) {
-  const lines = combined.split("\n").map((l) => l.trimEnd());
-  const nonEmpty = lines.filter((l) => l.trim().length > 0);
-
-  const summaryRe =
-    /(?:^|\s)(?:tests?\s+\d+|suites?\s+\d+|pass(?:ed)?\s*[:=]?\s*\d+|fail(?:ed|ures?)?\s*[:=]?\s*\d+|skipped?\s*[:=]?\s*\d+|duration_ms|test result:|passed in \d|failed in \d|ran \d+ tests?|total:\s*\d+|Tests:\s+|Test Suites:\s+|FAIL\s+|PASS\s+|ok\s+\S+\s+\d|---\s+FAIL:|errors?\b)/i;
-
-  if (exitCode === 0) {
-    // Passing run: keep summary lines, warnings, and test count totals; collapse passing checklists
-    const kept = [];
-    for (const line of nonEmpty) {
-      if (
-        summaryRe.test(line) ||
-        /\bwarn(?:ing)?\b/i.test(line) ||
-        /^ℹ\s+(?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)\b/i.test(line.trim())
-      ) {
-        kept.push(line);
-      }
-    }
-    if (kept.length > 0) {
-      const unique = [];
-      for (const l of kept) {
-        if (unique[unique.length - 1] !== l) unique.push(l);
-      }
-      return `PASS (exit 0) — ${nonEmpty.length} raw lines compacted:\n${unique.slice(-40).join("\n")}`;
-    }
-    // Fallback: last 20 lines
-    return `PASS (exit 0) — tail:\n${nonEmpty.slice(-20).join("\n")}`;
+// Find a run of identical lines, or lines with one consecutive numeric counter.
+// Any other value change ends the run so that the exceptional line remains visible.
+function repeatedRunEnd(lines, start) {
+  const first = lines[start];
+  const second = lines[start + 1];
+  let end = start + 1;
+  if (second === undefined) return end;
+  if (first === second) {
+    while (lines[end] === first) end++;
+    return end;
   }
+  const left = first.split(/(\d+)/);
+  const right = second.split(/(\d+)/);
+  if (left.length !== right.length) return end;
+  const counter = left.findIndex((part, i) => part !== right[i]);
+  if (counter < 0 || counter % 2 === 0) return end;
+  const initial = Number(left[counter]);
+  if (!Number.isSafeInteger(initial)) return end;
+  const prefix = left.slice(0, counter).join("");
+  const suffix = left.slice(counter + 1).join("");
+  const width = left[counter].length;
+  while (end < lines.length) {
+    const value = String(initial + (end - start)).padStart(width, "0");
+    if (lines[end] !== prefix + value + suffix) break;
+    end++;
+  }
+  return end;
+}
+
+const PASS_REPORTER_LINE = /^\s*(?:TAP version \d+$|# Subtest: |ok \d+(?:\s+-\s|$)|[✔✓]\s+.*\([\d.]+\s*(?:ms|s)\)\s*$|--- PASS: |PASS\s+\S+\.(?:[cm]?[jt]sx?|py)\b|test \S+ \.\.\. ok$|---$|\.\.\.$|\d+\.\.\d+$)/;
+const TAP_TEST_METADATA = /^\s+(?:duration_ms:\s+[\d.]+|type:\s+['"]?(?:test|suite)['"]?)\s*$/;
+const TEST_TOTAL_LINE = /^\s*(?:[#ℹ]\s*)?(?:(?:tests?|suites?|pass|fail|cancelled|skipped|todo|duration_ms)\s+\d|(?:Tests|Test Suites|test result):|\d+ passed\b|Ran \d+ tests?\b)/i;
+
+export function compactPassingTestOutput(text, maxBytes, maxChars = maxBytes) {
+  const fits = value => value.length <= maxChars && Buffer.byteLength(value, "utf8") <= maxBytes;
+  if (fits(text)) return text;
+  const lines = text.split(/\r?\n/).filter(line => line.trim());
+  const header = `PASS (exit 0) — ${lines.length} raw lines compacted:\n`;
+  if (!fits(header)) return truncateUtf8Safe(header.slice(0, maxChars), maxBytes);
+  const withoutReporter = lines.filter(line =>
+    !(PASS_REPORTER_LINE.test(line) || TAP_TEST_METADATA.test(line)) ||
+    /\bwarn(?:ing)?\b/i.test(line) || isFailureAnchorLine(line)
+  );
+  const diagnostics = withoutReporter.length ? withoutReporter : lines;
+  let body = diagnostics.join("\n");
+  if (fits(header + body)) return header + body;
+
+  const kept = [];
+  for (let start = 0; start < diagnostics.length;) {
+    const end = repeatedRunEnd(diagnostics, start);
+    if (end - start >= 4) {
+      kept.push(diagnostics[start], `... [${end - start - 2} repeated lines omitted] ...`, diagnostics[end - 1]);
+    } else {
+      kept.push(...diagnostics.slice(start, end));
+    }
+    start = end;
+  }
+  body = kept.join("\n");
+  if (fits(header + body)) return header + body;
+
+  // Keep warnings and the final counts visible even when unique diagnostics overflow.
+  const summaries = [];
+  const other = [];
+  for (const line of kept) {
+    if (TEST_TOTAL_LINE.test(line) || /\bwarn(?:ing)?\b/i.test(line) || isFailureAnchorLine(line)) summaries.push(line);
+    else other.push(line);
+  }
+  const marker = "\n... [middle output omitted] ...\n";
+  const availableBytes = maxBytes - Buffer.byteLength(header, "utf8");
+  const availableChars = maxChars - header.length;
+  const otherText = other.join("\n");
+  const summary = truncateHeadTailUtf8Safe(
+    summaries.join("\n"),
+    Math.max(Math.floor(availableBytes / 2), availableBytes - Buffer.byteLength(otherText, "utf8") - (other.length ? 1 : 0)),
+    marker,
+    Math.max(Math.floor(availableChars / 2), availableChars - otherText.length - (other.length ? 1 : 0))
+  );
+  const tail = summary && other.length ? "\n" + summary : summary;
+  body = truncateHeadTailUtf8Safe(otherText, availableBytes - Buffer.byteLength(tail, "utf8"), marker, availableChars - tail.length);
+  return header + body + tail;
+}
+
+/** Rule 4: test runners (node --test, npm/pnpm/yarn test, vitest, jest, pytest, go test, cargo test) */
+function filterTestRunner(combined, exitCode, ctx) {
+  if (exitCode === 0) return compactPassingTestOutput(combined, ctx.maxBytes);
+  const lines = combined.split("\n").map((l) => l.trimEnd());
 
   // Failing run: strip pure passing check lines, keep all failure blocks, assertions, stacks & summary
   const passNoiseRe = /^\s*(?:✔|✓|ok\s+\d+|PASS\s+|test\s+\S+\s+\.\.\.\s+ok\s*$|---\s+PASS:|passed\b.*\[100%\]|\.\s*$)/i;
@@ -2363,24 +3058,12 @@ function filterTerraform(combined, exitCode) {
 }
 
 /** Rule 11: Playwright test runner */
-function filterPlaywright(combined, exitCode) {
+function filterPlaywright(combined, exitCode, ctx) {
   const lines = combined.split("\n").map((l) => l.trimEnd());
-  const nonEmpty = lines.filter((l) => l.trim().length > 0);
-
-  if (exitCode === 0) {
-    const keepRe =
-      /(?:Running\s+\d+\s+tests?|\b\d+\s+(?:passed|failed|flaky|skipped|interrupted)\b|Slow test file|\bwarn(?:ing)?\b)/i;
-    const kept = nonEmpty.filter((l) => keepRe.test(l));
-    if (kept.length > 0) {
-      return `PASS (exit 0) — ${nonEmpty.length} raw lines compacted:\n${kept.slice(-35).join("\n")}`;
-    }
-    return `PASS (exit 0) — tail:\n${nonEmpty.slice(-20).join("\n")}`;
-  }
-
-  // On failure: strip passing test lines, keep all failure blocks, locators, call logs & summary
   const passLineRe = /^\s*(?:✓|✔|ok\s+\d+)\s+\d+\s+\[[^\]]+\]/i;
-  const kept = lines.filter((l) => !passLineRe.test(l));
+  const kept = lines.filter((line) => !passLineRe.test(line));
   const collapsed = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (exitCode === 0) return compactPassingTestOutput(collapsed || combined, ctx.maxBytes);
   return collapsed || combined;
 }
 
@@ -2763,6 +3446,13 @@ export const FILTER_RULES = [
     preserveTailOnFail: true,
     pattern:
       /^(?:(?:npm|pnpm|yarn|bun)(?:\.cmd|\.exe)?\s+(?:run\s+)?test(?:\s|$)|node(?:\.exe)?\s+--test(?:\s|$)|(?:npx(?:\.cmd)?\s+)?(?:vitest|jest|mocha|ava)(?:\s|$)|pytest(?:\s|$)|python(?:3)?(?:\.exe)?\s+-m\s+(?:pytest|unittest)(?:\s|$)|go(?:\.exe)?\s+test(?:\s|$)|cargo(?:\.exe)?\s+test(?:\s|$)|dotnet(?:\.exe)?\s+test(?:\s|$))/i,
+    match(cmd) {
+      const pm = parsePkgManagerCommand(cmd);
+      if (pm) {
+        return pm.subcommand === "test" ? { matched: true, skipTarget: pm.rest } : false;
+      }
+      return this.pattern.test(cmd);
+    },
     filter: filterTestRunner
   },
   {
@@ -2770,6 +3460,15 @@ export const FILTER_RULES = [
     preserveTailOnFail: true,
     pattern:
       /^(?:(?:npm|pnpm|yarn|bun)(?:\.cmd|\.exe)?\s+(?:run\s+)?(?:build|lint|typecheck|check)(?:\s|$)|(?:npx(?:\.cmd)?\s+)?(?:tsc|eslint|biome|vite\s+build|next\s+build|webpack)(?:\s|$)|ruff\s+check(?:\s|$)|mypy(?:\s|$)|flake8(?:\s|$)|cargo(?:\.exe)?\s+(?:build|check|clippy)(?:\s|$)|go(?:\.exe)?\s+(?:build|vet)(?:\s|$)|dotnet(?:\.exe)?\s+build(?:\s|$))/i,
+    match(cmd) {
+      const pm = parsePkgManagerCommand(cmd);
+      if (pm) {
+        return ["build", "lint", "typecheck", "check"].includes(pm.subcommand)
+          ? { matched: true, skipTarget: pm.rest }
+          : false;
+      }
+      return this.pattern.test(cmd);
+    },
     filter: filterBuildLint
   },
   {
@@ -2777,6 +3476,15 @@ export const FILTER_RULES = [
     preserveTailOnFail: true,
     pattern:
       /^(?:(?:npm|pnpm|yarn|bun)(?:\.cmd|\.exe)?\s+(?:install|i|ci|add|update)(?:\s|$)|(?:pip|pip3|uv\s+pip)(?:\.exe)?\s+install(?:\s|$))/i,
+    match(cmd) {
+      const pm = parsePkgManagerCommand(cmd);
+      if (pm) {
+        return pm.action !== "run" && ["install", "i", "ci", "add", "update"].includes(pm.subcommand)
+          ? { matched: true, skipTarget: pm.rest }
+          : false;
+      }
+      return this.pattern.test(cmd);
+    },
     filter: filterPkgInstall
   },
   {
@@ -2810,6 +3518,23 @@ export const FILTER_RULES = [
     id: "playwright",
     preserveTailOnFail: true,
     pattern: /^(?:(?:npx|pnpm|yarn|bunx)(?:\.cmd|\.exe)?\s+)?playwright(?:\.cmd|\.exe)?\s+test(?:\s|$)/i,
+    match(cmd) {
+      if (this.pattern.test(cmd)) return true;
+      const pm = parsePkgManagerCommand(cmd);
+      if (!pm) return false;
+      if (
+        pm.action !== "run" &&
+        pm.manager !== "npm" &&
+        pm.subcommand === "playwright" &&
+        /^\s+test(?:\s|$)/i.test(pm.rest)
+      ) {
+        return { matched: true, skipTarget: pm.rest };
+      }
+      if (pm.action === "exec" && /^\s+playwright(?:\.cmd|\.exe)?\s+test(?:\s|$)/i.test(pm.rest)) {
+        return { matched: true, skipTarget: pm.rest };
+      }
+      return false;
+    },
     filter: filterPlaywright
   }
 ];
@@ -2915,6 +3640,17 @@ export function applyFilterRule(ruleId, rawStdout, rawStderr, exitCode = 0, opti
     (rawStderr ? (rawStdout && !rawStdout.endsWith("\n") ? "\n" : "") + rawStderr : "");
   const rawBytes = Buffer.byteLength(rawCombined, "utf8");
   const cleaned = stripAnsiAndProgress(rawCombined);
+  // A complete passing log needs no footer. Don't withhold its last few hundred bytes to reserve one.
+  if (ruleId === "test-runner" && exitCode === 0 && !options.note && rawBytes <= maxBytes && !isJsonLikeFn?.(cleaned)) {
+    return {
+      filteredText: cleaned,
+      rawBytes,
+      filteredBytes: Buffer.byteLength(cleaned, "utf8"),
+      wasFiltered: false,
+      truncated: false,
+      crushedJson: false
+    };
+  }
 
   let rule = FILTER_RULES.find((r) => r.id === ruleId);
   if (!rule && typeof ruleId === "string" && ruleId.startsWith("custom:")) {
@@ -2955,8 +3691,10 @@ export function applyFilterRule(ruleId, rawStdout, rawStderr, exitCode = 0, opti
 
   const noteParts = [];
   if (options.note) noteParts.push(options.note);
+  const passingTest = exitCode === 0 && (ruleId === "test-runner" || ruleId === "playwright");
+  const queryHint = passingTest ? "use ctx_search for details missing from this preview" : "query via agy-dart_context ctx_search";
   const sourceHint = options.sourceId
-    ? ` full output indexed as ${options.sourceId} (query via agy-dart_context ctx_search)`
+    ? ` full output indexed as ${options.sourceId} (${queryHint})`
     : "";
 
   const reserveFooter = Math.max(

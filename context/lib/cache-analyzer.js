@@ -71,6 +71,10 @@ const TTL_SAMPLE_MAX_SEC = 14400;
 const TTL_PURE_COLD_MAX_CACHE_RATIO = 0.25;
 const TTL_IMPLICIT_MAX_CAP_SEC = 3600;
 const TTL_KEEPALIVE_STEP_RE = /\[agy-dart TTL(?:保活| Keepalive)(?:\s|\])/i;
+const PRIOR_CONTEXT_MATCH_ENABLED_PROFILES = new Set(["gemini-4-512k"]);
+const PRIOR_CONTEXT_MATCH_TAIL_SLACK = 2049;
+const TAIL_TRUNCATED_STEP_ARRAYS = new WeakSet();
+const SUBAGENT_STEP_TYPE_RE = /^SUBAGENT(?:_|$)/i;
 
 
 function toNonNegNum(val) {
@@ -141,6 +145,7 @@ export function extractStepTokenUsage(step) {
     return {
       inputTokens: 0,
       cacheReadTokens: 0,
+      cacheReadReported: false,
       cacheCreationTokens: 0,
       cacheCreation1hTokens: 0,
       outputTokens: 0,
@@ -175,18 +180,19 @@ export function extractStepTokenUsage(step) {
       toNonNegNum(usage.prompt_cache_hit_tokens) !== null
     );
 
-  const cacheReadTokens =
-    firstPosOrNonNeg(
-      step.cache_read_tokens,
-      step.cache_read_input_tokens,
-      usage.cache_read_tokens,
-      usage.cache_read_input_tokens,
-      usage.cachedContentTokenCount,
-      usage.cached_content_token_count,
-      usage.prompt_tokens_details?.cached_tokens,
-      usage.input_tokens_details?.cached_tokens,
-      usage.prompt_cache_hit_tokens
-    ) ?? 0;
+  const rawCacheRead = firstPosOrNonNeg(
+    step.cache_read_tokens,
+    step.cache_read_input_tokens,
+    usage.cache_read_tokens,
+    usage.cache_read_input_tokens,
+    usage.cachedContentTokenCount,
+    usage.cached_content_token_count,
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.input_tokens_details?.cached_tokens,
+    usage.prompt_cache_hit_tokens
+  );
+  const cacheReadReported = rawCacheRead !== null;
+  const cacheReadTokens = rawCacheRead === null || rawCacheRead === 0 ? 0 : rawCacheRead;
 
   const cacheCreation1hTokens =
     firstPosOrNonNeg(
@@ -252,6 +258,7 @@ export function extractStepTokenUsage(step) {
   return {
     inputTokens,
     cacheReadTokens,
+    cacheReadReported,
     cacheCreationTokens,
     cacheCreation1hTokens,
     outputTokens,
@@ -698,12 +705,212 @@ export function readTranscriptTail(filePath, maxBytes = 131072, options = {}) {
           ? totalUsageSteps >= 1
           : primaryCtxSteps >= minUsageSteps || (primaryCtxSteps === 0 && totalUsageSteps >= minUsageSteps);
       if (hasEnoughUsage || offset === 0 || windowBytes >= HARD_CAP_BYTES) {
+        if (offset > 0) {
+          TAIL_TRUNCATED_STEP_ARRAYS.add(steps);
+        }
         return steps;
       }
       windowBytes = Math.min(stat.size, Math.min(HARD_CAP_BYTES, windowBytes * 4));
     }
   } catch {
     return [];
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+const UTF8_FATAL_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+/**
+ * Fixed-window head + tail reader for handoff brief intent extraction.
+ * Strictly reads at most `headBytes` (default 64 KiB) from the start and `tailBytes`
+ * (default 128 KiB) from the end without ever widening up to 2 MiB.
+ * Drops partial boundary lines on raw Buffers before UTF-8 decoding so only complete
+ * JSONL records are parsed and split multi-byte characters never corrupt output.
+ */
+export function readTranscriptHeadTailFixed(filePath, { headBytes = 65536, tailBytes = 131072 } = {}) {
+  const empty = {
+    headSteps: [],
+    tailSteps: [],
+    headBytesRead: 0,
+    tailBytesRead: 0,
+    totalBytesRead: 0,
+    fileSize: 0,
+    overlapped: true
+  };
+  if (!filePath || typeof filePath !== "string") return empty;
+  const headCap = Number.isFinite(Number(headBytes)) && Number(headBytes) >= 0 ? Math.floor(Number(headBytes)) : 65536;
+  const tailCap = Number.isFinite(Number(tailBytes)) && Number(tailBytes) >= 0 ? Math.floor(Number(tailBytes)) : 131072;
+  if (headCap === 0 && tailCap === 0) return empty;
+
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size <= 0) return empty;
+
+    const readChunkExact = (length, position) => {
+      if (length <= 0) return Buffer.alloc(0);
+      const buf = Buffer.allocUnsafe(length);
+      let total = 0;
+      while (total < length) {
+        const n = fs.readSync(fd, buf, total, length - total, position + total);
+        if (n <= 0) break;
+        total += n;
+      }
+      return total === length ? buf : buf.subarray(0, total);
+    };
+
+    const parseStrictUtf8JsonlLine = (lineBuf, { requireBraces = false } = {}) => {
+      if (!lineBuf || lineBuf.length === 0) return null;
+      let end = lineBuf.length;
+      if (end > 0 && lineBuf[end - 1] === 0x0d) {
+        end -= 1;
+      }
+      if (end === 0) return null;
+      const slice = end === lineBuf.length ? lineBuf : lineBuf.subarray(0, end);
+      if ((slice[0] & 0xc0) === 0x80) return null;
+      try {
+        const decoded = UTF8_FATAL_DECODER.decode(slice);
+        const trimmed = decoded.trim();
+        if (!trimmed) return null;
+        if (requireBraces && !(trimmed.startsWith("{") && trimmed.endsWith("}"))) {
+          return null;
+        }
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed;
+        }
+      } catch {
+        // Invalid UTF-8 bytes or malformed JSON -> drop ONLY this line
+      }
+      return null;
+    };
+
+    const parseStrictUtf8JsonlBuffer = (buf) => {
+      if (!buf || buf.length === 0) return [];
+      const steps = [];
+      let lineStart = 0;
+      while (lineStart < buf.length) {
+        const nlIdx = buf.indexOf(0x0a, lineStart);
+        const lineEnd = nlIdx >= 0 ? nlIdx : buf.length;
+        if (lineEnd > lineStart) {
+          const parsed = parseStrictUtf8JsonlLine(buf.subarray(lineStart, lineEnd));
+          if (parsed) steps.push(parsed);
+        }
+        if (nlIdx < 0) break;
+        lineStart = nlIdx + 1;
+      }
+      return steps;
+    };
+
+    const parseHeadSlice = (buf, reachedEof) => {
+      if (!buf || buf.length === 0) return [];
+      if (reachedEof) {
+        return parseStrictUtf8JsonlBuffer(buf);
+      }
+      // Drop trailing incomplete line at raw byte boundary before strict per-line UTF-8 decode
+      const lastNl = buf.lastIndexOf(0x0a);
+      if (lastNl < 0) return [];
+      return parseStrictUtf8JsonlBuffer(buf.subarray(0, lastNl + 1));
+    };
+
+    const parseTailSliceExact = (buf, offset, prevByte) => {
+      if (!buf || buf.length === 0) return [];
+      if (offset === 0 || prevByte === 0x0a) {
+        return parseStrictUtf8JsonlBuffer(buf);
+      }
+      // Drop leading incomplete line at raw byte boundary before strict per-line UTF-8 decode
+      const firstNl = buf.indexOf(0x0a);
+      if (firstNl < 0 || firstNl + 1 >= buf.length) return [];
+      return parseStrictUtf8JsonlBuffer(buf.subarray(firstNl + 1));
+    };
+
+    const parseTailSliceLarge = (buf, offset) => {
+      if (!buf || buf.length === 0) return [];
+      if (offset === 0) {
+        return parseStrictUtf8JsonlBuffer(buf);
+      }
+      const firstNl = buf.indexOf(0x0a);
+      const firstLineBuf = firstNl >= 0 ? buf.subarray(0, firstNl) : buf;
+      const restBuf = firstNl >= 0 && firstNl + 1 < buf.length ? buf.subarray(firstNl + 1) : null;
+      const steps = [];
+      // Verify whether the tail window begins cleanly on a complete JSONL object line without
+      // performing any extra probe read before `tailOffset`. Any strict proper suffix of a valid
+      // JSON object carries unmatched outer closing braces and fails `JSON.parse`.
+      const parsedFirst = parseStrictUtf8JsonlLine(firstLineBuf, { requireBraces: true });
+      if (parsedFirst) {
+        steps.push(parsedFirst);
+      }
+      if (restBuf && restBuf.length > 0) {
+        steps.push(...parseStrictUtf8JsonlBuffer(restBuf));
+      }
+      return steps;
+    };
+
+    const fileSize = stat.size;
+    // Overlapping fast path: read once without duplicate I/O, but still parse head <= headCap
+    // and tail <= tailCap strictly along their raw byte boundaries.
+    if (fileSize <= headCap + tailCap) {
+      const fullBuf = readChunkExact(fileSize, 0);
+      const bytesRead = fullBuf.length;
+      const headLen = Math.min(headCap, bytesRead);
+      const headSteps = headLen > 0 ? parseHeadSlice(fullBuf.subarray(0, headLen), headLen === bytesRead) : [];
+
+      let tailSteps = [];
+      let tailLen = 0;
+      if (tailCap > 0) {
+        tailLen = Math.min(tailCap, bytesRead);
+        const tailOffset = Math.max(0, bytesRead - tailLen);
+        const prevByte = tailOffset > 0 ? fullBuf[tailOffset - 1] : 0x0a;
+        tailSteps = parseTailSliceExact(fullBuf.subarray(tailOffset, bytesRead), tailOffset, prevByte);
+      }
+
+      return {
+        headSteps,
+        tailSteps,
+        headBytesRead: headLen,
+        tailBytesRead: tailLen,
+        totalBytesRead: bytesRead,
+        fileSize,
+        overlapped: true
+      };
+    }
+
+    // Large file path: strictly <= headCap head read + strictly <= tailCap tail read (no extra probe byte)
+    let headSteps = [];
+    let headBytesRead = 0;
+    if (headCap > 0) {
+      const headBuf = readChunkExact(Math.min(headCap, fileSize), 0);
+      headBytesRead = headBuf.length;
+      headSteps = parseHeadSlice(headBuf, headBytesRead === fileSize);
+    }
+
+    let tailSteps = [];
+    let tailBytesRead = 0;
+    if (tailCap > 0) {
+      const tailLen = Math.min(tailCap, fileSize);
+      const tailOffset = Math.max(0, fileSize - tailLen);
+      const tailBuf = readChunkExact(tailLen, tailOffset);
+      tailBytesRead = tailBuf.length;
+      tailSteps = parseTailSliceLarge(tailBuf, tailOffset);
+    }
+
+    return {
+      headSteps,
+      tailSteps,
+      headBytesRead,
+      tailBytesRead,
+      totalBytesRead: headBytesRead + tailBytesRead,
+      fileSize,
+      overlapped: false
+    };
+  } catch {
+    return empty;
   } finally {
     if (fd !== null) {
       try {
@@ -739,24 +946,44 @@ function normPath(raw, baseCwd = "") {
   return p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
 }
 
-function shortTargetLabel(rawPath, maxLen = 42) {
+export function shortTargetLabel(rawPath, maxLen = 42) {
   if (!rawPath) return "";
   const cleaned = String(rawPath).trim().replace(/\\/g, "/");
   if (!cleaned) return "";
   if (cleaned.length <= maxLen) return cleaned;
   const parts = cleaned.split("/").filter(Boolean);
-  if (parts.length >= 2) {
+  const looksLikePath =
+    parts.length >= 2 &&
+    (!/\s/.test(cleaned) || /^(?:[a-zA-Z]:\/|\/|\.\.?\/)/.test(cleaned));
+  if (looksLikePath) {
     const tail = `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
     if (tail.length <= maxLen) return tail;
+    const base = parts[parts.length - 1];
+    if (base.length <= maxLen) return base;
+    return maxLen > 3 ? `...${base.slice(-(maxLen - 3))}` : base.slice(-Math.max(1, maxLen));
   }
-  return cleaned.slice(0, maxLen - 3) + "...";
+  return maxLen > 3 ? cleaned.slice(0, maxLen - 3) + "..." : cleaned.slice(0, Math.max(1, maxLen));
+}
+
+function unwrapQuotedWrapperArg(val) {
+  if (typeof val !== "string") return "";
+  const trimmed = val.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === "string") return parsed.trim();
+    } catch {
+      return trimmed.slice(1, -1).trim();
+    }
+  }
+  return trimmed;
 }
 
 function unwrapEffectiveTool(call) {
-  const rawName = String(call?.name || "").trim();
+  const rawName = unwrapQuotedWrapperArg(String(call?.name || ""));
   const args = getCallArgs(call) || {};
   if (rawName === "call_mcp_tool") {
-    const mcpTool = String(args.ToolName ?? args.toolName ?? "").trim();
+    const mcpTool = unwrapQuotedWrapperArg(String(args.ToolName ?? args.toolName ?? ""));
     let mcpArgs = args.Arguments ?? args.arguments;
     if (typeof mcpArgs === "string") {
       try {
@@ -835,11 +1062,14 @@ export function describeToolCall(call) {
     const o = Array.isArray(args.outlines) ? args.outlines.length : 0;
     const s = Array.isArray(args.slices) ? args.slices.length : 0;
     target = [o ? `${o} outlines` : "", s ? `${s} slices` : ""].filter(Boolean).join(", ");
-  } else if (bareTool === "ctx_execute") {
-    target = shortTargetLabel(args.intent || args.file || args.language || "shell", 36);
-  } else if (bareTool === "ctx_index") {
+  } else if (bareTool === "ctx_execute" || /(?:^|_)ctx_execute$/.test(bareTool)) {
+    const intentLabel = [args.intent, args.summary, args.description].find(
+      (v) => typeof v === "string" && v.trim()
+    );
+    target = shortTargetLabel(intentLabel || args.file || args.language || "shell", 36);
+  } else if (bareTool === "ctx_index" || /(?:^|_)ctx_index$/.test(bareTool)) {
     target = shortTargetLabel(args.url || args.path || args.label || "text", 36);
-  } else if (bareTool === "ctx_search") {
+  } else if (bareTool === "ctx_search" || /(?:^|_)ctx_search$/.test(bareTool)) {
     const qs = Array.isArray(args.queries) ? args.queries.join(",") : "";
     target = shortTargetLabel(qs, 36);
   } else if (args.Path || args.path || args.url || args.query) {
@@ -869,8 +1099,100 @@ const READ_ONLY_INSPECT_TOOLS = new Set([
   "list_dir"
 ]);
 
+const STEP_CANCELED_TEXT_RE =
+  /(?:tool execution was cancel(?:ed|led)|user cancel(?:ed|led)|operation (?:was )?cancel(?:ed|led)|command (?:was )?cancel(?:ed|led)|request (?:was )?(?:cancel(?:ed|led)|aborted)|execution (?:was )?(?:cancel(?:ed|led)|aborted))/i;
+
+const STEP_PURE_TIMEOUT_TEXT_RE =
+  /(?:^|\n)\s*(?:command|execution|operation|process|request)\s+timed\s*out\b|(?:^|\n)\s*TIMED\s*OUT\b/i;
+
+const REAL_CODE_ERROR_TEXT_RE =
+  /(?:Encountered error in step execution|Atomic edit aborted|Partial edit applied|Tool error \(|Verify \[FAIL|## \[FAIL|## \[ERROR|(?:^|\n)\s*(?:AssertionError|TypeError|SyntaxError|ReferenceError|ImportError|ModuleNotFoundError|ValueError|NameError|AttributeError|KeyError|IndexError|FileNotFoundError|RuntimeError|IndentationError|ZeroDivisionError|ZodError|✖\s+|not ok\s+\d+|FAIL\s+\S))/m;
+
+const SPECIFIC_ERROR_KIND_RE =
+  /\b(ModuleNotFoundError|ImportError|SyntaxError|IndentationError|NameError|AttributeError|TypeError|ValueError|KeyError|IndexError|ReferenceError|RangeError|AssertionError|FileNotFoundError|PermissionError|ZeroDivisionError|RuntimeError|ZodError|ValidationError|TS\d{4}|error\[E\d{4}\])\b/i;
+
+function isStepCanceledResult(step) {
+  if (!step || typeof step !== "object") return false;
+  if (step.aborted === true || step.cancelled === true || step.canceled === true) return true;
+  if (
+    /^(?:cancelled|canceled|aborted|interrupted)$/i.test(
+      String(step.status ?? step.stop_reason ?? step.stopReason ?? "")
+    )
+  ) {
+    return true;
+  }
+  const text = typeof step.content === "string" ? step.content : "";
+  return Boolean(text && STEP_CANCELED_TEXT_RE.test(text));
+}
+
+function isStepTimeoutOnlyResult(step, bareTool = "") {
+  if (!step || typeof step !== "object") return false;
+  const text = typeof step.content === "string" ? step.content : "";
+  // Never mask atomic/edit errors or explicit FAIL/ERROR banners as timeout-only
+  if (
+    text &&
+    (text.includes("Atomic edit aborted") ||
+      text.includes("Partial edit applied") ||
+      text.includes("Tool error (") ||
+      text.includes("Verify [FAIL") ||
+      text.includes("## [FAIL") ||
+      text.includes("## [ERROR"))
+  ) {
+    return false;
+  }
+  if (text && (text.includes("Verify [TIMEOUT") || text.includes("Verify [NOT RUN:"))) {
+    return true;
+  }
+  if (text && (text.includes("## [TIMEOUT") || text.includes("## [SKIPPED]"))) {
+    return true;
+  }
+  if (step.timed_out === true || step.timedOut === true) {
+    return !(text && REAL_CODE_ERROR_TEXT_RE.test(text));
+  }
+  if (text && STEP_PURE_TIMEOUT_TEXT_RE.test(text) && !REAL_CODE_ERROR_TEXT_RE.test(text)) {
+    if (!bareTool || !READ_ONLY_INSPECT_TOOLS.has(bareTool)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function extractFailureProfile(failedResults) {
+  let errorKind = "generic";
+  let passedCount = null;
+  for (const r of failedResults) {
+    const text = typeof r?.content === "string" ? r.content : "";
+    if (!text) continue;
+    const passMatches = [
+      ...text.matchAll(/\b(\d+)\s+passed\b/gi),
+      ...text.matchAll(/(?:^|\n)\s*pass\s+(\d+)\b/gim)
+    ];
+    for (const m of passMatches) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n >= 0 && (passedCount === null || n > passedCount)) {
+        passedCount = n;
+      }
+    }
+    if (errorKind === "generic") {
+      if (text.includes("Atomic edit aborted") || text.includes("Partial edit applied")) {
+        errorKind = "edit_error";
+      } else {
+        const m = text.match(SPECIFIC_ERROR_KIND_RE);
+        if (m && m[1]) {
+          errorKind = m[1].toLowerCase().replace(/^error\[|\]$/g, "");
+        } else if (/(?:^|\n)\s*E\s+assert\b/m.test(text) || /\bAssertionError\b/i.test(text)) {
+          errorKind = "assertionerror";
+        }
+      }
+    }
+  }
+  return { errorKind, passedCount };
+}
+
 function isStepFailureResult(step, bareTool = "") {
   if (!step || typeof step !== "object") return false;
+  if (isStepCanceledResult(step)) return false;
+  if (isStepTimeoutOnlyResult(step, bareTool)) return false;
   if (step.status === "ERROR" || step.is_error === true || step.isError === true) return true;
   const code = step.exit_code ?? step.exitCode;
   if (typeof code === "number" && code !== 0) return true;
@@ -882,10 +1204,8 @@ function isStepFailureResult(step, bareTool = "") {
     text.includes("Partial edit applied") ||
     text.includes("Tool error (") ||
     text.includes("Verify [FAIL") ||
-    text.includes("Verify [TIMEOUT") ||
     text.includes("## [FAIL") ||
-    text.includes("## [ERROR") ||
-    text.includes("## [TIMEOUT")
+    text.includes("## [ERROR")
   ) {
     return true;
   }
@@ -896,7 +1216,11 @@ function isStepFailureResult(step, bareTool = "") {
   if (/(?:exit(?:ed)?(?:\s+with)?\s+code|FAIL\s*\(exit)\s*:?\s*[1-9]\d*/i.test(text)) {
     return true;
   }
-  if (/(?:^|\n)\s*(?:AssertionError|TypeError|SyntaxError|ReferenceError|✖\s+|not ok\s+\d+|FAIL\s+\S)/m.test(text)) {
+  if (
+    /(?:^|\n)\s*(?:AssertionError|TypeError|SyntaxError|ReferenceError|ImportError|ModuleNotFoundError|ValueError|NameError|AttributeError|KeyError|IndexError|FileNotFoundError|RuntimeError|IndentationError|ZeroDivisionError|ZodError|✖\s+|not ok\s+\d+|FAIL\s+\S)/m.test(
+      text
+    )
+  ) {
     return true;
   }
   const failCountMatch = text.match(/\b(\d+)\s+failed\b/i);
@@ -1190,6 +1514,15 @@ export function createEmptySubagentBreakdown() {
   return finalizeSubagentBreakdown(createRawSubagentCounters(), 0);
 }
 
+/** Return a clean zero-initialized driftBreakdown structure for prefix_drift read states */
+export function createEmptyDriftBreakdown() {
+  return {
+    zeroRead: 0,
+    partialRead: 0,
+    unreportedRead: 0
+  };
+}
+
 const MILD_PRUNE_MIN_PREV_TOKENS = 12000;
 const MILD_PRUNE_KEEP_RATIO = 0.85;
 const MILD_PRUNE_MIN_DROP_TOKENS = 8000;
@@ -1435,8 +1768,10 @@ export function analyzeTranscriptCache(steps, options = {}) {
     multimodal_media: 0,
     prefix_drift: 0
   };
+  const driftBreakdown = createEmptyDriftBreakdown();
   const recentBusts = [];
   const allTurns = [];
+  const turnMeta = [];
   const turnBillingItems = [];
   const deltaAttributions = [];
 
@@ -1480,6 +1815,9 @@ export function analyzeTranscriptCache(steps, options = {}) {
   let prevPlannerMs = null;
   let mediaLoadedSincePrev = false;
   let systemMsgSincePrev = false;
+  let subagentSincePrevUsage = false;
+  let missingUsagePlannerSincePrev = false;
+  let compactionSincePrevUsage = false;
   let hasSeenPlanner = false;
   let inToolLoop = false;
   let prevTurnTools = [];
@@ -1497,8 +1835,43 @@ export function analyzeTranscriptCache(steps, options = {}) {
   let editEpoch = 0;
   const lastPassCheckEpoch = new Map();
   let pendingEditFiles = new Set();
-  let editFailOscillations = 0;
-  const oscillatingFilesCount = new Map();
+  const fileOscState = new Map(); // normPath -> { label, failCycles, oscCount, seenErrorKinds, bestPassedCount }
+
+  const recordFileFailureCycle = (filesIterable, failedResults) => {
+    const uniqueFiles = Array.from(new Set(filesIterable)).filter(Boolean);
+    if (uniqueFiles.length === 0) return;
+    const { errorKind, passedCount } = extractFailureProfile(failedResults);
+    for (const f of uniqueFiles) {
+      let st = fileOscState.get(f);
+      if (!st) {
+        st = {
+          label: shortTargetLabel(f, 36),
+          failCycles: 1,
+          oscCount: 1,
+          seenErrorKinds: new Set(errorKind !== "generic" ? [errorKind] : []),
+          bestPassedCount: passedCount !== null ? passedCount : 0
+        };
+        fileOscState.set(f, st);
+        continue;
+      }
+      st.failCycles += 1;
+      const passedImproved = passedCount !== null && passedCount > st.bestPassedCount;
+      const isNewSpecificError = errorKind !== "generic" && !st.seenErrorKinds.has(errorKind);
+      if (passedCount !== null && passedCount > st.bestPassedCount) {
+        st.bestPassedCount = passedCount;
+      }
+      if (errorKind !== "generic") {
+        st.seenErrorKinds.add(errorKind);
+      }
+      if (passedImproved) {
+        // Test pass count strictly improved -> forward convergence
+      } else if (isNewSpecificError && st.failCycles < 4) {
+        // Progressed past prior error class into a distinct new failure stage
+      } else {
+        st.oscCount += 1;
+      }
+    }
+  };
 
   // Context composition & primary vs subagent attribution accumulators
   const compRaw = createRawCompositionBuckets();
@@ -1517,6 +1890,10 @@ export function analyzeTranscriptCache(steps, options = {}) {
     }
 
     const stepIsSubagent = isSubagentStep(step);
+    const stepIsSubagentType = SUBAGENT_STEP_TYPE_RE.test(String(step.type || ""));
+    if ((stepIsSubagent || stepIsSubagentType) && turnMeta.length > 0 && step.type !== "PLANNER_RESPONSE") {
+      subagentSincePrevUsage = true;
+    }
 
     let stepMediaBytes = 0;
     let stepMediaEstTokens = 0;
@@ -1566,6 +1943,9 @@ export function analyzeTranscriptCache(steps, options = {}) {
       if (!stepIsSubagent) {
         inToolLoop = false;
       }
+      if (turnMeta.length > 0 && isSlashCompactText(userText)) {
+        compactionSincePrevUsage = true;
+      }
       if ((!stepIsSubagent || !seenPrimaryCompactTurn) && isSlashCompactText(userText)) {
         const refPrevUserCompact = stepIsSubagent ? prevCompactSubCtx : prevCompactPrimaryCtx;
         seenReadSignatures.clear();
@@ -1585,6 +1965,9 @@ export function analyzeTranscriptCache(steps, options = {}) {
     }
 
     const isExplicitCompactStep = detectExplicitCompactionStep(step);
+    if (turnMeta.length > 0 && isExplicitCompactStep) {
+      compactionSincePrevUsage = true;
+    }
     if (isExplicitCompactStep && (!stepIsSubagent || !seenPrimaryCompactTurn)) {
       const refPrevCompactCtx = stepIsSubagent ? prevCompactSubCtx : prevCompactPrimaryCtx;
       const explicitUsage = step.type === "PLANNER_RESPONSE" ? extractStepTokenUsage(step) : null;
@@ -1753,6 +2136,16 @@ export function analyzeTranscriptCache(steps, options = {}) {
         resultByCallId.set(String(rid), r);
       }
     }
+    const isStepLevelAborted =
+      step.aborted === true ||
+      step.cancelled === true ||
+      step.canceled === true ||
+      /^(?:cancelled|canceled|aborted|interrupted)$/i.test(
+        String(step.stop_reason ?? step.stopReason ?? step.status ?? "")
+      );
+    const allFollowingCanceled =
+      followingResults.length > 0 && followingResults.every((r) => isStepCanceledResult(r));
+    const isTurnAborted = isStepLevelAborted || allFollowingCanceled;
 
     // Track duplicate read_file / view_file calls, edit invalidations, loop fingerprints & edit<->fail oscillations
     if (Array.isArray(step.tool_calls)) {
@@ -1814,6 +2207,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
           bareToolByCallId.set(callIdKey, desc.bareTool);
         }
         const matchedResult = (callIdKey && resultByCallId.get(callIdKey)) || followingResults[callIdx];
+        const callCanceled = matchedResult ? isStepCanceledResult(matchedResult) : false;
         const callFailed = matchedResult ? isStepFailureResult(matchedResult, desc.bareTool) : false;
         const resultBytes =
           matchedResult && typeof matchedResult.content === "string"
@@ -1831,13 +2225,13 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
         const edited = extractCallEditPaths(call);
         const isCheckCall = isCheckOrVerifyCall(call);
-        if (!stepIsSubagent) {
+        if (!stepIsSubagent && !isTurnAborted && !callCanceled) {
           for (const ep of edited) turnEditedFiles.push(ep);
           if (edited.length > 0 && !callFailed) editEpoch += 1;
           if (isCheckCall) turnRanCheck = true;
         }
 
-        if (!stepIsSubagent && !IGNORED_LOOP_TOOLS.has(desc.bareTool)) {
+        if (!stepIsSubagent && !isTurnAborted && !callCanceled && !IGNORED_LOOP_TOOLS.has(desc.bareTool)) {
           let effectiveFp = desc.fingerprint;
           // Passing verification after a fresh edit is healthy TDD progress, not a doom loop
           if (
@@ -1885,7 +2279,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
             if (e && e.path) invalidatePath(normPath(e.path, baseCwd));
           }
         } else if (name === "call_mcp_tool" && args) {
-          const mcpTool = String(args.ToolName ?? args.toolName ?? "").trim();
+          const mcpTool = unwrapQuotedWrapperArg(String(args.ToolName ?? args.toolName ?? ""));
           let mcpArgs = args.Arguments ?? args.arguments;
           if (typeof mcpArgs === "string") {
             try {
@@ -1910,47 +2304,46 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
     // Update edit<->fail oscillation state and active tool-loop state from primary conversation turns only
     if (!stepIsSubagent) {
-      const isTurnAborted =
-        step.aborted === true ||
-        step.cancelled === true ||
-        step.canceled === true ||
-        /^(?:cancelled|canceled|aborted|interrupted)$/i.test(
-          String(step.stop_reason ?? step.stopReason ?? step.status ?? "")
-        );
       const hasActiveToolCalls = callBareTools.some((t) => t && t !== "finish");
       inToolLoop = !isTurnAborted && (hasActiveToolCalls || followingResults.length > 0);
-      const turnFailed = followingResults.some((r, rIdx) => {
-        const rid = r?.tool_call_id ?? r?.call_id ?? r?.toolCallId ?? null;
-        const bareTool =
-          (rid !== null && rid !== undefined && bareToolByCallId.get(String(rid))) || callBareTools[rIdx] || "";
-        return isStepFailureResult(r, bareTool);
-      });
-      if (turnEditedFiles.length > 0 && turnFailed) {
-        editFailOscillations += 1;
-        for (const f of turnEditedFiles) {
-          const shortF = shortTargetLabel(f, 36);
-          oscillatingFilesCount.set(shortF, (oscillatingFilesCount.get(shortF) || 0) + 1);
-        }
-        pendingEditFiles.clear();
-      } else if (turnEditedFiles.length > 0 && turnRanCheck && !turnFailed && followingResults.length > 0) {
-        editFailOscillations = 0;
-        pendingEditFiles.clear();
-        oscillatingFilesCount.clear();
-      } else if (turnEditedFiles.length > 0) {
-        for (const f of turnEditedFiles) pendingEditFiles.add(f);
-      } else if (turnRanCheck && turnFailed) {
-        if (pendingEditFiles.size > 0) {
-          editFailOscillations += 1;
-          for (const f of pendingEditFiles) {
-            const shortF = shortTargetLabel(f, 36);
-            oscillatingFilesCount.set(shortF, (oscillatingFilesCount.get(shortF) || 0) + 1);
+      if (!isTurnAborted) {
+        const failedResults = [];
+        let turnTimedOutOnly = false;
+        for (let rIdx = 0; rIdx < followingResults.length; rIdx++) {
+          const r = followingResults[rIdx];
+          const rid = r?.tool_call_id ?? r?.call_id ?? r?.toolCallId ?? null;
+          const bareTool =
+            (rid !== null && rid !== undefined && bareToolByCallId.get(String(rid))) || callBareTools[rIdx] || "";
+          if (isStepFailureResult(r, bareTool)) {
+            failedResults.push(r);
+          } else if (isStepTimeoutOnlyResult(r, bareTool)) {
+            turnTimedOutOnly = true;
           }
+        }
+        const turnFailed = failedResults.length > 0;
+        if (turnEditedFiles.length > 0 && turnFailed) {
+          recordFileFailureCycle(turnEditedFiles, failedResults);
+          pendingEditFiles.clear();
+        } else if (
+          turnEditedFiles.length > 0 &&
+          turnRanCheck &&
+          !turnFailed &&
+          !turnTimedOutOnly &&
+          followingResults.length > 0
+        ) {
+          fileOscState.clear();
+          pendingEditFiles.clear();
+        } else if (turnEditedFiles.length > 0) {
+          for (const f of turnEditedFiles) pendingEditFiles.add(f);
+        } else if (turnRanCheck && turnFailed) {
+          if (pendingEditFiles.size > 0) {
+            recordFileFailureCycle(pendingEditFiles, failedResults);
+            pendingEditFiles.clear();
+          }
+        } else if (turnRanCheck && !turnFailed && !turnTimedOutOnly && followingResults.length > 0) {
+          fileOscState.clear();
           pendingEditFiles.clear();
         }
-      } else if (turnRanCheck && !turnFailed && followingResults.length > 0) {
-        editFailOscillations = 0;
-        pendingEditFiles.clear();
-        oscillatingFilesCount.clear();
       }
     }
 
@@ -2013,28 +2406,55 @@ export function analyzeTranscriptCache(steps, options = {}) {
 
       const deltaTokens = hasSeenPlanner ? ctxTok - prevCtxTokens : 0;
       let dominantTrigger = null;
+      let triggerDisplayLabel = null;
       if (prevTurnTools.length > 0) {
         dominantTrigger = prevTurnTools[0];
+        let totalTurnResultBytes = 0;
         for (const item of prevTurnTools) {
+          totalTurnResultBytes += item.resultBytes || 0;
           if (item.resultBytes > dominantTrigger.resultBytes) {
             dominantTrigger = item;
           }
         }
+        const toolCount = prevTurnTools.length;
+        triggerDisplayLabel =
+          toolCount > 1 ? `${dominantTrigger.label} +${toolCount - 1}` : dominantTrigger.label;
         if (deltaTokens > 0) {
-          deltaAttributions.push({
+          const entry = {
             stepIndex: step.step_index ?? i,
             turn: turnsWithUsage,
             deltaTokens,
             ctxTokens: ctxTok,
             tool: dominantTrigger.tool,
             target: dominantTrigger.target,
-            label: dominantTrigger.label
-          });
+            label: triggerDisplayLabel,
+            toolCount
+          };
+          if (toolCount > 1) {
+            entry.parallelTools = prevTurnTools
+              .slice()
+              .sort((a, b) => (b.resultBytes || 0) - (a.resultBytes || 0))
+              .slice(0, 6)
+              .map((item) => ({
+                tool: item.tool,
+                target: item.target,
+                label: item.label,
+                resultBytes: item.resultBytes || 0,
+                sharePct:
+                  totalTurnResultBytes > 0
+                    ? Math.round(((item.resultBytes || 0) / totalTurnResultBytes) * 100)
+                    : Math.round(100 / toolCount)
+              }));
+          }
+          deltaAttributions.push(entry);
         }
       }
 
       let turnWasBust = false;
       let turnBustCause = null;
+      let turnBustReadState = null;
+      let turnBustEntry = null;
+      let turnWasWarmHit = false;
       let turnWastedTokens = 0;
       let turnWastedRewritten = 0;
 
@@ -2050,6 +2470,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
         const sameModel = !prevModel || !model || prevModel === model;
 
         if (!isBust) {
+          if (safeCache > 0) turnWasWarmHit = true;
           if (retainedRatio >= BUST_DROP_RATIO && safeCache > 0 && gapSec !== null && sameModel) {
             if (maxWarmHitGapSec === null || gapSec > maxWarmHitGapSec) {
               maxWarmHitGapSec = gapSec;
@@ -2118,6 +2539,18 @@ export function analyzeTranscriptCache(steps, options = {}) {
           }
 
           turnBustCause = cause;
+          if (cause === "prefix_drift") {
+            if (!turnUsage.cacheReadReported) {
+              turnBustReadState = "unreported";
+              driftBreakdown.unreportedRead += 1;
+            } else if (safeCache === 0) {
+              turnBustReadState = "zero";
+              driftBreakdown.zeroRead += 1;
+            } else {
+              turnBustReadState = "partial";
+              driftBreakdown.partialRead += 1;
+            }
+          }
           const expectedReusable = Math.min(prevCtxTokens, ctxTok);
           const wastedTokens = Math.max(0, expectedReusable - safeCache);
           turnWastedTokens = wastedTokens;
@@ -2126,18 +2559,20 @@ export function analyzeTranscriptCache(steps, options = {}) {
           wastedTokensTotal += wastedTokens;
           wastedRewrittenTokens += turnWastedRewritten;
 
-          recentBusts.push({
+          turnBustEntry = {
             stepIndex: step.step_index ?? i,
             hasExplicitStepIndex: step.step_index !== undefined && step.step_index !== null,
             at: step.created_at || null,
             cause,
+            bustReadState: turnBustReadState,
             prevCtxTokens,
             currCtxTokens: ctxTok,
             cacheReadTokens: safeCache,
             wastedTokens,
             gapSec,
             model: model || prevModel || null
-          });
+          };
+          recentBusts.push(turnBustEntry);
         }
       }
 
@@ -2164,7 +2599,31 @@ export function analyzeTranscriptCache(steps, options = {}) {
         deltaTokens,
         isBust: turnWasBust,
         bustCause: turnBustCause,
-        triggerTool: dominantTrigger ? dominantTrigger.label : null
+        bustReadState: turnBustReadState,
+        triggerTool: triggerDisplayLabel
+      });
+
+      const hadCompactionOrShrink =
+        compactionSincePrevUsage ||
+        turnShrink.shrunk ||
+        (hasSeenPlanner && prevCtxTokens > 0 && ctxTok < prevCtxTokens * BUST_DROP_RATIO);
+      turnMeta.push({
+        turnIndex: allTurns.length - 1,
+        stepIndex: step.step_index ?? i,
+        rawModel: model.trim(),
+        ctxTokens: ctxTok,
+        cacheReadTokens: safeCache,
+        cacheReadReported: turnUsage.cacheReadReported,
+        isBust: turnWasBust,
+        bustCause: turnBustCause,
+        wasWarmHit: turnWasWarmHit,
+        isSubagent: stepIsSubagent,
+        subagentSincePrev: subagentSincePrevUsage,
+        missingUsagePlannerSincePrev,
+        compactionInSegment: hadCompactionOrShrink,
+        mediaInSegment: mediaLoadedSincePrev,
+        systemMsgInSegment: systemMsgSincePrev,
+        bustEntry: turnBustEntry
       });
 
       if (turnShrink.shrunk) {
@@ -2199,12 +2658,98 @@ export function analyzeTranscriptCache(steps, options = {}) {
       hasSeenPlanner = true;
       mediaLoadedSincePrev = false;
       systemMsgSincePrev = false;
-    } else if (tMs !== null) {
-      lastPlannerMs = tMs;
-      if (!hasSeenPlanner) hasSeenPlanner = true;
+      subagentSincePrevUsage = false;
+      missingUsagePlannerSincePrev = false;
+      compactionSincePrevUsage = false;
+    } else {
+      if (turnMeta.length > 0) {
+        missingUsagePlannerSincePrev = true;
+        if (stepIsSubagent) subagentSincePrevUsage = true;
+      }
+      if (tMs !== null) {
+        lastPlannerMs = tMs;
+        if (!hasSeenPlanner) hasSeenPlanner = true;
+      }
     }
 
     prevTurnTools = currTurnTools;
+  }
+
+  // Optional cross-turn observation (display-only; never alters primary causes, waste, or TTL calibration).
+  // Enabled only on validated gemini-4-512k profile in v1; basic read-state breakdown applies to all backends.
+  const isTailTruncated =
+    Boolean(options.isTailSlice) || (Array.isArray(steps) && TAIL_TRUNCATED_STEP_ARRAYS.has(steps));
+  const isEligiblePriorMatchCold = (m) =>
+    Boolean(
+      m &&
+      !m.isSubagent &&
+      m.isBust &&
+      m.cacheReadReported &&
+      m.cacheReadTokens === 0 &&
+      (m.bustCause === "prefix_drift" || m.bustCause === "ttl_idle_expiry")
+    );
+  const isPriorMatchSegmentClean = (m) =>
+    Boolean(
+      m &&
+      !m.isSubagent &&
+      !m.subagentSincePrev &&
+      !m.missingUsagePlannerSincePrev &&
+      !m.compactionInSegment &&
+      !m.mediaInSegment &&
+      !m.systemMsgInSegment
+    );
+  for (let idx = 0; idx < turnMeta.length; ) {
+    if (!isEligiblePriorMatchCold(turnMeta[idx])) {
+      idx += 1;
+      continue;
+    }
+    let runEnd = idx;
+    while (runEnd + 1 < turnMeta.length && isEligiblePriorMatchCold(turnMeta[runEnd + 1])) {
+      runEnd += 1;
+    }
+    const runLen = runEnd - idx + 1;
+    const refIdx = idx - 1;
+    const recIdx = runEnd + 1;
+    if (runLen >= 1 && runLen <= 2 && refIdx >= 0 && recIdx < turnMeta.length) {
+      const ref = turnMeta[refIdx];
+      const colds = runLen === 1 ? [turnMeta[idx]] : [turnMeta[idx], turnMeta[idx + 1]];
+      const rec = turnMeta[recIdx];
+      const refModel = ref.rawModel;
+      const isEnabledProfile =
+        Boolean(refModel) && PRIOR_CONTEXT_MATCH_ENABLED_PROFILES.has(resolveModelProfile(refModel).id);
+      const refIsValid =
+        !ref.isSubagent &&
+        !(ref.isBust && !ref.cacheReadReported) &&
+        !(isTailTruncated && refIdx === 0 && ref.cacheReadTokens === 0);
+      if (
+        isEnabledProfile &&
+        refIsValid &&
+        colds.every((c) => isPriorMatchSegmentClean(c) && c.rawModel === refModel) &&
+        isPriorMatchSegmentClean(rec) &&
+        rec.rawModel === refModel &&
+        rec.cacheReadReported &&
+        rec.cacheReadTokens > 0 &&
+        rec.wasWarmHit
+      ) {
+        const P = ref.ctxTokens;
+        const R = rec.cacheReadTokens;
+        if (
+          (R === P || R === P + 1) &&
+          colds.every((c) => R < c.ctxTokens - PRIOR_CONTEXT_MATCH_TAIL_SLACK)
+        ) {
+          const match = {
+            referenceStepIndex: ref.stepIndex,
+            recoveryStepIndex: rec.stepIndex
+          };
+          const firstCold = turnMeta[idx];
+          allTurns[firstCold.turnIndex].priorContextMatch = match;
+          if (firstCold.bustEntry) {
+            firstCold.bustEntry.priorContextMatch = { ...match };
+          }
+        }
+      }
+    }
+    idx = runEnd + 1;
   }
 
   // Resolve model-aware profile, per-conversation maxTokenLimit, empirical TTL, and API cost model
@@ -2407,6 +2952,10 @@ export function analyzeTranscriptCache(steps, options = {}) {
   const repeatRate = windowSize > 0 ? Number(((windowSize - fpCounts.size) / windowSize).toFixed(4)) : 0;
   const repeatCritical = maxRepeatCount >= 4 || (windowSize >= 6 && repeatRate >= 0.5 && maxRepeatCount >= 3);
   const repeatWarn = !repeatCritical && maxRepeatCount >= 3;
+  let editFailOscillations = 0;
+  for (const st of fileOscState.values()) {
+    if (st.oscCount > editFailOscillations) editFailOscillations = st.oscCount;
+  }
   const oscCritical = editFailOscillations >= 3;
   const oscWarn = !oscCritical && editFailOscillations >= 2;
   const hasRepeat = repeatCritical || repeatWarn;
@@ -2420,10 +2969,11 @@ export function analyzeTranscriptCache(steps, options = {}) {
         : hasRepeat
           ? "repeat_loop"
           : null;
-  const oscillatingFiles = Array.from(oscillatingFilesCount.entries())
-    .sort((a, b) => b[1] - a[1])
+  const oscillatingFiles = Array.from(fileOscState.values())
+    .filter((st) => st.oscCount >= 2)
+    .sort((a, b) => b.oscCount - a.oscCount || b.failCycles - a.failCycles)
     .slice(0, 3)
-    .map(([file]) => file);
+    .map((st) => st.label);
 
   const loopWatch = {
     status: loopStatus,
@@ -2486,6 +3036,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
     estimatedWastedUsd,
     bustCount,
     bustsByCause,
+    driftBreakdown,
     wastedTokensTotal,
     totalMediaCount,
     multimodalHighCtxTurns,
@@ -2510,6 +3061,7 @@ export function analyzeMultipleSessionsCache(sessions, options = {}) {
     multimodal_media: 0,
     prefix_drift: 0
   };
+  const driftBreakdown = createEmptyDriftBreakdown();
   let sessionCount = 0;
   let turnsWithUsage = 0;
   let warmTurns = 0;
@@ -2617,6 +3169,11 @@ export function analyzeMultipleSessionsCache(sessions, options = {}) {
     for (const k of Object.keys(bustsByCause)) {
       bustsByCause[k] += res.bustsByCause[k] || 0;
     }
+    if (res.driftBreakdown) {
+      driftBreakdown.zeroRead += res.driftBreakdown.zeroRead || 0;
+      driftBreakdown.partialRead += res.driftBreakdown.partialRead || 0;
+      driftBreakdown.unreportedRead += res.driftBreakdown.unreportedRead || 0;
+    }
     for (const b of res.recentBusts) {
       allRecentBusts.push({ item: b, ts: parseTimeMs(b?.at), ord: allRecentBusts.length });
     }
@@ -2696,6 +3253,7 @@ export function analyzeMultipleSessionsCache(sessions, options = {}) {
     peakContextTokens,
     bustCount,
     bustsByCause,
+    driftBreakdown,
     wastedTokensTotal,
     multimodalHighCtxTurns,
     duplicateReadCount,
@@ -2707,6 +3265,246 @@ export function analyzeMultipleSessionsCache(sessions, options = {}) {
     topContextDeltas,
     recentBusts: sortedBusts.slice(-15)
   };
+}
+
+const RESERVED_BRAIN_CONV_IDS = new Set([
+  "default",
+  "all",
+  "lifetime",
+  "app",
+  "__unbound__",
+  "unknown",
+  "none",
+  "null",
+  "undefined"
+]);
+
+function isUncPathLocal(p) {
+  if (!p || typeof p !== "string") return false;
+  return /^[\\/]{2}/.test(p.trim());
+}
+
+function resolveCanonicalPathLocal(p) {
+  const real =
+    typeof fs.realpathSync.native === "function" ? fs.realpathSync.native(p) : fs.realpathSync(p);
+  if (process.platform === "win32") {
+    const driveMatch = real.match(/^\\\\\?\\([a-zA-Z]:\\.*)$/);
+    if (driveMatch) return driveMatch[1];
+  }
+  return real;
+}
+
+function isStrictPathInside(childPath, parentPath) {
+  if (!childPath || !parentPath) return false;
+  const nc = process.platform === "win32" ? childPath.toLowerCase() : childPath;
+  const np = process.platform === "win32" ? parentPath.toLowerCase() : parentPath;
+  const rel = path.relative(np, nc);
+  return Boolean(
+    rel &&
+      rel !== "." &&
+      rel !== ".." &&
+      !rel.startsWith(`..${path.sep}`) &&
+      !rel.startsWith("../") &&
+      !path.isAbsolute(rel)
+  );
+}
+
+/**
+ * Return allowed Antigravity brain root directories (extra roots first, then default user roots).
+ */
+export function getAntigravityBrainRoots(extraRoots = []) {
+  const home = os.homedir();
+  const rawList = [
+    ...(Array.isArray(extraRoots) ? extraRoots : []),
+    path.join(home, ".gemini", "antigravity", "brain"),
+    path.join(home, ".gemini", "antigravity-ide", "brain"),
+    path.join(home, ".gemini", "antigravity-cli", "brain")
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const r of rawList) {
+    if (typeof r !== "string") continue;
+    const trimmed = r.trim();
+    if (!trimmed || trimmed.includes("\0") || isUncPathLocal(trimmed) || !path.isAbsolute(trimmed)) continue;
+    const resolved = path.resolve(trimmed);
+    if (isUncPathLocal(resolved)) continue;
+    const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(resolved);
+  }
+  return out;
+}
+
+const PREFERRED_TRANSCRIPT_REL_PATHS = Object.freeze([
+  [".system_generated", "logs", "transcript.jsonl"],
+  [".system_generated", "transcript.jsonl"],
+  ["transcript.jsonl"],
+  [".system_generated", "logs", "transcript_full.jsonl"],
+  [".system_generated", "transcript_full.jsonl"],
+  ["transcript_full.jsonl"]
+]);
+const CONVERSATION_ARTIFACT_REL_PATHS = Object.freeze([
+  ["task.md"],
+  ["implementation_plan.md"],
+  ["walkthrough.md"]
+]);
+
+function inspectConversationDirOwnership(convDirInfo) {
+  let hasOwnedFile = false;
+  let hasSuspiciousEscape = false;
+  const allCandidates = [...PREFERRED_TRANSCRIPT_REL_PATHS, ...CONVERSATION_ARTIFACT_REL_PATHS];
+
+  for (const segs of allCandidates) {
+    if (resolveConversationOwnedFile(convDirInfo, segs)) {
+      hasOwnedFile = true;
+      break;
+    }
+    const candPath = path.join(convDirInfo.dir, ...segs);
+    try {
+      fs.lstatSync(candPath);
+      // Candidate entry exists on disk in a supported slot yet failed strict ownership validation
+      // (e.g. symlink/junction escaping the conversation dir). Lock onto this root instead of hopping.
+      hasSuspiciousEscape = true;
+    } catch {
+      // Missing slot -> normal
+    }
+  }
+
+  if (!hasOwnedFile && !hasSuspiciousEscape) {
+    // Also detect escaping `.system_generated` or `.system_generated/logs` junctions
+    for (const dirSegs of [[".system_generated"], [".system_generated", "logs"]]) {
+      const dirCand = path.join(convDirInfo.dir, ...dirSegs);
+      try {
+        const st = fs.lstatSync(dirCand);
+        if (st.isSymbolicLink()) {
+          hasSuspiciousEscape = true;
+          break;
+        }
+        const realSub = resolveCanonicalPathLocal(dirCand);
+        if (isUncPathLocal(realSub) || !isStrictPathInside(realSub, convDirInfo.dir)) {
+          hasSuspiciousEscape = true;
+          break;
+        }
+      } catch {
+        // Missing subdir -> normal
+      }
+    }
+  }
+
+  return { hasOwnedFile, hasSuspiciousEscape };
+}
+
+/**
+ * Resolve and canonically validate a single conversation's owned brain directory.
+ * Blocks `..`, UNC paths, symlinks/Windows junctions escaping the brain root, and
+ * junctions redirecting a conversation directory to a sibling conversation.
+ * Across multiple brain roots (`extraRoots` > `antigravity` > `antigravity-ide` > `antigravity-cli`),
+ * locks onto the first root containing any valid owned transcript/artifact (or suspicious escape),
+ * skipping empty placeholder directories so they do not shadow a real session in a later root.
+ */
+export function resolveConversationBrainDir(conversationId, extraRoots = []) {
+  if (typeof conversationId !== "string") return null;
+  const safeId = conversationId.trim();
+  if (!safeId || RESERVED_BRAIN_CONV_IDS.has(safeId.toLowerCase()) || !isSafeConversationId(safeId)) {
+    return null;
+  }
+  const roots = getAntigravityBrainRoots(extraRoots);
+  let firstEmptyValid = null;
+  for (const resolvedRoot of roots) {
+    let realRoot;
+    try {
+      const rootStat = fs.statSync(resolvedRoot);
+      if (!rootStat.isDirectory()) continue;
+      realRoot = resolveCanonicalPathLocal(resolvedRoot);
+      if (isUncPathLocal(realRoot)) continue;
+    } catch {
+      continue;
+    }
+    const expectedDir = path.join(realRoot, safeId);
+    try {
+      const lstat = fs.lstatSync(expectedDir);
+      // Reject symlink or Windows junction at conversation root (prevents sibling-session redirection)
+      if (lstat.isSymbolicLink() || !lstat.isDirectory()) continue;
+      const realCand = resolveCanonicalPathLocal(expectedDir);
+      if (isUncPathLocal(realCand)) continue;
+      const cmpCand = process.platform === "win32" ? realCand.toLowerCase() : realCand;
+      const cmpExpected = process.platform === "win32" ? expectedDir.toLowerCase() : expectedDir;
+      if (cmpCand !== cmpExpected || !isStrictPathInside(realCand, realRoot)) continue;
+      const info = {
+        root: resolvedRoot,
+        realRoot,
+        dir: realCand,
+        conversationId: safeId
+      };
+      const ownership = inspectConversationDirOwnership(info);
+      if (ownership.hasOwnedFile || ownership.hasSuspiciousEscape) {
+        return info;
+      }
+      if (!firstEmptyValid) {
+        firstEmptyValid = info;
+      }
+    } catch {
+      // Missing or inaccessible in this brain root -> try next root
+    }
+  }
+  return firstEmptyValid;
+}
+
+/**
+ * Independently verify that a candidate regular file inside a validated conversation brain dir
+ * remains canonically owned by that exact conversation (blocks sibling-session links, junctions, UNC).
+ */
+export function resolveConversationOwnedFile(convDirInfo, relativeSegments = []) {
+  if (!convDirInfo || typeof convDirInfo.dir !== "string" || !convDirInfo.dir) return null;
+  if (!Array.isArray(relativeSegments) || relativeSegments.length === 0) return null;
+  for (const seg of relativeSegments) {
+    if (
+      typeof seg !== "string" ||
+      !seg ||
+      seg === "." ||
+      seg === ".." ||
+      seg.includes("\0") ||
+      seg.includes("/") ||
+      seg.includes("\\")
+    ) {
+      return null;
+    }
+  }
+  const candPath = path.join(convDirInfo.dir, ...relativeSegments);
+  if (isUncPathLocal(candPath) || !isStrictPathInside(candPath, convDirInfo.dir)) {
+    return null;
+  }
+  try {
+    // Must exist on disk
+    fs.lstatSync(candPath);
+    const realFile = resolveCanonicalPathLocal(candPath);
+    if (isUncPathLocal(realFile)) return null;
+    if (!isStrictPathInside(realFile, convDirInfo.dir)) return null;
+    const stat = fs.statSync(realFile);
+    if (!stat.isFile()) return null;
+    return { path: realFile, stat };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Strictly locate the preferred transcript for a confirmed conversationId inside its own
+ * verified brain directory: prefers `transcript.jsonl` and falls back to the SAME session's
+ * `transcript_full.jsonl`. Never falls back across sessions.
+ */
+export function findPreferredTranscriptForConversation(
+  conversationId,
+  { extraRoots = [], convDirInfo = null } = {}
+) {
+  const dirInfo = convDirInfo || resolveConversationBrainDir(conversationId, extraRoots);
+  if (!dirInfo) return null;
+  for (const segs of PREFERRED_TRANSCRIPT_REL_PATHS) {
+    const owned = resolveConversationOwnedFile(dirInfo, segs);
+    if (owned) return owned.path;
+  }
+  return null;
 }
 
 /**
@@ -2947,6 +3745,20 @@ export function formatCacheDiagMarkdown(diag) {
     diag.estimatedWastedUsd > 0
       ? `${(diag.wastedTokensTotal || 0).toLocaleString("en-US")} (~${formatUsdReport(diag.estimatedWastedUsd)})`
       : `${(diag.wastedTokensTotal || 0).toLocaleString("en-US")}`;
+  const driftCount = c.prefix_drift || 0;
+  const db = diag.driftBreakdown && typeof diag.driftBreakdown === "object" ? diag.driftBreakdown : null;
+  const isNonNegFinite = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+  const hasDriftBreakdown = Boolean(
+    db &&
+    isNonNegFinite(db.zeroRead) &&
+    isNonNegFinite(db.partialRead) &&
+    isNonNegFinite(db.unreportedRead) &&
+    db.zeroRead + db.partialRead + db.unreportedRead === driftCount
+  );
+  const driftDetailVal =
+    driftCount > 0 && hasDriftBreakdown
+      ? `${driftCount} (zero-read: ${db.zeroRead}, partial hit: ${db.partialRead}, unreported: ${db.unreportedRead})`
+      : `${driftCount}`;
   lines.push(
     `| Total cache busts detected | ${diag.bustCount} |`,
     `| Wasted re-prefill tokens | ${wastedTokensStr} |`,
@@ -2955,9 +3767,45 @@ export function formatCacheDiagMarkdown(diag) {
     `| Bust cause: Model switch | ${c.model_switch || 0} |`,
     `| Bust cause: System injection | ${c.system_injection || 0} |`,
     `| Bust cause: Multimodal media | ${c.multimodal_media || 0} |`,
-    `| Bust cause: Prefix drift / eviction | ${c.prefix_drift || 0} |`,
+    `| Bust cause: Unattributed | ${driftDetailVal} |`,
     `| Duplicate identical read_file calls | ${diag.duplicateReadCount || 0} |`
   );
+  const isValidPriorMatchItem = (b) =>
+    Boolean(
+      b?.priorContextMatch &&
+      typeof b.priorContextMatch === "object" &&
+      isNonNegFinite(b.priorContextMatch.referenceStepIndex) &&
+      isNonNegFinite(b.priorContextMatch.recoveryStepIndex)
+    );
+  const priorKeyOf = (b) =>
+    `${b.at ?? ""}|${isNonNegFinite(b.stepIndex) ? b.stepIndex : "?"}|${b.priorContextMatch.referenceStepIndex}|${b.priorContextMatch.recoveryStepIndex}`;
+  const bustPriors = Array.isArray(diag.recentBusts) ? diag.recentBusts.filter(isValidPriorMatchItem) : [];
+  const bustPriorCounts = new Map();
+  for (const b of bustPriors) {
+    const k = priorKeyOf(b);
+    bustPriorCounts.set(k, (bustPriorCounts.get(k) || 0) + 1);
+  }
+  const extraTurnPriors = [];
+  if (Array.isArray(diag.recentTurns)) {
+    for (const t of diag.recentTurns) {
+      if (!isValidPriorMatchItem(t)) continue;
+      const k = priorKeyOf(t);
+      const rem = bustPriorCounts.get(k) || 0;
+      if (rem > 0) {
+        bustPriorCounts.set(k, rem - 1);
+      } else {
+        extraTurnPriors.push(t);
+      }
+    }
+  }
+  const priorMatches = [...extraTurnPriors, ...bustPriors];
+  if (priorMatches.length > 0) {
+    const notes = priorMatches.map(
+      (b) =>
+        `step ${isNonNegFinite(b.stepIndex) ? b.stepIndex : "?"}: subsequent cache read near step ${b.priorContextMatch.referenceStepIndex} (recovered at step ${b.priorContextMatch.recoveryStepIndex})`
+    );
+    lines.push(`| Prior-context read match (observation) | ${priorMatches.length} (${notes.join("; ")}) |`);
+  }
   if (diag.loopWatch && diag.loopWatch.status !== "ok") {
     lines.push(
       `| Convergence watch | ${diag.loopWatch.status.toUpperCase()} (${diag.loopWatch.reason}, osc=${diag.loopWatch.editFailOscillations}, maxRepeat=${diag.loopWatch.maxRepeatCount}) |`

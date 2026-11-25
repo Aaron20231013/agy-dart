@@ -733,7 +733,7 @@ test("v1.6.1-4: Suppress false-idle TTL alerts during stopped_bg_pending, active
           getStore: () => store,
           getConfig: () => ({
             stallWatchdog: true,
-            ttlDesktopNotify: false, // Even with ttlDesktopNotify=false, exhausted 3/3 fires 1 limit reminder!
+            ttlDesktopNotify: true,
             ttlKeepalive: true,
             ttlKeepaliveMaxCount: 3,
             ttlNotifyLeadSec: 60
@@ -746,6 +746,14 @@ test("v1.6.1-4: Suppress false-idle TTL alerts during stopped_bg_pending, active
             return { dispatched: true };
           }
         });
+        store.setTtlKeepaliveEnabled(false, "conv-parent-with-child");
+        monExhausted.tick();
+        assert.equal(ttlPopups.length, 0, "Turning off warming must silence a previously exhausted conversation");
+        store.setTtlKeepaliveEnabled(true, "conv-parent-with-child");
+        store.setTtlDesktopNotifyEnabled(false);
+        monExhausted.tick();
+        assert.equal(ttlPopups.length, 0, "A muted TTL alert must stay silent when warming is exhausted");
+        store.setTtlDesktopNotifyEnabled(true);
         monExhausted.tick();
         assert.equal(ttlPopups.length, 1, "True-idle conversation after exhausting 3/3 keepalives must fire 1 desktop alert");
         assert.ok(ttlPopups[0].title.includes("3/3"));
@@ -1005,6 +1013,18 @@ test("v1.6.1-4: Suppress false-idle TTL alerts during stopped_bg_pending, active
           routes.set(routePath, handler);
         }
       });
+
+      // The sidecar can open mid-turn without access to the host process clock.
+      const previousPath = process.env.PATH;
+      try {
+        process.env.PATH = tmpDir;
+        const status = routes.get("/api/watchdog")({ scope: "conversation", conversationId: "conv-sidecar-live" });
+        assert.equal(status.current?.phase, WATCHDOG_PHASES.LLM_INFLIGHT,
+          "Opening the dashboard must preserve a fresh lease when the host start time is unknown");
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+      }
 
       const liveDiag = routes.get("/api/cache-diag")({
         scope: "conversation",
@@ -1279,8 +1299,8 @@ test("v1.6.1-4: Suppress false-idle TTL alerts during stopped_bg_pending, active
         vmCtx.window.sidecar.fetch = origVmFetch;
         assert.equal(getEl("wd-severity-badge").textContent, "已关闭", "Failed overlapping keepalive edit must NOT corrupt cachedWatchdog.enabled");
         assert.equal(getEl("kv-ttl-bar-fill").className, "ttl-fill is-expired", "Failed overlapping keepalive edit must NOT re-freeze #kv-ttl-bar-fill");
-        assert.equal(getEl("kv-keepalive-btn").innerText, "自动续温：0/3", "Overlapping failed keepalive edit must reconcile back to server 0/3");
-        assert.equal(getEl("kv-keepalive-max").value, "3");
+        assert.equal(getEl("kv-keepalive-btn").innerText, "自动续温：0/1", "Overlapping failed keepalive edit must reconcile back to server 0/1");
+        assert.equal(getEl("kv-keepalive-max").value, "1");
       }
 
       // Re-enable Watchdog & re-seed active turn before testing Stop hook restoration

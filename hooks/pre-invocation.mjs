@@ -5,6 +5,7 @@
  * Uses Antigravity's zero-prefix-pollution UI-only `metadata.user_markdown`
  * (with empty `systemMessage: ""`) so alerts never mutate the model prompt prefix.
  */
+import { executionReceiptsFromSteps, fastToolClaimsFromSteps } from "../context/lib/execution-receipts.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -416,7 +417,7 @@ async function main() {
         : (cfgSnapshot.sources.ttlKeepalive !== "default" ||
             cfgSnapshot.sources.ttlKeepaliveMaxCount !== "default") &&
           Boolean(effectiveCfg.ttlKeepalive) &&
-          Number(effectiveCfg.ttlKeepaliveMaxCount ?? 3) >= 1);
+          Number(effectiveCfg.ttlKeepaliveMaxCount ?? 1) >= 1);
   const watermarkNotifyExplicit =
     effectiveCfg.watermarkDesktopNotify === true && cfgSnapshot.sources.watermarkDesktopNotify !== "default";
   const dbExists = fs.existsSync(resolvedDbPath);
@@ -743,6 +744,42 @@ async function main() {
       }
     }
 
+    // Claim context receipts (ctx_execute/ctx_index/ctx_batch) & agy-dart_fast savings under unified rootSessionId
+    if ((dbExists || store.db) && loadedSteps.length > 0) {
+      try {
+        const rawRootCandidate =
+          sessionId && sessionId !== "default" && sessionId !== targetConvId
+            ? sessionId
+            : resolvedParentConvId || targetConvId;
+        const claimOwner =
+          typeof store.resolveRootSessionId === "function"
+            ? store.resolveRootSessionId(rawRootCandidate)
+            : rawRootCandidate;
+        store.claimExecutionReceipts(claimOwner, executionReceiptsFromSteps(loadedSteps));
+        const fastClaims = fastToolClaimsFromSteps(loadedSteps);
+        if (fastClaims.length > 0 && typeof store.claimFastToolClaims === "function") {
+          const isFullTranscript = txStatSize > 0 && txStatSize <= 131072;
+          let windowStartIso = "";
+          if (!isFullTranscript) {
+            let earliestMs = Infinity;
+            for (const c of fastClaims) {
+              if (Number.isFinite(c.completedAtMs) && c.completedAtMs < earliestMs) {
+                earliestMs = c.completedAtMs;
+              }
+            }
+            if (Number.isFinite(earliestMs)) {
+              windowStartIso = new Date(earliestMs - 120000).toISOString();
+            }
+          }
+          store.claimFastToolClaims(claimOwner, fastClaims, {
+            directConvId: targetConvId,
+            windowStartIso,
+            isFullTranscript
+          });
+        }
+      } catch {} // A busy database can be retried on the next invocation.
+    }
+
     // Record Sidecar Stall Watchdog / Idle TTL / Watermark execution lease (isolated by direct conversationId)
     const watchdogActive = Boolean(
       effectiveCfg.stallWatchdog &&
@@ -808,7 +845,7 @@ async function main() {
           cfgSnapshot.sources.ttlKeepaliveMaxCount !== "default"
         ) {
           ttlKeepaliveExplicit =
-            Boolean(effectiveCfg.ttlKeepalive) && Number(effectiveCfg.ttlKeepaliveMaxCount ?? 3) >= 1;
+            Boolean(effectiveCfg.ttlKeepalive) && Number(effectiveCfg.ttlKeepaliveMaxCount ?? 1) >= 1;
         }
       }
     }
@@ -894,8 +931,24 @@ async function main() {
 
         if (matchedDirectKeepalive || (matchedKeepaliveInTrailingSteps && !sawUserStepAfterPlanner)) {
           isKeepaliveTurn = true;
-          if (!isMidTurnContinuation && kaState?.pendingAck && typeof store.setTtlKeepaliveState === "function") {
-            store.setTtlKeepaliveState(targetConvId, { pendingAck: false, updatedTs: Date.now() });
+          if (!isMidTurnContinuation && typeof store.setTtlKeepaliveState === "function") {
+            const nowAckMs = Date.now();
+            const ackDelayMs = kaState?.lastSentTs > 0 ? nowAckMs - kaState.lastSentTs : 0;
+            if (
+              kaState?.pendingAck &&
+              ackDelayMs > 0 &&
+              ackDelayMs <= 30_000 &&
+              typeof store.recordTtlKeepaliveDeliveryMs === "function"
+            ) {
+              store.recordTtlKeepaliveDeliveryMs(ackDelayMs);
+            }
+            if (kaState?.pendingAck || !kaState?.inKeepaliveTurn) {
+              store.setTtlKeepaliveState(targetConvId, {
+                pendingAck: false,
+                inKeepaliveTurn: true,
+                updatedTs: nowAckMs
+              });
+            }
           }
         } else if (
           !isMidTurnContinuation &&
@@ -906,7 +959,16 @@ async function main() {
         ) {
           isKeepaliveTurn = true;
           if (typeof store.setTtlKeepaliveState === "function") {
-            store.setTtlKeepaliveState(targetConvId, { pendingAck: false, updatedTs: Date.now() });
+            const nowAckMs = Date.now();
+            const ackDelayMs = kaState.lastSentTs > 0 ? nowAckMs - kaState.lastSentTs : 0;
+            if (ackDelayMs > 0 && ackDelayMs <= 30_000 && typeof store.recordTtlKeepaliveDeliveryMs === "function") {
+              store.recordTtlKeepaliveDeliveryMs(ackDelayMs);
+            }
+            store.setTtlKeepaliveState(targetConvId, {
+              pendingAck: false,
+              inKeepaliveTurn: true,
+              updatedTs: nowAckMs
+            });
           }
         }
 
@@ -922,10 +984,18 @@ async function main() {
 
         if (
           !isKeepaliveTurn &&
+          !isMidTurnContinuation &&
+          isBackgroundWakeup &&
+          kaState?.inKeepaliveTurn &&
+          typeof store.setTtlKeepaliveState === "function"
+        ) {
+          store.setTtlKeepaliveState(targetConvId, { inKeepaliveTurn: false, updatedTs: Date.now() });
+        } else if (
+          !isKeepaliveTurn &&
           !isBackgroundWakeup &&
           !isMidTurnContinuation &&
           kaState &&
-          (kaState.usedCount > 0 || kaState.pendingAck) &&
+          (kaState.usedCount > 0 || kaState.pendingAck || kaState.coldMissTripped || kaState.inKeepaliveTurn) &&
           typeof store.resetTtlKeepaliveState === "function"
         ) {
           store.resetTtlKeepaliveState(targetConvId);

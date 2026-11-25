@@ -99,14 +99,11 @@ test("Opt 1: fast/mcp-server.mjs schema slimming cuts Turn-0 budget while preser
   assert.equal(report.blocks.tools.canonical, true);
   assert.equal(report.blocks.tools.fast.toolCount, 4);
   assert.equal(report.blocks.tools.context.toolCount, 8);
-  assert.ok(
-    report.blocks.tools.fast.bytes < 3600,
-    `Expected fast schema < 3600 B (down from 6132 B), got ${report.blocks.tools.fast.bytes}`
-  );
-  assert.ok(
-    report.totalTokens < 3150,
-    `Expected Turn-0 total < 3150 est. tokens (down from 3632), got ${report.totalTokens}`
-  );
+  assert.ok(report.blocks.tools.fast.bytes < 3100);
+  assert.ok(report.blocks.brake.tokens < 400, "Keep detailed tool arguments in the on-demand skill");
+  assert.equal(report.configuredStartup.toolCount, 4);
+  assert.equal(report.configuredStartup.schemaTokens, report.blocks.tools.fast.tokens);
+  assert.equal(report.configuredStartup.estimatedTokens, report.totalTokens - report.blocks.tools.context.tokens);
 
   const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
   try {
@@ -122,10 +119,10 @@ test("Opt 1: fast/mcp-server.mjs schema slimming cuts Turn-0 budget while preser
     const bs = byName.get("batch_search").inputSchema;
     assert.deepEqual(bs.required, ["queries"]);
     assert.deepEqual(Object.keys(bs.properties).sort(), ["cwd", "maxChars", "queries"]);
-    assert.deepEqual(bs.properties.queries.items.properties.type.enum, ["text", "regex", "glob", "git"]);
+    assert.deepEqual(bs.properties.queries.items.properties.type.enum, ["text", "regex", "glob", "fuzzy", "git"]);
     assert.deepEqual(
       Object.keys(bs.properties.queries.items.properties).sort(),
-      ["caseSensitive", "contextLines", "glob", "maxResults", "path", "pattern", "type"]
+      ["caseSensitive", "contextLines", "fileType", "glob", "maxResults", "multiline", "outputMode", "path", "pattern", "sortBy", "type"]
     );
     assert.equal(bs.properties.maxChars.maximum, 8800);
 
@@ -742,6 +739,77 @@ test("Opt 5: Enhanced ctx_resume structured sessionCheckpoint (0 new MCP tools, 
   }
 });
 
+test("Shared ctx_execute savings follow the host conversation exactly once", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-execution-receipts-"));
+  const dbPath = path.join(dir, "context.db");
+  const env = {
+    AGY_DART_DB_PATH: dbPath, ANTIGRAVITY_CONVERSATION_ID: "", ANTIGRAVITY_PARENT_CONVERSATION_ID: "",
+    ANTIGRAVITY_ROOT_CONVERSATION_ID: "", CONVERSATION_ID: ""
+  };
+  const client = createPersistentMcpClient(path.join(ROOT, "context/server.js"), env);
+  const store = new ContextModeStore({ dbPath });
+  try {
+    store.recordEvent({ sessionId: "default", kind: "execution", tool: "ctx_execute", sandboxBytes: 25, returnedBytes: 5 });
+    // Exercise an upgrade with an existing anonymous event in the v152 schema.
+    store.db.exec("DROP INDEX idx_events_receipt; ALTER TABLE events DROP COLUMN execution_receipt; PRAGMA user_version = 152;");
+    store.close();
+    const execute = (code, metadata = {}) => client.request("tools/call", {
+      name: "ctx_execute", arguments: { language: "nodejs", cwd: dir, code }, ...metadata
+    }).then(response => JSON.parse(response.result.content[0].text));
+    const code = 'console.log("abcdef".repeat(4000))';
+    const [a, b, scoped] = await Promise.all([
+      execute(code), execute(code), execute(code, {
+        arguments: { language: "nodejs", cwd: dir, code, sessionId: "wrong" },
+        _meta: { conversationId: "already-bound" }
+      })
+    ]);
+    assert.ok(a.ok && a.rawBytes > a.returnedBytes);
+    assert.ok(a.executionReceipt);
+    assert.notEqual(a.executionReceipt, b.executionReceipt);
+    assert.equal(scoped.executionReceipt, undefined);
+    const allBefore = store.getStats("all");
+    const toolCall = { name: "call_mcp_tool", args: { ServerName: "agy-dart_context", ToolName: "ctx_execute" } };
+    const post = (id, result, call = toolCall) => runHook("hooks/post-tool-use.mjs", {
+      common: { conversationId: id }, toolCall: call, toolResponse: { content: [{ text: JSON.stringify(result) }] }
+    }, dbPath, env);
+    post("wrong", a, { name: "call_mcp_tool", args: { ServerName: "other", ToolName: "ctx_execute" } });
+    post("conv-a", a);
+    post("conv-a", a);
+    assert.equal(store.getStats("conv-a").keptOutBytes, a.rawBytes - a.returnedBytes);
+    assert.equal(store.getStats("conv-b").calls, 0);
+    assert.equal(store.getStats("wrong").calls, 0);
+
+    // Hosts that omit the response in PostToolUse persist it in the next invocation's transcript.
+    const tx = path.join(dir, "transcript.jsonl");
+    const planner = { step_index: 10, type: "PLANNER_RESPONSE", tool_calls: [
+      { name: "read_file" },
+      { name: "call_mcp_tool", args: { ServerName: '"agy-dart_context"', ToolName: '"ctx_execute"' } }
+    ] };
+    const steps = [
+      planner, { type: "GENERIC", step_index: 11, content: JSON.stringify(b) },
+      { type: "GENERIC", step_index: 12, content: "Created At: 2026-11-23T06:00:00Z\n" + JSON.stringify(b, null, 2).slice(0, 4000) }
+    ];
+    const invocation = () => runHook("hooks/pre-invocation.mjs", {
+      common: { conversationId: "conv-b", transcriptPath: tx }
+    }, dbPath, env);
+    fs.writeFileSync(tx, steps.slice(0, 2).map(s => JSON.stringify(s)).join("\n"));
+    invocation();
+    assert.equal(store.getStats("conv-b").calls, 0);
+    fs.writeFileSync(tx, steps.map(s => JSON.stringify(s)).join("\n"));
+    invocation();
+    invocation();
+    assert.equal(store.getStats("conv-b").keptOutBytes, b.rawBytes - b.returnedBytes);
+    assert.equal(store.getStats("already-bound").calls, 1);
+    assert.equal(store.getStats("default").calls, 1);
+    assert.equal(store.getStats("default").keptOutBytes, 20);
+    assert.deepEqual(store.getStats("all"), allBefore);
+  } finally {
+    await client.close();
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
 test("Shared MCP server per-call sessionId isolation (AsyncLocalStorage prevents cross-tab leak, recovers checkpoint & scopes purge)", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-shared-mcp-"));
   const tmpDb = path.join(tmpDir, "context.db");
@@ -790,11 +858,11 @@ test("Shared MCP server per-call sessionId isolation (AsyncLocalStorage prevents
       assert.deepEqual(resA.sessionCheckpoint.modifiedFiles, ["alpha.js"]);
       assert.equal(resA.hint, undefined);
 
-      // 2. Subsequent call WITHOUT sessionId MUST revert to 'default' (zero global currentSessionId leak!) and include hint
+      // 2. Subsequent call without an ID uses its workspace, never the previous named session.
       const resDefault = JSON.parse(
-        (await client.request("tools/call", { name: "ctx_resume", arguments: {} })).result.content[0].text
+        (await client.request("tools/call", { name: "ctx_resume", arguments: { cwd: tmpDir } })).result.content[0].text
       );
-      assert.equal(resDefault.sessionId, "default", "Previous per-call sessionId must NOT leak into subsequent calls");
+      assert.match(resDefault.sessionId, /^workspace:[a-f\d]{64}$/);
       assert.equal(resDefault.sessionCheckpoint.modifiedFileCount, 0);
       assert.ok(typeof resDefault.hint === "string" && resDefault.hint.includes("sessionId"), "Empty default resume must provide actionable hint when UUID checkpoints exist");
 
@@ -846,7 +914,7 @@ test("Opt 6: read_slices({ slices }) bounded 4MB/256KB cache + apply_edits inval
     fs.writeFileSync(smallPath, "alpha_0001\nbeta__0002\ngamma_0003\n", "utf8");
     fs.utimesSync(smallPath, fixedSec, fixedSec);
 
-    const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
+    const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"), { AGY_DART_DB_PATH: tmpDb });
     try {
       await client.request("initialize", {
         protocolVersion: "2024-11-05",
@@ -1444,5 +1512,41 @@ test("Hardening regressions: SSRF IPv6/dual-stack/slowloris, lowercase/URL secre
   } finally {
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("run_checks keeps both ends of failed commands under character and JSON-RPC byte limits", async t => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "agy-failure-ends-"));
+  let client = null;
+  t.after(async () => {
+    if (client) await client.close();
+    fs.rmSync(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
+  fs.writeFileSync(path.join(cwd, "fail.cjs"), [
+    "const name = process.argv[2];",
+    'console.error("setup begins " + name);',
+    'const line = "error " + ("中🧪" + String.fromCharCode(34, 92)).repeat(32) + "\\n";',
+    'process.stderr.write(line.repeat(name === "large" ? 7500 : 80));',
+    'console.error("final cause " + name);',
+    "process.exitCode = 1;"
+  ].join("\n"));
+  client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"), { AGY_DART_DB_PATH: path.join(cwd, "fast-test.db") });
+  for (const outputMode of ["compact", "full"]) {
+    for (const maxChars of [1000, 8800]) {
+      const response = await client.request("tools/call", { name: "run_checks", arguments: {
+        cwd, commands: ["node fail.cjs large", "node fail.cjs small"], outputMode, maxChars
+      } });
+      assert.equal(response.result.isError, false);
+      const text = response.result.content[0].text;
+      assert.match(text, /2 failed/);
+      for (const name of ["large", "small"]) {
+        assert.ok(text.includes("setup begins " + name), text);
+        assert.ok(text.includes("final cause " + name), text);
+      }
+      assert.match(text, /truncated/);
+      assert.ok(text.isWellFormed());
+      assert.ok(text.length <= maxChars);
+      assert.ok(Buffer.byteLength(JSON.stringify(response) + "\n") <= 8800);
+    }
   }
 });

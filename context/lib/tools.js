@@ -1,11 +1,12 @@
 import fs from "node:fs";
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import { fileURLToPath } from "node:url";
 import { getConfigSnapshot } from "./config.js";
-import { executeCode, resolveExecTimeoutMs, runProcess, OUTPUT_CAP } from "./executor.js";
+import { executeCode, inferLanguageFromFile, resolveExecTimeoutMs, runProcess, OUTPUT_CAP } from "./executor.js";
 import { SNIPPET_MAX_BYTES } from "./store.js";
 import {
   detectSensitiveFile,
@@ -22,9 +23,13 @@ const MAX_MCP_JSON_BYTES = 8700;
 const MAX_FETCH_REDIRECTS = 5;
 const MAX_FETCH_BODY_BYTES = 10 * 1024 * 1024;
 const MAX_INDEX_FILE_BYTES = 32 * 1024 * 1024;
-const RESERVED_SESSION_SENTINELS = new Set(["all", "lifetime", "app"]);
+const RESERVED_SESSION_SENTINELS = new Set(["all", "lifetime", "app", "default"]);
 
-function normalizeExplicitSessionId(raw) {
+function isAnonymousSession(id) {
+  return id === "default" || /^workspace:[a-f0-9]{64}$/.test(id);
+}
+
+export function normalizeSessionId(raw) {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   if (!trimmed || trimmed.length > 128) return null;
@@ -36,7 +41,21 @@ function normalizeExplicitSessionId(raw) {
 function expandArgPath(raw) {
   if (typeof raw !== "string") return "";
   let s = raw.trim();
+  while (s.length >= 2) {
+    const q = s[0];
+    if ((q === '"' || q === "'") && s[s.length - 1] === q) {
+      const inner = s.slice(1, -1);
+      if (inner.includes(q)) break;
+      s = inner.trim();
+      continue;
+    }
+    break;
+  }
   if (!s) return "";
+  const joinExpandedTail = (base, rawTail) => {
+    const segs = String(rawTail || "").split(/[\\/]+/).filter(Boolean);
+    return segs.length > 0 ? path.join(base, ...segs) : base;
+  };
   if (/^file:\/\//i.test(s)) {
     try {
       s = fileURLToPath(s);
@@ -46,9 +65,43 @@ function expandArgPath(raw) {
   } else if (s === "~") {
     s = os.homedir();
   } else if (s.startsWith("~/") || s.startsWith("~\\")) {
-    s = path.join(os.homedir(), s.slice(2));
+    s = joinExpandedTail(os.homedir(), s.slice(2));
+  } else {
+    const tmpMatch = s.match(
+      /^(?:\$\{(?:env:)?(?:TMPDIR|TEMP|TMP)\}|\$(?:env:)?(?:TMPDIR|TEMP|TMP)|%(?:TEMP|TMP)%)(?=$|[\\/])(.*)$/i
+    );
+    if (tmpMatch) {
+      s = joinExpandedTail(os.tmpdir(), tmpMatch[1]);
+    } else {
+      const homeMatch = s.match(
+        /^(?:\$\{(?:env:)?(?:HOME|USERPROFILE)\}|\$(?:env:)?(?:HOME|USERPROFILE)|%(?:HOME|USERPROFILE)%)(?=$|[\\/])(.*)$/i
+      );
+      if (homeMatch) {
+        s = joinExpandedTail(os.homedir(), homeMatch[1]);
+      } else {
+        const localAppMatch = s.match(
+          /^(?:\$\{(?:env:)?LOCALAPPDATA\}|\$(?:env:)?LOCALAPPDATA|%LOCALAPPDATA%)(?=$|[\\/])(.*)$/i
+        );
+        if (localAppMatch) {
+          const base = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+          s = joinExpandedTail(base, localAppMatch[1]);
+        }
+      }
+    }
   }
   return s;
+}
+
+const MAX_INTENT_LABEL_BYTES = 240;
+
+function resolveIntentText(...candidates) {
+  for (const candidate of candidates) {
+    if (typeof candidate === "string") {
+      const collapsed = candidate.replace(/\s+/g, " ").trim();
+      if (collapsed) return truncateUtf8(collapsed, MAX_INTENT_LABEL_BYTES);
+    }
+  }
+  return "";
 }
 
 function resolveCallCwd(
@@ -61,14 +114,14 @@ function resolveCallCwd(
   if (!cleanedArg) {
     if (requireConfirmedWorkspace && !workspaceConfirmed) {
       throw new Error(
-        `Workspace root could not be determined (server cwd is inside plugin directory '${base}'). Pass the active workspace absolute path in 'cwd'.`
+        `Workspace root could not be determined from server cwd '${base}'. Pass the active workspace absolute path in 'cwd'.`
       );
     }
     return base;
   }
   if (!path.isAbsolute(cleanedArg) && requireConfirmedWorkspace && !workspaceConfirmed) {
     throw new Error(
-      `Workspace root could not be determined (server cwd is inside plugin directory '${base}'). Pass the active workspace absolute path in 'cwd'.`
+      `Workspace root could not be determined from server cwd '${base}'. Pass the active workspace absolute path in 'cwd'.`
     );
   }
   const resolved = path.resolve(base, cleanedArg);
@@ -355,25 +408,35 @@ export function createTools({
   return {
     // 1. ctx_execute
     async ctx_execute({
-      language = "shell",
+      language = undefined,
       code = "",
       file = "",
       args = [],
       intent = "",
+      summary = "",
+      description = "",
       cwd: argCwd = "",
       timeoutSec = undefined,
       timeoutMs: argTimeoutMs = undefined
     } = {}) {
       const startTime = Date.now();
+      const resolvedIntent = resolveIntentText(intent, summary, description);
+      const expandedFile = typeof file === "string" && file.trim() ? expandArgPath(file) : "";
+      const effectiveCode = expandedFile && typeof code === "string" && !code.trim() ? "" : code;
+      const rawLang = typeof language === "string" ? language.trim() : "";
+      const effectiveLanguage =
+        rawLang || (expandedFile ? inferLanguageFromFile(expandedFile) : "") || "shell";
       const ws = resolveWs();
       const cwd = resolveCallCwd(argCwd, ws.cwd, {
         requireConfirmedWorkspace: true,
         workspaceConfirmed: ws.confirmed
       });
-      const sessionId = getSessionId();
+      const sessionId = getSessionId(cwd);
 
-      if (file) {
-        const absFile = path.isAbsolute(file) ? file : path.resolve(cwd, file);
+      if (expandedFile) {
+        const absFile = path.isAbsolute(expandedFile)
+          ? path.normalize(expandedFile)
+          : path.resolve(cwd, expandedFile);
         let realAbsFile = absFile;
         try {
           realAbsFile = fs.realpathSync(absFile);
@@ -397,9 +460,9 @@ export function createTools({
       const effTimeoutMs = resolveExecTimeoutMs(requestedTimeoutMs, cfgTimeoutMs);
 
       const result = await executeCode({
-        language,
-        code,
-        file,
+        language: effectiveLanguage,
+        code: effectiveCode,
+        file: expandedFile,
         args,
         cwd,
         timeoutMs: effTimeoutMs
@@ -416,6 +479,7 @@ export function createTools({
       const redacted = redactSecrets(rawCombined);
       const fullOutput = redacted.text;
       const fullBytes = Buffer.byteLength(fullOutput, "utf8");
+      const executionReceipt = isAnonymousSession(sessionId) ? randomBytes(16).toString("hex") : null;
 
       let sourceId = null;
       let deduplicated = false;
@@ -425,9 +489,9 @@ export function createTools({
           worktree: cwd,
           agent: "antigravity",
           kind: "execution",
-          label: intent || `${language} script (${elapsedMs}ms)`,
+          label: resolvedIntent || `${effectiveLanguage} script (${elapsedMs}ms)`,
           content: fullOutput,
-          dedup: true
+          dedup: !isAnonymousSession(sessionId)
         });
         sourceId = indexed.sourceId;
         deduplicated = Boolean(indexed.deduplicated);
@@ -454,12 +518,13 @@ export function createTools({
           if (crushed.crushed) {
             // Check JSON-in-JSON escaping overhead so capSerializedJsonField doesn't chop valid crushed JSON
             const probeObj = {
+              ...(executionReceipt ? { executionReceipt } : {}),
               ok: result.ok,
               exitCode: result.exitCode,
               ...(result.timedOut ? { timedOut: true } : {}),
               elapsedMs,
-              language,
-              intent: intent || null,
+              language: effectiveLanguage,
+              intent: resolvedIntent || null,
               sourceId,
               deduplicated,
               crushedJson: true,
@@ -495,12 +560,13 @@ export function createTools({
         : "\n\n... [truncated to protect context window]";
 
       const responseObj = {
+        ...(executionReceipt ? { executionReceipt } : {}),
         ok: result.ok,
         exitCode: result.exitCode,
         ...(result.timedOut ? { timedOut: true } : {}),
         elapsedMs,
-        language,
-        intent: intent || null,
+        language: effectiveLanguage,
+        intent: resolvedIntent || null,
         sourceId,
         deduplicated,
         ...(crushedJson ? { crushedJson: true } : {}),
@@ -540,8 +606,10 @@ export function createTools({
         agent: "antigravity",
         kind: "execution",
         tool: "ctx_execute",
-        key: language,
-        path: file || null,
+        executionReceipt,
+        sourceId,
+        key: effectiveLanguage,
+        path: expandedFile || null,
         ok: result.ok ? 1 : 0,
         exitCode: result.exitCode,
         bytes: fullBytes,
@@ -560,7 +628,7 @@ export function createTools({
         requireConfirmedWorkspace: true,
         workspaceConfirmed: ws.confirmed
       });
-      const sessionId = getSessionId();
+      const sessionId = getSessionId(cwd);
       const cmdList = Array.isArray(commands) ? commands : [commands];
       const outputs = [];
       let totalRawBytes = 0;
@@ -577,6 +645,7 @@ export function createTools({
       const redactedBatch = redactSecrets(outputs.join("\n"));
       const combined = redactedBatch.text;
       totalRawBytes = Buffer.byteLength(combined, "utf8");
+      const executionReceipt = isAnonymousSession(sessionId) ? randomBytes(16).toString("hex") : null;
       const indexed = store.indexContent({
         sessionId,
         worktree: cwd,
@@ -584,7 +653,7 @@ export function createTools({
         kind: "batch",
         label: `batch: ${cmdList.length} commands`,
         content: combined,
-        dedup: true
+        dedup: !isAnonymousSession(sessionId)
       });
       const deduplicated = Boolean(indexed.deduplicated);
 
@@ -611,6 +680,7 @@ export function createTools({
 
       const batchSuffix = `\n\n... [truncated to stay <=8.8 KB inline; use ctx_search(queries: [...], sourceId: "${indexed.sourceId}")]`;
       const batchResp = {
+        ...(executionReceipt ? { executionReceipt } : {}),
         commandsRun: cmdList.length,
         sourceId: indexed.sourceId,
         deduplicated,
@@ -647,6 +717,8 @@ export function createTools({
         agent: "antigravity",
         kind: "batch",
         tool: "ctx_batch",
+        executionReceipt,
+        sourceId: indexed.sourceId,
         ok: 1,
         bytes: totalRawBytes,
         body: returnedContent,
@@ -662,11 +734,12 @@ export function createTools({
       const ws = resolveWs();
       const expandedFilePath = filePath ? expandArgPath(filePath) : "";
       const needsWorkspaceForRelativeFile = Boolean(expandedFilePath && !path.isAbsolute(expandedFilePath));
-      const cwd = resolveCallCwd(argCwd, ws.cwd, {
+      const fileDir = !ws.confirmed && !argCwd && path.isAbsolute(expandedFilePath) ? path.dirname(expandedFilePath) : ws.cwd;
+      const cwd = resolveCallCwd(argCwd, fileDir, {
         requireConfirmedWorkspace: needsWorkspaceForRelativeFile,
         workspaceConfirmed: ws.confirmed
       });
-      const sessionId = getSessionId();
+      const sessionId = getSessionId(cwd);
       let rawText = content || "";
       let resolvedLabel = label;
       let sensitiveFileWarning = null;
@@ -729,6 +802,7 @@ export function createTools({
 
       const redacted = redactSecrets(rawText);
       const safeText = redacted.text;
+      const executionReceipt = isAnonymousSession(sessionId) ? randomBytes(16).toString("hex") : null;
 
       const indexed = store.indexContent({
         sessionId,
@@ -737,11 +811,12 @@ export function createTools({
         kind: url ? "web" : filePath ? "file" : "text",
         label: resolvedLabel || "manual_index",
         content: safeText,
-        dedup: true
+        dedup: !isAnonymousSession(sessionId)
       });
 
       const deduplicated = Boolean(indexed.deduplicated);
       const returnObj = {
+        ...(executionReceipt ? { executionReceipt } : {}),
         sourceId: indexed.sourceId,
         label: indexed.label,
         bytesTotal: indexed.bytesTotal,
@@ -762,6 +837,8 @@ export function createTools({
         agent: "antigravity",
         kind: "index",
         tool: "ctx_index",
+        executionReceipt,
+        sourceId: indexed.sourceId,
         path: filePath || safeUrlForMeta || null,
         ok: 1,
         bytes: deduplicated ? 0 : indexed.bytesTotal,
@@ -780,7 +857,7 @@ export function createTools({
         requireConfirmedWorkspace: scope === "worktree",
         workspaceConfirmed: ws.confirmed
       });
-      const sessionId = getSessionId();
+      const sessionId = scope === "all" || scope === "worktree" ? null : getSessionId(cwd);
 
       const res = store.search({
         queries,
@@ -847,9 +924,9 @@ export function createTools({
     },
 
     // 5. ctx_resume
-    async ctx_resume({ seq = null, sessionId: argSessionId = null } = {}) {
-      const explicitSid = normalizeExplicitSessionId(argSessionId);
-      const sessionId = explicitSid || getSessionId();
+    async ctx_resume({ seq = null, sessionId: argSessionId = null, cwd: argCwd = "" } = {}) {
+      const explicitSid = normalizeSessionId(argSessionId);
+      const sessionId = explicitSid || getSessionId(resolveCallCwd(argCwd, resolveWs().cwd));
       if (seq !== null && seq !== undefined) {
         const ev = store.getEventBySeq(seq, sessionId);
         if (!ev) throw new Error(`Event sequence #${seq} not found`);
@@ -912,13 +989,13 @@ export function createTools({
       };
 
       if (
-        sessionId === "default" &&
+        isAnonymousSession(sessionId) &&
         isCheckpointEmpty &&
         typeof store.hasNonDefaultCheckpoints === "function" &&
         store.hasNonDefaultCheckpoints()
       ) {
         resumePayload.hint =
-          "Shared MCP server resolved sessionId='default' (no host conversationId env). Pass sessionId: '<your Conversation ID>' to recover this conversation's PostToolUse checkpoint & isolated stats.";
+          "No host conversation ID was provided. Pass sessionId: '<your Conversation ID>' to recover this conversation's PostToolUse checkpoint and stats.";
       }
 
       // Strictly guarantee <= 8.8 KB UTF-8 inline cap even with adversarial CJK paths/commands
@@ -954,6 +1031,9 @@ export function createTools({
         for (const k of ["lastTest", "lastBuild"]) {
           const item = resumePayload.sessionCheckpoint[k];
           if (!item) continue;
+          if (typeof item.failureExcerpt === "string") {
+            item.failureExcerpt = truncateUtf8(item.failureExcerpt, 240);
+          }
           if (typeof item.summary === "string") item.summary = truncateUtf8(item.summary, 180);
           if (typeof item.command === "string") item.command = truncateUtf8(item.command, 120);
         }
@@ -962,8 +1042,18 @@ export function createTools({
         for (const k of ["lastTest", "lastBuild"]) {
           const item = resumePayload.sessionCheckpoint[k];
           if (!item) continue;
+          if (typeof item.failureExcerpt === "string") {
+            item.failureExcerpt = truncateUtf8(item.failureExcerpt, 100);
+          }
           if (typeof item.summary === "string") item.summary = truncateUtf8(item.summary, 64);
           if (typeof item.command === "string") item.command = truncateUtf8(item.command, 64);
+        }
+      }
+      if (jsonBytes() > MAX_RESUME_JSON_BYTES && resumePayload.sessionCheckpoint) {
+        for (const k of ["lastTest", "lastBuild"]) {
+          const item = resumePayload.sessionCheckpoint[k];
+          if (!item) continue;
+          if ("failureExcerpt" in item) delete item.failureExcerpt;
         }
       }
 
@@ -971,9 +1061,9 @@ export function createTools({
     },
 
     // 6. ctx_stats
-    async ctx_stats({ reset = false, sessionId: argSessionId = null } = {}) {
-      const explicitSid = normalizeExplicitSessionId(argSessionId);
-      const sessionId = explicitSid || getSessionId();
+    async ctx_stats({ reset = false, sessionId: argSessionId = null, cwd: argCwd = "" } = {}) {
+      const explicitSid = normalizeSessionId(argSessionId);
+      const sessionId = explicitSid || getSessionId(resolveCallCwd(argCwd, resolveWs().cwd));
       if (reset) {
         store.purge({ scope: "session", sessionId });
       }
@@ -986,7 +1076,7 @@ export function createTools({
         "────────────────────────────────────────────────────────────────────────────────",
         ` agy-dart context stats [session: ${sessionId}]`,
         "────────────────────────────────────────────────────────────────────────────────",
-        `  Total Operations:      ${s.calls} (exec:${bd.executions || 0}, idx:${bd.indexes || 0}, cli-filter:${bd.cliFilters || 0}, dedup:${bd.dedups || 0}, blocked:${bd.interceptions || 0})`,
+        `  Total Operations:      ${s.calls} (exec:${bd.executions || 0}, idx:${bd.indexes || 0}, fast:${bd.fastTools || 0}, cli-filter:${bd.cliFilters || 0}, dedup:${bd.dedups || 0}, blocked:${bd.interceptions || 0})`,
         `  Raw Data Handled:      ${formatBytes(s.totalRawBytes)}`,
         `  Data Fed into LLM:     ${formatBytes(s.totalReturnedBytes)}`,
         `  Tokens Kept Out:       ~${s.tokensKeptOut.toLocaleString()} tokens (${formatBytes(s.keptOutBytes)})`,
@@ -1032,12 +1122,13 @@ export function createTools({
           rejected: diag.rejected
         };
       } catch {}
-      const cutoffInfo = store.getCutoffInfo(getSessionId());
+      const sessionId = getSessionId(cwd, { optional: true });
+      const cutoffInfo = store.getCutoffInfo(sessionId);
       const out = {
         doctor: doc,
         features: {
-          cliFilterEnabled: store.isCliFilterEnabled(getSessionId()),
-          readDedupEnabled: store.isReadDedupEnabled(getSessionId()),
+          cliFilterEnabled: store.isCliFilterEnabled(sessionId),
+          readDedupEnabled: store.isReadDedupEnabled(sessionId),
           diffReadEnabled: cfgSnap.values.diffRead,
           headingAwareMarkdownChunking: true,
           secretRedactionEnabled: isSecretRedactionEnabled(),
@@ -1056,7 +1147,7 @@ export function createTools({
           exemptExtensionsCount: Array.isArray(cfgSnap.values.exemptExtensions) ? cfgSnap.values.exemptExtensions.length : 0
         },
         readDedup: {
-          enabled: store.isReadDedupEnabled(getSessionId()),
+          enabled: store.isReadDedupEnabled(sessionId),
           minBytes: cfgSnap.values.readDedupMinBytes,
           maxSteps: cfgSnap.values.readDedupMaxSteps,
           maxTurns: cfgSnap.values.readDedupMaxTurns
@@ -1111,13 +1202,13 @@ export function createTools({
       sessionId: argSessionId = null,
       cwd: argCwd = ""
     } = {}) {
-      const explicitSid = normalizeExplicitSessionId(argSessionId);
-      const sessionId = explicitSid || getSessionId();
+      const explicitSid = normalizeSessionId(argSessionId);
       const ws = resolveWs();
       const cwd = resolveCallCwd(argCwd, ws.cwd, {
         requireConfirmedWorkspace: scope === "worktree",
         workspaceConfirmed: ws.confirmed
       });
+      const sessionId = scope === "session" || scope === "conversation" ? explicitSid || getSessionId(cwd) : null;
       return store.purge({ scope, sessionId, worktree: cwd, olderThanDays, vacuum });
     }
   };

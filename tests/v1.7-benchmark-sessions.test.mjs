@@ -1,0 +1,21 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import {analyzeTranscriptSessions,resolveSessionOrPathInput} from "../fast/benchmark.mjs";
+test("v1.7 normalized billing, independent cold miss and session prefix resolution",async t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),"agy-sessions-"));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const file=path.join(dir,"abcdef123",".system_generated","logs","transcript.jsonl");
+ fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,"");
+ const resolve=id=>resolveSessionOrPathInput(id,{searchRoots:[dir]});
+ assert.equal(await resolve("abcdef"),file);
+ const second=file.replace("abcdef123","abcdef456");fs.mkdirSync(path.dirname(second),{recursive:true});fs.writeFileSync(second,"");
+ await assert.rejects(resolve("abcdef"),/Ambiguous/);
+ const step={type:"PLANNER_RESPONSE",input_tokens:500,output_tokens:10,cache_read_tokens:0,tool_calls:[{name:"read_file",args:{Path:"x"}}]};
+ const m=analyzeTranscriptSessions([[step,step]]);
+ assert.equal(m.totalTokenThroughput,1020);assert.equal(m.blindReadFileCalls,2);
+ assert.equal(m.compactionCount,0);assert.equal(m.suspectedTruncationCount,0);
+ const c=analyzeTranscriptSessions([[step,{type:"SYSTEM_MESSAGE",content:"CHECKPOINT: # Resuming from a compaction"},{...step,input_tokens:100}]]);
+ assert.equal(c.compactionCount,1);assert.equal(c.suspectedTruncationCount,0);
+});

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
@@ -10,7 +11,7 @@ try {
   enableVersionedCompileCache();
 } catch {}
 
-const [{ stableSortObject }, { ContextModeStore }, { createTools }, handoffMod] = await Promise.all([
+const [{ stableSortObject }, { ContextModeStore }, { createTools, normalizeSessionId }, handoffMod] = await Promise.all([
   import("./lib/stable-json.js"),
   import("./lib/store.js"),
   import("./lib/tools.js"),
@@ -28,7 +29,6 @@ try {
   if (pkg.version) pkgVersion = pkg.version;
 } catch {}
 
-const RESERVED_SESSION_SENTINELS = new Set(["all", "lifetime", "app"]);
 const INSTALLED_PLUGIN_PATH_RE =
   /\/(?:\.gemini\/(?:config|antigravity)\/plugins|\.agents\/plugins|\.t3\/userdata\/providers\/antigravity\/[^/]+\/(?:\.gemini\/config\/)?plugins)\/agy-dart(?:\/|$)/i;
 
@@ -85,19 +85,53 @@ function resolveDirectoryCandidate(raw) {
   return null;
 }
 
+function resolveSingleWorkspace(candidates) {
+  const roots = new Map();
+  for (const raw of candidates) {
+    const dir = resolveDirectoryCandidate(raw);
+    if (dir && !isInsideInstalledPluginDir(dir)) roots.set(normalizeCompareDir(dir), dir);
+  }
+  return roots.size === 1 ? roots.values().next().value : null;
+}
+
 function isExplicitAbsoluteCwdArg(raw) {
   if (typeof raw !== "string") return false;
-  const s = raw.trim();
+  let s = raw.trim();
+  while (s.length >= 2) {
+    const q = s[0];
+    if ((q === '"' || q === "'") && s[s.length - 1] === q) {
+      const inner = s.slice(1, -1);
+      if (inner.includes(q)) break;
+      s = inner.trim();
+      continue;
+    }
+    break;
+  }
   if (!s) return false;
-  if (/^file:\/\//i.test(s) || s === "~" || s.startsWith("~/") || s.startsWith("~\\")) return true;
+  if (/^file:\/\//i.test(s)) {
+    try {
+      return path.isAbsolute(fileURLToPath(s));
+    } catch {
+      return false;
+    }
+  }
+  if (
+    s === "~" ||
+    s.startsWith("~/") ||
+    s.startsWith("~\\") ||
+    /^(?:\$\{(?:env:)?(?:TMPDIR|TEMP|TMP|HOME|USERPROFILE|LOCALAPPDATA)\}|\$(?:env:)?(?:TMPDIR|TEMP|TMP|HOME|USERPROFILE|LOCALAPPDATA)|%(?:TEMP|TMP|HOME|USERPROFILE|LOCALAPPDATA)%)(?=$|[\\/])/i.test(s)
+  ) {
+    return true;
+  }
   return path.isAbsolute(s);
 }
 
 const store = new ContextModeStore();
-const envWorkspaceDir =
-  resolveDirectoryCandidate(process.env.ANTIGRAVITY_WORKSPACE_ROOT) ||
-  resolveDirectoryCandidate(process.env.VSCODE_CWD);
-let currentCwd = envWorkspaceDir || process.cwd();
+const envWorkspaceDir = resolveDirectoryCandidate(process.env.ANTIGRAVITY_WORKSPACE_ROOT);
+// VS Code may launch several projects from the same directory. It is a path
+// hint for a known conversation, never the owner of anonymous project data.
+const launchCwd = resolveDirectoryCandidate(process.env.VSCODE_CWD) || process.cwd();
+let currentCwd = envWorkspaceDir || launchCwd;
 let explicitWorkspaceConfigured = Boolean(envWorkspaceDir && !isInsideInstalledPluginDir(envWorkspaceDir));
 let clientSupportsRoots = false;
 let cachedRootsDir = null;
@@ -109,24 +143,14 @@ const pendingClientRequests = new Map();
 let initSessionId = null;
 const callContext = new AsyncLocalStorage();
 
-function normalizeCallSessionId(raw) {
-  if (typeof raw !== "string") return null;
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 128) return null;
-  if (/[\x00-\x1f\x7f\\/]/.test(trimmed)) return null;
-  if (RESERVED_SESSION_SENTINELS.has(trimmed.toLowerCase())) return null;
-  return trimmed;
-}
-
-function resolveSessionIdForCall() {
+function resolveHostSessionId() {
   return (
     callContext.getStore()?.sessionId ||
     initSessionId ||
-    normalizeCallSessionId(process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID) ||
-    normalizeCallSessionId(process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID) ||
-    normalizeCallSessionId(process.env.ANTIGRAVITY_CONVERSATION_ID) ||
-    normalizeCallSessionId(process.env.CONVERSATION_ID) ||
-    "default"
+    normalizeSessionId(process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID) ||
+    normalizeSessionId(process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID) ||
+    normalizeSessionId(process.env.ANTIGRAVITY_CONVERSATION_ID) ||
+    normalizeSessionId(process.env.CONVERSATION_ID)
   );
 }
 
@@ -138,17 +162,45 @@ function resolveActiveWorkspaceState() {
     return { cwd: cachedRootsDir, confirmed: true };
   }
   const insidePlugin = isInsideInstalledPluginDir(currentCwd);
-  if (insidePlugin && inferWorkspaceFromStore) {
-    const inferred = inferWorkspaceFromStore(store, resolveSessionIdForCall());
+  const hostSessionId = resolveHostSessionId();
+  if (insidePlugin && hostSessionId && inferWorkspaceFromStore) {
+    const inferred = inferWorkspaceFromStore(store, hostSessionId);
     if (inferred && !isInsideInstalledPluginDir(inferred)) {
       return { cwd: inferred, confirmed: true };
     }
   }
-  return { cwd: currentCwd, confirmed: !insidePlugin };
+  return { cwd: currentCwd, confirmed: !insidePlugin && Boolean(hostSessionId) };
 }
 
 function resolveActiveWorkspaceCwd() {
   return resolveActiveWorkspaceState().cwd;
+}
+
+const adoptedWorkspaces = new Set();
+
+function resolveSessionIdForCall(cwd, { optional = false } = {}) {
+  const hostSessionId = resolveHostSessionId();
+  if (hostSessionId) {
+    try {
+      return typeof store.resolveRootSessionId === "function"
+        ? store.resolveRootSessionId(hostSessionId)
+        : hostSessionId;
+    } catch {
+      return hostSessionId;
+    }
+  }
+  const located = explicitWorkspaceConfigured || cachedRootsDir || callContext.getStore()?.explicitPath;
+  if (!located || !handoffMod.isSafeWorkspaceDir?.(cwd) || isInsideInstalledPluginDir(cwd)) {
+    if (optional) return null;
+    throw new Error("Workspace root could not be determined for anonymous session data. Pass the active workspace absolute path in 'cwd'.");
+  }
+  const canonicalDir = fs.realpathSync.native(cwd);
+  const id = "workspace:" + createHash("sha256").update(canonicalDir).digest("hex");
+  if (!adoptedWorkspaces.has(cwd)) {
+    store.adoptLegacyWorkspaceData(cwd, id);
+    adoptedWorkspaces.add(cwd);
+  }
+  return id;
 }
 
 const tools = createTools({
@@ -160,16 +212,15 @@ const tools = createTools({
     callContext.getStore()?.directConversationId ||
     callContext.getStore()?.sessionId ||
     initSessionId ||
-    normalizeCallSessionId(process.env.ANTIGRAVITY_CONVERSATION_ID) ||
-    normalizeCallSessionId(process.env.CONVERSATION_ID) ||
-    "default"
+    normalizeSessionId(process.env.ANTIGRAVITY_CONVERSATION_ID) ||
+    normalizeSessionId(process.env.CONVERSATION_ID)
 });
 
 // Deterministic, compact Turn-0 tool schemas (keeps server KV-cache prefix lean and stable)
 const RAW_TOOL_DEFINITIONS = [
   {
     name: "ctx_batch",
-    description: "Run sequential shell commands, index output into FTS5, and return matching snippets (<=8.8 KB).",
+    description: "Run shell commands in order. Index output and return a preview or query hits.",
     inputSchema: {
       type: "object",
       properties: {
@@ -182,7 +233,7 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_doctor",
-    description: "Check SQLite WAL/FTS5 health, DB size, feature toggles, and runtimes.",
+    description: "Check database, settings and runtime health.",
     inputSchema: {
       type: "object",
       properties: {
@@ -192,23 +243,24 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_execute",
-    description: "Run JS/Python/Shell/PowerShell in sandbox to filter >16 KB logs or giant JSON/CSV/API data (<=8.8 KB inline + FTS5 index).",
+    description: "Filter large data with code. Return a preview and index the output. Give intent first. For >5 lines use a conversation scratch dir (or OS temp) and pass file + args.",
     inputSchema: {
       type: "object",
       properties: {
+        intent: { type: "string" },
         language: { type: "string", enum: ["javascript", "nodejs", "python", "shell", "powershell", "cmd"] },
         code: { type: "string" },
         file: { type: "string" },
         args: { type: "array", items: { type: "string" } },
         cwd: { type: "string" },
-        intent: { type: "string" },
+        sessionId: { type: "string" },
         timeoutSec: { type: "integer", minimum: 1, maximum: 300 }
       }
     }
   },
   {
     name: "ctx_index",
-    description: "Index local file, URL, or raw text into SQLite FTS5 (heading-aware for Markdown).",
+    description: "Index a file, URL or text for ctx_search.",
     inputSchema: {
       type: "object",
       properties: {
@@ -222,7 +274,7 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_purge",
-    description: "Purge indexed sources/events for session, worktree, all, or stale TTL entries (optional VACUUM).",
+    description: "Delete indexed data in scope (default: session).",
     inputSchema: {
       type: "object",
       properties: {
@@ -236,10 +288,11 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_resume",
-    description: "Recover indexed sources/events and PostToolUse checkpoint after /compact.",
+    description: "Recover session state after /compact or fetch an event by seq.",
     inputSchema: {
       type: "object",
       properties: {
+        cwd: { type: "string" },
         seq: { type: "integer" },
         sessionId: { type: "string" }
       }
@@ -247,7 +300,7 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_search",
-    description: "Search SQLite FTS5 sources via Porter BM25 + Trigram RRF.",
+    description: "Find ranked snippets in indexed sources.",
     inputSchema: {
       type: "object",
       properties: {
@@ -263,10 +316,11 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_stats",
-    description: "Show context savings report (sandbox, CLI filter, read dedup, interceptions).",
+    description: "Report context savings. reset purges session data.",
     inputSchema: {
       type: "object",
       properties: {
+        cwd: { type: "string" },
         reset: { type: "boolean" },
         sessionId: { type: "string" }
       }
@@ -305,16 +359,7 @@ function requestClientRootsList(timeoutMs = 1000) {
       resolve: (respMsg) => {
         clearTimeout(timer);
         const roots = respMsg?.result?.roots;
-        if (Array.isArray(roots)) {
-          for (const item of roots) {
-            const candidate = resolveDirectoryCandidate(item?.uri || item?.path);
-            if (candidate && !isInsideInstalledPluginDir(candidate)) {
-              resolve(candidate);
-              return;
-            }
-          }
-        }
-        resolve(null);
+        resolve(Array.isArray(roots) ? resolveSingleWorkspace(roots.map(item => item?.uri || item?.path)) : null);
       }
     });
     sendJsonRpc({ jsonrpc: "2.0", id: reqId, method: "roots/list" });
@@ -418,6 +463,8 @@ rl.on("line", async (line) => {
   }
   if (!hasId) {
     if (method === "notifications/roots/list_changed") {
+      explicitWorkspaceConfigured = false;
+      currentCwd = launchCwd;
       rootsEpoch += 1;
       cachedRootsDir = null;
       rootsQueried = false;
@@ -440,15 +487,12 @@ rl.on("line", async (line) => {
           params?.rootUri,
           params?.rootPath
         ];
-        for (const cand of initCandidates) {
-          const resolved = resolveDirectoryCandidate(cand);
-          if (resolved && !isInsideInstalledPluginDir(resolved)) {
-            currentCwd = resolved;
-            explicitWorkspaceConfigured = true;
-            break;
-          }
+        if (initCandidates.some(Boolean)) {
+          const resolved = resolveSingleWorkspace(initCandidates);
+          currentCwd = resolved || launchCwd;
+          explicitWorkspaceConfigured = Boolean(resolved);
         }
-        const initSid = normalizeCallSessionId(params?.sessionId);
+        const initSid = normalizeSessionId(params?.sessionId);
         if (initSid) initSessionId = initSid;
         sendResponse(id, {
           protocolVersion: params?.protocolVersion || "2024-11-05",
@@ -504,24 +548,30 @@ rl.on("line", async (line) => {
         ) {
           const epoch = rootsEpoch;
           const rootsDir = await requestClientRootsList(1000);
-          if (rootsEpoch === epoch) {
-            rootsQueried = true;
-            cachedRootsDir = rootsDir;
+          if (rootsEpoch !== epoch) {
+            sendResponse(id, {
+              isError: true,
+              content: [{ type: "text", text: "Workspace roots changed during this call. Retry with the active workspace in 'cwd'." }]
+            });
+            break;
           }
+          rootsQueried = true;
+          cachedRootsDir = rootsDir;
         }
         // Strictly per-call session isolation via AsyncLocalStorage: never mutate process-global
         // session state across concurrent conversations sharing one long-lived MCP stdio server.
-        const callSessionId =
-          [
-            toolArgs.sessionId,
-            toolArgs.conversationId,
-            params?._meta?.rootConversationId,
-            params?._meta?.conversationId,
-            params?._meta?.sessionId,
-            params?.sessionId
-          ]
-            .map(normalizeCallSessionId)
-            .find(Boolean) ?? null;
+        const hostIds = [
+          params?._meta?.rootConversationId,
+          params?._meta?.parentConversationId,
+          params?._meta?.conversationId,
+          params?._meta?.sessionId,
+          params?.sessionId
+        ];
+        const argumentIds = [toolArgs.sessionId, toolArgs.conversationId];
+        // The host owns execution/index/batch attribution. Other tools support explicit cross-session queries.
+        const isHostAttributed = toolName === "ctx_execute" || toolName === "ctx_index" || toolName === "ctx_batch";
+        const candidates = isHostAttributed ? [...hostIds, ...argumentIds] : [...argumentIds, ...hostIds];
+        const callSessionId = candidates.map(normalizeSessionId).find(Boolean) ?? null;
         const callDirectConvId =
           [
             toolArgs.conversationId,
@@ -530,7 +580,7 @@ rl.on("line", async (line) => {
             params?._meta?.sessionId,
             params?.sessionId
           ]
-            .map(normalizeCallSessionId)
+            .map(normalizeSessionId)
             .find(Boolean) ?? null;
 
         if (typeof toolName !== "string" || !Object.hasOwn(tools, toolName)) {
@@ -540,7 +590,11 @@ rl.on("line", async (line) => {
 
         try {
           const result = await callContext.run(
-            { sessionId: callSessionId, directConversationId: callDirectConvId },
+            {
+              sessionId: callSessionId, directConversationId: callDirectConvId,
+              explicitPath: isExplicitAbsoluteCwdArg(toolArgs.cwd) ||
+                (toolName === "ctx_index" && !toolArgs.cwd && isExplicitAbsoluteCwdArg(toolArgs.path))
+            },
             () => tools[toolName](toolArgs)
           );
           sendResponse(id, {

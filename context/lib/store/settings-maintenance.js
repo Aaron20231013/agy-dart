@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { getConfigSnapshot, getEffectiveConfig, parseUiLang } from "../config.js";
+import { readConversationParentId } from "../watchdog-lease.js";
 import {
   DEFAULT_ACTIVE_CATEGORIES,
   DEFAULT_CUTOFF_BYTES,
@@ -86,6 +87,7 @@ function inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, { transcriptPath = "
     if (home) {
       candidates.push(path.join(home, ".gemini", "antigravity", "conversation_summaries.db"));
       candidates.push(path.join(home, ".gemini", "antigravity-ide", "conversation_summaries.db"));
+      candidates.push(path.join(home, ".gemini", "antigravity-cli", "conversation_summaries.db"));
     }
   }
   const seen = new Set();
@@ -115,11 +117,10 @@ function inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, { transcriptPath = "
           row = sdb.prepare("SELECT title FROM conversation_summaries WHERE conversation_id = ? LIMIT 1").get(cid);
         }
       }
-      if (!row) continue;
+      const parentId = readConversationParentId(sdb, cid, row?.parent_conversation_id);
+      if (!row && !parentId) continue;
+      row ??= {};
       const title = typeof row.title === "string" ? row.title.trim() : "";
-      const rawParent = typeof row.parent_conversation_id === "string" ? row.parent_conversation_id.trim() : "";
-      const parentId =
-        rawParent && rawParent !== cid && /^[A-Za-z0-9._-]+$/.test(rawParent) ? rawParent.slice(0, 128) : "";
       const depth = Number(row.nesting_depth);
       const agent = typeof row.agent_name === "string" ? row.agent_name.trim() : "";
       const killed = Boolean(row.killed === true || (Number.isFinite(Number(row.killed)) && Number(row.killed) > 0));
@@ -273,13 +274,130 @@ export function normalizeStarPromptState(raw) {
   };
 }
 
+function isSpecialSessionScope(sid) {
+  if (typeof sid !== "string") return true;
+  const trimmed = sid.trim();
+  if (!trimmed) return true;
+  return /^(?:default|all|app|lifetime|__unbound__)$/i.test(trimmed) || /^workspace:/i.test(trimmed);
+}
+
+function sanitizeLeaseLinkId(raw) {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128 || /[\x00-\x1f\x7f\\/]/.test(trimmed) || isSpecialSessionScope(trimmed)) {
+    return "";
+  }
+  return trimmed;
+}
+
 export class SettingsMaintenanceMethods {
+  /** Resolve a conversationId to its top-level rootSessionId via watchdog_lease parent/root links */
+  resolveRootSessionId(sessionId) {
+    const raw = typeof sessionId === "string" ? sessionId.trim() : "";
+    if (!raw) return "default";
+    if (isSpecialSessionScope(raw)) return raw;
+    this.open();
+    let cur = raw;
+    const visited = new Set([cur]);
+    for (let depth = 0; depth < 12; depth++) {
+      let leaseRaw = null;
+      try {
+        leaseRaw = this.getMeta(`watchdog_lease:${cur}`, null);
+      } catch {
+        break;
+      }
+      if (!leaseRaw) break;
+      let lease = null;
+      try {
+        lease = JSON.parse(leaseRaw);
+      } catch {
+        break;
+      }
+      if (!lease || typeof lease !== "object") break;
+      const rootCand = sanitizeLeaseLinkId(lease.rootSessionId);
+      const parentCand = sanitizeLeaseLinkId(lease.parentConversationId);
+      const next =
+        rootCand && rootCand !== cur
+          ? rootCand
+          : parentCand && parentCand !== cur
+            ? parentCand
+            : "";
+      if (!next || visited.has(next)) break;
+      visited.add(next);
+      cur = next;
+    }
+    return cur;
+  }
+
+  /** Return [sessionId, ...descendantSubagentIds] for clean parent-level rollup without double-counting */
+  getSessionFamilyIds(sessionId) {
+    const raw = typeof sessionId === "string" ? sessionId.trim() : "";
+    if (!raw) return ["default"];
+    if (isSpecialSessionScope(raw)) return [raw];
+    this.open();
+    let rows = [];
+    try {
+      rows = this.listMetaByPrefix("watchdog_lease:");
+    } catch {
+      return [raw];
+    }
+    if (!rows || rows.length === 0) return [raw];
+
+    const links = new Map();
+    for (const row of rows) {
+      if (!row || typeof row.key !== "string" || typeof row.value !== "string") continue;
+      const cid = sanitizeLeaseLinkId(row.key.slice("watchdog_lease:".length));
+      if (!cid) continue;
+      try {
+        const lease = JSON.parse(row.value);
+        if (!lease || typeof lease !== "object") continue;
+        const rootCand = sanitizeLeaseLinkId(lease.rootSessionId);
+        const parentCand = sanitizeLeaseLinkId(lease.parentConversationId);
+        const ancestors = [];
+        if (parentCand && parentCand !== cid) ancestors.push(parentCand);
+        if (rootCand && rootCand !== cid && rootCand !== parentCand) ancestors.push(rootCand);
+        if (ancestors.length > 0) {
+          links.set(cid, ancestors);
+        }
+      } catch {}
+    }
+
+    const family = new Set([raw]);
+    for (const cid of links.keys()) {
+      if (family.has(cid)) continue;
+      const queue = [...(links.get(cid) || [])];
+      const seen = new Set([cid]);
+      while (queue.length > 0 && seen.size <= 32) {
+        const anc = queue.shift();
+        if (!anc || seen.has(anc)) continue;
+        if (anc === raw) {
+          family.add(cid);
+          break;
+        }
+        seen.add(anc);
+        const nextAncs = links.get(anc);
+        if (nextAncs) {
+          for (const na of nextAncs) {
+            if (!seen.has(na)) queue.push(na);
+          }
+        }
+      }
+      if (family.size >= 500) break;
+    }
+    return Array.from(family);
+  }
+
   /** Calculate token savings & statistics */
   getStats(sessionId, options = {}) {
     this.open();
     const sid = sessionId || "default";
     const sinceTs = options.sinceTs || null;
     const sinceIso = sinceTs ? new Date(sinceTs).toISOString() : null;
+    const isGlobalOrApp = sid === "all" || sid === "lifetime" || (sid === "app" && sinceIso);
+    const effectiveSid = isGlobalOrApp ? sid : this.resolveRootSessionId(sid);
+    const familyIds = isGlobalOrApp ? null : this.getSessionFamilyIds(effectiveSid);
+    const inClause = familyIds && familyIds.length > 1 ? `IN (${familyIds.map(() => "?").join(",")})` : "= ?";
+    const sidParams = familyIds && familyIds.length > 1 ? familyIds : [effectiveSid];
 
     let eventStats;
     let sourceStats;
@@ -311,7 +429,7 @@ export class SettingsMaintenanceMethods {
           AND NOT EXISTS (
             SELECT 1 FROM events e
             WHERE e.tool = 'ctx_index'
-              AND e.sandbox_bytes = s.bytes_total
+              AND (e.source_id = s.id OR e.sandbox_bytes = s.bytes_total)
           )
       `).get();
     } else if (sid === "app" && sinceIso) {
@@ -342,7 +460,7 @@ export class SettingsMaintenanceMethods {
           AND NOT EXISTS (
             SELECT 1 FROM events e
             WHERE e.tool = 'ctx_index'
-              AND e.sandbox_bytes = s.bytes_total
+              AND (e.source_id = s.id OR e.sandbox_bytes = s.bytes_total)
           )
       `).get(sinceIso, sinceTs);
     } else {
@@ -353,8 +471,8 @@ export class SettingsMaintenanceMethods {
           SUM(returned_bytes) AS total_returned_bytes,
           SUM(MAX(0, MAX(sandbox_bytes, bytes, returned_bytes) - returned_bytes)) AS total_kept_out_bytes
         FROM events
-        WHERE session_id = ? AND COALESCE(key, '') != 'dedup_bypass'
-      `).get(sid);
+        WHERE session_id ${inClause} AND COALESCE(key, '') != 'dedup_bypass'
+      `).get(...sidParams);
 
       sourceStats = this.db.prepare(`
         SELECT
@@ -362,21 +480,21 @@ export class SettingsMaintenanceMethods {
           SUM(bytes_total) AS total_source_bytes,
           SUM(chunk_count) AS total_chunks
         FROM sources
-        WHERE session_id = ?
-      `).get(sid);
+        WHERE session_id ${inClause}
+      `).get(...sidParams);
 
       unrecordedSources = this.db.prepare(`
         SELECT COALESCE(SUM(bytes_total), 0) AS unrecorded_source_bytes
         FROM sources s
-        WHERE s.session_id = ?
+        WHERE s.session_id ${inClause}
           AND s.kind NOT IN ('execution', 'batch', 'tool_output', 'exec')
           AND NOT EXISTS (
             SELECT 1 FROM events e
-            WHERE e.session_id = s.session_id
+            WHERE e.session_id ${inClause}
               AND e.tool = 'ctx_index'
-              AND e.sandbox_bytes = s.bytes_total
+              AND (e.source_id = s.id OR e.sandbox_bytes = s.bytes_total)
           )
-      `).get(sid);
+      `).get(...sidParams, ...sidParams);
     }
 
     const unrecordedBytes = unrecordedSources?.unrecorded_source_bytes || 0;
@@ -404,8 +522,8 @@ export class SettingsMaintenanceMethods {
         breakdownRows = this.db.prepare(`
           SELECT kind, COUNT(*) AS cnt,
             COALESCE(SUM(MAX(0, MAX(sandbox_bytes, bytes, returned_bytes) - returned_bytes)), 0) AS saved_bytes
-          FROM events WHERE session_id = ? AND COALESCE(key, '') != 'dedup_bypass' GROUP BY kind
-        `).all(sid);
+          FROM events WHERE session_id ${inClause} AND COALESCE(key, '') != 'dedup_bypass' GROUP BY kind
+        `).all(...sidParams);
       }
     } catch {}
 
@@ -415,8 +533,10 @@ export class SettingsMaintenanceMethods {
       dedups: 0,
       executions: 0,
       indexes: 0,
+      fastTools: 0,
       cliFilterSavedBytes: 0,
-      dedupSavedBytes: 0
+      dedupSavedBytes: 0,
+      fastToolSavedBytes: 0
     };
     for (const row of breakdownRows) {
       if (row.kind === "interception") breakdown.interceptions = row.cnt;
@@ -430,6 +550,9 @@ export class SettingsMaintenanceMethods {
         breakdown.executions += row.cnt;
       } else if (row.kind === "index") {
         breakdown.indexes = row.cnt;
+      } else if (row.kind === "fast_slice" || row.kind === "fast_check" || row.kind === "fast_search") {
+        breakdown.fastTools += row.cnt;
+        breakdown.fastToolSavedBytes += row.saved_bytes || 0;
       }
     }
 
@@ -471,7 +594,14 @@ export class SettingsMaintenanceMethods {
       } else if (sid === "app" && sinceIso) {
         rows = this.db.prepare(`${baseSql} WHERE created_at >= ? GROUP BY kind, COALESCE(key, '')`).all(sinceIso);
       } else {
-        rows = this.db.prepare(`${baseSql} WHERE session_id = ? GROUP BY kind, COALESCE(key, '')`).all(sid);
+        const effectiveSid = this.resolveRootSessionId(sid);
+        const familyIds = this.getSessionFamilyIds(effectiveSid);
+        if (familyIds.length > 1) {
+          const placeholders = familyIds.map(() => "?").join(",");
+          rows = this.db.prepare(`${baseSql} WHERE session_id IN (${placeholders}) GROUP BY kind, COALESCE(key, '')`).all(...familyIds);
+        } else {
+          rows = this.db.prepare(`${baseSql} WHERE session_id = ? GROUP BY kind, COALESCE(key, '')`).all(effectiveSid);
+        }
       }
     } catch {}
 
@@ -481,7 +611,8 @@ export class SettingsMaintenanceMethods {
       diff_read: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 },
       large_file_guard: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 },
       sandbox_execute: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 },
-      fts_index: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 }
+      fts_index: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 },
+      fast_tools: { calls: 0, rawBytes: 0, returnedBytes: 0, savedBytes: 0 }
     };
 
     const add = (name, r) => {
@@ -501,6 +632,7 @@ export class SettingsMaintenanceMethods {
       else if (r.kind === "interception") add("large_file_guard", r);
       else if (r.kind === "execution" || r.kind === "batch") add("sandbox_execute", r);
       else if (r.kind === "index") add("fts_index", r);
+      else if (r.kind === "fast_slice" || r.kind === "fast_check" || r.kind === "fast_search") add("fast_tools", r);
     }
 
     const ghost =
@@ -1299,7 +1431,7 @@ export class SettingsMaintenanceMethods {
     return boolVal;
   }
 
-  /** Return last remembered non-zero global keepalive max count (1..20, fallback 3) */
+  /** Return last remembered non-zero global keepalive max count (1..20, fallback 1) */
   getFallbackNonZeroKeepaliveMaxCount() {
     this.open();
     const raw = this.getMeta("cache:ttl_keepalive_last_nonzero_max", null);
@@ -1314,7 +1446,7 @@ export class SettingsMaintenanceMethods {
     if (Number.isFinite(cfgMax) && cfgMax >= 1) {
       return Math.min(20, Math.max(1, Math.floor(cfgMax)));
     }
-    return 3;
+    return 1;
   }
 
   /** True iff global keepalive max count (0..20) has been explicitly persisted in SQLite meta */
@@ -1334,7 +1466,7 @@ export class SettingsMaintenanceMethods {
       return 0;
     }
     if (snap.sources.ttlKeepaliveMaxCount === "env") {
-      return clampGlobal(snap.values.ttlKeepaliveMaxCount ?? 3);
+      return clampGlobal(snap.values.ttlKeepaliveMaxCount ?? 1);
     }
     const envForcedOn = snap.sources.ttlKeepalive === "env" && snap.values.ttlKeepalive === true;
     this.open();
@@ -1349,7 +1481,7 @@ export class SettingsMaintenanceMethods {
     if (snap.values.ttlKeepalive === false) {
       return 0;
     }
-    const cfgVal = clampGlobal(snap.values.ttlKeepaliveMaxCount ?? 3);
+    const cfgVal = clampGlobal(snap.values.ttlKeepaliveMaxCount ?? 1);
     return cfgVal === 0 && envForcedOn ? this.getFallbackNonZeroKeepaliveMaxCount() : cfgVal;
   }
 
@@ -1363,7 +1495,7 @@ export class SettingsMaintenanceMethods {
       typeof maxCount === "object" ||
       (typeof maxCount === "string" && maxCount.trim() === "");
     const n = isBlankOrInvalid ? NaN : Number(maxCount);
-    const clamped = Number.isFinite(n) ? Math.min(20, Math.max(0, Math.floor(n))) : 3;
+    const clamped = Number.isFinite(n) ? Math.min(20, Math.max(0, Math.floor(n))) : 1;
     this.setMeta("cache:ttl_keepalive_global_max_count", String(clamped));
     if (clamped >= 1) {
       this.setMeta("cache:ttl_keepalive_last_nonzero_max", String(clamped));
@@ -1371,7 +1503,72 @@ export class SettingsMaintenanceMethods {
     return clamped;
   }
 
-  /** Check if KV-cache TTL auto-keepalive is enabled for a conversation (default ON; env kill-switch > per-conv sqlite > env max/on > global sqlite > config) */
+  /** True iff global keepalive min context % (0..100) has been explicitly persisted in SQLite meta */
+  hasExplicitGlobalTtlKeepaliveMinContextPct() {
+    this.open();
+    const raw = this.getMeta("cache:ttl_keepalive_min_context_pct", null);
+    if (raw === null || raw === "") return false;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 && n <= 100;
+  }
+
+  /** Resolve global default keepalive min context window % (0..100, default 15%; env > sqlite > config) */
+  getGlobalTtlKeepaliveMinContextPct() {
+    const snap = getConfigSnapshot();
+    const clampPct = (v) => Math.min(100, Math.max(0, Math.floor(Number(v))));
+    if (snap.sources.ttlKeepaliveMinContextPct === "env") {
+      return clampPct(snap.values.ttlKeepaliveMinContextPct ?? 15);
+    }
+    this.open();
+    const raw = this.getMeta("cache:ttl_keepalive_min_context_pct", null);
+    if (raw !== null && raw !== "") {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n >= 0 && n <= 100) {
+        return clampPct(n);
+      }
+    }
+    return clampPct(snap.values.ttlKeepaliveMinContextPct ?? 15);
+  }
+
+  /** Persist global default keepalive min context window % (0..100; 0 means no threshold) in SQLite meta */
+  setGlobalTtlKeepaliveMinContextPct(pct) {
+    this.open();
+    const isBlankOrInvalid =
+      pct === null ||
+      pct === undefined ||
+      typeof pct === "boolean" ||
+      typeof pct === "object" ||
+      (typeof pct === "string" && pct.trim() === "");
+    const n = isBlankOrInvalid ? NaN : Number(pct);
+    const clamped = Number.isFinite(n) ? Math.min(100, Math.max(0, Math.floor(n))) : 15;
+    this.setMeta("cache:ttl_keepalive_min_context_pct", String(clamped));
+    return clamped;
+  }
+
+  /** Read smoothed keepalive send->PreInvocation delivery latency in ms (0..20000; 0 = uncalibrated) */
+  getTtlKeepaliveDeliveryMs() {
+    this.open();
+    const raw = this.getMeta("cache:ttl_keepalive_delivery_ms", null);
+    if (raw === null || raw === "") return 0;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.min(20000, Math.max(0, Math.round(n))) : 0;
+  }
+
+  /** Record a measured keepalive send->PreInvocation ack latency sample (EMA smoothed, clamped 50..20000 ms) */
+  recordTtlKeepaliveDeliveryMs(sampleMs) {
+    const s = Number(sampleMs);
+    if (!Number.isFinite(s) || s <= 0 || s > 30000) {
+      return this.getTtlKeepaliveDeliveryMs();
+    }
+    this.open();
+    const clampedSample = Math.min(20000, Math.max(50, Math.round(s)));
+    const prev = this.getTtlKeepaliveDeliveryMs();
+    const next = prev > 0 ? Math.round(prev * 0.6 + clampedSample * 0.4) : clampedSample;
+    this.setMeta("cache:ttl_keepalive_delivery_ms", String(next));
+    return next;
+  }
+
+  /** Resolve opt-in keepalive: env kill-switch > per-conv sqlite > env max/on > global sqlite > config. */
   isTtlKeepaliveEnabled(conversationId = null) {
     const snap = getConfigSnapshot();
     if (snap.sources.ttlKeepalive === "env" && snap.values.ttlKeepalive === false) {
@@ -1460,22 +1657,18 @@ export class SettingsMaintenanceMethods {
               continue;
             }
           }
-          if (!leaseObj?.convTitle) {
-            const txPath = resolveStoreCandidateTranscriptPath(cid, {
-              transcriptPath: typeof leaseObj?.transcriptPath === "string" ? leaseObj.transcriptPath : "",
+          const txPath = resolveStoreCandidateTranscriptPath(cid, {
+            transcriptPath: typeof leaseObj?.transcriptPath === "string" ? leaseObj.transcriptPath : "",
+            allowDefaultDb: allowDefaultSummaryDb
+          });
+          if ((allowDefaultSummaryDb || txPath) && DatabaseSyncCtor) {
+            const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
+              transcriptPath: txPath,
               allowDefaultDb: allowDefaultSummaryDb
             });
-            if ((allowDefaultSummaryDb || txPath) && DatabaseSyncCtor) {
-              const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
-                transcriptPath: txPath,
-                allowDefaultDb: allowDefaultSummaryDb
-              });
-              if (summary.isSubagent) continue;
-              if (!summary.title && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) continue;
-            } else if (txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
-              continue;
-            }
+            if (summary.isSubagent) continue;
           }
+          if (txPath && inspectTranscriptGenesisFileForSubagent(txPath)) continue;
           return true;
         } catch {}
       }
@@ -1486,7 +1679,7 @@ export class SettingsMaintenanceMethods {
   /** Resolve max auto-keepalive activations for a conversation before a fresh user message (1..20, fallback to last non-zero when global is 0) */
   getTtlKeepaliveMaxCount(conversationId = null) {
     const snap = getConfigSnapshot();
-    const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 3)));
+    const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 1)));
     const cleanId = this._sanitizeKeepaliveConvId(conversationId);
     if (cleanId) {
       const st = this.getTtlKeepaliveState(cleanId);
@@ -1507,7 +1700,7 @@ export class SettingsMaintenanceMethods {
 
   /** Persist per-conversation max auto-keepalive count (1..20) in SQLite meta */
   setTtlKeepaliveMaxCount(maxCount, conversationId = null) {
-    const clamped = Math.min(20, Math.max(1, Math.floor(Number(maxCount) || 3)));
+    const clamped = Math.min(20, Math.max(1, Math.floor(Number(maxCount) || 1)));
     const targetId = this._sanitizeKeepaliveConvId(conversationId) || "__unbound__";
     const cur = this.getTtlKeepaliveState(targetId);
     const shouldAutoEnable = cur.enabled === null && this.getGlobalTtlKeepaliveMaxCount() === 0;
@@ -1542,6 +1735,8 @@ export class SettingsMaintenanceMethods {
       !cur.lastIdleAnchorTs &&
       !cur.lastSentTs &&
       !cur.pendingAck &&
+      !cur.coldMissTripped &&
+      !cur.inKeepaliveTurn &&
       !cur.lastError
     ) {
       this.deleteMeta(metaKey);
@@ -1574,6 +1769,9 @@ export class SettingsMaintenanceMethods {
       lastIdleAnchorTs: 0,
       lastSentTs: 0,
       pendingAck: false,
+      coldMissTripped: false,
+      inKeepaliveTurn: false,
+      lastColdCheckUsed: 0,
       lastError: "",
       updatedTs: 0
     };
@@ -1616,6 +1814,12 @@ export class SettingsMaintenanceMethods {
         lastIdleAnchorTs: Number.isFinite(Number(parsed.lastIdleAnchorTs)) && Number(parsed.lastIdleAnchorTs) > 0 ? Math.floor(Number(parsed.lastIdleAnchorTs)) : 0,
         lastSentTs: Number.isFinite(Number(parsed.lastSentTs)) && Number(parsed.lastSentTs) > 0 ? Math.floor(Number(parsed.lastSentTs)) : 0,
         pendingAck: Boolean(parsed.pendingAck),
+        coldMissTripped: Boolean(parsed.coldMissTripped),
+        inKeepaliveTurn: Boolean(parsed.inKeepaliveTurn),
+        lastColdCheckUsed:
+          Number.isFinite(Number(parsed.lastColdCheckUsed)) && Number(parsed.lastColdCheckUsed) >= 0
+            ? Math.floor(Number(parsed.lastColdCheckUsed))
+            : 0,
         lastError: typeof parsed.lastError === "string" ? parsed.lastError.slice(0, 180) : "",
         updatedTs
       };
@@ -1686,6 +1890,9 @@ export class SettingsMaintenanceMethods {
           lastIdleAnchorTs: 0,
           lastSentTs: 0,
           pendingAck: false,
+          coldMissTripped: false,
+          inKeepaliveTurn: false,
+          lastColdCheckUsed: 0,
           lastError: "",
           updatedTs: safeNow
         };
@@ -1719,7 +1926,7 @@ export class SettingsMaintenanceMethods {
       safePatch.maxCount === null
         ? null
         : safePatch.maxCount !== undefined
-          ? Math.min(20, Math.max(1, Math.floor(Number(safePatch.maxCount) || 3)))
+          ? Math.min(20, Math.max(1, Math.floor(Number(safePatch.maxCount) || 1)))
           : cur.maxCount;
     const next = {
       enabled: nextEnabled,
@@ -1737,6 +1944,14 @@ export class SettingsMaintenanceMethods {
           ? Math.max(0, Math.floor(Number(safePatch.lastSentTs) || 0))
           : cur.lastSentTs,
       pendingAck: safePatch.pendingAck !== undefined ? Boolean(safePatch.pendingAck) : cur.pendingAck,
+      coldMissTripped:
+        safePatch.coldMissTripped !== undefined ? Boolean(safePatch.coldMissTripped) : cur.coldMissTripped,
+      inKeepaliveTurn:
+        safePatch.inKeepaliveTurn !== undefined ? Boolean(safePatch.inKeepaliveTurn) : cur.inKeepaliveTurn,
+      lastColdCheckUsed:
+        safePatch.lastColdCheckUsed !== undefined
+          ? Math.max(0, Math.floor(Number(safePatch.lastColdCheckUsed) || 0))
+          : cur.lastColdCheckUsed,
       lastError:
         safePatch.lastError !== undefined ? String(safePatch.lastError || "").slice(0, 180) : cur.lastError,
       updatedTs:
@@ -1748,13 +1963,16 @@ export class SettingsMaintenanceMethods {
     return next;
   }
 
-  /** Reset per-conversation TTL auto-keepalive counter back to 0 */
+  /** Reset per-conversation TTL auto-keepalive counter & cold-miss breaker back to 0 */
   resetTtlKeepaliveState(conversationId, nowMs = Date.now()) {
     return this.setTtlKeepaliveState(conversationId, {
       usedCount: 0,
       lastIdleAnchorTs: 0,
       lastSentTs: 0,
       pendingAck: false,
+      coldMissTripped: false,
+      inKeepaliveTurn: false,
+      lastColdCheckUsed: 0,
       lastError: "",
       updatedTs: nowMs
     });
@@ -2027,33 +2245,9 @@ export class SettingsMaintenanceMethods {
             });
             continue;
           }
-          if (lease.convTitle) {
-            if (
-              lease.phase === "IDLE" &&
-              lease.stopReason !== "USER_CANCELED" &&
-              (allowDefaultSummaryDb || lease.transcriptPath) &&
-              DatabaseSyncCtor
-            ) {
-              const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
-                transcriptPath: typeof lease.transcriptPath === "string" ? lease.transcriptPath : "",
-                allowDefaultDb: allowDefaultSummaryDb
-              });
-              if (summary.killed) {
-                subagentRepairMap.set(cid, {
-                  markSubagent: false,
-                  markKilled: true,
-                  scrubKeepalive: true,
-                  parentId: ""
-                });
-              }
-            }
-            continue;
-          }
-
           let detectedSub = false;
           let detectedKilled = false;
           let foundParent = "";
-          let foundTitle = "";
           const txPath = resolveStoreCandidateTranscriptPath(cid, {
             transcriptPath: typeof lease.transcriptPath === "string" ? lease.transcriptPath : "",
             allowDefaultDb: allowDefaultSummaryDb
@@ -2068,9 +2262,8 @@ export class SettingsMaintenanceMethods {
             if (summary.parentId && summary.parentId !== cid) {
               foundParent = summary.parentId;
             }
-            if (summary.title) foundTitle = summary.title;
           }
-          if (!detectedSub && !foundTitle && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
+          if (!detectedSub && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
             detectedSub = true;
           }
           if (detectedSub || detectedKilled) {
@@ -2096,7 +2289,6 @@ export class SettingsMaintenanceMethods {
           const txPath = resolveStoreCandidateTranscriptPath(cid, { allowDefaultDb: allowDefaultSummaryDb });
           let detectedSub = false;
           let detectedKilled = false;
-          let foundTitle = "";
           if ((allowDefaultSummaryDb || txPath) && DatabaseSyncCtor) {
             const summary = inspectSummaryDbForSubagent(DatabaseSyncCtor, cid, {
               transcriptPath: txPath,
@@ -2104,9 +2296,8 @@ export class SettingsMaintenanceMethods {
             });
             if (summary.isSubagent) detectedSub = true;
             if (summary.killed) detectedKilled = true;
-            if (summary.title) foundTitle = summary.title;
           }
-          if (!detectedSub && !foundTitle && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
+          if (!detectedSub && txPath && inspectTranscriptGenesisFileForSubagent(txPath)) {
             detectedSub = true;
           }
           if (detectedSub || detectedKilled) {
@@ -2441,6 +2632,8 @@ export class SettingsMaintenanceMethods {
                 parsedObj.lastIdleAnchorTs > 0 ||
                 parsedObj.lastSentTs > 0 ||
                 parsedObj.pendingAck ||
+                parsedObj.coldMissTripped ||
+                parsedObj.inKeepaliveTurn ||
                 parsedObj.lastError)
             ) {
               upsertMetaStmt.run(
@@ -2455,6 +2648,9 @@ export class SettingsMaintenanceMethods {
                   lastIdleAnchorTs: 0,
                   lastSentTs: 0,
                   pendingAck: false,
+                  coldMissTripped: false,
+                  inKeepaliveTurn: false,
+                  lastColdCheckUsed: 0,
                   lastError: "",
                   updatedTs: entryTs > 0 ? entryTs : now
                 })

@@ -12,7 +12,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        node-version: ["22", "24"]
+        node-version: ["22.16.0", "22", "24"]
 
     runs-on: ${{ matrix.os }}
 
@@ -35,7 +35,7 @@ jobs:
         run: npm run prefix:budget
 
       - name: Audit Prompt Cache configuration
-        run: npm run cache:audit -- --workspace . --no-live
+        run: node scripts/cache-audit.mjs --workspace . --no-live
 
       - name: Verify AI_REVIEW_BRIEF.md metrics have zero drift
         run: node scripts/gen-review-brief.mjs --check

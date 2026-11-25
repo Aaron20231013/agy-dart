@@ -2,7 +2,7 @@
 .SYNOPSIS
   One-command Windows installer for agy-dart (supports both clone-free `irm ... | iex` and local repo runs).
 .EXAMPLE
-  irm https://raw.githubusercontent.com/zou172866/agy-dart/main/install.ps1 | iex
+  irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-dart/v1.7.2/install.ps1 | iex
   .\install.ps1 -InstallRg
   .\install.ps1 -ToolLoading fast-eager
   .\install.ps1 -WithDevtools
@@ -25,7 +25,7 @@ $ErrorActionPreference = "Stop"
 $ScriptPath = $MyInvocation.MyCommand.Path
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-  $msg = "Node.js >= 22 is required. Install Node.js first: https://nodejs.org/"
+  $msg = "Install Node.js 22.16+ (22.x) or 24+ with built-in SQLite FTS5: https://nodejs.org/"
   if ($ScriptPath) { Write-Error $msg; exit 1 } else { throw $msg }
 }
 
@@ -40,14 +40,14 @@ try {
     $RepoDir = Join-Path $TempWorkDir "repo"
     if (Get-Command git -ErrorAction SilentlyContinue) {
       Write-Host "[agy-dart] Fetching latest release from GitHub..."
-      & git clone --depth 1 --quiet "https://github.com/zou172866/agy-dart.git" $RepoDir
+      & git clone --depth 1 --branch v1.7.2 --quiet "https://github.com/zou172866/Antigravity-agy-dart.git" $RepoDir
       if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE" }
     } else {
       Write-Host "[agy-dart] Downloading archive from GitHub..."
       $ZipFile = Join-Path $TempWorkDir "agy-dart.zip"
-      Invoke-WebRequest -Uri "https://github.com/zou172866/agy-dart/archive/refs/heads/main.zip" -OutFile $ZipFile -UseBasicParsing
+      Invoke-WebRequest -Uri "https://github.com/zou172866/Antigravity-agy-dart/archive/refs/tags/v1.7.2.zip" -OutFile $ZipFile -UseBasicParsing
       Expand-Archive -Path $ZipFile -DestinationPath $TempWorkDir -Force
-      $Extracted = Get-ChildItem -Path $TempWorkDir -Directory -Filter "agy-dart-*" | Select-Object -First 1
+      $Extracted = Get-ChildItem -Path $TempWorkDir -Directory -Filter "*agy-dart-*" | Select-Object -First 1
       if (-not $Extracted) { throw "Failed to unpack agy-dart archive." }
       $RepoDir = $Extracted.FullName
     }

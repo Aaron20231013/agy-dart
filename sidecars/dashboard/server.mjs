@@ -7,19 +7,32 @@ import os from "node:os";
 import { execFile, execSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { getEffectiveConfig } from "../../context/lib/config.js";
+import { executionReceiptsFromSteps, fastToolClaimsFromSteps } from "../../context/lib/execution-receipts.js";
 import { buildHandoffBrief, inferWorkspaceFromStore } from "../../context/lib/handoff.js";
+import {
+  buildStatusLineSetupInfo,
+  collectLocalRollingUsage,
+  projectQuotaSnapshot,
+  readStatusLineQuotaSnapshot
+} from "../../context/lib/quota.js";
 import {
   DEFAULT_STALE_LEASE_MS,
   WatchdogMonitor,
   collectChildSubagentActivity,
-  detectSubagentFromTranscriptFile,
+  classifyTranscriptGenesisFile,
+  inspectLatestTurnInSteps,
   isHeadlessWorkerPrompt,
+  isKeepaliveTurnFlushedForRound,
   isSameWorkspacePath,
   isTrajectoryMetadataSubagent,
   listWatchdogLeases,
   lookupConversationSummary,
   readWatchdogLease,
-  resolveCandidateTranscriptPath
+  readWatchdogTranscriptTail,
+  resolveCandidateTranscriptPath,
+  resolveTrustedCheckpointSessionId,
+  WATCHDOG_PHASES,
+  writeWatchdogLeaseIfUnchanged
 } from "../../context/lib/watchdog.js";
 import {
   analyzeTranscriptCache,
@@ -27,6 +40,7 @@ import {
   CONTEXT_CRITICAL_TOKENS,
   CONTEXT_WARN_TOKENS,
   createEmptyContextComposition,
+  createEmptyDriftBreakdown,
   createEmptySubagentBreakdown,
   DEFAULT_CACHE_TTL_SEC,
   findTranscriptForConversation,
@@ -44,16 +58,23 @@ const { ContextModeStore, FILE_CATEGORIES } = await import("../../context/lib/st
 
 const __selfPath = path.resolve(fileURLToPath(import.meta.url));
 const __dirname = path.dirname(__selfPath);
+const PLUGIN_ROOT = path.resolve(__dirname, "..", "..");
 const HTML_FILE = path.join(__dirname, "index.html");
 const CUSTOM_THEME_CSS_FILE = path.join(__dirname, "custom-theme.css");
 export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
+const OVERSIZED_BODY_DRAIN_TIMEOUT_MS = 5_000;
 const SIDECAR_CSRF_TOKEN = crypto.randomBytes(24).toString("hex");
+const QUOTA_LOCAL_CACHE_TTL_MS = 15_000;
 
 let _runtimeStore = null;
 let _appStartTime = null;
+let _hostStartTime = null;
 let _runtimeInitialized = false;
 let _watchdogMonitor = null;
 const _convProjectIdCache = new Map();
+const _quotaFileUsageCache = new Map();
+let _quotaLocalRollupCache = null;
+let _quotaRefreshScheduled = false;
 
 function runAgentApiAsync(args, { projectId = "", timeoutMs = 12000 } = {}) {
   const exe = process.env.ANTIGRAVITY_AGENTAPI_EXE;
@@ -89,14 +110,8 @@ function isDefaultRuntimeStoreDb(store) {
   return false;
 }
 
-function isSidecarConversationSubagent(conversationId, { store = null, transcriptPath = "", allowDefaultDb = null } = {}) {
-  if (!conversationId || conversationId === "__unbound__" || !isSafeConversationId(conversationId)) {
-    return false;
-  }
+function localConversationIdentity(conversationId, { store = null, transcriptPath = "", allowDefaultDb = null } = {}) {
   const activeStore = store || _runtimeStore;
-  if (_watchdogMonitor && activeStore) {
-    return _watchdogMonitor._isConversationSubagent(activeStore, conversationId);
-  }
   const lease = activeStore ? readWatchdogLease(activeStore, conversationId) : null;
   if (lease) {
     if (
@@ -105,29 +120,35 @@ function isSidecarConversationSubagent(conversationId, { store = null, transcrip
       (lease.rootSessionId && lease.rootSessionId !== conversationId) ||
       (lease.lastUserInput && isHeadlessWorkerPrompt(lease.lastUserInput))
     ) {
-      return true;
+      return "subagent";
     }
-    if (lease.convTitle) return false;
   }
   const effectiveAllowDefaultDb = allowDefaultDb !== null ? Boolean(allowDefaultDb) : isDefaultRuntimeStoreDb(activeStore);
   const txPath =
     transcriptPath ||
     lease?.transcriptPath ||
     resolveCandidateTranscriptPath(conversationId, { allowDefaultDb: effectiveAllowDefaultDb });
-  let foundTitle = "";
+  let summary;
   if (effectiveAllowDefaultDb || txPath) {
-    const summary = lookupConversationSummary(conversationId, {
+    summary = lookupConversationSummary(conversationId, {
       transcriptPath: txPath,
       allowDefaultDb: effectiveAllowDefaultDb,
       checkSubagent: true
     });
-    if (summary.isSubagent) return true;
-    if (summary.title) foundTitle = summary.title;
+    if (summary.isSubagent) return "subagent";
   }
-  if (!foundTitle && txPath && detectSubagentFromTranscriptFile(txPath)) {
-    return true;
+  const genesis = classifyTranscriptGenesisFile(txPath);
+  if (genesis !== "unknown") return genesis;
+  return summary?.found ? "human" : "unknown";
+}
+
+function isSidecarConversationSubagent(conversationId, options = {}) {
+  if (!isSafeConversationId(conversationId) || conversationId === "__unbound__") return false;
+  const store = options.store || _runtimeStore;
+  if (_watchdogMonitor && store) {
+    return _watchdogMonitor._isConversationSubagent(store, conversationId);
   }
-  return false;
+  return localConversationIdentity(conversationId, options) === "subagent";
 }
 
 function isSidecarConversationKilled(conversationId, { store = null, transcriptPath = "", allowDefaultDb = null } = {}) {
@@ -158,7 +179,8 @@ export async function sendSidecarKeepaliveMessage(
   if (!cleanMsg) {
     return { ok: false, error: "empty_message" };
   }
-  if (isSidecarConversationSubagent(conversationId, { allowDefaultDb: allowDefaultSummaryDb })) {
+  const localIdentity = localConversationIdentity(conversationId, { allowDefaultDb: allowDefaultSummaryDb });
+  if (localIdentity === "subagent") {
     _convProjectIdCache.delete(conversationId);
     return { ok: false, skippedSubagent: true, error: "subagent_keepalive_suppressed" };
   }
@@ -169,10 +191,12 @@ export async function sendSidecarKeepaliveMessage(
 
   const cachedProjectId = _convProjectIdCache.get(conversationId) || "";
   let projectId = "";
+  let hasMetadata = false;
   try {
     const metaRes = await execFn(["get-conversation-metadata", conversationId], { timeoutMs: 8000 });
     const metaEvent = metaRes?.response?.conversationMetadata || metaRes?.response?.conversation_metadata;
     const metaObj = metaEvent?.metadata && typeof metaEvent.metadata === "object" ? metaEvent.metadata : metaEvent || {};
+    hasMetadata = Boolean(metaEvent && typeof metaObj === "object" && !Array.isArray(metaObj) && Object.keys(metaObj).length);
     if (isTrajectoryMetadataSubagent(conversationId, metaEvent || metaObj)) {
       _convProjectIdCache.delete(conversationId);
       return { ok: false, skippedSubagent: true, error: "subagent_keepalive_suppressed" };
@@ -196,7 +220,10 @@ export async function sendSidecarKeepaliveMessage(
       _convProjectIdCache.set(conversationId, projectId);
     }
   } catch {
-    // Fall back to cached or ambient ANTIGRAVITY_PROJECT_ID if metadata lookup is unavailable
+    // A locally identified primary chat can still use its cached or ambient project.
+  }
+  if (!hasMetadata && localIdentity === "unknown") {
+    return { ok: false, error: "conversation_identity_unavailable" };
   }
   if (!projectId) {
     projectId = cachedProjectId || process.env.ANTIGRAVITY_PROJECT_ID || "";
@@ -213,9 +240,9 @@ export async function sendSidecarKeepaliveMessage(
   }
 }
 
-function getAppStartTime() {
-  if (_appStartTime !== null) return _appStartTime;
-  let ts = null;
+function getHostStartTime() {
+  if (_hostStartTime !== null) return _hostStartTime;
+  _hostStartTime = 0;
   if (process.platform === "win32") {
     try {
       const out = execSync(
@@ -223,11 +250,14 @@ function getAppStartTime() {
         { encoding: "utf8", timeout: 3000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }
       );
       const parsed = new Date(out.trim()).getTime();
-      if (!Number.isNaN(parsed) && parsed > 0) ts = parsed;
+      if (Number.isFinite(parsed) && parsed > 0) _hostStartTime = parsed;
     } catch {}
   }
-  _appStartTime = ts || (Date.now() - Math.round(process.uptime() * 1000));
-  return _appStartTime;
+  return _hostStartTime;
+}
+
+function getAppStartTime() {
+  return _appStartTime ??= getHostStartTime() || (Date.now() - Math.round(process.uptime() * 1000));
 }
 
 export function stopWatchdogMonitor() {
@@ -243,7 +273,8 @@ export function getWatchdogMonitor(options = {}) {
   if (!_watchdogMonitor) {
     _watchdogMonitor = new WatchdogMonitor({
       getStore: () => getRuntimeStore(),
-      getAppStartTime: () => getAppStartTime(),
+      // Only a known host restart can invalidate a lease that predates the dashboard.
+      getAppStartTime: getHostStartTime,
       ...options
     });
   }
@@ -253,6 +284,10 @@ export function getWatchdogMonitor(options = {}) {
 export function closeRuntimeStore() {
   stopWatchdogMonitor();
   _convProjectIdCache.clear();
+  claimedTranscriptStatCache.clear();
+  _quotaFileUsageCache.clear();
+  _quotaLocalRollupCache = null;
+  _quotaRefreshScheduled = false;
   if (_runtimeStore) {
     try {
       _runtimeStore.close();
@@ -347,6 +382,19 @@ export function timingSafeTokenMatch(provided, expected) {
   return crypto.timingSafeEqual(a, b);
 }
 
+function discardOversizedBody(req) {
+  req.resume();
+  if (req.complete || req.destroyed) return;
+  // Let a normal upload finish after the 413, but bound time spent draining an unfinished one.
+  const timer = setTimeout(() => {
+    if (!req.complete && !req.destroyed) req.destroy();
+  }, OVERSIZED_BODY_DRAIN_TIMEOUT_MS);
+  timer.unref();
+  const cancelTimer = () => clearTimeout(timer);
+  req.once("end", cancelTimer);
+  req.once("close", cancelTimer);
+}
+
 export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
   return new Promise((resolve) => {
     const rawContentLen = req.headers?.["content-length"];
@@ -354,9 +402,7 @@ export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
       const declaredLen = Number(rawContentLen);
       if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
         req.on("error", () => {});
-        try {
-          req.pause();
-        } catch {}
+        discardOversizedBody(req);
         resolve({ ok: false, status: 413, error: `Request body exceeds ${Math.round(maxBytes / 1024)} KB limit` });
         return;
       }
@@ -379,9 +425,7 @@ export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
       if (totalBytes > maxBytes) {
         overflowed = true;
         chunks.length = 0;
-        try {
-          req.pause();
-        } catch {}
+        discardOversizedBody(req);
         finish({ ok: false, status: 413, error: `Request body exceeds ${Math.round(maxBytes / 1024)} KB limit` });
         return;
       }
@@ -420,17 +464,6 @@ export function readBoundedJsonBody(req, maxBytes = MAX_REQUEST_BODY_BYTES) {
         finish({ ok: false, status: 400, error: "Request stream closed prematurely" });
       }
     });
-  });
-}
-
-function scheduleOversizedSocketClose(req, res) {
-  res.once("finish", () => {
-    const closeTimer = setTimeout(() => {
-      try {
-        req.destroy();
-      } catch {}
-    }, 150);
-    closeTimer.unref?.();
   });
 }
 
@@ -551,19 +584,145 @@ function resolveTargetSession(data, defaultConvId = "default") {
   return { scope, convId, targetSid };
 }
 
+const claimedTranscriptStatCache = new Map(); // `${dbPath}|${txPath}` -> `${mtimeMs}:${size}`
+const MAX_CLAIMED_TX_CACHE_ENTRIES = 128;
+
+function setClaimedTranscriptCache(cacheKey, statSig) {
+  if (claimedTranscriptStatCache.has(cacheKey)) {
+    claimedTranscriptStatCache.delete(cacheKey);
+  } else if (claimedTranscriptStatCache.size >= MAX_CLAIMED_TX_CACHE_ENTRIES) {
+    const oldest = claimedTranscriptStatCache.keys().next().value;
+    if (oldest !== undefined) claimedTranscriptStatCache.delete(oldest);
+  }
+  claimedTranscriptStatCache.set(cacheKey, statSig);
+}
+
+function syncTranscriptClaimsForSteps(store, transcriptOwner, steps, { isFullTranscript = true } = {}) {
+  if (!store || !transcriptOwner || !Array.isArray(steps) || steps.length === 0) return true;
+  let rootOwner = transcriptOwner;
+  try {
+    if (typeof store.resolveRootSessionId === "function") {
+      rootOwner = store.resolveRootSessionId(transcriptOwner);
+    }
+  } catch {
+    return false;
+  }
+  let ok = true;
+  try {
+    store.claimExecutionReceipts(rootOwner, executionReceiptsFromSteps(steps));
+  } catch {
+    ok = false;
+  }
+  try {
+    const fastClaims = fastToolClaimsFromSteps(steps);
+    if (fastClaims.length > 0 && typeof store.claimFastToolClaims === "function") {
+      let windowStartIso = "";
+      if (!isFullTranscript) {
+        let earliestMs = Infinity;
+        for (const c of fastClaims) {
+          const t = Number.isFinite(c.createdAtMs) ? c.createdAtMs : c.completedAtMs;
+          if (Number.isFinite(t) && t < earliestMs) {
+            earliestMs = t;
+          }
+        }
+        if (Number.isFinite(earliestMs)) {
+          windowStartIso = new Date(earliestMs - 120000).toISOString();
+        }
+      }
+      store.claimFastToolClaims(rootOwner, fastClaims, {
+        directConvId: transcriptOwner,
+        windowStartIso,
+        isFullTranscript
+      });
+    }
+  } catch {
+    ok = false;
+  }
+  return ok;
+}
+
+function syncConversationFamilyTranscripts(store, convId) {
+  if (
+    !store ||
+    !convId ||
+    convId === "default" ||
+    convId === "all" ||
+    convId === "app" ||
+    convId === "lifetime" ||
+    convId === "__unbound__" ||
+    !isSafeConversationId(convId)
+  ) {
+    return;
+  }
+  try {
+    const rootId = typeof store.resolveRootSessionId === "function" ? store.resolveRootSessionId(convId) : convId;
+    const familySet = new Set(
+      typeof store.getSessionFamilyIds === "function" ? store.getSessionFamilyIds(rootId) : [rootId]
+    );
+    familySet.add(convId);
+    const leases = listWatchdogLeases(store);
+    const candidates = new Map(); // cid -> { txPath, updatedTs }
+    for (const lease of leases) {
+      if (!lease || !lease.conversationId) continue;
+      const cid = lease.conversationId;
+      const leaseRoot = lease.rootSessionId || lease.parentConversationId || cid;
+      if (!familySet.has(cid) && leaseRoot !== rootId && lease.parentConversationId !== rootId) continue;
+      if (lease.transcriptPath && typeof lease.transcriptPath === "string") {
+        candidates.set(cid, { txPath: lease.transcriptPath, updatedTs: Number(lease.updatedTs || 0) });
+      }
+    }
+    if (!candidates.has(rootId)) {
+      const rootTx =
+        resolveCandidateTranscriptPath(rootId, { allowDefaultDb: isDefaultRuntimeStoreDb(store) }) ||
+        findTranscriptForConversation(rootId, { exactOnly: true });
+      if (rootTx) candidates.set(rootId, { txPath: rootTx, updatedTs: Date.now() });
+    }
+    const sorted = Array.from(candidates.entries())
+      .sort((a, b) => b[1].updatedTs - a[1].updatedTs)
+      .slice(0, 12);
+    for (const [cid, info] of sorted) {
+      const txPath = info.txPath;
+      if (!txPath || !fs.existsSync(txPath)) continue;
+      let st;
+      try {
+        st = fs.statSync(txPath);
+        if (!st.isFile() || st.size <= 0) continue;
+      } catch {
+        continue;
+      }
+      const cacheKey = `${store.dbPath || ""}|${rootId}|${txPath}`;
+      const statSig = `${st.mtimeMs}:${st.size}`;
+      if (claimedTranscriptStatCache.get(cacheKey) === statSig) continue;
+      const isFull = st.size <= 2 * 1024 * 1024;
+      const steps = isFull
+        ? parseTranscriptLines(fs.readFileSync(txPath, "utf8"))
+        : readTranscriptTail(txPath, 524288);
+      if (syncTranscriptClaimsForSteps(store, cid, steps, { isFullTranscript: isFull })) {
+        setClaimedTranscriptCache(cacheKey, statSig);
+      }
+    }
+  } catch {}
+}
+
 function getStatsPayload(data, defaultConvId = "default") {
   const store = getRuntimeStore();
   const appStartTime = getAppStartTime();
   const { scope, convId, targetSid } = resolveTargetSession(data, defaultConvId);
   const isLifetimeScope = scope === "lifetime" || scope === "all";
   const isAppScope = scope === "app" || scope === "session";
+  const effectiveConvId =
+    !isLifetimeScope && !isAppScope && typeof store.resolveRootSessionId === "function"
+      ? store.resolveRootSessionId(convId)
+      : convId;
+  const statsTargetSid = isLifetimeScope ? "all" : isAppScope ? "app" : effectiveConvId;
   let stats;
   if (isLifetimeScope) {
     stats = store.getStats("all");
   } else if (isAppScope) {
     stats = store.getStats("app", { sinceTs: appStartTime });
   } else {
-    stats = store.getStats(convId);
+    syncConversationFamilyTranscripts(store, effectiveConvId);
+    stats = store.getStats(effectiveConvId);
   }
 
   stats.scope = scope;
@@ -620,10 +779,13 @@ function getStatsPayload(data, defaultConvId = "default") {
   stats.cliFilterEnabled = store.isCliFilterEnabled(targetSid);
   stats.readDedupEnabled = store.isReadDedupEnabled(targetSid);
   const sinceOpts = scope === "app" || scope === "session" ? { sinceTs: appStartTime } : {};
-  stats.ghost = store.getGhostStats(targetSid, sinceOpts);
-  stats.featureRoi = store.getFeatureRoi(targetSid, { ...sinceOpts, ghost: stats.ghost });
+  stats.ghost = store.getGhostStats(statsTargetSid, sinceOpts);
+  stats.featureRoi = store.getFeatureRoi(statsTargetSid, { ...sinceOpts, ghost: stats.ghost });
   try {
     stats.starPrompt = store.evaluateStarPrompt({ markTriggered: true });
+  } catch {}
+  try {
+    stats.quota = getQuotaPayload({ forceRefresh: Boolean(data?.forceRefresh), allowNonBlocking: true });
   } catch {}
 
   stats.version = getPackageVersion();
@@ -760,6 +922,8 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
   const ttlDesktopNotifyEnabled = store.isTtlDesktopNotifyEnabled();
   const globalTtlKeepaliveMaxCount = store.getGlobalTtlKeepaliveMaxCount();
   const fallbackTtlKeepaliveMaxCount = store.getFallbackNonZeroKeepaliveMaxCount();
+  const globalTtlKeepaliveMinContextPct = store.getGlobalTtlKeepaliveMinContextPct();
+  const deliveryLatencyMs = store.getTtlKeepaliveDeliveryMs();
   const isSpecificConvForKa = Boolean(
     convId && convId !== "default" && convId !== "all" && convId !== "app"
   );
@@ -772,7 +936,11 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
   const kaState =
     !isExplicitSubagentForKa && kaConvId
       ? store.getTtlKeepaliveState(kaConvId)
-      : { usedCount: 0, lastSentTs: 0, lastError: "" };
+      : { usedCount: 0, coldMissTripped: false, lastSentTs: 0, lastError: "" };
+  const initialCustomOverride = Boolean(
+    !isExplicitSubagentForKa && kaConvId && store.hasCustomTtlKeepaliveOverride(kaConvId)
+  );
+  const defaultWindowTokens = resolveModelProfile(null).windowTokens;
   const ttlKeepalive = {
     conversationId: kaConvId,
     enabled: isExplicitSubagentForKa ? false : store.isTtlKeepaliveEnabled(kaConvId || null),
@@ -781,11 +949,16 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     maxCount: store.getTtlKeepaliveMaxCount(kaConvId || null),
     globalMaxCount: globalTtlKeepaliveMaxCount,
     fallbackMaxCount: fallbackTtlKeepaliveMaxCount,
-    isCustomOverride: Boolean(
-      !isExplicitSubagentForKa && kaConvId && store.hasCustomTtlKeepaliveOverride(kaConvId)
-    ),
+    minContextPct: globalTtlKeepaliveMinContextPct,
+    minContextTokens: initialCustomOverride
+      ? 0
+      : Math.round((defaultWindowTokens * globalTtlKeepaliveMinContextPct) / 100),
+    windowTokens: defaultWindowTokens,
+    isCustomOverride: initialCustomOverride,
     usedCount: kaState.usedCount,
-    leadSec: Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30))),
+    coldMissTripped: Boolean(kaState.coldMissTripped),
+    deliveryLatencyMs,
+    leadSec: Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 60))),
     lastSentTs: kaState.lastSentTs || 0,
     lastError: kaState.lastError || ""
   };
@@ -824,6 +997,13 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     const ttlSource = explicitTtlSec !== undefined ? "explicit" : "profile";
     const effTtl = explicitTtlSec ?? defProfile.ttlSec;
     const conversationActive = isSpecificConv ? isSidecarConversationActive(convId, store) : false;
+    const noTxKeepalive = {
+      ...ttlKeepalive,
+      windowTokens: effectiveWindow,
+      minContextTokens: ttlKeepalive.isCustomOverride
+        ? 0
+        : Math.round((effectiveWindow * globalTtlKeepaliveMinContextPct) / 100)
+    };
     return {
       ok: true,
       transcriptFound: false,
@@ -834,7 +1014,8 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       ttlDesktopNotifyEnabled,
       globalTtlKeepaliveMaxCount,
       fallbackTtlKeepaliveMaxCount,
-      ttlKeepalive,
+      globalTtlKeepaliveMinContextPct,
+      ttlKeepalive: noTxKeepalive,
       cacheTtlSec: effTtl,
       ttlSource,
       ttlCalibration: {
@@ -886,6 +1067,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
         multimodal_media: 0,
         prefix_drift: 0
       },
+      driftBreakdown: createEmptyDriftBreakdown(),
       wastedTokensTotal: 0,
       duplicateReadCount: 0,
       loopWatch: {
@@ -901,7 +1083,8 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       contextComposition: createEmptyContextComposition(),
       subagentBreakdown: createEmptySubagentBreakdown(),
       recentTurns: [],
-      topContextDeltas: []
+      topContextDeltas: [],
+      recentBusts: []
     };
   }
   try {
@@ -916,7 +1099,9 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
           supported: false,
           isSubagent: true,
           isCustomOverride: false,
+          minContextTokens: 0,
           usedCount: 0,
+          coldMissTripped: false,
           lastSentTs: 0,
           lastError: ""
         };
@@ -928,6 +1113,7 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
         : resolvedObsConvId;
       if (fallbackPrimaryConvId) {
         const resolvedKa = store.getTtlKeepaliveState(fallbackPrimaryConvId);
+        const resolvedCustom = store.hasCustomTtlKeepaliveOverride(fallbackPrimaryConvId);
         effectiveTtlKeepalive = {
           ...ttlKeepalive,
           conversationId: fallbackPrimaryConvId,
@@ -935,8 +1121,9 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
           supported: true,
           isSubagent: false,
           maxCount: store.getTtlKeepaliveMaxCount(fallbackPrimaryConvId),
-          isCustomOverride: store.hasCustomTtlKeepaliveOverride(fallbackPrimaryConvId),
+          isCustomOverride: resolvedCustom,
           usedCount: resolvedKa.usedCount,
+          coldMissTripped: Boolean(resolvedKa.coldMissTripped),
           lastSentTs: resolvedKa.lastSentTs || 0,
           lastError: resolvedKa.lastError || ""
         };
@@ -948,13 +1135,26 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
     const cacheKey = `${baseKeyPrefix}:${calStamp}`;
     const cached = parsedDiagCache.get(cacheKey);
     let diag;
+    let parsedSteps = null;
     if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
       diag = refreshWallClockTtl(cached.diag, explicitTtlSec);
     } else {
-      const steps =
-        st.size <= 2 * 1024 * 1024
-          ? parseTranscriptLines(fs.readFileSync(transcriptPath, "utf8"))
-          : readTranscriptTail(transcriptPath, 524288);
+      const isFullTranscript = st.size <= 2 * 1024 * 1024;
+      const steps = isFullTranscript
+        ? parseTranscriptLines(fs.readFileSync(transcriptPath, "utf8"))
+        : readTranscriptTail(transcriptPath, 524288);
+      parsedSteps = steps;
+      const transcriptOwner = inferConvIdFromTranscriptPath(transcriptPath);
+      if (transcriptOwner && transcriptOwner === resolvedObsConvId) {
+        const rootOwner =
+          typeof store.resolveRootSessionId === "function"
+            ? store.resolveRootSessionId(transcriptOwner)
+            : transcriptOwner;
+        if (syncTranscriptClaimsForSteps(store, transcriptOwner, steps, { isFullTranscript })) {
+          setClaimedTranscriptCache(`${store.dbPath || ""}|${rootOwner}|${transcriptPath}`, `${st.mtimeMs}:${st.size}`);
+        }
+        syncConversationFamilyTranscripts(store, transcriptOwner);
+      }
       const nowMs = Date.now();
       const obsConvId = resolvedObsConvId;
       const diagOpts = {
@@ -983,6 +1183,78 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       });
       diag = { ...diag, serverNowMs: nowMs };
     }
+
+    // Layer-2 post-flush cold-miss circuit breaker & live window-token threshold sync
+    const kaTargetForDiag = effectiveTtlKeepalive.conversationId;
+    if (
+      kaTargetForDiag &&
+      kaTargetForDiag !== "__unbound__" &&
+      !effectiveTtlKeepalive.isSubagent &&
+      kaTargetForDiag === resolvedObsConvId
+    ) {
+      const liveKa = store.getTtlKeepaliveState(kaTargetForDiag);
+      if (
+        liveKa.usedCount >= 1 &&
+        !liveKa.pendingAck &&
+        !liveKa.inKeepaliveTurn &&
+        (liveKa.lastColdCheckUsed || 0) < liveKa.usedCount
+      ) {
+        const tailToCheck = parsedSteps || readWatchdogTranscriptTail(transcriptPath, 32768).steps;
+        const info = inspectLatestTurnInSteps(tailToCheck);
+        if (isKeepaliveTurnFlushedForRound(info, liveKa)) {
+          const nextColdTripped = Boolean(liveKa.coldMissTripped || info.cacheReadTokens === 0);
+          store.setTtlKeepaliveState(kaTargetForDiag, {
+            coldMissTripped: nextColdTripped,
+            lastColdCheckUsed: liveKa.usedCount,
+            updatedTs: Date.now()
+          });
+          effectiveTtlKeepalive = { ...effectiveTtlKeepalive, coldMissTripped: nextColdTripped };
+        }
+      }
+      if (diag?.currentContextTokens > 0) {
+        try {
+          const idleLease = readWatchdogLease(store, kaTargetForDiag);
+          if (
+            idleLease &&
+            idleLease.phase === WATCHDOG_PHASES.IDLE &&
+            !idleLease.isSubagent &&
+            Number(idleLease.contextTokens || 0) === 0
+          ) {
+            const parsedLastPlannerMs = diag.lastPlannerAt ? Date.parse(diag.lastPlannerAt) : NaN;
+            const anchorTs = idleLease.idleAnchorTs || idleLease.updatedTs || 0;
+            const syncedOriginTs =
+              Number.isFinite(parsedLastPlannerMs) &&
+              parsedLastPlannerMs > 0 &&
+              anchorTs > 0 &&
+              parsedLastPlannerMs <= anchorTs &&
+              anchorTs - parsedLastPlannerMs <= 30 * 60 * 1000
+                ? Math.floor(parsedLastPlannerMs)
+                : idleLease.cacheOriginTs;
+            writeWatchdogLeaseIfUnchanged(store, idleLease.updatedTs, idleLease.phase, {
+              ...idleLease,
+              contextTokens: Math.floor(Number(diag.currentContextTokens)),
+              ...(Number(diag.modelProfile?.windowTokens) > 0
+                ? { windowTokens: Math.floor(Number(diag.modelProfile.windowTokens)) }
+                : {}),
+              ...(diag.currentModel ? { model: diag.currentModel } : {}),
+              ...(syncedOriginTs > 0 ? { cacheOriginTs: syncedOriginTs } : {})
+            });
+          }
+        } catch {}
+      }
+    }
+    const resolvedWinTokens =
+      Number(diag?.modelProfile?.windowTokens) > 0
+        ? Math.floor(Number(diag.modelProfile.windowTokens))
+        : defaultWindowTokens;
+    effectiveTtlKeepalive = {
+      ...effectiveTtlKeepalive,
+      windowTokens: resolvedWinTokens,
+      minContextTokens: effectiveTtlKeepalive.isCustomOverride
+        ? 0
+        : Math.round((resolvedWinTokens * globalTtlKeepaliveMinContextPct) / 100)
+    };
+
     const activeTargetConvId = resolvedObsConvId || (isSpecificConv ? convId : "");
     const conversationActive = isSidecarConversationActive(activeTargetConvId, store);
     if (
@@ -1002,8 +1274,10 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       ttlDesktopNotifyEnabled,
       globalTtlKeepaliveMaxCount,
       fallbackTtlKeepaliveMaxCount,
+      globalTtlKeepaliveMinContextPct,
       ttlKeepalive: effectiveTtlKeepalive,
       ...diag,
+      driftBreakdown: diag.driftBreakdown ?? createEmptyDriftBreakdown(),
       contextComposition: diag.contextComposition ?? createEmptyContextComposition(),
       subagentBreakdown: diag.subagentBreakdown ?? createEmptySubagentBreakdown(),
       serverNowMs: diag.serverNowMs ?? Date.now()
@@ -1013,6 +1287,8 @@ function getCacheDiagPayload(data, defaultConvId = "default") {
       ok: false,
       transcriptFound: false,
       serverNowMs: Date.now(),
+      driftBreakdown: createEmptyDriftBreakdown(),
+      recentBusts: [],
       contextComposition: createEmptyContextComposition(),
       subagentBreakdown: createEmptySubagentBreakdown(),
       error: err?.message || String(err)
@@ -1188,13 +1464,176 @@ export function resolveAllowedHandoffCwd(rawCwd, knownRoots = []) {
   return "";
 }
 
+const RESERVED_CONFIRMED_CONV_IDS = new Set([
+  "default",
+  "all",
+  "lifetime",
+  "app",
+  "__unbound__",
+  "unknown",
+  "none",
+  "null",
+  "undefined"
+]);
+
+function validateHandoffMode(rawMode, { allowAgent = true } = {}) {
+  if (rawMode === undefined) {
+    return { ok: true, mode: "full" };
+  }
+  if (typeof rawMode !== "string") {
+    return { ok: false, error: "Field 'mode' must be a string ('full' or 'agent')" };
+  }
+  if (rawMode === "full") {
+    return { ok: true, mode: "full" };
+  }
+  if (rawMode === "agent") {
+    if (!allowAgent) {
+      return { ok: false, error: "Handoff mode 'agent' requires POST with application/json" };
+    }
+    return { ok: true, mode: "agent" };
+  }
+  return { ok: false, error: "Invalid 'mode' value: expected 'full' or 'agent'" };
+}
+
+function validateOptionalBooleanField(data, fieldName) {
+  if (data && data[fieldName] !== undefined && typeof data[fieldName] !== "boolean") {
+    return { ok: false, error: `Field '${fieldName}' must be a boolean` };
+  }
+  return { ok: true };
+}
+
+function resolveConfirmedConversation(data = {}, defaultConvId = "default") {
+  const unboundHostTab = isUnboundSidecarHostRequest(data);
+  const safeSessionId = typeof data?.sessionId === "string" ? data.sessionId.trim() : "";
+  const explicitConvId = typeof data?.conversationId === "string" ? data.conversationId.trim() : "";
+  const safeDefaultConv = typeof defaultConvId === "string" ? defaultConvId.trim() : "";
+  const rawScope = typeof data?.scope === "string" && data.scope.trim() ? data.scope.trim() : "";
+  const scope =
+    rawScope === "all"
+      ? "lifetime"
+      : rawScope === "session"
+        ? "app"
+        : rawScope || (safeSessionId === "all" ? "lifetime" : safeSessionId === "app" ? "app" : "conversation");
+
+  // Rich conversation attribution ONLY accepts explicit conversationId > native defaultConvId;
+  // NEVER falls back to checkpoint sessionId.
+  const attributedConv = unboundHostTab ? "" : explicitConvId || safeDefaultConv || "default";
+  const isSpecificConv = Boolean(
+    attributedConv &&
+      !RESERVED_CONFIRMED_CONV_IDS.has(attributedConv.toLowerCase()) &&
+      isSafeConversationId(attributedConv)
+  );
+  const confirmed = Boolean(
+    scope === "conversation" &&
+      !unboundHostTab &&
+      data?.conversationConfirmed !== false &&
+      isSpecificConv
+  );
+  const convId = unboundHostTab ? "__unbound__" : attributedConv || "default";
+  const targetSid =
+    scope === "lifetime" || scope === "all"
+      ? "all"
+      : scope === "app" || scope === "session"
+        ? "app"
+        : unboundHostTab
+          ? "__unbound__"
+          : convId;
+  const hasExplicitSessionOnly = Boolean(
+    scope === "conversation" &&
+      !unboundHostTab &&
+      !isSpecificConv &&
+      safeSessionId &&
+      safeSessionId !== "all" &&
+      safeSessionId !== "app"
+  );
+  const hasExplicitReservedOrUnsafeConv = Boolean(
+    !unboundHostTab &&
+      !isSpecificConv &&
+      explicitConvId &&
+      explicitConvId.toLowerCase() !== "default"
+  );
+
+  return {
+    scope,
+    convId,
+    targetSid,
+    unboundHostTab,
+    confirmed,
+    confirmedConversationId: confirmed ? attributedConv : "",
+    hasExplicitSessionOnly,
+    hasExplicitReservedOrUnsafeConv
+  };
+}
+
+function buildStructuredVerificationSummary(slot) {
+  if (!slot || typeof slot !== "object") return "";
+  const exitNum =
+    slot.exitCode !== null &&
+    slot.exitCode !== undefined &&
+    typeof slot.exitCode !== "boolean" &&
+    String(slot.exitCode).trim() !== "" &&
+    Number.isFinite(Number(slot.exitCode))
+      ? Number(slot.exitCode)
+      : null;
+  if (slot.ok) {
+    return exitNum !== null ? `passed (exit ${exitNum})` : "passed";
+  }
+  return exitNum !== null ? `failed (exit ${exitNum})` : "failed";
+}
+
+function stripResumeFailureExcerpts(resumeRes) {
+  if (!resumeRes || typeof resumeRes !== "object") return resumeRes;
+  const cp = resumeRes.sessionCheckpoint;
+  if (!cp || typeof cp !== "object") return resumeRes;
+  const stripSlot = (slot) => {
+    if (!slot || typeof slot !== "object") return slot;
+    const copy = { ...slot };
+    delete copy.failureExcerpt;
+    delete copy.firstErrorLine;
+    delete copy.excerpt;
+    delete copy.stderr;
+    delete copy.error;
+    copy.summary = buildStructuredVerificationSummary(copy);
+    return copy;
+  };
+  return {
+    ...resumeRes,
+    sessionCheckpoint: {
+      ...cp,
+      lastTest: stripSlot(cp.lastTest),
+      lastBuild: stripSlot(cp.lastBuild)
+    }
+  };
+}
+
 function getResumePayload(data = {}, defaultConvId = "default") {
   const store = getRuntimeStore();
   const appStartTime = getAppStartTime();
-  const { scope, convId } = resolveTargetSession(data, defaultConvId);
-  if (scope === "lifetime" || scope === "all") return store.getResumeState("all", 10);
-  if (scope === "app" || scope === "session") return store.getResumeState("app", 10, { sinceTs: appStartTime });
-  return store.getResumeState(convId, 10);
+  const {
+    scope,
+    convId,
+    unboundHostTab,
+    confirmed,
+    confirmedConversationId,
+    hasExplicitSessionOnly,
+    hasExplicitReservedOrUnsafeConv
+  } = resolveConfirmedConversation(data, defaultConvId);
+  const explicitRawSid = typeof data?.sessionId === "string" ? data.sessionId.trim() : "";
+  let res;
+  if (scope === "lifetime" || scope === "all") {
+    res = store.getResumeState("all", 10);
+  } else if (scope === "app" || scope === "session") {
+    res = store.getResumeState("app", 10, { sinceTs: appStartTime });
+  } else if (unboundHostTab || hasExplicitSessionOnly || hasExplicitReservedOrUnsafeConv) {
+    res = store.getResumeState("__unbound__", 10);
+  } else if (confirmed && confirmedConversationId) {
+    const trustedSid =
+      resolveTrustedCheckpointSessionId(store, confirmedConversationId, explicitRawSid) || convId;
+    res = store.getResumeState(trustedSid, 10);
+  } else {
+    res = store.getResumeState(convId, 10);
+  }
+  return confirmed ? res : stripResumeFailureExcerpts(res);
 }
 
 function getSourceChunksPayload(data = {}) {
@@ -1209,75 +1648,254 @@ function getSourceChunksPayload(data = {}) {
 function getHandoffPayload(data = {}, defaultConvId = "default") {
   const store = getRuntimeStore();
   const appStartTime = getAppStartTime();
-  const { scope, convId, targetSid } = resolveTargetSession(data, defaultConvId);
+  const mode = data?.mode === "agent" ? "agent" : "full";
+  const {
+    scope,
+    convId,
+    targetSid,
+    unboundHostTab,
+    confirmed,
+    confirmedConversationId,
+    hasExplicitSessionOnly,
+    hasExplicitReservedOrUnsafeConv
+  } = resolveConfirmedConversation(data, defaultConvId);
   const sinceTs = scope === "app" || scope === "session" ? appStartTime : null;
+
+  const explicitRawSid = typeof data?.sessionId === "string" ? data.sessionId.trim() : "";
+  const isIsolatedUnconfirmed =
+    scope === "conversation" &&
+    !confirmed &&
+    (unboundHostTab ||
+      data?.conversationConfirmed === false ||
+      hasExplicitSessionOnly ||
+      hasExplicitReservedOrUnsafeConv);
+
+  let effectiveCheckpointSid = targetSid;
+  if (confirmed && confirmedConversationId) {
+    effectiveCheckpointSid =
+      resolveTrustedCheckpointSessionId(store, confirmedConversationId, explicitRawSid) ||
+      confirmedConversationId;
+  } else if (isIsolatedUnconfirmed) {
+    effectiveCheckpointSid = "__unbound__";
+  }
+
   const rawCwd = typeof data.cwd === "string" ? data.cwd.trim() : "";
-  const cwd = rawCwd
-    ? resolveAllowedHandoffCwd(rawCwd, collectKnownWorktrees(store, targetSid, sinceTs))
-    : inferWorkspaceFromStore(store, targetSid, sinceTs);
+  const skipWorkspaceInference = isIsolatedUnconfirmed || (scope === "conversation" && !confirmed && mode === "agent");
+  const cwd = skipWorkspaceInference
+    ? ""
+    : rawCwd
+      ? resolveAllowedHandoffCwd(rawCwd, collectKnownWorktrees(store, effectiveCheckpointSid, sinceTs))
+      : inferWorkspaceFromStore(store, effectiveCheckpointSid, sinceTs);
   const rawMaxBytes = parseOptionalPositiveNumber(data.maxBytes);
   const maxBytes = rawMaxBytes !== undefined
     ? Math.min(16384, Math.max(256, Math.floor(rawMaxBytes)))
     : 5800;
+
+  // Skip KV-cache diag recompute in `agent` mode (drawer does not render KV-cache section);
+  // in `full` mode align cache-diag attribution strictly with the resolved conversation/checkpoint.
   let cacheDiag = null;
-  try {
-    const diag = getCacheDiagPayload(data, defaultConvId);
-    if (diag && diag.ok && diag.transcriptFound) {
-      cacheDiag = diag;
-    }
-  } catch {}
-  let stallContext = null;
-  if (data.includeStall !== false) {
+  if (mode !== "agent") {
     try {
-      const monitor = getWatchdogMonitor();
-      const targetConv = convId && convId !== "default" ? convId : "";
-      if (targetConv) {
-        monitor.tick();
-        stallContext = monitor.getStallContextForConversation(targetConv);
-      } else if (scope !== "conversation") {
-        monitor.tick();
-        stallContext = monitor.getTopAlertingStallContext();
+      const cacheDiagInput = {
+        ...data,
+        scope,
+        conversationId: confirmed
+          ? confirmedConversationId
+          : isIsolatedUnconfirmed
+            ? "__unbound__"
+            : scope === "conversation" && convId !== "default"
+              ? convId
+              : "",
+        sessionId: effectiveCheckpointSid
+      };
+      const diag = getCacheDiagPayload(cacheDiagInput, confirmed ? confirmedConversationId : "default");
+      if (diag && diag.ok && diag.transcriptFound) {
+        cacheDiag = diag;
       }
     } catch {}
   }
+
+  const rawStallConvId = typeof data?.stallConversationId === "string" ? data.stallConversationId.trim() : "";
+  const hasExplicitStallConvId = Boolean(rawStallConvId);
+  const validStallConvId =
+    hasExplicitStallConvId &&
+    !RESERVED_CONFIRMED_CONV_IDS.has(rawStallConvId.toLowerCase()) &&
+    isSafeConversationId(rawStallConvId)
+      ? rawStallConvId
+      : "";
+
+  const monitor = getWatchdogMonitor();
+  let stallContext = null;
+  if (data.includeStall !== false) {
+    try {
+      if (confirmed && confirmedConversationId) {
+        monitor.tick();
+        stallContext = monitor.getStallContextForConversation(confirmedConversationId, { includeUserInput: true });
+      } else if (scope !== "conversation") {
+        monitor.tick();
+        if (hasExplicitStallConvId) {
+          const targetedStall = validStallConvId
+            ? monitor.getStallContextForConversation(validStallConvId, { includeUserInput: false })
+            : null;
+          stallContext = targetedStall ? { ...targetedStall, lastUserInput: "" } : null;
+        } else {
+          const topStall = monitor.getTopAlertingStallContext();
+          stallContext = topStall ? { ...topStall, lastUserInput: "" } : null;
+        }
+      }
+    } catch {}
+  }
+
   const brief = buildHandoffBrief({
     store,
-    sessionId: targetSid,
+    mode,
+    conversationId: confirmedConversationId,
+    conversationConfirmed: confirmed,
+    scope,
+    sessionId: effectiveCheckpointSid,
     cwd,
     cacheDiag,
     maxBytes,
     sinceTs,
-    stallContext
+    stallContext,
+    brainRoots: Array.isArray(monitor?.brainRoots) ? monitor.brainRoots : []
   });
-  return {
+
+  const responseConvId = unboundHostTab
+    ? typeof data?.conversationId === "string" && data.conversationId.trim() === "__unbound__"
+      ? "__unbound__"
+      : ""
+    : hasExplicitSessionOnly || hasExplicitReservedOrUnsafeConv
+      ? ""
+      : convId;
+
+  const payload = {
     ok: true,
     scope,
-    conversationId: convId,
-    sessionId: targetSid,
+    conversationId: responseConvId,
+    sessionId: effectiveCheckpointSid,
     hasStallContext: Boolean(stallContext),
     markdown: brief.markdown,
     summary: brief.summary,
     bytes: brief.bytes,
     truncated: brief.truncated
   };
+
+  if (mode === "agent") {
+    payload.mode = "agent";
+    payload.confirmedConversation = brief.confirmedConversation;
+    payload.secretRedactionEnabled = brief.secretRedactionEnabled !== false;
+    payload.anchors = brief.anchors;
+    payload.sampledAt = brief.sampledAt || "";
+    payload.resumeCommand = brief.resumeCommand;
+    payload.incidentKey = stallContext?.incidentKey || "";
+    if (hasExplicitStallConvId && scope !== "conversation" && stallContext?.conversationId) {
+      payload.stallConversationId = stallContext.conversationId;
+    }
+  }
+
+  return payload;
 }
 
 function getWatchdogPayload(data = {}, defaultConvId = "default") {
-  const unboundHostTab = isUnboundSidecarHostRequest(data);
-  const { scope, convId } = resolveTargetSession(data, unboundHostTab ? "default" : defaultConvId);
+  const { scope, convId, unboundHostTab, confirmed, hasExplicitSessionOnly, hasExplicitReservedOrUnsafeConv } =
+    resolveConfirmedConversation(data, defaultConvId);
   const monitor = getWatchdogMonitor();
-  const targetConv = unboundHostTab ? "__unbound__" : convId && convId !== "default" ? convId : "";
+  const targetConv =
+    unboundHostTab || hasExplicitSessionOnly
+      ? "__unbound__"
+      : hasExplicitReservedOrUnsafeConv
+        ? (scope === "conversation" ? "__unbound__" : "")
+        : convId && convId !== "default"
+          ? convId
+          : "";
   const status = monitor.getStatus({
     conversationId: targetConv,
     scope,
-    refresh: true
+    refresh: true,
+    includeRichRescue: confirmed
   });
   return {
     ...status,
     scope,
     conversationId: unboundHostTab
       ? (typeof data?.conversationId === "string" && data.conversationId.trim() === "__unbound__" ? "__unbound__" : "")
-      : convId
+      : hasExplicitSessionOnly || hasExplicitReservedOrUnsafeConv
+        ? ""
+        : convId
+  };
+}
+
+function refreshLocalQuotaRollupSync(envRootsRaw, nowMs) {
+  if (_quotaLocalRollupCache && _quotaLocalRollupCache.envRootsRaw !== envRootsRaw) {
+    _quotaFileUsageCache.clear();
+  }
+  const localOpts = envRootsRaw
+    ? {
+        roots: envRootsRaw.split(path.delimiter).filter(Boolean),
+        includeDefaultRoots: false,
+        nowMs,
+        cache: _quotaFileUsageCache
+      }
+    : { nowMs, cache: _quotaFileUsageCache };
+  const local = collectLocalRollingUsage(localOpts);
+  _quotaLocalRollupCache = { ts: nowMs, envRootsRaw, payload: local };
+  return local;
+}
+
+export function getQuotaPayload(data = {}) {
+  const nowMs = Date.now();
+  const forceRefresh = Boolean(data?.forceRefresh);
+  const allowNonBlocking = Boolean(data?.allowNonBlocking);
+  const store = getRuntimeStore();
+  const rawSnap = readStatusLineQuotaSnapshot(store, { nowMs });
+  const official = projectQuotaSnapshot(rawSnap, { nowMs });
+
+  const envRootsRaw =
+    typeof process.env.AGY_DART_QUOTA_BRAIN_ROOTS === "string"
+      ? process.env.AGY_DART_QUOTA_BRAIN_ROOTS.trim()
+      : "";
+  const allowDefaultRoots = isDefaultRuntimeStoreDb(store);
+
+  let local;
+  if (!envRootsRaw && !allowDefaultRoots) {
+    // Isolated non-default DB without explicit brain roots (e.g., tests): never scan host ~/.gemini transcripts
+    local = collectLocalRollingUsage({ roots: [], includeDefaultRoots: false, nowMs });
+  } else {
+    const cacheFresh =
+      !forceRefresh &&
+      _quotaLocalRollupCache &&
+      _quotaLocalRollupCache.envRootsRaw === envRootsRaw &&
+      nowMs - _quotaLocalRollupCache.ts < QUOTA_LOCAL_CACHE_TTL_MS;
+
+    if (cacheFresh) {
+      local = _quotaLocalRollupCache.payload;
+    } else if (allowNonBlocking && !forceRefresh && !envRootsRaw) {
+      local =
+        _quotaLocalRollupCache && _quotaLocalRollupCache.envRootsRaw === envRootsRaw
+          ? _quotaLocalRollupCache.payload
+          : collectLocalRollingUsage({ roots: [], includeDefaultRoots: false, nowMs });
+      if (!_quotaRefreshScheduled) {
+        _quotaRefreshScheduled = true;
+        setImmediate(() => {
+          _quotaRefreshScheduled = false;
+          try {
+            if (_runtimeStore && isDefaultRuntimeStoreDb(_runtimeStore)) {
+              refreshLocalQuotaRollupSync(envRootsRaw, Date.now());
+            }
+          } catch {}
+        }).unref?.();
+      }
+    } else {
+      local = refreshLocalQuotaRollupSync(envRootsRaw, nowMs);
+    }
+  }
+
+  return {
+    ok: true,
+    official,
+    local,
+    setup: buildStatusLineSetupInfo(PLUGIN_ROOT)
   };
 }
 
@@ -1285,22 +1903,35 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
   if (data.fromSidecarHost !== undefined && typeof data.fromSidecarHost !== "boolean") {
     return { ok: false, status: 400, error: "Field 'fromSidecarHost' must be a boolean" };
   }
+  if (data.conversationConfirmed !== undefined && typeof data.conversationConfirmed !== "boolean") {
+    return { ok: false, status: 400, error: "Field 'conversationConfirmed' must be a boolean" };
+  }
   const store = getRuntimeStore();
   const monitor = getWatchdogMonitor();
-  const unboundHostTab = isUnboundSidecarHostRequest(data);
-  const { scope, convId } = resolveTargetSession(data, unboundHostTab ? "default" : defaultConvId);
-  const targetConv = convId && convId !== "default" ? convId : "";
+  const { scope, convId, unboundHostTab, confirmed, hasExplicitSessionOnly, hasExplicitReservedOrUnsafeConv } =
+    resolveConfirmedConversation(data, defaultConvId);
+  const targetConv =
+    !unboundHostTab && !hasExplicitSessionOnly && !hasExplicitReservedOrUnsafeConv && convId && convId !== "default"
+      ? convId
+      : "";
+  const statusTargetConv =
+    unboundHostTab || hasExplicitSessionOnly
+      ? "__unbound__"
+      : hasExplicitReservedOrUnsafeConv
+        ? (scope === "conversation" ? "__unbound__" : "")
+        : targetConv;
+  const getScopedStatus = (opts) => ({ ...monitor.getStatus(opts), scope });
   const action = typeof data.action === "string" && data.action.trim() ? data.action.trim() : "";
 
   if (action === "ack" || action === "snooze") {
     const res = monitor.acknowledge(targetConv, data.snoozeSec);
     if (!res.ok) return { ok: false, status: 400, error: res.error };
-    return { ...res, status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false }) };
+    return { ...res, status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: false, includeRichRescue: confirmed }) };
   }
   if (action === "clear" || action === "markIdle") {
     const res = monitor.markIdle(targetConv, "user_marked_idle");
     if (!res.ok) return { ok: false, status: 400, error: res.error };
-    return { ...res, status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false }) };
+    return { ...res, status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: false, includeRichRescue: confirmed }) };
   }
   if (action === "setEnabled") {
     const cur = store.isWatchdogEnabled();
@@ -1314,7 +1945,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       enabled: effective,
-      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed })
     };
   }
   if (action === "setDesktopNotify") {
@@ -1326,7 +1957,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       desktopNotifyEnabled: effective,
-      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed })
     };
   }
   if (action === "setTtlDesktopNotify") {
@@ -1338,7 +1969,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       ttlDesktopNotifyEnabled: effective,
-      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed })
     };
   }
   if (action === "setGlobalTtlKeepalive") {
@@ -1360,7 +1991,31 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       ok: true,
       globalTtlKeepaliveMaxCount: effectiveGlobal,
       fallbackTtlKeepaliveMaxCount: fallbackMax,
-      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed })
+    };
+  }
+  if (action === "setTtlKeepaliveMinContextPct") {
+    const rawPct = data.minContextPct !== undefined ? data.minContextPct : data.pct;
+    const invalidType =
+      rawPct === undefined ||
+      rawPct === null ||
+      typeof rawPct === "boolean" ||
+      typeof rawPct === "object" ||
+      (typeof rawPct === "string" && rawPct.trim() === "");
+    const parsedPct = invalidType ? NaN : Number(rawPct);
+    if (!Number.isFinite(parsedPct) || !Number.isInteger(parsedPct) || parsedPct < 0 || parsedPct > 100) {
+      return {
+        ok: false,
+        status: 400,
+        error: "Invalid 'minContextPct' value: expected integer between 0 and 100"
+      };
+    }
+    store.setGlobalTtlKeepaliveMinContextPct(parsedPct);
+    const effectivePct = store.getGlobalTtlKeepaliveMinContextPct();
+    return {
+      ok: true,
+      globalTtlKeepaliveMinContextPct: effectivePct,
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed })
     };
   }
   if (
@@ -1384,7 +2039,8 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
         ? "__unbound__"
         : !hasExplicitEmptyConv && targetConv && isSafeConversationId(targetConv)
           ? targetConv
-          : monitor.getStatus({ scope, refresh: false })?.ttlKeepalive?.conversationId || "__unbound__";
+          : monitor.getStatus({ scope, refresh: false, includeRichRescue: false })?.ttlKeepalive?.conversationId || "__unbound__";
+    const kaRichAllowed = Boolean(confirmed && kaConv === targetConv && kaConv !== "__unbound__");
 
     if (kaConv !== "__unbound__" && monitor._isConversationSubagent(store, kaConv)) {
       try {
@@ -1396,7 +2052,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
         isSubagent: true,
         ttlKeepaliveEnabled: false,
         ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(null),
-        status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
+        status: getScopedStatus({ conversationId: kaConv, scope, refresh: true, includeRichRescue: kaRichAllowed })
       };
     }
 
@@ -1408,7 +2064,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
         isCustomOverride: false,
         ttlKeepaliveEnabled: store.isTtlKeepaliveEnabled(kaConv),
         ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(kaConv),
-        status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
+        status: getScopedStatus({ conversationId: kaConv, scope, refresh: true, includeRichRescue: kaRichAllowed })
       };
     }
 
@@ -1446,7 +2102,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
         isCustomOverride: store.hasCustomTtlKeepaliveOverride(kaConv),
         ttlKeepaliveEnabled: store.isTtlKeepaliveEnabled(kaConv),
         ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(kaConv),
-        status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
+        status: getScopedStatus({ conversationId: kaConv, scope, refresh: true, includeRichRescue: kaRichAllowed })
       };
     }
 
@@ -1454,7 +2110,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       conversationId: kaConv,
-      status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
+      status: getScopedStatus({ conversationId: kaConv, scope, refresh: true, includeRichRescue: kaRichAllowed })
     };
   }
   if (action === "setUiLang") {
@@ -1468,7 +2124,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       ok: true,
       uiLang: info.lang,
       uiLangSource: info.source,
-      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: false })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: false, includeRichRescue: confirmed })
     };
   }
   if (action === "focusConversation") {
@@ -1482,9 +2138,17 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       skipOsFocus: data.skipOsFocus === true
     });
     if (!res.ok) return { ok: false, status: 400, error: res.error };
+    const focusRichAllowed = Boolean(
+      scope === "conversation" &&
+        !unboundHostTab &&
+        data.conversationConfirmed !== false &&
+        res.conversationId &&
+        !RESERVED_CONFIRMED_CONV_IDS.has(res.conversationId.toLowerCase()) &&
+        isSafeConversationId(res.conversationId)
+    );
     return {
       ...res,
-      status: monitor.getStatus({ conversationId: res.conversationId, scope, refresh: false })
+      status: getScopedStatus({ conversationId: res.conversationId, scope, refresh: false, includeRichRescue: focusRichAllowed })
     };
   }
   if (action === "ackJump") {
@@ -1492,17 +2156,17 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     if (!res.ok) return { ok: false, status: 400, error: res.error };
     return {
       ...res,
-      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: false, includeRichRescue: confirmed })
     };
   }
   if (action === "tick") {
-    return monitor.getStatus({ conversationId: targetConv, scope, refresh: true });
+    return getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed });
   }
   return {
     ok: false,
     status: 400,
     error:
-      "Invalid watchdog action: expected 'ack', 'snooze', 'clear', 'markIdle', 'setEnabled', 'setDesktopNotify', 'setTtlDesktopNotify', 'setTtlKeepalive', 'setGlobalTtlKeepalive', 'resetTtlKeepalive', 'resetTtlKeepaliveOverride', 'setUiLang', 'focusConversation', 'ackJump', or 'tick'"
+      "Invalid watchdog action: expected 'ack', 'snooze', 'clear', 'markIdle', 'setEnabled', 'setDesktopNotify', 'setTtlDesktopNotify', 'setTtlKeepalive', 'setGlobalTtlKeepalive', 'setTtlKeepaliveMinContextPct', 'resetTtlKeepalive', 'resetTtlKeepaliveOverride', 'setUiLang', 'focusConversation', 'ackJump', or 'tick'"
   };
 }
 
@@ -1756,7 +2420,8 @@ const READ_ENDPOINTS = new Set([
   "/api/source-chunks",
   "/api/cache-diag",
   "/api/handoff",
-  "/api/watchdog"
+  "/api/watchdog",
+  "/api/quota"
 ]);
 
 const MUTATING_ENDPOINTS = new Set([
@@ -1868,15 +2533,12 @@ export function createStandaloneServer({
           }
           const parsed = await readBoundedJsonBody(req, maxBodyBytes);
           if (!parsed.ok) {
-            if (parsed.status === 413) {
-              scheduleOversizedSocketClose(req, res);
-            }
-            sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
+            sendJson(res, parsed.status, { error: parsed.error });
             return;
           }
           data = { ...data, ...parsed.data };
         }
-        const fieldCheck = validateStringFields(data, ["scope", "conversationId", "sessionId", "sourceId", "cwd"]);
+        const fieldCheck = validateStringFields(data, ["scope", "conversationId", "stallConversationId", "sessionId", "sourceId", "cwd"]);
         if (!fieldCheck.ok) {
           sendJson(res, 400, { error: fieldCheck.error });
           return;
@@ -1890,6 +2552,13 @@ export function createStandaloneServer({
           return;
         }
         if (url.pathname === "/api/resume") {
+          for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+            const bCheck = validateOptionalBooleanField(data, bf);
+            if (!bCheck.ok) {
+              sendJson(res, 400, { error: bCheck.error });
+              return;
+            }
+          }
           sendJson(res, 200, getResumePayload(data));
           return;
         }
@@ -1906,15 +2575,44 @@ export function createStandaloneServer({
           return;
         }
         if (url.pathname === "/api/handoff") {
-          sendJson(res, 200, getHandoffPayload(data));
+          for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+            const bCheck = validateOptionalBooleanField(data, bf);
+            if (!bCheck.ok) {
+              sendJson(res, 400, { error: bCheck.error });
+              return;
+            }
+          }
+          const modeCheck = validateHandoffMode(data.mode, { allowAgent: req.method === "POST" });
+          if (!modeCheck.ok) {
+            sendJson(res, 400, { error: modeCheck.error });
+            return;
+          }
+          sendJson(res, 200, getHandoffPayload({ ...data, mode: modeCheck.mode }));
           return;
         }
         if (url.pathname === "/api/watchdog") {
-          if (data.fromSidecarHost !== undefined && typeof data.fromSidecarHost !== "boolean") {
-            sendJson(res, 400, { error: "Field 'fromSidecarHost' must be a boolean" });
-            return;
+          for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+            const bCheck = validateOptionalBooleanField(data, bf);
+            if (!bCheck.ok) {
+              sendJson(res, 400, { error: bCheck.error });
+              return;
+            }
           }
           sendJson(res, 200, getWatchdogPayload(data));
+          return;
+        }
+        if (url.pathname === "/api/quota") {
+          if (req.method === "GET" && typeof data.forceRefresh === "string") {
+            const low = data.forceRefresh.trim().toLowerCase();
+            if (low === "true" || low === "1") data.forceRefresh = true;
+            else if (low === "false" || low === "0" || low === "") data.forceRefresh = false;
+          }
+          const bCheck = validateOptionalBooleanField(data, "forceRefresh");
+          if (!bCheck.ok) {
+            sendJson(res, 400, { error: bCheck.error });
+            return;
+          }
+          sendJson(res, 200, getQuotaPayload(data));
           return;
         }
       }
@@ -1927,10 +2625,7 @@ export function createStandaloneServer({
         }
         const parsed = await readBoundedJsonBody(req, maxBodyBytes);
         if (!parsed.ok) {
-          if (parsed.status === 413) {
-            scheduleOversizedSocketClose(req, res);
-          }
-          sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
+          sendJson(res, parsed.status, { error: parsed.error });
           return;
         }
         const searchCheck = validateAndNormalizeSearchInput(parsed.data);
@@ -1955,10 +2650,7 @@ export function createStandaloneServer({
         }
         const parsed = await readBoundedJsonBody(req, maxBodyBytes);
         if (!parsed.ok) {
-          if (parsed.status === 413) {
-            scheduleOversizedSocketClose(req, res);
-          }
-          sendJson(res, parsed.status, { error: parsed.error }, parsed.status === 413 ? { Connection: "close" } : {});
+          sendJson(res, parsed.status, { error: parsed.error });
           return;
         }
         const data = parsed.data;
@@ -2068,6 +2760,7 @@ if (isDirectRun) {
         : [];
     const watchedBackendFiles = [
       __selfPath,
+      path.resolve(__dirname, "../../context/lib/handoff.js"),
       path.resolve(__dirname, "../../context/lib/watchdog.js"),
       path.resolve(__dirname, "../../context/lib/watchdog-lease.js"),
       path.resolve(__dirname, "../../context/lib/store.js"),
@@ -2200,6 +2893,10 @@ export function registerSidecarRoutes(app) {
     if (!data) return makeBadRequest("Request body must be a JSON object");
     const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
     if (!check.ok) return makeBadRequest(check.error);
+    for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+      const bCheck = validateOptionalBooleanField(data, bf);
+      if (!bCheck.ok) return makeBadRequest(bCheck.error);
+    }
     return getResumePayload(data, app.config?.conversationId);
   }, "POST");
   app.api("/api/source-chunks", (rawData) => {
@@ -2222,9 +2919,15 @@ export function registerSidecarRoutes(app) {
   app.api("/api/handoff", (rawData) => {
     const data = normalizeSidecarBody(rawData);
     if (!data) return makeBadRequest("Request body must be a JSON object");
-    const check = validateStringFields(data, ["scope", "conversationId", "sessionId", "cwd"]);
+    const check = validateStringFields(data, ["scope", "conversationId", "stallConversationId", "sessionId", "cwd"]);
     if (!check.ok) return makeBadRequest(check.error);
-    return getHandoffPayload(data, app.config?.conversationId);
+    for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+      const bCheck = validateOptionalBooleanField(data, bf);
+      if (!bCheck.ok) return makeBadRequest(bCheck.error);
+    }
+    const modeCheck = validateHandoffMode(data.mode, { allowAgent: true });
+    if (!modeCheck.ok) return makeBadRequest(modeCheck.error);
+    return getHandoffPayload({ ...data, mode: modeCheck.mode }, app.config?.conversationId);
   }, "POST");
   app.api("/api/search", (rawData) => {
     const data = normalizeSidecarBody(rawData);
@@ -2296,8 +2999,9 @@ export function registerSidecarRoutes(app) {
     if (!data) return makeBadRequest("Request body must be a JSON object");
     const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
     if (!check.ok) return makeBadRequest(check.error);
-    if (data.fromSidecarHost !== undefined && typeof data.fromSidecarHost !== "boolean") {
-      return makeBadRequest("Field 'fromSidecarHost' must be a boolean");
+    for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+      const bCheck = validateOptionalBooleanField(data, bf);
+      if (!bCheck.ok) return makeBadRequest(bCheck.error);
     }
     return getWatchdogPayload(data, app.config?.conversationId);
   }, "POST");
@@ -2316,5 +3020,12 @@ export function registerSidecarRoutes(app) {
     const res = handleStarPromptMutation(data);
     if (res.ok === false) return makeBadRequest(res.error);
     return res;
+  }, "POST");
+  app.api("/api/quota", (rawData) => {
+    const data = normalizeSidecarBody(rawData);
+    if (!data) return makeBadRequest("Request body must be a JSON object");
+    const bCheck = validateOptionalBooleanField(data, "forceRefresh");
+    if (!bCheck.ok) return makeBadRequest(bCheck.error);
+    return getQuotaPayload(data);
   }, "POST");
 }

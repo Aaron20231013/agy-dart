@@ -173,7 +173,7 @@ test("1. Clean healthy agy-dart setup scores 100 (Grade A) with live dual-MCP ve
     // Check 1: rules/AGENTS.md & skills/agy-dart/SKILL.md discovered
     assert.equal(report.prefix.ruleCount, 1);
     assert.equal(report.prefix.skillCount, 1);
-    assert.ok(report.prefix.ruleTokens > 400 && report.prefix.ruleTokens < 1500);
+    assert.ok(report.prefix.ruleTokens > 0 && report.prefix.ruleTokens < 400);
     assert.ok(report.prefix.skillFrontmatterTokens > 10 && report.prefix.skillFrontmatterTokens < 200);
 
     // Check 2: fast & context MCP servers both probed twice and 100% deterministic & canonical

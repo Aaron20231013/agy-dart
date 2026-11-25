@@ -294,7 +294,7 @@ test("v1.5.2-4: read_slices({ outlines }) extracts indented HTML (<style>/<body>
           }
         }
       }
-    ]);
+    ], { AGY_DART_DB_PATH: path.join(tmpDir, "v152-outlines.db") });
 
     assert.equal(stderr, "", "fast/mcp-server.mjs must emit 0 bytes stderr");
     const htmlResp = responses.find((r) => r.id === 2);

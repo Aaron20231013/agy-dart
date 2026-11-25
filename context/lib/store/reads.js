@@ -780,15 +780,19 @@ export class ReadMethods {
         `)
         .get(sinceTs);
     } else {
+      const effectiveSid = typeof this.resolveRootSessionId === "function" ? this.resolveRootSessionId(sid) : sid;
+      const familyIds = typeof this.getSessionFamilyIds === "function" ? this.getSessionFamilyIds(effectiveSid) : [effectiveSid];
+      const inClause = familyIds.length > 1 ? `IN (${familyIds.map(() => "?").join(",")})` : "= ?";
+      const params = familyIds.length > 1 ? familyIds : [effectiveSid];
       row = this.db
         .prepare(`
           SELECT
             COUNT(*) AS total_blocked,
             COALESCE(SUM(CASE WHEN recall_reads >= 2 AND file_size > 0 AND recall_bytes >= file_size * 0.7 THEN 1 ELSE 0 END), 0) AS ghost_recalls
           FROM ghost_interceptions
-          WHERE session_id = ?
+          WHERE session_id ${inClause}
         `)
-        .get(sid);
+        .get(...params);
     }
 
     const totalBlocked = Number(row?.total_blocked || 0);

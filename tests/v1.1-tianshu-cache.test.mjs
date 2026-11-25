@@ -327,7 +327,7 @@ test("T2: read_slices({ outlines }) cross-call LRU cache hits on unchanged (mtim
   fs.utimesSync(targetFile, fixedSec, fixedSec);
   const origStat = fs.statSync(targetFile);
 
-  const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
+  const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"), { AGY_DART_DB_PATH: path.join(tmpDir, "fast-lru.db") });
   try {
     const initResp = await client.request("initialize", {
       protocolVersion: "2024-11-05",
@@ -648,7 +648,7 @@ test("T5 & T6: SessionWarmth / compactAdvice / cost savings, PreInvocation hot-c
           }
         }
       }
-    ]);
+    ], { AGY_DART_DB_PATH: path.join(tmpDir, "fast-warmth.db") });
     const checkText = checkRes.responses[1].result.content[0].text;
     assert.ok(!checkText.includes("unit test alpha passes"), "Pure ✔ passing line should be stripped");
     assert.ok(!checkText.includes("unit test beta passes"), "Pure ✓ passing line should be stripped");
@@ -1000,7 +1000,7 @@ test("Review hardening: live V8 compile-cache artifacts, Windows case-safe pruni
     fs.writeFileSync(caseFile, "export function origAlpha() { return 1; }\n", "utf8");
     fs.utimesSync(caseFile, fixedSec, fixedSec);
 
-    const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"));
+    const client = createPersistentMcpClient(path.join(ROOT, "fast", "mcp-server.mjs"), { AGY_DART_DB_PATH: path.join(tmpDir, "fast-lru129.db") });
     try {
       await client.request("initialize", {
         protocolVersion: "2024-11-05",

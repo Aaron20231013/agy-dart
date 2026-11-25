@@ -38,6 +38,76 @@ const ROOT = path.resolve(__dirname, "..");
 
 const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 25));
 
+test("keepalive checks late parent links even for titled leases without a summary row", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-parent-link-"));
+  const summaryPath = path.join(dir, "conversation_summaries.db");
+  const previous = process.env.AGY_DART_SUMMARY_DB_PATH;
+  process.env.AGY_DART_SUMMARY_DB_PATH = summaryPath;
+  const db = new DatabaseSync(summaryPath);
+  const store = new ContextModeStore({ dbPath: path.join(dir, "context.db") });
+  t.after(() => {
+    db.close();
+    store.close();
+    if (previous === undefined) delete process.env.AGY_DART_SUMMARY_DB_PATH;
+    else process.env.AGY_DART_SUMMARY_DB_PATH = previous;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  db.exec(`
+    CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT);
+    CREATE TABLE conversation_parents (conversation_id TEXT PRIMARY KEY, parent_id TEXT);
+    INSERT INTO conversation_summaries VALUES ('parent-chat', 'Main', '[]');
+    INSERT INTO conversation_parents VALUES ('parent-chat', 'parent-chat');
+  `);
+  const now = Date.now();
+  const sends = [];
+  const parentTranscript = path.join(dir, "parent.jsonl");
+  fs.writeFileSync(parentTranscript, [
+    { step_index: 0, type: "USER_INPUT", content: "Review the changes" },
+    { step_index: 1, type: "PLANNER_RESPONSE", is_subagent: true, tool_calls: [{ name: "finish" }] }
+  ].map(step => JSON.stringify(step)).join("\n"));
+  const monitor = new WatchdogMonitor({
+    getStore: () => store,
+    getConfig: () => ({ stallWatchdog: true, ttlKeepalive: true, ttlKeepaliveMaxCount: 3, ttlKeepaliveLeadSec: 30 }),
+    nowFn: () => now,
+    keepaliveSendFn: async ({ conversationId }) => { sends.push(conversationId); return { ok: true }; }
+  });
+  for (const id of ["child-chat", "parent-chat"]) {
+    writeWatchdogLease(store, {
+      conversationId: id, rootSessionId: id, convTitle: "Cached title",
+      transcriptPath: id === "parent-chat" ? parentTranscript : "",
+      phase: WATCHDOG_PHASES.IDLE, subphase: "stopped", stopReason: "NO_TOOL_CALL",
+      contextTokens: 150000, cacheTtlSec: 300, idleAnchorTs: now - 275000, updatedTs: now - 275000
+    });
+    store.setTtlKeepaliveState(id, { enabled: true });
+    assert.equal(monitor._isConversationSubagent(store, id), false);
+  }
+  db.exec("INSERT INTO conversation_parents VALUES ('child-chat', 'parent-chat')");
+  monitor.tick();
+  await flushMicrotasks();
+  assert.deepEqual(sends, ["parent-chat"]);
+  assert.equal(readWatchdogLease(store, "child-chat").parentConversationId, "parent-chat");
+  assert.equal(store.getMeta("cache:ttl_keepalive_state:child-chat", null), null);
+
+  const calls = [];
+  const result = await sendSidecarKeepaliveMessage("child-chat", "OK", {
+    execFn: async ([cmd]) => { calls.push(cmd); return {}; }
+  });
+  assert.equal(result.skippedSubagent, true);
+  assert.ok(!calls.includes("send-message"));
+
+  calls.length = 0;
+  const fallback = await sendSidecarKeepaliveMessage("parent-chat", "OK", {
+    allowDefaultSummaryDb: true,
+    execFn: async ([cmd]) => {
+      calls.push(cmd);
+      if (cmd === "get-conversation-metadata") throw new Error("offline");
+      return { ok: true };
+    }
+  });
+  assert.equal(fallback.ok, true);
+  assert.deepEqual(calls, ["get-conversation-metadata", "send-message"]);
+});
+
 function httpJsonRequest(port, reqPath, { method = "POST", headers = {}, body = null } = {}) {
   return new Promise((resolve, reject) => {
     const payload = body !== null ? JSON.stringify(body) : "";
@@ -73,7 +143,7 @@ function httpJsonRequest(port, reqPath, { method = "POST", headers = {}, body = 
   });
 }
 
-test("v1.5.4-ka-1: Default 3x per-conversation TTL auto-keepalive (no 60k threshold), per-session isolation, failure rollback & desktop notify coordination", async () => {
+test("v1.5.4-ka-1: Opt-in TTL auto-keepalive, per-session isolation, failure rollback & desktop notify coordination", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-ka-unit-"));
   const dbPath = path.join(tmpDir, "context.db");
   const store = new ContextModeStore({ dbPath });
@@ -88,6 +158,7 @@ test("v1.5.4-ka-1: Default 3x per-conversation TTL auto-keepalive (no 60k thresh
 
   const monitor = new WatchdogMonitor({
     getStore: () => store,
+    getConfig: () => ({ ttlKeepaliveLeadSec: 30 }),
     nowFn: () => nowMs,
     monoNsFn: () => monoNs,
     keepaliveSendFn: async (payload) => {
@@ -105,8 +176,11 @@ test("v1.5.4-ka-1: Default 3x per-conversation TTL auto-keepalive (no 60k thresh
   });
 
   try {
-    assert.equal(store.isTtlKeepaliveEnabled(), true, "Auto-keepalive defaults to ON");
-    assert.equal(store.getTtlKeepaliveMaxCount(), 3, "Default max keepalive count is 3");
+    assert.equal(store.isTtlKeepaliveEnabled(), false, "Auto-keepalive defaults to OFF");
+    assert.equal(store.getTtlKeepaliveMaxCount(), 1, "Default max keepalive count is 1");
+    assert.equal(store.getGlobalTtlKeepaliveMinContextPct(), 15, "Default min context % is 15%");
+    store.setGlobalTtlKeepaliveMaxCount(3);
+    store.setGlobalTtlKeepaliveMinContextPct(0);
 
     const seedStoppedLease = (convId, anchorTs, ctxTokens = 8500, extra = {}) => {
       writeWatchdogLease(store, {
@@ -126,7 +200,8 @@ test("v1.5.4-ka-1: Default 3x per-conversation TTL auto-keepalive (no 60k thresh
       });
     };
 
-    // 1. Small context (8.5k < 60k, even with ttlDesktopNotify OFF by default) triggers 1/3, 2/3, 3/3 silently (0 popups, even on in-flight ticks after 3/3!), and pops up ONLY AFTER 3/3 on the 4th expiring cycle!
+    // With alerts enabled, small contexts stay quiet until the final renewed cache is expiring.
+    store.setTtlDesktopNotifyEnabled(true);
     for (let round = 1; round <= 4; round++) {
       const anchor = nowMs;
       seedStoppedLease("conv-small-ctx", anchor, 8500);
@@ -382,7 +457,7 @@ test("v1.5.4-ka-2: PreInvocation preserves lastUserInput on keepalive turn, rese
     assert.equal(calls.length, 2, "Must query get-conversation-metadata first even when ANTIGRAVITY_PROJECT_ID exists");
     assert.equal(calls[1].projectId, "proj-test-123");
 
-    // When get-conversation-metadata fails, falls back cleanly to ambient ANTIGRAVITY_PROJECT_ID
+    // An ambient project identifies the window, but cannot establish conversation identity.
     const fallbackCalls = [];
     const fbSend = await sendSidecarKeepaliveMessage("552f7955-908a-476e-aaf2-bcdba7254f92", "[agy-dart TTL保活 1/3] OK", {
       execFn: async (args, opts) => {
@@ -393,9 +468,8 @@ test("v1.5.4-ka-2: PreInvocation preserves lastUserInput on keepalive turn, rese
         return { ok: true };
       }
     });
-    assert.equal(fbSend.ok, true);
-    assert.equal(fallbackCalls.length, 2);
-    assert.equal(fallbackCalls[1].projectId, "proj-ambient-window-a");
+    assert.equal(fbSend.error, "conversation_identity_unavailable");
+    assert.deepEqual(fallbackCalls.map(c => c.args[0]), ["get-conversation-metadata"]);
   } finally {
     if (srv) await new Promise((resolve) => srv.close(resolve));
     closeRuntimeStore();
@@ -410,7 +484,7 @@ test("v1.5.4-ka-2: PreInvocation preserves lastUserInput on keepalive turn, rese
   }
 });
 
-test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundary, array content + SYSTEM_MESSAGE shadowing, and decoupled default-ON keepalive with stallWatchdog disabled", async () => {
+test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundary, array content + SYSTEM_MESSAGE shadowing, and opt-in keepalive with stallWatchdog disabled", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-ka-edge-"));
   const dbPath = path.join(tmpDir, "context.db");
   const cfgPath = path.join(tmpDir, "config.json");
@@ -533,7 +607,7 @@ test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundar
         conversationId: "conv-decoupled-ka",
         transcriptPath: txPath,
         invocationNum: 0,
-        lastUserInput: "测试关闭看门狗后默认自动续温"
+        lastUserInput: "测试关闭看门狗后手动开启续温"
       },
       decoupledEnv
     );
@@ -549,7 +623,7 @@ test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundar
     const stDec = new ContextModeStore({ dbPath });
     try {
       const decLease = readWatchdogLease(stDec, "conv-decoupled-ka");
-      assert.ok(decLease, "Default-ON auto-keepalive must still record lease when stallWatchdog is disabled");
+      assert.ok(decLease, "Explicit keepalive must still record a lease when stallWatchdog is disabled");
       assert.equal(decLease.phase, WATCHDOG_PHASES.IDLE);
       assert.equal(decLease.subphase, "stopped");
       assert.ok(decLease.idleAnchorTs > 0);
@@ -558,7 +632,7 @@ test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundar
       const simNow = decLease.idleAnchorTs + 280_000; // 20s left on 300s Claude TTL (<= 30s lead)
       const mon = new WatchdogMonitor({
         getStore: () => stDec,
-        getConfig: () => ({ stallWatchdog: false, ttlDesktopNotify: false }),
+        getConfig: () => ({ stallWatchdog: false, ttlDesktopNotify: false, ttlKeepalive: true }),
         nowFn: () => simNow,
         monoNsFn: () => 10_000_000_000n,
         keepaliveSendFn: async (p) => {
@@ -568,7 +642,7 @@ test("v1.5.4-ka-3: Edge cases — un-flushed transcript PLANNER_RESPONSE boundar
       });
       mon.tick();
       await flushMicrotasks();
-      assert.equal(sent.length, 1, "WatchdogMonitor with stallWatchdog=false must still fire default-ON keepalive");
+      assert.equal(sent.length, 1, "Explicit keepalive must still fire with stallWatchdog=false");
       assert.equal(sent[0].conversationId, "conv-decoupled-ka");
     } finally {
       stDec.close();
@@ -812,6 +886,7 @@ test("v1.5.4-ka-5: Empirical TTL floor (>= profileTtl) prevents premature ~90s k
     const store = new ContextModeStore({ dbPath });
     store.open();
     store.setUiLang("zh");
+    store.setGlobalTtlKeepaliveMaxCount(3);
     store.setMeta("ttl_calibration:v1:gemini-4-512k", JSON.stringify(prodHistory));
 
     let simNow = nowMs;
@@ -1449,17 +1524,17 @@ test("v1.5.4-ka-8: Sticky topbar keepalive capsule & strict per-conversation win
   let srv = null;
   let openStore = null;
   try {
-    // 2. Legacy global keys (`cache:ttl_keepalive_enabled = "false"` & `cache:ttl_keepalive_max_count = "9"`)
+    // 2. Legacy global keys (`cache:ttl_keepalive_enabled = "true"` & `cache:ttl_keepalive_max_count = "9"`)
     //    must NEVER poison new conversations, and sanitizeModelTtlState() scrubs them cleanly!
     const store = new ContextModeStore({ dbPath });
     openStore = store;
     store.open();
     store.setUiLang("zh");
-    store.setMeta("cache:ttl_keepalive_enabled", "false");
+    store.setMeta("cache:ttl_keepalive_enabled", "true");
     store.setMeta("cache:ttl_keepalive_max_count", "9");
 
-    assert.equal(store.isTtlKeepaliveEnabled("conv-fresh-window"), true, "Stale global false in meta must NOT disable new conversations");
-    assert.equal(store.getTtlKeepaliveMaxCount("conv-fresh-window"), 3, "Stale global maxCount in meta must NOT override default 3");
+    assert.equal(store.isTtlKeepaliveEnabled("conv-fresh-window"), false, "Obsolete global keys must not enable new conversations");
+    assert.equal(store.getTtlKeepaliveMaxCount("conv-fresh-window"), 1, "Stale global maxCount in meta must NOT override default 1");
 
     const scrubRes = store.sanitizeModelTtlState();
     assert.equal(scrubRes.removedLegacyGlobalKeepalive, 2, "sanitizeModelTtlState must remove both legacy global keepalive keys");
@@ -1469,7 +1544,8 @@ test("v1.5.4-ka-8: Sticky topbar keepalive capsule & strict per-conversation win
     // 3. Per-conversation isolation across 3 simultaneous windows in WatchdogMonitor:
     //    - conv-win-a: toggled OFF (enabled=false) -> 0 keepalives, 0 exhausted popups
     //    - conv-win-b: custom maxCount=2 (enabled=true) -> 2 keepalives, exhausted popup on cycle 3
-    //    - conv-win-c: untouched default (enabled=true, maxCount=3) -> 3 keepalives, exhausted popup on cycle 4
+    //    - conv-win-c: untouched global=3 -> 3 keepalives, exhausted popup on cycle 4
+    store.setGlobalTtlKeepaliveMaxCount(3);
     store.setTtlKeepaliveEnabled(false, "conv-win-a");
     store.setTtlKeepaliveMaxCount(2, "conv-win-b");
 
@@ -1485,6 +1561,7 @@ test("v1.5.4-ka-8: Sticky topbar keepalive capsule & strict per-conversation win
     const sentNotifications = [];
     const monitor = new WatchdogMonitor({
       getStore: () => store,
+      getConfig: () => ({ ttlKeepaliveLeadSec: 30, ttlDesktopNotify: true }),
       nowFn: () => nowMs,
       monoNsFn: () => monoNs,
       keepaliveSendFn: async (p) => {
@@ -1855,11 +1932,12 @@ test("v1.5.4-ka-8: Sticky topbar keepalive capsule & strict per-conversation win
     assert.equal(kaGrp.className, "keepalive-group is-on");
 
     // Open brand-new empty tab (`hostConvId = ""`) while another window ("conv-other-window") is OFF:
-    // empty tab must NOT inherit conv-other-window's OFF state; shows clean default 0/3!
+    // The new tab follows the factory default without a custom window override.
     hostConvId = "";
     await vmCtx.refreshData(true);
-    assert.equal(kaBtn.innerText, "自动续温：0/3");
-    assert.equal(kaGrp.className, "keepalive-group is-on");
+    assert.equal(kaBtn.innerText, "自动续温：关");
+    assert.equal(kaBtn.dataset.custom, "0");
+    assert.equal(kaGrp.className, "keepalive-group");
   } finally {
     if (openStore) {
       try {
@@ -1957,8 +2035,8 @@ test("v1.5.4-ka-9: Review hardening — SidecarApp app.config.conversationId iso
       conversationId: "conv-boot-window",
       fromSidecarHost: true
     });
-    assert.equal(wdBoot.ttlKeepalive.enabled, true, "conv-boot-window must stay untouched at default ON");
-    assert.equal(wdBoot.ttlKeepalive.maxCount, 3, "conv-boot-window must stay untouched at default maxCount=3");
+    assert.equal(wdBoot.ttlKeepalive.enabled, false, "conv-boot-window must follow the default OFF setting");
+    assert.equal(wdBoot.ttlKeepalive.maxCount, 1, "conv-boot-window must stay untouched at default maxCount=1");
 
     closeRuntimeStore();
 
@@ -2022,8 +2100,8 @@ test("v1.5.4-ka-9: Review hardening — SidecarApp app.config.conversationId iso
         assert.equal(stCheck.isTtlKeepaliveEnabled("conv-new-chat-1"), false, "New chat Turn 0 must inherit pre-message OFF toggle");
         assert.equal(stCheck.getTtlKeepaliveMaxCount("conv-new-chat-1"), 7, "New chat Turn 0 must inherit pre-message maxCount=7");
         assert.equal(stCheck.getMeta("cache:ttl_keepalive_state:__unbound__", null), null, "__unbound__ must be cleared after Turn-0 claim");
-        assert.equal(stCheck.isTtlKeepaliveEnabled("conv-subagent-1"), true);
-        assert.equal(stCheck.isTtlKeepaliveEnabled("conv-next-chat-2"), true, "Subsequent new chat starts cleanly at default ON");
+        assert.equal(stCheck.isTtlKeepaliveEnabled("conv-subagent-1"), false);
+        assert.equal(stCheck.isTtlKeepaliveEnabled("conv-next-chat-2"), false, "Subsequent new chat follows the default OFF setting");
 
         // Stale >30m `__unbound__` auto-expires on read
         const staleUnboundTs = Date.now() - 35 * 60 * 1000;
@@ -3192,7 +3270,7 @@ test("v1.5.4-ka-11: Review hardening — real CortexTrajectoryMetadata workflow 
     {
       const stOrphan = new ContextModeStore({ dbPath });
       try {
-        stOrphan.setTtlKeepaliveState("conv-custom-profile-human", { enabled: null });
+        stOrphan.clearTtlKeepaliveOverride("conv-custom-profile-human");
         assert.equal(
           stOrphan.hasAnyExplicitTtlKeepaliveEnabled(),
           false,
@@ -3977,7 +4055,7 @@ test("v1.5.4-ka-12: Adversarial hardening — PreToolUse agentName/isSubagent wi
       await flushMicrotasks();
       assert.equal(dualSent.length, 1, "Two concurrent WatchdogMonitor instances must NOT double-send keepalive");
 
-      // Now test cross-process TTL popup deduplication when keepalive is OFF (`ttlKeepalive: false`, `ttlDesktopNotify: true`)
+      // Muted windows must not consume the shared popup claim. Re-enabling allows one notification.
       const anchorPopupDual = baseNow - 255_000;
       writeWatchdogLease(st, {
         ...readWatchdogLease(st, "conv-primary-main"),
@@ -4004,6 +4082,10 @@ test("v1.5.4-ka-12: Adversarial hardening — PreToolUse agentName/isSubagent wi
       const pMonB = makePopupMon();
       pMonA.tick();
       pMonB.tick();
+      assert.equal(dualPopups.length, 0, "Both monitors must remain silent while warming is off");
+      st.setTtlKeepaliveEnabled(true, "conv-primary-main");
+      pMonA.tick();
+      pMonB.tick();
       assert.equal(dualPopups.length, 1, "Two concurrent WatchdogMonitor instances must NOT fire duplicate TTL desktop popups");
     } finally {
       st.close();
@@ -4020,6 +4102,17 @@ test("v1.5.4-ka-12: Adversarial hardening — PreToolUse agentName/isSubagent wi
         probeSrv.close(() => resolve(p));
       });
     });
+    // Supply the SidecarApp lifecycle contract even on CI machines without Antigravity.
+    const sdkHome = path.join(tmpDir, "reload-home");
+    const sdkDir = path.join(sdkHome, ".gemini/config/node_modules/sidecar_sdk");
+    fs.mkdirSync(sdkDir, { recursive: true });
+    fs.writeFileSync(path.join(sdkDir, "index.mjs"), `export class SidecarApp {
+      config = {};
+      api() {}
+      page() {}
+      async run() { this.timer = setInterval(() => {}, 1000); }
+      async close() { clearInterval(this.timer); }
+    }`);
     const reloadChild = spawn(process.execPath, [path.join(ROOT, "sidecars", "dashboard", "server.mjs")], {
       cwd: ROOT,
       windowsHide: true,
@@ -4030,6 +4123,7 @@ test("v1.5.4-ka-12: Adversarial hardening — PreToolUse agentName/isSubagent wi
         ANTIGRAVITY_CSRF_TOKEN: "csrf-reload-test",
         ANTIGRAVITY_SIDECAR_WEB_PORT: String(reloadPort),
         ANTIGRAVITY_SIDECAR_UI_TOKEN: "ui-tok-reload-test",
+        HOME: sdkHome, USERPROFILE: sdkHome,
         AGY_DART_SIDECAR_WATCH_FILE: watchSentinel,
         AGY_DART_SIDECAR_RELOAD_POLL_MS: "180",
         AGY_DART_DISABLE_COMPILE_CACHE: "1"
@@ -4100,11 +4194,18 @@ test("v1.5.4-ka-13: Global keepalive maxCount (0..20), per-window override vs fo
     // 1. Store-level global inheritance, custom override isolation, 0-count OFF semantics & survival across sanitize/prune/clear
     const st = new ContextModeStore({ dbPath });
     try {
-      assert.equal(st.getGlobalTtlKeepaliveMaxCount(3), 3);
-      assert.equal(st.getFallbackNonZeroKeepaliveMaxCount(3), 3);
-      assert.equal(st.isTtlKeepaliveEnabled("conv-win-a", true), true);
-      assert.equal(st.getTtlKeepaliveMaxCount("conv-win-a", 3), 3);
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 0);
+      assert.equal(st.getFallbackNonZeroKeepaliveMaxCount(), 1);
+      assert.equal(st.isTtlKeepaliveEnabled("conv-win-a"), false);
+      assert.equal(st.getTtlKeepaliveMaxCount("conv-win-a"), 1);
       assert.equal(st.hasCustomTtlKeepaliveOverride("conv-win-a"), false);
+
+      // Upgrades preserve an explicit count in config.json and an explicit disable takes precedence.
+      fs.writeFileSync(cfgPath, JSON.stringify({ ttlKeepaliveMaxCount: 4 }));
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 4);
+      fs.writeFileSync(cfgPath, JSON.stringify({ ttlKeepalive: false, ttlKeepaliveMaxCount: 4 }));
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 0);
+      fs.writeFileSync(cfgPath, "{}");
 
       // Window B sets custom override maxCount = 6
       st.setTtlKeepaliveMaxCount(6, "conv-win-b");
@@ -4183,8 +4284,10 @@ test("v1.5.4-ka-13: Global keepalive maxCount (0..20), per-window override vs fo
 
       let statCalls = 0;
       const sentZero = [];
+      const notificationsWhileOff = [];
       const monZero = new WatchdogMonitor({
         getStore: () => st,
+        notifyFn: (notification) => notificationsWhileOff.push(notification),
         getConfig: () => ({
           stallWatchdog: true,
           ttlKeepalive: true,
@@ -4205,6 +4308,7 @@ test("v1.5.4-ka-13: Global keepalive maxCount (0..20), per-window override vs fo
       monZero.tick();
       await flushMicrotasks();
       assert.equal(sentZero.length, 0, "Global maxCount=0 must suppress auto-keepalive on uncustomized windows");
+      assert.deepEqual(notificationsWhileOff, [], "Global maxCount=0 must silence TTL notifications");
       assert.equal(monZero.statSyncCount, 0, "IDLE WatchdogMonitor.tick() with global maxCount=0 must maintain statSyncCount === 0");
       assert.equal(statCalls, 0, "IDLE WatchdogMonitor.tick() with global maxCount=0 must perform 0 transcript statSync calls");
 
@@ -4239,7 +4343,8 @@ test("v1.5.4-ka-13: Global keepalive maxCount (0..20), per-window override vs fo
 
     // 2. HTTP `/api/watchdog/action` boundary validation (`0..20` valid; out-of-range/non-int -> 400) + auto-enable + resetTtlKeepaliveOverride
     const token = "csrf-global-ka-test-token-012345";
-    srv = createStandaloneServer({ csrfToken: token });
+    // The panel toggles live notification settings while simulated leases are still in the test DB.
+    srv = createStandaloneServer({ csrfToken: token, watchdogOptions: { notifyFn: () => ({ dispatched: true }) } });
     await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
     const port = srv.address().port;
     const headers = {
@@ -4897,6 +5002,1593 @@ test("v1.5.4-ka-13: Global keepalive maxCount (0..20), per-window override vs fo
     else process.env.AGY_DART_DB_PATH = prevDbEnv;
     if (prevCfgEnv === undefined) delete process.env.AGY_DART_CONFIG_PATH;
     else process.env.AGY_DART_CONFIG_PATH = prevCfgEnv;
+    resetConfigCache();
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test("v1.5.4-ka-14: Cloud clock alignment + 60s lead + delivery EMA, default 1x, 3-layer cold-miss circuit breaker, adjustable window % threshold (512k/256k/200k/0% + custom bypass) & accordion UI", async () => {
+  const { CONFIG_DEFAULTS, getEffectiveConfig } = await import("../context/lib/config.js");
+  const { handleStopPayload } = await import("../hooks/stop.mjs");
+  const { recordHookLeaseTransition } = await import("../context/lib/watchdog-lease.js");
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-ka-v154-14-"));
+  const dbPath = path.join(tmpDir, "context.db");
+  const cfgPath = path.join(tmpDir, "config.json");
+  fs.writeFileSync(cfgPath, "{}", "utf8");
+
+  const prevDbEnv = process.env.AGY_DART_DB_PATH;
+  const prevCfgEnv = process.env.AGY_DART_CONFIG_PATH;
+  const prevMinPctEnv = process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT;
+  process.env.AGY_DART_DB_PATH = dbPath;
+  process.env.AGY_DART_CONFIG_PATH = cfgPath;
+  delete process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT;
+  resetConfigCache();
+
+  let srv = null;
+  try {
+    // 1. Verify updated product defaults: maxCount=1, leadSec=60s, minContextPct=15%
+    assert.equal(CONFIG_DEFAULTS.ttlKeepalive, false);
+    assert.equal(CONFIG_DEFAULTS.ttlKeepaliveMaxCount, 1);
+    assert.equal(CONFIG_DEFAULTS.ttlKeepaliveLeadSec, 60);
+    assert.equal(CONFIG_DEFAULTS.ttlKeepaliveMinContextPct, 15);
+    const effDefaults = getEffectiveConfig();
+    assert.equal(effDefaults.ttlKeepaliveMaxCount, 1);
+    assert.equal(effDefaults.ttlKeepaliveLeadSec, 60);
+    assert.equal(effDefaults.ttlKeepaliveMinContextPct, 15);
+
+    // 2. Cloud Clock Alignment + 60s Lead + Send Pipeline Latency EMA Compensation
+    const st = new ContextModeStore({ dbPath });
+    st.open();
+    st.setUiLang("zh");
+    try {
+      assert.equal(st.getGlobalTtlKeepaliveMaxCount(), 0);
+      assert.equal(st.getGlobalTtlKeepaliveMinContextPct(), 15);
+      assert.equal(st.getTtlKeepaliveDeliveryMs(), 0);
+
+      let clockMs = 1_800_000_000_000;
+      let monoNs = 1_000_000_000n;
+      const setClock = (nextMs) => {
+        const delta = Math.max(0, nextMs - clockMs);
+        clockMs = nextMs;
+        monoNs += BigInt(delta) * 1_000_000n;
+      };
+      const sent = [];
+      let statCalls = 0;
+      const mon = new WatchdogMonitor({
+        getStore: () => st,
+        nowFn: () => clockMs,
+        monoNsFn: () => monoNs,
+        statFn: (p) => {
+          statCalls += 1;
+          return fs.statSync(p);
+        },
+        keepaliveSendFn: async (p) => {
+          sent.push(p);
+          return { ok: true };
+        }
+      });
+
+      // 2a. Long 55s thinking/streaming turn: PreInvocation starts prefill at t0, Stop completes at t0 + 55s
+      const t0 = clockMs;
+      recordHookLeaseTransition(
+        st,
+        "PreInvocation",
+        { conversationId: "conv-cloud-align", invocationNum: 0, lastUserInput: "深度推理分析" },
+        { nowMs: t0, contextTokens: 90_000, windowTokens: 200_000, model: "claude-opus-4-6-thinking" }
+      );
+      setClock(t0 + 55_000);
+      recordHookLeaseTransition(
+        st,
+        "Stop",
+        { conversationId: "conv-cloud-align", terminationReason: "NO_TOOL_CALL" },
+        { nowMs: clockMs }
+      );
+      const alignedLease = readWatchdogLease(st, "conv-cloud-align");
+      assert.equal(alignedLease.idleAnchorTs, t0 + 55_000);
+      assert.equal(alignedLease.cacheOriginTs, t0, "Stop must preserve turn LLM prefill start as cacheOriginTs");
+
+      // At t0 + 239s (184s after Stop, 61s left on cloud 5m TTL): must NOT fire yet
+      setClock(t0 + 239_000);
+      mon.tick();
+      await flushMicrotasks();
+      assert.equal(sent.length, 0, "61s before cloud TTL expiry must not fire yet");
+
+      // At t0 + 240s (185s after Stop, 60s left on cloud 5m TTL — 55s earlier than old late Stop+240s!): fires 1/1!
+      setClock(t0 + 240_000);
+      mon.tick();
+      await flushMicrotasks();
+      assert.equal(sent.length, 0, "A fresh install must send no keepalive even inside the trigger window");
+      st.setGlobalTtlKeepaliveMaxCount(1);
+      mon.tick();
+      await flushMicrotasks();
+      assert.equal(sent.length, 1, "Cloud-aligned keepalive must fire at t0 + 240s (4m00s cloud time), not Stop + 240s");
+      assert.ok(sent[0].message.includes("1/1"));
+      assert.equal(statCalls, 0, "IDLE tick must perform 0 fs.statSync calls");
+
+      // Default maxCount=1 stops after 1/1 on renewed cycle
+      recordHookLeaseTransition(
+        st,
+        "PreInvocation",
+        { conversationId: "conv-cloud-align", invocationNum: 0, lastUserInput: sent[0].message },
+        { nowMs: clockMs + 2_000, isKeepaliveTurn: true, contextTokens: 90_000, windowTokens: 200_000 }
+      );
+      recordHookLeaseTransition(
+        st,
+        "Stop",
+        { conversationId: "conv-cloud-align", terminationReason: "NO_TOOL_CALL" },
+        { nowMs: clockMs + 4_000 }
+      );
+      setClock(clockMs + 250_000);
+      mon.tick();
+      await flushMicrotasks();
+      assert.equal(sent.length, 1, "Default maxCount=1 must NOT fire a 2nd keepalive");
+
+      // 2b. Multi-tool turn + flushed PLANNER_RESPONSE.created_at + Turn-0/1 Stop token enrichment
+      const txAlign = path.join(tmpDir, "tx-align.jsonl");
+      const tTurn = clockMs;
+      recordHookLeaseTransition(
+        st,
+        "PreInvocation",
+        { conversationId: "conv-tool-align", invocationNum: 0, lastUserInput: "跑检查并总结" },
+        { nowMs: tTurn, transcriptPath: txAlign, contextTokens: 0 }
+      );
+      recordHookLeaseTransition(
+        st,
+        "PostToolUse",
+        { conversationId: "conv-tool-align" },
+        { nowMs: tTurn + 20_000, toolName: "run_checks", toolArgs: {} }
+      );
+      const plannerCreatedMs = tTurn + 21_000;
+      fs.writeFileSync(
+        txAlign,
+        [
+          { step_index: 1, type: "USER_INPUT", created_at: new Date(tTurn).toISOString(), content: "跑检查并总结" },
+          {
+            step_index: 2,
+            type: "PLANNER_RESPONSE",
+            created_at: new Date(plannerCreatedMs).toISOString(),
+            completed_at: new Date(tTurn + 69_000).toISOString(),
+            model: "gemini-4-carbon-high",
+            max_token_limit: 512_000,
+            input_tokens: 85_000,
+            cache_read_tokens: 0,
+            output_tokens: 400,
+            content: "检查完成。"
+          }
+        ]
+          .map((s) => JSON.stringify(s))
+          .join("\n") + "\n",
+        "utf8"
+      );
+      await handleStopPayload(
+        { conversationId: "conv-tool-align", transcriptPath: txAlign, terminationReason: "NO_TOOL_CALL" },
+        { store: st, nowMs: tTurn + 70_000 }
+      );
+      const toolLease = readWatchdogLease(st, "conv-tool-align");
+      assert.equal(toolLease.cacheOriginTs, plannerCreatedMs, "Stop must align cacheOriginTs to PLANNER_RESPONSE.created_at");
+      assert.equal(toolLease.contextTokens, 85_000, "Stop must enrich contextTokens on Turn 0/1");
+      assert.equal(toolLease.windowTokens, 512_000, "Stop must enrich max_token_limit on Turn 0/1");
+      assert.equal(
+        st.getTtlKeepaliveState("conv-tool-align").coldMissTripped,
+        false,
+        "Human Turn-1 cold prefill (cache_read=0) must NEVER trip keepalive cold-miss circuit breaker"
+      );
+
+      // 2c. Send->PreInvocation pipeline latency EMA compensation (+4s for 3200ms ack latency)
+      st.recordTtlKeepaliveDeliveryMs(3_200);
+      assert.equal(st.getTtlKeepaliveDeliveryMs(), 3_200);
+      // 300s TTL - (60s lead + ceil(3.2s)=4s) = 236s after plannerCreatedMs!
+      setClock(plannerCreatedMs + 235_000); // remSec = 65s > 64s -> no fire
+      mon.tick();
+      await flushMicrotasks();
+      assert.equal(sent.filter((s) => s.conversationId === "conv-tool-align").length, 0);
+
+      setClock(plannerCreatedMs + 236_000); // remSec = 64s <= 64s -> fires!
+      mon.tick();
+      await flushMicrotasks();
+      assert.equal(
+        sent.filter((s) => s.conversationId === "conv-tool-align").length,
+        1,
+        "Delivery latency compensation must advance trigger by 4s so keepalive arrives at cloud ~4m00s"
+      );
+
+      // 3. Adjustable Window % Threshold (15%: 512k=76.8k, 256k=38.4k, 200k=30k; 0% = no min; custom window bypasses)
+      st.setMeta("cache:ttl_keepalive_delivery_ms", "0");
+      const baseWinTs = clockMs + 500_000;
+      const seedWindowCase = (cid, ctxTok, winTok, model = "claude-sonnet-4-5") => {
+        writeWatchdogLease(st, {
+          conversationId: cid,
+          rootSessionId: cid,
+          convTitle: cid,
+          phase: WATCHDOG_PHASES.IDLE,
+          subphase: "stopped",
+          stopReason: "NO_TOOL_CALL",
+          contextTokens: ctxTok,
+          windowTokens: winTok,
+          model,
+          cacheTtlSec: 300,
+          idleAnchorTs: baseWinTs,
+          cacheOriginTs: baseWinTs,
+          phaseChangedTs: baseWinTs,
+          updatedTs: baseWinTs
+        });
+      };
+      seedWindowCase("win-512k-below", 76_000, 512_000, "gemini-4-carbon-high");
+      seedWindowCase("win-512k-above", 77_000, 512_000, "gemini-4-carbon-high");
+      seedWindowCase("win-256k-below", 38_000, 256_000, "gemini-2.5-pro");
+      seedWindowCase("win-256k-above", 39_000, 256_000, "gemini-2.5-pro");
+      seedWindowCase("win-200k-below", 29_500, 200_000, "claude-opus-4-6-thinking");
+      seedWindowCase("win-200k-above", 30_000, 200_000, "claude-opus-4-6-thinking");
+      seedWindowCase("win-custom-small", 8_000, 200_000, "claude-opus-4-6-thinking");
+      st.setTtlKeepaliveEnabled(true, "win-custom-small"); // manual per-window override bypasses 15% threshold!
+
+      sent.length = 0;
+      setClock(baseWinTs + 245_000); // 55s left <= 60s lead
+      mon.tick();
+      await flushMicrotasks();
+
+      const firedIds15 = sent.map((s) => s.conversationId).sort();
+      assert.deepEqual(
+        firedIds15,
+        ["win-200k-above", "win-256k-above", "win-512k-above", "win-custom-small"],
+        "15% window threshold must filter <76.8k(512k)/<38.4k(256k)/<30k(200k) while exempting manual per-window overrides"
+      );
+
+      // Setting 0% removes threshold -> small uncustomized contexts now fire too!
+      st.setGlobalTtlKeepaliveMinContextPct(0);
+      sent.length = 0;
+      mon.tick();
+      await flushMicrotasks();
+      const firedIds0 = sent.map((s) => s.conversationId).sort();
+      assert.deepEqual(
+        firedIds0,
+        ["win-200k-below", "win-256k-below", "win-512k-below"],
+        "0% threshold must allow all small-context windows without minimum"
+      );
+      st.setGlobalTtlKeepaliveMinContextPct(15);
+
+      // 4. Multi-Round Cold-Miss Auto Circuit Breaker (Layers 1, 2, 3) + Reset & Human Turn Recovery
+      st.setGlobalTtlKeepaliveMaxCount(3);
+      const txCold = path.join(tmpDir, "tx-cold.jsonl");
+      const tCold = clockMs + 100_000;
+      fs.writeFileSync(
+        txCold,
+        [
+          { step_index: 1, type: "USER_INPUT", created_at: new Date(tCold).toISOString(), content: "开始长任务" },
+          {
+            step_index: 2,
+            type: "PLANNER_RESPONSE",
+            created_at: new Date(tCold + 1_000).toISOString(),
+            model: "claude-opus-4-6-thinking",
+            input_tokens: 5_000,
+            cache_read_tokens: 75_000,
+            output_tokens: 100,
+            content: "收到。"
+          },
+          {
+            step_index: 3,
+            type: "SYSTEM_MESSAGE",
+            created_at: new Date(tCold + 242_000).toISOString(),
+            content: "[agy-dart TTL保活 1/3] 仅回复 OK 以保持上下文缓存热度，请勿调用任何工具或修改任何内容。"
+          },
+          {
+            step_index: 4,
+            type: "PLANNER_RESPONSE",
+            created_at: new Date(tCold + 243_000).toISOString(),
+            model: "claude-opus-4-6-thinking",
+            input_tokens: 80_200,
+            cache_read_tokens: 0,
+            output_tokens: 4,
+            content: "OK"
+          }
+        ]
+          .map((s) => JSON.stringify(s))
+          .join("\n") + "\n",
+        "utf8"
+      );
+      writeWatchdogLease(st, {
+        conversationId: "conv-cold-l1",
+        rootSessionId: "conv-cold-l1",
+        convTitle: "冷断测试L1",
+        phase: WATCHDOG_PHASES.LLM_INFLIGHT,
+        subphase: "high_ctx",
+        startedTs: tCold + 242_000,
+        lastLlmStartTs: tCold + 242_000,
+        updatedTs: tCold + 242_000,
+        transcriptPath: txCold,
+        contextTokens: 80_000,
+        windowTokens: 200_000
+      });
+      st.setTtlKeepaliveState("conv-cold-l1", {
+        usedCount: 1,
+        lastSentTs: tCold + 241_500,
+        inKeepaliveTurn: true,
+        updatedTs: tCold + 242_000
+      });
+      // Layer 1: Stop hook sees cache_read_tokens === 0 on keepalive turn -> trips coldMissTripped!
+      await handleStopPayload(
+        { conversationId: "conv-cold-l1", transcriptPath: txCold, terminationReason: "NO_TOOL_CALL" },
+        { store: st, nowMs: tCold + 245_000 }
+      );
+      assert.equal(st.getTtlKeepaliveState("conv-cold-l1").coldMissTripped, true, "Layer 1 Stop hook must trip coldMissTripped on cache_read=0");
+      assert.equal(st.getTtlKeepaliveState("conv-cold-l1").inKeepaliveTurn, false);
+
+      // Next idle expiry on conv-cold-l1 MUST NOT fire round 2/3!
+      sent.length = 0;
+      setClock(tCold + 243_000 + 250_000);
+      mon.tick();
+      await flushMicrotasks();
+      assert.equal(sent.filter((s) => s.conversationId === "conv-cold-l1").length, 0, "Tripped coldMissTripped must block round 2/3");
+
+      // Manual reset clears coldMissTripped -> round 1/3 is allowed again!
+      st.resetTtlKeepaliveState("conv-cold-l1", clockMs);
+      assert.equal(st.getTtlKeepaliveState("conv-cold-l1").coldMissTripped, false);
+
+      // Layer 3: Un-flushed at Stop, flushed 200ms later, headless Watchdog catches cold miss with 0 fs.statSync!
+      const txColdL3 = path.join(tmpDir, "tx-cold-l3.jsonl");
+      const tL3 = clockMs + 50_000;
+      const preFlushSteps = [
+        { step_index: 1, type: "USER_INPUT", created_at: new Date(tL3).toISOString(), content: "任务L3" },
+        { step_index: 2, type: "PLANNER_RESPONSE", created_at: new Date(tL3 + 1_000).toISOString(), input_tokens: 5_000, cache_read_tokens: 75_000, output_tokens: 20 },
+        { step_index: 3, type: "SYSTEM_MESSAGE", created_at: new Date(tL3 + 242_000).toISOString(), content: "[agy-dart TTL保活 1/3] 仅回复 OK" }
+      ];
+      fs.writeFileSync(txColdL3, preFlushSteps.map((s) => JSON.stringify(s)).join("\n") + "\n", "utf8");
+      writeWatchdogLease(st, {
+        conversationId: "conv-cold-l3",
+        rootSessionId: "conv-cold-l3",
+        convTitle: "冷断测试L3",
+        phase: WATCHDOG_PHASES.LLM_INFLIGHT,
+        subphase: "high_ctx",
+        startedTs: tL3 + 242_000,
+        lastLlmStartTs: tL3 + 242_000,
+        updatedTs: tL3 + 242_000,
+        transcriptPath: txColdL3,
+        contextTokens: 80_000,
+        windowTokens: 200_000
+      });
+      st.setTtlKeepaliveState("conv-cold-l3", {
+        usedCount: 1,
+        lastSentTs: tL3 + 241_500,
+        inKeepaliveTurn: true,
+        lastColdCheckUsed: 0,
+        updatedTs: tL3 + 242_000
+      });
+      await handleStopPayload(
+        { conversationId: "conv-cold-l3", transcriptPath: txColdL3, terminationReason: "NO_TOOL_CALL" },
+        { store: st, nowMs: tL3 + 244_000 }
+      );
+      assert.equal(st.getTtlKeepaliveState("conv-cold-l3").coldMissTripped, false, "Not yet flushed at Stop");
+      assert.equal(st.getTtlKeepaliveState("conv-cold-l3").lastColdCheckUsed, 0);
+
+      // Now flush the cold-miss PLANNER_RESPONSE to disk AFTER Stop!
+      fs.appendFileSync(
+        txColdL3,
+        JSON.stringify({
+          step_index: 4,
+          type: "PLANNER_RESPONSE",
+          created_at: new Date(tL3 + 242_500).toISOString(),
+          input_tokens: 80_100,
+          cache_read_tokens: 0,
+          output_tokens: 3,
+          content: "OK"
+        }) + "\n",
+        "utf8"
+      );
+      sent.length = 0;
+      const statBeforeL3 = statCalls;
+      setClock(tL3 + 242_000 + 250_000);
+      mon.tick();
+      await flushMicrotasks();
+      assert.equal(statCalls, statBeforeL3, "Layer 3 IDLE cold-miss check must perform 0 fs.statSync calls");
+      assert.equal(st.getTtlKeepaliveState("conv-cold-l3").coldMissTripped, true, "Layer 3 Watchdog tail check must trip coldMissTripped");
+      assert.equal(sent.filter((s) => s.conversationId === "conv-cold-l3").length, 0, "Layer 3 must abort sending round 2/3");
+
+      // Genuine human PreInvocation turn recovers coldMissTripped -> false!
+      st.close();
+      const rRecover = spawnSync(process.execPath, [path.join(ROOT, "hooks", "pre-invocation.mjs")], {
+        input: JSON.stringify({ conversationId: "conv-cold-l3", invocationNum: 0, lastUserInput: "我回来了，继续下一步" }),
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, AGY_DART_DB_PATH: dbPath, AGY_DART_CONFIG_PATH: cfgPath }
+      });
+      assert.equal(rRecover.status, 0);
+      assert.equal(rRecover.stderr, "");
+
+      const stAfterRecover = new ContextModeStore({ dbPath });
+      try {
+        const recKa = stAfterRecover.getTtlKeepaliveState("conv-cold-l3");
+        assert.equal(recKa.usedCount, 0);
+        assert.equal(recKa.coldMissTripped, false, "Genuine human message must recover coldMissTripped -> false");
+
+        // Survival across sanitizeModelTtlState, pruneByTtl, and clearSessionOverrides + env override
+        stAfterRecover.setGlobalTtlKeepaliveMinContextPct(22);
+        stAfterRecover.recordTtlKeepaliveDeliveryMs(2_500);
+        stAfterRecover.sanitizeModelTtlState();
+        stAfterRecover.pruneByTtl({ maxAgeDays: 14 });
+        stAfterRecover.clearSessionOverrides();
+        assert.equal(stAfterRecover.getGlobalTtlKeepaliveMinContextPct(), 22);
+        assert.ok(stAfterRecover.getTtlKeepaliveDeliveryMs() > 0);
+
+        process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT = "25";
+        resetConfigCache();
+        assert.equal(stAfterRecover.getGlobalTtlKeepaliveMinContextPct(), 25, "Env must override SQLite minContextPct");
+        delete process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT;
+        resetConfigCache();
+        stAfterRecover.setGlobalTtlKeepaliveMinContextPct(15);
+      } finally {
+        stAfterRecover.close();
+      }
+    } finally {
+      if (st.db) st.close();
+    }
+
+    // 5. Sidecar HTTP API validation + Accordion placement + VM live k-value & cold-miss rendering
+    const htmlSrc = fs.readFileSync(path.join(ROOT, "sidecars", "dashboard", "index.html"), "utf8");
+    const idxAccordion = htmlSrc.indexOf('id="exempt-accordion"');
+    const idxAccordionEnd = htmlSrc.indexOf("</details>", idxAccordion);
+    const idxMinCtxCtrl = htmlSrc.indexOf('id="ka-min-ctx-control"');
+    const idxMinCtxInput = htmlSrc.indexOf('id="ka-min-ctx-pct-input"');
+    const idxCutoffSelect = htmlSrc.indexOf('id="cutoff-select"');
+    assert.ok(idxAccordion > 0 && idxAccordionEnd > idxAccordion, "#exempt-accordion must exist");
+    assert.ok(
+      idxMinCtxCtrl > idxAccordion && idxMinCtxCtrl < idxAccordionEnd && idxMinCtxInput > idxMinCtxCtrl,
+      "#ka-min-ctx-control must be placed inside bottom #exempt-accordion alongside Cutoff/Exempt settings"
+    );
+    assert.ok(Math.abs(idxCutoffSelect - idxMinCtxInput) < 900, "#ka-min-ctx-pct-input must sit alongside #cutoff-select");
+
+    const token = "test-ka14-csrf-0123456789abcdef";
+    srv = createStandaloneServer({ csrfToken: token });
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    const port = srv.address().port;
+    const headers = {
+      Host: `127.0.0.1:${port}`,
+      Connection: "close",
+      "Content-Type": "application/json",
+      "X-Agy-Dart-Token": token
+    };
+
+    for (const badPct of [-1, 101, 12.5, "", true, false, null, {}, []]) {
+      const badRes = await httpJsonRequest(port, "/api/watchdog/action", {
+        headers,
+        body: { action: "setTtlKeepaliveMinContextPct", minContextPct: badPct }
+      });
+      assert.equal(badRes.status, 400, `Invalid minContextPct ${JSON.stringify(badPct)} must return HTTP 400`);
+    }
+
+    for (const okPct of [0, 15, 25, 100, 15]) {
+      const okRes = await httpJsonRequest(port, "/api/watchdog/action", {
+        headers,
+        body: { action: "setTtlKeepaliveMinContextPct", minContextPct: okPct }
+      });
+      assert.equal(okRes.status, 200);
+      assert.equal(okRes.json.globalTtlKeepaliveMinContextPct, okPct);
+      assert.equal(okRes.json.status.globalTtlKeepaliveMinContextPct, okPct);
+    }
+
+    // Seed cold-miss tripped state on `conv-vm-cold` for VM rendering & reset verification
+    {
+      const stVm = new ContextModeStore({ dbPath });
+      stVm.setGlobalTtlKeepaliveMaxCount(3);
+      stVm.setTtlKeepaliveState("conv-vm-cold", { usedCount: 1, coldMissTripped: true });
+      stVm.close();
+    }
+    closeRuntimeStore();
+
+    const scriptMatch = htmlSrc.match(/<script>([\s\S]*?)<\/script>/);
+    assert.ok(scriptMatch && scriptMatch[1]);
+    const elements = new Map();
+    const makeEl = (id) => ({
+      id,
+      value: id === "ka-min-ctx-pct-input" ? "15" : "1",
+      textContent: "",
+      innerText: "",
+      innerHTML: "",
+      title: "",
+      className: "",
+      disabled: false,
+      hidden: false,
+      style: {},
+      dataset:
+        id === "kv-keepalive-btn"
+          ? { enabled: "1", used: "0", max: "1", custom: "0", cold: "0" }
+          : id === "kv-global-keepalive-btn"
+            ? { max: "1", fallback: "1" }
+            : {},
+      options: [],
+      classList: {
+        _s: new Set(),
+        add(...c) { c.forEach((x) => this._s.add(x)); },
+        remove(...c) { c.forEach((x) => this._s.delete(x)); },
+        contains(x) { return this._s.has(x); },
+        toggle(x, f) {
+          if (f === undefined) {
+            if (this._s.has(x)) { this._s.delete(x); return false; }
+            this._s.add(x); return true;
+          }
+          if (f) this._s.add(x); else this._s.delete(x);
+          return Boolean(f);
+        }
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      focus() {},
+      blur() {}
+    });
+    const getEl = (id) => {
+      if (!elements.has(id)) elements.set(id, makeEl(id));
+      return elements.get(id);
+    };
+
+    const vmFetch = async (url, opts = {}) => {
+      const res = await httpJsonRequest(port, url, {
+        method: opts.method || "POST",
+        headers,
+        body: opts.body ? JSON.parse(opts.body) : {}
+      });
+      return {
+        ok: res.status >= 200 && res.status < 300,
+        status: res.status,
+        json: async () => res.json
+      };
+    };
+
+    const vmCtx = vm.createContext({
+      window: {
+        location: { search: "?conversationId=conv-vm-cold&lang=zh" },
+        addEventListener() {}
+      },
+      document: {
+        hidden: false,
+        activeElement: null,
+        title: "",
+        documentElement: { lang: "zh-CN" },
+        getElementById: getEl,
+        querySelector: () => ({ getAttribute: () => token }),
+        querySelectorAll: () => [],
+        addEventListener() {}
+      },
+      navigator: { language: "zh-CN", clipboard: { writeText: async () => {} } },
+      localStorage: { getItem: () => null, setItem() {} },
+      sessionStorage: { getItem: () => null, setItem() {} },
+      fetch: vmFetch,
+      Headers,
+      URLSearchParams,
+      setTimeout: (fn) => { fn(); return 1; },
+      clearTimeout() {},
+      setInterval: () => 1,
+      clearInterval() {},
+      confirm: () => true,
+      alert() {},
+      Date,
+      Math,
+      Number,
+      String,
+      Boolean,
+      Array,
+      Object,
+      Set,
+      Map,
+      JSON,
+      Promise,
+      Error,
+      RegExp,
+      parseInt,
+      parseFloat,
+      isFinite,
+      encodeURIComponent,
+      decodeURIComponent,
+      console: { error() {}, log() {}, warn() {} }
+    });
+
+    vm.runInContext(scriptMatch[1], vmCtx);
+    await vmCtx.refreshData(true);
+    await flushMicrotasks();
+
+    // Layer 2: Verify `/api/cache-diag` also detects a post-Stop flushed keepalive cold miss (cache_read = 0)
+    const txLayer2 = path.join(tmpDir, "tx-cold-l2.jsonl");
+    const tL2 = Date.now() - 10_000;
+    fs.writeFileSync(
+      txLayer2,
+      [
+        { step_index: 1, type: "USER_INPUT", created_at: new Date(tL2).toISOString(), content: "开始L2" },
+        { step_index: 2, type: "PLANNER_RESPONSE", created_at: new Date(tL2 + 1_000).toISOString(), input_tokens: 4_000, cache_read_tokens: 60_000, output_tokens: 20 },
+        { step_index: 3, type: "SYSTEM_MESSAGE", created_at: new Date(tL2 + 5_000).toISOString(), content: "[agy-dart TTL保活 1/3] 仅回复 OK" },
+        { step_index: 4, type: "PLANNER_RESPONSE", created_at: new Date(tL2 + 6_000).toISOString(), input_tokens: 64_100, cache_read_tokens: 0, output_tokens: 3, content: "OK" }
+      ]
+        .map((s) => JSON.stringify(s))
+        .join("\n") + "\n",
+      "utf8"
+    );
+    {
+      const stL2 = new ContextModeStore({ dbPath });
+      writeWatchdogLease(stL2, {
+        conversationId: "conv-cold-l2",
+        rootSessionId: "conv-cold-l2",
+        convTitle: "冷断测试L2",
+        phase: WATCHDOG_PHASES.IDLE,
+        subphase: "stopped",
+        stopReason: "NO_TOOL_CALL",
+        transcriptPath: txLayer2,
+        contextTokens: 64_100,
+        windowTokens: 200_000,
+        idleAnchorTs: tL2 + 6_500,
+        cacheOriginTs: tL2 + 6_000,
+        updatedTs: tL2 + 6_500
+      });
+      stL2.setTtlKeepaliveState("conv-cold-l2", {
+        usedCount: 1,
+        lastSentTs: tL2 + 4_800,
+        pendingAck: false,
+        inKeepaliveTurn: false,
+        coldMissTripped: false,
+        lastColdCheckUsed: 0,
+        updatedTs: tL2 + 6_500
+      });
+      stL2.close();
+      closeRuntimeStore();
+    }
+    const cdL2 = await httpJsonRequest(port, "/api/cache-diag", {
+      headers,
+      body: { scope: "conversation", conversationId: "conv-cold-l2" }
+    });
+    assert.equal(cdL2.status, 200);
+    assert.equal(cdL2.json.ttlKeepalive.coldMissTripped, true, "Layer 2 /api/cache-diag must trip coldMissTripped on post-flush cache_read=0");
+
+    // Cold-miss tripped UI state in ZH & EN
+    assert.equal(getEl("kv-keepalive-btn").innerText, "自动续温：1/3（冷断）");
+    assert.ok(getEl("kv-keepalive-group").className.includes("is-exhausted"), "Cold-tripped capsule must show amber exhausted styling");
+    assert.equal(getEl("kv-keepalive-reset-btn").className, "keepalive-reset-btn", "Reset ↺ button must show when coldMissTripped");
+
+    vmCtx.setLanguage("en", true);
+    await flushMicrotasks();
+    assert.equal(getEl("kv-keepalive-btn").innerText, "Auto-Keepalive: 1/3 (Cold)");
+    vmCtx.setLanguage("zh", true);
+    await flushMicrotasks();
+
+    // Live k-value conversion for 512k / 256k / 200k / 0%
+    vmCtx.renderKeepaliveMinContextControls(15, 512_000);
+    assert.equal(getEl("ka-min-ctx-k-hint").textContent, "≈77k/512k");
+    vmCtx.renderKeepaliveMinContextControls(15, 256_000);
+    assert.equal(getEl("ka-min-ctx-k-hint").textContent, "≈38k/256k");
+    vmCtx.renderKeepaliveMinContextControls(15, 200_000);
+    assert.equal(getEl("ka-min-ctx-k-hint").textContent, "≈30k/200k");
+
+    await vmCtx.changeTtlKeepaliveMinContextPct("0");
+    await flushMicrotasks();
+    assert.equal(getEl("ka-min-ctx-pct-input").value, "0");
+    assert.equal(getEl("ka-min-ctx-k-hint").textContent, "（无门槛）");
+
+    await vmCtx.changeTtlKeepaliveMinContextPct("20");
+    await flushMicrotasks();
+    assert.equal(getEl("ka-min-ctx-pct-input").value, "20");
+    assert.equal(getEl("ka-min-ctx-k-hint").textContent, "≈40k/200k");
+
+    // Manual ↺ reset clears coldMissTripped back to 0/3!
+    await vmCtx.resetTtlKeepalive();
+    await flushMicrotasks();
+    assert.equal(getEl("kv-keepalive-btn").innerText, "自动续温：0/3");
+    assert.equal(getEl("kv-keepalive-btn").dataset.cold, "0");
+  } finally {
+    if (srv) {
+      srv.closeAllConnections?.();
+      await new Promise((resolve) => srv.close(resolve));
+    }
+    closeRuntimeStore();
+    if (prevDbEnv === undefined) delete process.env.AGY_DART_DB_PATH;
+    else process.env.AGY_DART_DB_PATH = prevDbEnv;
+    if (prevCfgEnv === undefined) delete process.env.AGY_DART_CONFIG_PATH;
+    else process.env.AGY_DART_CONFIG_PATH = prevCfgEnv;
+    if (prevMinPctEnv === undefined) delete process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT;
+    else process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT = prevMinPctEnv;
+    resetConfigCache();
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test("v1.5.4-ka-15: Hardened multi-tool causal cacheOriginTs, clock skew bounds, Round-2+ cold-miss anti-poisoning, Turn-0 delayed flush backfill, >32KB transcript tail, disabled-watchdog decoupling & Sidecar VM races", async () => {
+  const { handleStopPayload } = await import("../hooks/stop.mjs");
+  const {
+    readWatchdogTranscriptTail,
+    recordHookLeaseTransition
+  } = await import("../context/lib/watchdog-lease.js");
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-ka-v154-15-"));
+  const dbPath = path.join(tmpDir, "context.db");
+  const cfgPath = path.join(tmpDir, "config.json");
+  fs.writeFileSync(cfgPath, "{}", "utf8");
+
+  const prevDbEnv = process.env.AGY_DART_DB_PATH;
+  const prevCfgEnv = process.env.AGY_DART_CONFIG_PATH;
+  const prevMinPctEnv = process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT;
+  const prevDisWdEnv = process.env.AGY_DART_DISABLE_STALL_WATCHDOG;
+  process.env.AGY_DART_DB_PATH = dbPath;
+  process.env.AGY_DART_CONFIG_PATH = cfgPath;
+  delete process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT;
+  delete process.env.AGY_DART_DISABLE_STALL_WATCHDOG;
+  resetConfigCache();
+
+  let srv = null;
+  try {
+    const st = new ContextModeStore({ dbPath });
+    st.open();
+    st.setUiLang("zh");
+
+    let clockMs = 1_850_000_000_000;
+    let monoNs = 1_000_000_000n;
+    const setClock = (nextMs) => {
+      const delta = Math.max(0, nextMs - clockMs);
+      clockMs = nextMs;
+      monoNs += BigInt(delta) * 1_000_000n;
+    };
+    const sent = [];
+    let statCalls = 0;
+    const mon = new WatchdogMonitor({
+      getStore: () => st,
+      nowFn: () => clockMs,
+      monoNsFn: () => monoNs,
+      statFn: (p) => {
+        statCalls += 1;
+        return fs.statSync(p);
+      },
+      keepaliveSendFn: async (p) => {
+        sent.push(p);
+        return { ok: true };
+      }
+    });
+
+    try {
+      // 1a. PostToolUse -> denied PreToolUse -> un-flushed Stop preserves the denial-triggered LLM prefill start (t1 + 32s, not t1 or Stop t1 + 45s)
+      const t1 = clockMs;
+      recordHookLeaseTransition(
+        st,
+        "PreInvocation",
+        { conversationId: "conv-denied-tool", invocationNum: 0, lastUserInput: "检查目录" },
+        { nowMs: t1, contextTokens: 80_000, windowTokens: 200_000 }
+      );
+      recordHookLeaseTransition(
+        st,
+        "PostToolUse",
+        { conversationId: "conv-denied-tool" },
+        { nowMs: t1 + 30_000, toolName: "run_command", toolArgs: { CommandLine: "git status" } }
+      );
+      recordHookLeaseTransition(
+        st,
+        "PreToolUse",
+        { conversationId: "conv-denied-tool" },
+        { nowMs: t1 + 32_000, toolName: "run_command", decision: "deny" }
+      );
+      recordHookLeaseTransition(
+        st,
+        "Stop",
+        { conversationId: "conv-denied-tool", terminationReason: "NO_TOOL_CALL" },
+        { nowMs: t1 + 45_000 }
+      );
+      assert.equal(
+        readWatchdogLease(st, "conv-denied-tool").cacheOriginTs,
+        t1 + 32_000,
+        "PostToolUse -> denied PreToolUse -> un-flushed Stop must preserve denial-triggered LLM prefill start (t1 + 32s)"
+      );
+
+      // 1b. Clock skew bounds: minor future skew (+3s <= +5s) clamps to Stop; bogus future skew (+20s > +5s) & stale (< startedTs - 5s) fall back to causal floor
+      const txFutureClamp = path.join(tmpDir, "tx-future-clamp.jsonl");
+      recordHookLeaseTransition(
+        st,
+        "PreInvocation",
+        { conversationId: "conv-future-clamp", invocationNum: 0, lastUserInput: "测试轻微时钟超前" },
+        { nowMs: t1, transcriptPath: txFutureClamp, contextTokens: 60_000, windowTokens: 200_000 }
+      );
+      fs.writeFileSync(
+        txFutureClamp,
+        [
+          { step_index: 1, type: "USER_INPUT", created_at: new Date(t1).toISOString(), content: "测试轻微时钟超前" },
+          {
+            step_index: 2,
+            type: "PLANNER_RESPONSE",
+            created_at: new Date(t1 + 48_000).toISOString(), // +3s ahead of Stop (t1 + 45s) -> clamped to Stop
+            input_tokens: 60_000,
+            cache_read_tokens: 55_000,
+            output_tokens: 20,
+            content: "完成"
+          }
+        ]
+          .map((s) => JSON.stringify(s))
+          .join("\n") + "\n",
+        "utf8"
+      );
+      await handleStopPayload(
+        { conversationId: "conv-future-clamp", transcriptPath: txFutureClamp, terminationReason: "NO_TOOL_CALL" },
+        { store: st, nowMs: t1 + 45_000 }
+      );
+      assert.equal(
+        readWatchdogLease(st, "conv-future-clamp").cacheOriginTs,
+        t1 + 45_000,
+        "Minor future-skewed PLANNER_RESPONSE.created_at (+3s) must clamp to Stop nowMs"
+      );
+
+      const txFutureSkew = path.join(tmpDir, "tx-future-skew.jsonl");
+      recordHookLeaseTransition(
+        st,
+        "PreInvocation",
+        { conversationId: "conv-future-skew", invocationNum: 0, lastUserInput: "测试大时钟超前" },
+        { nowMs: t1, transcriptPath: txFutureSkew, contextTokens: 60_000, windowTokens: 200_000 }
+      );
+      fs.writeFileSync(
+        txFutureSkew,
+        [
+          { step_index: 1, type: "USER_INPUT", created_at: new Date(t1).toISOString(), content: "测试大时钟超前" },
+          {
+            step_index: 2,
+            type: "PLANNER_RESPONSE",
+            created_at: new Date(t1 + 65_000).toISOString(), // +20s ahead of Stop (t1 + 45s) -> rejected to causal floor t1
+            input_tokens: 60_000,
+            cache_read_tokens: 55_000,
+            output_tokens: 20,
+            content: "完成"
+          }
+        ]
+          .map((s) => JSON.stringify(s))
+          .join("\n") + "\n",
+        "utf8"
+      );
+      await handleStopPayload(
+        { conversationId: "conv-future-skew", transcriptPath: txFutureSkew, terminationReason: "NO_TOOL_CALL" },
+        { store: st, nowMs: t1 + 45_000 }
+      );
+      assert.equal(
+        readWatchdogLease(st, "conv-future-skew").cacheOriginTs,
+        t1,
+        "Bogus future PLANNER_RESPONSE.created_at (+20s > +5s tolerance) must fall back to causal LLM start timestamp"
+      );
+
+      const txStaleSkew = path.join(tmpDir, "tx-stale-skew.jsonl");
+      recordHookLeaseTransition(
+        st,
+        "PreInvocation",
+        { conversationId: "conv-stale-skew", invocationNum: 0, lastUserInput: "测试过期时间戳" },
+        { nowMs: t1 + 50_000, transcriptPath: txStaleSkew, contextTokens: 60_000, windowTokens: 200_000 }
+      );
+      fs.writeFileSync(
+        txStaleSkew,
+        [
+          { step_index: 1, type: "USER_INPUT", created_at: new Date(t1 + 50_000).toISOString(), content: "测试过期时间戳" },
+          {
+            step_index: 2,
+            type: "PLANNER_RESPONSE",
+            created_at: new Date(t1 + 30_000).toISOString(), // 20s before turn startedTs
+            input_tokens: 60_000,
+            cache_read_tokens: 55_000,
+            output_tokens: 20,
+            content: "完成"
+          }
+        ]
+          .map((s) => JSON.stringify(s))
+          .join("\n") + "\n",
+        "utf8"
+      );
+      await handleStopPayload(
+        { conversationId: "conv-stale-skew", transcriptPath: txStaleSkew, terminationReason: "NO_TOOL_CALL" },
+        { store: st, nowMs: t1 + 70_000 }
+      );
+      assert.equal(
+        readWatchdogLease(st, "conv-stale-skew").cacheOriginTs,
+        t1 + 50_000,
+        "Stale PLANNER_RESPONSE.created_at (< causal floor - 5s) must fall back to causal LLM start timestamp"
+      );
+
+      // 1c. PreToolUse(read_file, allow) without PostToolUse + un-flushed Stop advances causal floor to >= PreToolUse
+      const tRead = t1 + 100_000;
+      recordHookLeaseTransition(
+        st,
+        "PreInvocation",
+        { conversationId: "conv-read-floor", invocationNum: 0, lastUserInput: "读取配置" },
+        { nowMs: tRead, contextTokens: 70_000, windowTokens: 200_000 }
+      );
+      recordHookLeaseTransition(
+        st,
+        "PreToolUse",
+        { conversationId: "conv-read-floor" },
+        { nowMs: tRead + 40_000, toolName: "read_file", blocked: false }
+      );
+      recordHookLeaseTransition(
+        st,
+        "Stop",
+        { conversationId: "conv-read-floor", terminationReason: "NO_TOOL_CALL" },
+        { nowMs: tRead + 60_000 }
+      );
+      assert.equal(
+        readWatchdogLease(st, "conv-read-floor").cacheOriginTs,
+        tRead + 40_000,
+        "Allowed read_file PreToolUse (without PostToolUse hook) must advance causal cacheOriginTs floor"
+      );
+
+      // 1d. Multi-tool turn where intermediate PLANNER_RESPONSE (with tool_calls) + GENERIC flushed, but final PLANNER_RESPONSE has NOT flushed at Stop
+      const txMultiTool = path.join(tmpDir, "tx-multi-tool.jsonl");
+      const tMulti = tRead + 100_000;
+      recordHookLeaseTransition(
+        st,
+        "PreInvocation",
+        { conversationId: "conv-multi-unflushed", invocationNum: 0, lastUserInput: "长工具执行并总结" },
+        { nowMs: tMulti, transcriptPath: txMultiTool, contextTokens: 0 }
+      );
+      recordHookLeaseTransition(
+        st,
+        "PostToolUse",
+        { conversationId: "conv-multi-unflushed" },
+        { nowMs: tMulti + 180_000, toolName: "run_command", toolArgs: { CommandLine: "npm test" } }
+      );
+      fs.writeFileSync(
+        txMultiTool,
+        [
+          { step_index: 1, type: "USER_INPUT", created_at: new Date(tMulti).toISOString(), content: "长工具执行并总结" },
+          {
+            step_index: 2,
+            type: "PLANNER_RESPONSE",
+            created_at: new Date(tMulti + 1_000).toISOString(),
+            model: "gemini-4-carbon-high",
+            max_token_limit: 512_000,
+            input_tokens: 15_000,
+            cache_read_tokens: 140_000,
+            output_tokens: 80,
+            tool_calls: [{ id: "tc-1", name: "run_command" }]
+          },
+          {
+            step_index: 3,
+            type: "GENERIC",
+            created_at: new Date(tMulti + 180_000).toISOString(),
+            tool_call_id: "tc-1",
+            output: "PASS"
+          }
+        ]
+          .map((s) => JSON.stringify(s))
+          .join("\n") + "\n",
+        "utf8"
+      );
+      await handleStopPayload(
+        { conversationId: "conv-multi-unflushed", transcriptPath: txMultiTool, terminationReason: "NO_TOOL_CALL" },
+        { store: st, nowMs: tMulti + 210_000 }
+      );
+      const multiLease = readWatchdogLease(st, "conv-multi-unflushed");
+      assert.equal(
+        multiLease.cacheOriginTs,
+        tMulti + 180_000,
+        "Intermediate PLANNER_RESPONSE with tool_calls must NEVER clobber PostToolUse cacheOriginTs (tMulti + 180s)"
+      );
+      assert.equal(multiLease.contextTokens, 155_000, "Intermediate turn PLANNER_RESPONSE must still enrich Turn-0 contextTokens");
+      assert.equal(multiLease.windowTokens, 512_000, "Intermediate turn PLANNER_RESPONSE must still enrich Turn-0 windowTokens");
+
+      // 2. Round-2+ Cold-Miss Circuit Breaker Anti-Poisoning (when Round 2 has not flushed yet during early poll/tick)
+      st.setGlobalTtlKeepaliveMaxCount(3);
+      const txRound2 = path.join(tmpDir, "tx-round2-cold.jsonl");
+      const tR = tMulti + 400_000;
+      fs.writeFileSync(
+        txRound2,
+        [
+          { step_index: 1, type: "USER_INPUT", created_at: new Date(tR).toISOString(), content: "保持多轮续温" },
+          { step_index: 2, type: "PLANNER_RESPONSE", created_at: new Date(tR + 1_000).toISOString(), input_tokens: 5_000, cache_read_tokens: 80_000, output_tokens: 40 },
+          { step_index: 3, type: "SYSTEM_MESSAGE", content: "[agy-dart TTL保活 1/3] 仅回复 OK" },
+          // Deliberately omit created_at on Round 1's PLANNER_RESPONSE to attack the missing-created_at branch too!
+          { step_index: 4, type: "PLANNER_RESPONSE", input_tokens: 100, cache_read_tokens: 85_000, output_tokens: 3, content: "OK" }
+        ]
+          .map((s) => JSON.stringify(s))
+          .join("\n") + "\n",
+        "utf8"
+      );
+      writeWatchdogLease(st, {
+        conversationId: "conv-r2-anti-poison",
+        rootSessionId: "conv-r2-anti-poison",
+        convTitle: "二轮冷断防投毒",
+        phase: WATCHDOG_PHASES.IDLE,
+        subphase: "stopped",
+        stopReason: "NO_TOOL_CALL",
+        transcriptPath: txRound2,
+        contextTokens: 85_100,
+        windowTokens: 200_000,
+        cacheTtlSec: 300,
+        idleAnchorTs: tR + 484_000,
+        cacheOriginTs: tR + 482_000,
+        phaseChangedTs: tR + 484_000,
+        updatedTs: tR + 484_000
+      });
+      st.setTtlKeepaliveState("conv-r2-anti-poison", {
+        usedCount: 2,
+        lastSentTs: tR + 481_000,
+        pendingAck: false,
+        inKeepaliveTurn: false,
+        coldMissTripped: false,
+        lastColdCheckUsed: 1,
+        updatedTs: tR + 484_000
+      });
+
+      // Poll Layer 3 before Round 2 flushes (still outside Round 3's trigger window at tR + 500s) -> no poison
+      setClock(tR + 500_000);
+      mon.tick();
+      assert.equal(st.getTtlKeepaliveState("conv-r2-anti-poison").lastColdCheckUsed, 1);
+
+      // Now Round 2 flushes with cache_read_tokens = 0 before Round 3's trigger window (tR + 482s + 240s = tR + 722s)
+      fs.appendFileSync(
+        txRound2,
+        [
+          { step_index: 5, type: "SYSTEM_MESSAGE", created_at: new Date(tR + 481_500).toISOString(), content: "[agy-dart TTL保活 2/3] 仅回复 OK" },
+          { step_index: 6, type: "PLANNER_RESPONSE", created_at: new Date(tR + 482_000).toISOString(), input_tokens: 85_200, cache_read_tokens: 0, output_tokens: 3, content: "OK" }
+        ]
+          .map((s) => JSON.stringify(s))
+          .join("\n") + "\n",
+        "utf8"
+      );
+      sent.length = 0;
+      statCalls = 0;
+      setClock(tR + 725_000); // Inside Round 3 trigger window!
+      mon.tick();
+      await flushMicrotasks();
+      const r2StateAfterTick = st.getTtlKeepaliveState("conv-r2-anti-poison");
+      assert.equal(r2StateAfterTick.coldMissTripped, true, "Layer 3 must trip coldMissTripped on Round 2's cache_read=0 without being poisoned by Round 1's 1/3 step");
+      assert.equal(r2StateAfterTick.lastColdCheckUsed, 2);
+      assert.equal(sent.filter((s) => s.conversationId === "conv-r2-anti-poison").length, 0, "Round 3/3 must NOT fire after Round 2 cold miss");
+      assert.equal(statCalls, 0, "Layer 3 pre-send tail check must perform 0 fs.statSync calls");
+
+      st.setGlobalTtlKeepaliveMaxCount(1);
+
+      // 3. Turn-0 Un-flushed Large Prompt IDLE Backfill (Headless WatchdogMonitor, 0 fs.statSync)
+      const txTurn0 = path.join(tmpDir, "tx-turn0-delayed.jsonl");
+      const tTurn0 = clockMs + 100_000;
+      fs.writeFileSync(
+        txTurn0,
+        JSON.stringify({ step_index: 1, type: "USER_INPUT", created_at: new Date(tTurn0).toISOString(), content: "95k首轮任务" }) + "\n",
+        "utf8"
+      );
+      recordHookLeaseTransition(
+        st,
+        "PreInvocation",
+        { conversationId: "conv-turn0-backfill", invocationNum: 0, lastUserInput: "95k首轮任务" },
+        { nowMs: tTurn0, transcriptPath: txTurn0, contextTokens: 0 }
+      );
+      await handleStopPayload(
+        { conversationId: "conv-turn0-backfill", transcriptPath: txTurn0, terminationReason: "NO_TOOL_CALL" },
+        { store: st, nowMs: tTurn0 + 10_000 }
+      );
+      assert.equal(readWatchdogLease(st, "conv-turn0-backfill").contextTokens, 0, "At Stop before disk flush, contextTokens is 0");
+
+      // Host flushes 95k PLANNER_RESPONSE 2s after Stop
+      fs.appendFileSync(
+        txTurn0,
+        JSON.stringify({
+          step_index: 2,
+          type: "PLANNER_RESPONSE",
+          created_at: new Date(tTurn0 + 1_000).toISOString(),
+          model: "claude-opus-4-6-thinking",
+          max_token_limit: 200_000,
+          input_tokens: 95_000,
+          cache_read_tokens: 0,
+          output_tokens: 300,
+          content: "首轮完成"
+        }) + "\n",
+        "utf8"
+      );
+      sent.length = 0;
+      statCalls = 0;
+      setClock(tTurn0 + 245_000);
+      mon.tick();
+      await flushMicrotasks();
+      assert.equal(
+        sent.filter((s) => s.conversationId === "conv-turn0-backfill").length,
+        1,
+        "Headless WatchdogMonitor must backfill delayed Turn-0 95k contextTokens and send 1/1 keepalive"
+      );
+      assert.equal(readWatchdogLease(st, "conv-turn0-backfill").contextTokens, 95_000);
+      assert.equal(statCalls, 0, "Turn-0 lazy backfill must perform 0 fs.statSync calls");
+
+      // 4. >32 KB transcript_full.jsonl tail line auto-widening (38 KB thinking payload)
+      const txGiant = path.join(tmpDir, "transcript_full.jsonl");
+      const tGiant = clockMs + 100_000;
+      fs.writeFileSync(
+        txGiant,
+        [
+          { step_index: 1, type: "USER_INPUT", created_at: new Date(tGiant - 250_000).toISOString(), content: "长思考测试" },
+          { step_index: 2, type: "SYSTEM_MESSAGE", created_at: new Date(tGiant - 2_000).toISOString(), content: "[agy-dart TTL保活 1/2] 仅回复 OK" },
+          {
+            step_index: 3,
+            type: "PLANNER_RESPONSE",
+            created_at: new Date(tGiant).toISOString(),
+            thinking: "深".repeat(14_000), // >42 KB UTF-8 line!
+            input_tokens: 92_000,
+            cache_read_tokens: 0,
+            output_tokens: 5,
+            content: "OK"
+          }
+        ]
+          .map((s) => JSON.stringify(s))
+          .join("\n") + "\n",
+        "utf8"
+      );
+      const giantTail = readWatchdogTranscriptTail(txGiant);
+      assert.ok(giantTail.steps.length >= 2, "readWatchdogTranscriptTail must auto-widen window to parse >32KB PLANNER_RESPONSE + preceding SYSTEM_MESSAGE");
+
+      st.setGlobalTtlKeepaliveMaxCount(2);
+      recordHookLeaseTransition(
+        st,
+        "PreInvocation",
+        { conversationId: "conv-giant-cold", invocationNum: 0, lastUserInput: "[agy-dart TTL保活 1/2] 仅回复 OK" },
+        { nowMs: tGiant - 1_500, isKeepaliveTurn: true, transcriptPath: txGiant, contextTokens: 92_000 }
+      );
+      st.setTtlKeepaliveState("conv-giant-cold", {
+        usedCount: 1,
+        lastSentTs: tGiant - 2_000,
+        inKeepaliveTurn: true,
+        coldMissTripped: false,
+        lastColdCheckUsed: 0
+      });
+      await handleStopPayload(
+        { conversationId: "conv-giant-cold", transcriptPath: txGiant, terminationReason: "NO_TOOL_CALL" },
+        { store: st, nowMs: tGiant + 3_000 }
+      );
+      assert.equal(
+        st.getTtlKeepaliveState("conv-giant-cold").coldMissTripped,
+        true,
+        "Layer 1 Stop must trip coldMissTripped even when PLANNER_RESPONSE line in transcript_full.jsonl exceeds 32 KB"
+      );
+      assert.equal(readWatchdogLease(st, "conv-giant-cold").cacheOriginTs, tGiant);
+      st.setGlobalTtlKeepaliveMaxCount(1);
+
+      // 5. Disabled Stall Watchdog (`watchdog:enabled = false`) preserves `globalTtlKeepaliveMinContextPct` & explicit keepalive leases while respecting v1.4-9 uncustomized quietness
+      st.setWatchdogEnabled(false);
+      const disabledStatus = mon.getStatus({ refresh: true });
+      assert.equal(disabledStatus.enabled, false);
+      assert.equal(
+        disabledStatus.globalTtlKeepaliveMinContextPct,
+        15,
+        "WatchdogMonitor.tick() when disabled must still expose globalTtlKeepaliveMinContextPct"
+      );
+      st.setGlobalTtlKeepaliveMaxCount(1); // explicit global keepalive (1x)
+    } finally {
+      st.close();
+    }
+
+    // Spawn real pre-invocation & stop hooks while SQLite watchdog:enabled = false + explicit global keepalive (1x)
+    const txWdOff = path.join(tmpDir, "tx-wd-off.jsonl");
+    fs.writeFileSync(
+      txWdOff,
+      JSON.stringify({ step_index: 1, type: "USER_INPUT", content: "UI关防卡死但显式开续温" }) + "\n",
+      "utf8"
+    );
+    const hookEnvUiOff = {
+      ...process.env,
+      AGY_DART_DB_PATH: dbPath,
+      AGY_DART_CONFIG_PATH: cfgPath
+    };
+    delete hookEnvUiOff.AGY_DART_DISABLE_STALL_WATCHDOG;
+    spawnSync(process.execPath, [path.join(ROOT, "hooks", "pre-invocation.mjs")], {
+      input: JSON.stringify({ conversationId: "conv-ui-wdoff-kaon", transcriptPath: txWdOff, invocationNum: 0, lastUserInput: "ping" }),
+      encoding: "utf8",
+      windowsHide: true,
+      env: hookEnvUiOff
+    });
+    spawnSync(process.execPath, [path.join(ROOT, "hooks", "stop.mjs")], {
+      input: JSON.stringify({ conversationId: "conv-ui-wdoff-kaon", transcriptPath: txWdOff, terminationReason: "NO_TOOL_CALL" }),
+      encoding: "utf8",
+      windowsHide: true,
+      env: hookEnvUiOff
+    });
+    {
+      const stVerify = new ContextModeStore({ dbPath });
+      try {
+        assert.equal(
+          readWatchdogLease(stVerify, "conv-ui-wdoff-kaon")?.subphase,
+          "stopped",
+          "Explicit Auto-Keepalive (1x) must still record leases when UI Stall Watchdog SQLite toggle is OFF"
+        );
+        stVerify.setWatchdogEnabled(true);
+      } finally {
+        stVerify.close();
+      }
+    }
+
+    // 6. Sidecar Server + VM: Layer-2 anti-poisoning, Turn-0 /api/cache-diag backfill, narrow CSS, below-min tooltip, Enter 1x override, env-pin focused snapback & concurrent 500 reconciliation
+    const htmlSrc = fs.readFileSync(path.join(ROOT, "sidecars", "dashboard", "index.html"), "utf8");
+    assert.match(htmlSrc, /\.cutoff-control\s*\{[^}]*flex-wrap:\s*wrap/s, ".cutoff-control must wrap cleanly on narrow Sidecar widths");
+    assert.match(htmlSrc, /\.cutoff-num-input\s*\{[^}]*width:\s*48px/s, ".cutoff-num-input must fit 3-digit 100% cleanly");
+    assert.match(htmlSrc, /#ka-min-ctx-label,\s*#ka-min-ctx-k-hint\s*\{[^}]*white-space:\s*nowrap/s);
+
+    // Seed conv-vm-small (12k < 30k on 200k window) + conv-diag-turn0 (un-flushed lease + flushed 90k transcript) + conv-l2-r2 (Round 1 warm, Round 2 un-flushed)
+    const txSmall = path.join(tmpDir, "tx-small-12k.jsonl");
+    const tNow = Date.now() - 5_000;
+    fs.writeFileSync(
+      txSmall,
+      [
+        { step_index: 1, type: "USER_INPUT", created_at: new Date(tNow).toISOString(), content: "小上下文窗口" },
+        {
+          step_index: 2,
+          type: "PLANNER_RESPONSE",
+          created_at: new Date(tNow + 1_000).toISOString(),
+          model: "claude-opus-4-6-thinking",
+          max_token_limit: 200_000,
+          input_tokens: 12_000,
+          cache_read_tokens: 0,
+          output_tokens: 50,
+          content: "短回复"
+        }
+      ]
+        .map((s) => JSON.stringify(s))
+        .join("\n") + "\n",
+      "utf8"
+    );
+    const txDiagTurn0 = path.join(tmpDir, "tx-diag-turn0.jsonl");
+    fs.writeFileSync(
+      txDiagTurn0,
+      [
+        { step_index: 1, type: "USER_INPUT", created_at: new Date(tNow).toISOString(), content: "诊断回填" },
+        {
+          step_index: 2,
+          type: "PLANNER_RESPONSE",
+          created_at: new Date(tNow + 1_000).toISOString(),
+          model: "claude-opus-4-6-thinking",
+          max_token_limit: 200_000,
+          input_tokens: 90_000,
+          cache_read_tokens: 0,
+          output_tokens: 100,
+          content: "已落盘"
+        }
+      ]
+        .map((s) => JSON.stringify(s))
+        .join("\n") + "\n",
+      "utf8"
+    );
+    const txL2AntiPoison = path.join(tmpDir, "tx-l2-antipoison.jsonl");
+    fs.writeFileSync(
+      txL2AntiPoison,
+      [
+        { step_index: 1, type: "USER_INPUT", created_at: new Date(tNow - 300_000).toISOString(), content: "L2防投毒" },
+        { step_index: 2, type: "SYSTEM_MESSAGE", created_at: new Date(tNow - 250_000).toISOString(), content: "[agy-dart TTL保活 1/3] 仅回复 OK" },
+        { step_index: 3, type: "PLANNER_RESPONSE", created_at: new Date(tNow - 249_000).toISOString(), input_tokens: 100, cache_read_tokens: 70_000, output_tokens: 3, content: "OK" }
+      ]
+        .map((s) => JSON.stringify(s))
+        .join("\n") + "\n",
+      "utf8"
+    );
+
+    {
+      const stSeed = new ContextModeStore({ dbPath });
+      writeWatchdogLease(stSeed, {
+        conversationId: "conv-vm-small",
+        rootSessionId: "conv-vm-small",
+        convTitle: "12k小窗口",
+        phase: WATCHDOG_PHASES.IDLE,
+        subphase: "stopped",
+        stopReason: "NO_TOOL_CALL",
+        transcriptPath: txSmall,
+        contextTokens: 12_050,
+        windowTokens: 200_000,
+        idleAnchorTs: tNow + 2_000,
+        cacheOriginTs: tNow + 1_000,
+        updatedTs: tNow + 2_000
+      });
+      writeWatchdogLease(stSeed, {
+        conversationId: "conv-diag-turn0",
+        rootSessionId: "conv-diag-turn0",
+        convTitle: "Turn0回填",
+        phase: WATCHDOG_PHASES.IDLE,
+        subphase: "stopped",
+        stopReason: "NO_TOOL_CALL",
+        transcriptPath: txDiagTurn0,
+        contextTokens: 0,
+        windowTokens: 0,
+        idleAnchorTs: tNow + 2_000,
+        cacheOriginTs: tNow,
+        updatedTs: tNow + 2_000
+      });
+      writeWatchdogLease(stSeed, {
+        conversationId: "conv-l2-antipoison",
+        rootSessionId: "conv-l2-antipoison",
+        convTitle: "L2二轮防投毒",
+        phase: WATCHDOG_PHASES.IDLE,
+        subphase: "stopped",
+        stopReason: "NO_TOOL_CALL",
+        transcriptPath: txL2AntiPoison,
+        contextTokens: 70_100,
+        windowTokens: 200_000,
+        idleAnchorTs: tNow,
+        cacheOriginTs: tNow - 1_000,
+        updatedTs: tNow
+      });
+      stSeed.setTtlKeepaliveState("conv-l2-antipoison", {
+        usedCount: 2,
+        lastSentTs: tNow - 2_000,
+        pendingAck: false,
+        inKeepaliveTurn: false,
+        coldMissTripped: false,
+        lastColdCheckUsed: 1,
+        updatedTs: tNow
+      });
+      stSeed.close();
+      closeRuntimeStore();
+    }
+
+    srv = createStandaloneServer();
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    const port = srv.address().port;
+    const indexRes = await httpJsonRequest(port, "/", { method: "GET" });
+    const token = indexRes.raw.match(/meta name="agy-dart-token" content="([^"]+)"/)[1];
+    const headers = { "Content-Type": "application/json", "X-Agy-Dart-Token": token };
+
+    // Verify /api/cache-diag Turn-0 IDLE lease backfill
+    const diagTurn0Res = await httpJsonRequest(port, "/api/cache-diag", {
+      headers,
+      body: { scope: "conversation", conversationId: "conv-diag-turn0" }
+    });
+    assert.equal(diagTurn0Res.status, 200);
+    {
+      const stCheck = new ContextModeStore({ dbPath });
+      try {
+        assert.equal(
+          readWatchdogLease(stCheck, "conv-diag-turn0").contextTokens,
+          90_000,
+          "/api/cache-diag must backfill Turn-0 IDLE lease contextTokens once transcript flushes"
+        );
+      } finally {
+        stCheck.close();
+      }
+    }
+
+    // Verify /api/cache-diag Layer 2 does NOT poison lastColdCheckUsed=2 while Round 2 is un-flushed, then trips once Round 2 flushes cold!
+    const l2BeforeFlush = await httpJsonRequest(port, "/api/cache-diag", {
+      headers,
+      body: { scope: "conversation", conversationId: "conv-l2-antipoison" }
+    });
+    assert.equal(l2BeforeFlush.json.ttlKeepalive.coldMissTripped, false);
+    fs.appendFileSync(
+      txL2AntiPoison,
+      [
+        { step_index: 4, type: "SYSTEM_MESSAGE", created_at: new Date(tNow - 1_500).toISOString(), content: "[agy-dart TTL保活 2/3] 仅回复 OK" },
+        { step_index: 5, type: "PLANNER_RESPONSE", created_at: new Date(tNow - 1_000).toISOString(), input_tokens: 70_200, cache_read_tokens: 0, output_tokens: 3, content: "OK" }
+      ]
+        .map((s) => JSON.stringify(s))
+        .join("\n") + "\n",
+      "utf8"
+    );
+    const l2AfterFlush = await httpJsonRequest(port, "/api/cache-diag", {
+      headers,
+      body: { scope: "conversation", conversationId: "conv-l2-antipoison" }
+    });
+    assert.equal(
+      l2AfterFlush.json.ttlKeepalive.coldMissTripped,
+      true,
+      "Layer 2 /api/cache-diag must trip coldMissTripped after Round 2 flushes even after an earlier pre-flush poll"
+    );
+
+    // VM tests on conv-vm-small
+    const scriptMatch = htmlSrc.match(/<script>([\s\S]*?)<\/script>/);
+    const elements = new Map();
+    const makeEl = (id) => ({
+      id,
+      value: id === "ka-min-ctx-pct-input" ? "15" : "1",
+      textContent: "",
+      innerText: "",
+      innerHTML: "",
+      title: "",
+      className: "",
+      disabled: false,
+      hidden: false,
+      style: {},
+      dataset:
+        id === "kv-keepalive-btn"
+          ? { enabled: "1", used: "0", max: "1", custom: "0", cold: "0" }
+          : id === "kv-global-keepalive-btn"
+            ? { max: "1", fallback: "1" }
+            : {},
+      options: [],
+      classList: {
+        _s: new Set(),
+        add(...c) { c.forEach((x) => this._s.add(x)); },
+        remove(...c) { c.forEach((x) => this._s.delete(x)); },
+        contains(x) { return this._s.has(x); },
+        toggle(x, f) {
+          if (f === undefined) {
+            if (this._s.has(x)) { this._s.delete(x); return false; }
+            this._s.add(x); return true;
+          }
+          if (f) this._s.add(x); else this._s.delete(x);
+          return Boolean(f);
+        }
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      focus() {},
+      blur() {}
+    });
+    const getEl = (id) => {
+      if (!elements.has(id)) elements.set(id, makeEl(id));
+      return elements.get(id);
+    };
+
+    let failWatchdog500 = false;
+    let holdNextStatsGate = null;
+    let delayedMinCtxGate = null;
+    const vmDoc = {
+      hidden: false,
+      activeElement: null,
+      title: "",
+      documentElement: { lang: "zh-CN" },
+      getElementById: getEl,
+      querySelector: () => ({ getAttribute: () => token }),
+      querySelectorAll: () => [],
+      addEventListener() {}
+    };
+
+    const vmFetch = async (url, opts = {}) => {
+      const parsedBody = opts.body ? JSON.parse(opts.body) : {};
+      if (url === "/api/stats" && holdNextStatsGate) {
+        const waitGate = holdNextStatsGate;
+        holdNextStatsGate = null;
+        await waitGate;
+      }
+      if (url === "/api/watchdog/action" && parsedBody.action === "setTtlKeepaliveMinContextPct" && delayedMinCtxGate) {
+        const waitGate = delayedMinCtxGate;
+        delayedMinCtxGate = null;
+        await waitGate;
+      }
+      if (url === "/api/watchdog/action" && failWatchdog500) {
+        return {
+          ok: false,
+          status: 500,
+          json: async () => ({ error: "simulated_500" })
+        };
+      }
+      const res = await httpJsonRequest(port, url, {
+        method: opts.method || "POST",
+        headers,
+        body: parsedBody
+      });
+      return {
+        ok: res.status >= 200 && res.status < 300,
+        status: res.status,
+        json: async () => res.json
+      };
+    };
+
+    const vmCtx = vm.createContext({
+      window: {
+        location: { search: "?conversationId=conv-vm-small&lang=zh" },
+        addEventListener() {}
+      },
+      document: vmDoc,
+      navigator: { language: "zh-CN", clipboard: { writeText: async () => {} } },
+      localStorage: { getItem: () => null, setItem() {} },
+      sessionStorage: { getItem: () => null, setItem() {} },
+      fetch: vmFetch,
+      Headers,
+      URLSearchParams,
+      setTimeout: (fn) => { fn(); return 1; },
+      clearTimeout() {},
+      setInterval: () => 1,
+      clearInterval() {},
+      confirm: () => true,
+      alert() {},
+      Date,
+      Math,
+      Number,
+      String,
+      Boolean,
+      Array,
+      Object,
+      Set,
+      Map,
+      JSON,
+      Promise,
+      Error,
+      RegExp,
+      parseInt,
+      parseFloat,
+      isFinite,
+      encodeURIComponent,
+      decodeURIComponent,
+      console: { error() {}, log() {}, warn() {} }
+    });
+
+    vm.runInContext(scriptMatch[1], vmCtx);
+    await vmCtx.refreshData(true);
+    await flushMicrotasks();
+
+    // 6a. Uncustomized 12k (< 30k / 15%) window preserves exact innerText while surfacing below-min hint in title!
+    assert.equal(getEl("kv-keepalive-btn").innerText, "自动续温：0/1");
+    assert.match(getEl("kv-keepalive-btn").title, /12k\s*(?:<|未达)\s*30k.*15%/, "Uncustomized below-min window must explain threshold pause in tooltip");
+
+    // 6b. Pressing Enter on #kv-keepalive-max (value="1") commits an explicit per-window 1x override & clears below-min pause!
+    const kaMaxKeydownMatch = htmlSrc.match(/id="kv-keepalive-max"[^>]*onkeydown="([^"]+)"/);
+    assert.ok(kaMaxKeydownMatch && kaMaxKeydownMatch[1], "#kv-keepalive-max must define Enter keydown handler");
+    const decodedKeydown = kaMaxKeydownMatch[1]
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">");
+    vm.runInContext(
+      `(function(event){ ${decodedKeydown} }).call(document.getElementById('kv-keepalive-max'), { key: 'Enter' })`,
+      vmCtx
+    );
+    await flushMicrotasks();
+    await flushMicrotasks();
+    assert.equal(getEl("kv-keepalive-btn").dataset.custom, "1", "Pressing Enter on default 1x must promote window to explicit custom override");
+    assert.equal(getEl("kv-keepalive-btn").innerText, "本窗续温：0/1");
+    assert.equal(
+      /12k\s*(?:<|未达)\s*30k/.test(getEl("kv-keepalive-btn").title),
+      false,
+      "Explicit per-window 1x override bypasses default 15% threshold and clears pause tooltip"
+    );
+
+    // 6c. Env-pinned AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT=25 snaps focused input back even during concurrent action
+    process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT = "25";
+    resetConfigCache();
+    vmDoc.activeElement = getEl("ka-min-ctx-pct-input");
+    await Promise.all([
+      vmCtx.changeTtlKeepaliveMinContextPct("5"),
+      vmCtx.changeGlobalTtlKeepaliveMax("4")
+    ]);
+    await flushMicrotasks();
+    assert.equal(
+      getEl("ka-min-ctx-pct-input").value,
+      "25",
+      "Focused #ka-min-ctx-pct-input must snap back to env-pinned 25% even when concurrent global action advances watchdogActionSeq"
+    );
+    assert.equal(getEl("ka-min-ctx-k-hint").textContent, "≈50k/200k");
+    vmDoc.activeElement = null;
+    delete process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT;
+    resetConfigCache();
+
+    // 6d. Language switch mid-flight during changeTtlKeepaliveMinContextPct("0") must NOT clobber optimistic "0" / "(no min)"
+    let releaseMinCtx;
+    delayedMinCtxGate = new Promise((resolve) => {
+      releaseMinCtx = resolve;
+    });
+    const pendingZeroPromise = vmCtx.changeTtlKeepaliveMinContextPct("0");
+    await flushMicrotasks();
+    vmCtx.setLanguage("en", true);
+    assert.equal(getEl("ka-min-ctx-pct-input").value, "0", "setLanguage during in-flight minContextPct action must keep optimistic 0%");
+    assert.equal(getEl("ka-min-ctx-k-hint").textContent, "(no min)");
+    releaseMinCtx();
+    await pendingZeroPromise;
+    await flushMicrotasks();
+    assert.equal(getEl("ka-min-ctx-pct-input").value, "0");
+    assert.equal(getEl("ka-min-ctx-k-hint").textContent, "(no min)");
+    vmCtx.setLanguage("zh", true);
+    await flushMicrotasks();
+
+    // 6e. Concurrent double HTTP 500 while autoRefreshInFlight === true still reconciles to server truth (0% & globalMax=4)
+    let releaseStats;
+    holdNextStatsGate = new Promise((resolve) => {
+      releaseStats = resolve;
+    });
+    const bgAutoRefresh = vmCtx.refreshData(false); // sets autoRefreshInFlight = true
+    await flushMicrotasks();
+
+    failWatchdog500 = true;
+    const pFailPct = vmCtx.changeTtlKeepaliveMinContextPct("30");
+    const pFailMax = vmCtx.changeGlobalTtlKeepaliveMax("9");
+    failWatchdog500 = false;
+    releaseStats();
+    await Promise.all([bgAutoRefresh, pFailPct, pFailMax]);
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    assert.equal(
+      getEl("ka-min-ctx-pct-input").value,
+      "0",
+      "Concurrent HTTP 500 rollback + refreshData(true) reconciliation must restore server truth 0% instead of leaving stale 30%"
+    );
+    assert.equal(getEl("kv-global-keepalive-max").value, "4");
+  } finally {
+    if (srv) {
+      srv.closeAllConnections?.();
+      await new Promise((resolve) => srv.close(resolve));
+    }
+    closeRuntimeStore();
+    if (prevDbEnv === undefined) delete process.env.AGY_DART_DB_PATH;
+    else process.env.AGY_DART_DB_PATH = prevDbEnv;
+    if (prevCfgEnv === undefined) delete process.env.AGY_DART_CONFIG_PATH;
+    else process.env.AGY_DART_CONFIG_PATH = prevCfgEnv;
+    if (prevMinPctEnv === undefined) delete process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT;
+    else process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT = prevMinPctEnv;
+    if (prevDisWdEnv === undefined) delete process.env.AGY_DART_DISABLE_STALL_WATCHDOG;
+    else process.env.AGY_DART_DISABLE_STALL_WATCHDOG = prevDisWdEnv;
     resetConfigCache();
     fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }

@@ -98,11 +98,15 @@ export async function handleStopPayload(payload = {}, options = {}) {
   let ownedStore = null;
   try {
     const {
+      computeCausalTurnLlmFloorTs,
       detectSubagentFromTranscriptFile,
+      inspectLatestTurnInSteps,
       isHeadlessWorkerPrompt,
+      isKeepaliveTurnFlushedForRound,
       isSubagentLeasePayload,
       lookupConversationSummary,
       readWatchdogLease,
+      readWatchdogTranscriptTail,
       recordHookLeaseTransition,
       resolveCandidateTranscriptPath,
       WATCHDOG_PHASES
@@ -187,12 +191,13 @@ export async function handleStopPayload(payload = {}, options = {}) {
       }
     }
     let ttlKeepaliveExplicit = false;
+    let convKaState = null;
     if (!detectedSubagent) {
+      convKaState =
+        typeof store.getTtlKeepaliveState === "function" ? store.getTtlKeepaliveState(directConvId) : null;
       if (cfgSnap.sources.ttlKeepalive === "env" && cfgSnap.values.ttlKeepalive === false) {
         ttlKeepaliveExplicit = false;
       } else {
-        const convKaState =
-          typeof store.getTtlKeepaliveState === "function" ? store.getTtlKeepaliveState(directConvId) : null;
         if (convKaState && typeof convKaState.enabled === "boolean") {
           ttlKeepaliveExplicit = convKaState.enabled;
         } else if (convKaState && typeof convKaState.maxCount === "number" && convKaState.maxCount >= 1) {
@@ -211,8 +216,14 @@ export async function handleStopPayload(payload = {}, options = {}) {
           cfgSnap.sources.ttlKeepaliveMaxCount !== "default"
         ) {
           ttlKeepaliveExplicit =
-            Boolean(cfgSnap.values.ttlKeepalive) && Number(cfgSnap.values.ttlKeepaliveMaxCount ?? 3) >= 1;
+            Boolean(cfgSnap.values.ttlKeepalive) && Number(cfgSnap.values.ttlKeepaliveMaxCount ?? 1) >= 1;
         }
+      }
+      if (!txPath && convKaState?.inKeepaliveTurn) {
+        txPath = resolveCandidateTranscriptPath(directConvId, {
+          summaryDbPath: safeOptions.summaryDbPath || "",
+          allowDefaultDb: allowDefaultSummaryDb
+        });
       }
     }
     const watermarkNotifyActive =
@@ -238,6 +249,77 @@ export async function handleStopPayload(payload = {}, options = {}) {
         }
       } catch {}
     }
+
+    let stopCacheOriginTs = 0;
+    let stopContextTokens = -1;
+    let stopWindowTokens = 0;
+    let stopModel = "";
+    const nowStopMs = Number.isFinite(safeOptions.nowMs) ? Math.floor(safeOptions.nowMs) : Date.now();
+    if (!detectedSubagent && txPath) {
+      try {
+        const { steps: tailSteps, mtimeMs: tailMtimeMs } = readWatchdogTranscriptTail(txPath, 32768);
+        if (tailSteps.length > 0) {
+          const info = inspectLatestTurnInSteps(tailSteps);
+          const turnFloorTs = existing?.startedTs > 0 ? existing.startedTs : 0;
+          const causalLlmFloorTs = computeCausalTurnLlmFloorTs(existing, nowStopMs);
+          const plannerInCurrentTurn = Boolean(
+            info.hasPlanner &&
+              !info.hasPromptAfterLastPlanner &&
+              (info.prefillTs > 0
+                ? (turnFloorTs === 0 || info.prefillTs >= turnFloorTs - 5_000) &&
+                  info.prefillTs <= nowStopMs + 5_000 &&
+                  nowStopMs - info.prefillTs <= 30 * 60 * 1000
+                : turnFloorTs === 0 || tailMtimeMs >= turnFloorTs - 2_000)
+          );
+          const finalPlannerFlushedForTurn = Boolean(
+            plannerInCurrentTurn &&
+              !info.hasToolContinuationAfterLastPlanner &&
+              (info.prefillTs <= 0 || causalLlmFloorTs === 0 || info.prefillTs >= causalLlmFloorTs - 5_000)
+          );
+          if (plannerInCurrentTurn) {
+            if (info.contextTokens > 0) stopContextTokens = info.contextTokens;
+            if (info.maxTokens > 0) stopWindowTokens = info.maxTokens;
+            if (info.model) stopModel = info.model;
+          }
+          if (finalPlannerFlushedForTurn && info.prefillTs > 0) {
+            stopCacheOriginTs = info.prefillTs;
+          }
+          const wasKeepaliveTurn = Boolean(
+            convKaState?.inKeepaliveTurn || (finalPlannerFlushedForTurn && info.precededByKeepalivePrompt)
+          );
+          if (wasKeepaliveTurn && convKaState && typeof store.setTtlKeepaliveState === "function") {
+            const matchesCurrentRound =
+              finalPlannerFlushedForTurn &&
+              info.contextTokens > 0 &&
+              (convKaState.inKeepaliveTurn
+                ? (info.keepaliveRound === null || !convKaState.usedCount || info.keepaliveRound === convKaState.usedCount) &&
+                  (info.prefillTs <= 0 || !convKaState.lastSentTs || info.prefillTs >= convKaState.lastSentTs - 5_000)
+                : isKeepaliveTurnFlushedForRound(info, convKaState));
+            if (matchesCurrentRound) {
+              const isColdMiss = info.cacheReadTokens === 0;
+              store.setTtlKeepaliveState(directConvId, {
+                inKeepaliveTurn: false,
+                lastColdCheckUsed: Math.max(convKaState.usedCount || 0, convKaState.lastColdCheckUsed || 0),
+                ...(isColdMiss ? { coldMissTripped: true } : {}),
+                updatedTs: nowStopMs
+              });
+            } else if (convKaState.inKeepaliveTurn) {
+              store.setTtlKeepaliveState(directConvId, {
+                inKeepaliveTurn: false,
+                updatedTs: nowStopMs
+              });
+            }
+          }
+        } else if (convKaState?.inKeepaliveTurn && typeof store.setTtlKeepaliveState === "function") {
+          store.setTtlKeepaliveState(directConvId, { inKeepaliveTurn: false, updatedTs: nowStopMs });
+        }
+      } catch {}
+    } else if (!detectedSubagent && convKaState?.inKeepaliveTurn && typeof store.setTtlKeepaliveState === "function") {
+      try {
+        store.setTtlKeepaliveState(directConvId, { inKeepaliveTurn: false, updatedTs: nowStopMs });
+      } catch {}
+    }
+
     const lease = recordHookLeaseTransition(store, "Stop", safePayload, {
       directConvId,
       rootSessionId:
@@ -247,9 +329,14 @@ export async function handleStopPayload(payload = {}, options = {}) {
       parentConversationId: resolvedParentConvId,
       isSubagent: detectedSubagent,
       cwd: safePayload.cwd || safePayload.common?.cwd || "",
+      ...(Number.isFinite(safeOptions.nowMs) ? { nowMs: safeOptions.nowMs } : {}),
       ...(txPath && !existing?.transcriptPath ? { transcriptPath: txPath } : {}),
       ...(resolvedSummaryTitle ? { convTitle: resolvedSummaryTitle } : {}),
       ...(stopModifiedPaths.length > 0 ? { modifiedOrReadPaths: stopModifiedPaths } : {}),
+      ...(stopCacheOriginTs > 0 ? { cacheOriginTs: stopCacheOriginTs } : {}),
+      ...(stopContextTokens > 0 ? { contextTokens: stopContextTokens } : {}),
+      ...(stopWindowTokens > 0 ? { windowTokens: stopWindowTokens } : {}),
+      ...(stopModel ? { model: stopModel } : {}),
       ...(safeOptions.stopReason !== undefined ? { stopReason: safeOptions.stopReason } : {}),
       ...(safeOptions.fullyIdle !== undefined ? { fullyIdle: safeOptions.fullyIdle } : {}),
       ...(safeOptions.error !== undefined ? { error: safeOptions.error } : {})

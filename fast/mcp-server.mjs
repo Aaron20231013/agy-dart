@@ -1,4 +1,5 @@
 // agy-fast MCP Stdio Server (bundled zero-dependency ESM)
+import { createHash as createHashNode } from "node:crypto";
 import fsSyncNode from "node:fs";
 import pathNodeTop from "node:path";
 import { performance as perfNode } from "node:perf_hooks";
@@ -71,8 +72,9 @@ function resolveDirectoryCandidateFast(raw) {
   return null;
 }
 let isSafeRegex = (pattern) => typeof pattern === "string" && pattern.length <= 512;
+let filterRulesMod;
 try {
-  const filterRulesMod = await import("../hooks/filter-rules.mjs");
+  filterRulesMod = await import("../hooks/filter-rules.mjs");
   if (typeof filterRulesMod?.isSafeRegex === "function") {
     isSafeRegex = filterRulesMod.isSafeRegex;
   }
@@ -116,17 +118,13 @@ function checkSensitiveFastPath(absPath) {
   } catch {}
   return null;
 }
-function buildBoundedToolRpcResponse(id, rawText, isError, maxRpcBytes = 8800) {
+function makeToolRpcResponse(id, text, isError) {
+  return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError: Boolean(isError) } };
+}
+function buildBoundedToolRpcResponse(id, rawText, isError, maxRpcBytes = 8799) {
   const safeInput = redactSecrets(typeof rawText === "string" ? rawText : String(rawText ?? "")).text;
   const wellFormed = typeof safeInput.toWellFormed === "function" ? safeInput.toWellFormed() : sliceSafeChars(safeInput, safeInput.length);
-  const makeEnv = (txt) => ({
-    jsonrpc: "2.0",
-    id,
-    result: {
-      content: [{ type: "text", text: txt }],
-      isError: Boolean(isError)
-    }
-  });
+  const makeEnv = (txt) => makeToolRpcResponse(id, txt, isError);
   const initialEnv = makeEnv(wellFormed);
   if (Buffer.byteLength(JSON.stringify(initialEnv), "utf8") <= maxRpcBytes) {
     return initialEnv;
@@ -158,6 +156,7 @@ var McpStdioServer = class {
   stdinEnded = false;
   onDrainExit;
   initWorkspaceRoot = null;
+  initSessionId = null;
   clientSupportsRoots = false;
   cachedRootsDir = null;
   rootsQueried = false;
@@ -318,6 +317,8 @@ var McpStdioServer = class {
           break;
         }
       }
+      const initSid = normalizeFastSessionId(msg.params?.sessionId);
+      if (initSid) this.initSessionId = initSid;
       const requested = typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion.trim() : "";
       const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : DEFAULT_PROTOCOL_VERSION;
       return {
@@ -394,12 +395,50 @@ var McpStdioServer = class {
           };
         }
       }
+      const hostSessionId =
+        [
+          msg.params?._meta?.rootConversationId,
+          msg.params?._meta?.parentConversationId,
+          msg.params?._meta?.conversationId,
+          msg.params?._meta?.sessionId,
+          msg.params?.sessionId,
+          this.initSessionId,
+          process.env.ANTIGRAVITY_ROOT_CONVERSATION_ID,
+          process.env.ANTIGRAVITY_PARENT_CONVERSATION_ID,
+          process.env.ANTIGRAVITY_CONVERSATION_ID,
+          process.env.CONVERSATION_ID
+        ]
+          .map(normalizeFastSessionId)
+          .find(Boolean) ?? null;
+      const directConvId =
+        [
+          msg.params?._meta?.conversationId,
+          msg.params?._meta?.sessionId,
+          msg.params?.sessionId,
+          this.initSessionId,
+          process.env.ANTIGRAVITY_CONVERSATION_ID,
+          process.env.CONVERSATION_ID
+        ]
+          .map(normalizeFastSessionId)
+          .find(Boolean) ?? null;
       try {
-        const res = await tool.handler(args, { server: this });
-        return buildBoundedToolRpcResponse(id, res.text, Boolean(res.isError), DEFAULT_INLINE_MAX_BYTES);
+        const res = await tool.handler(args, { server: this, rpcId: id });
+        const rpcResp = buildBoundedToolRpcResponse(id, res.text, Boolean(res.isError), DEFAULT_INLINE_MAX_BYTES - 1);
+        if (!res.isError && res.telemetry && res.telemetry.rawBytes > 0) {
+          try {
+            await recordFastSavingsEvent({
+              toolName: name,
+              telemetry: res.telemetry,
+              finalText: rpcResp.result.content[0].text,
+              hostSessionId,
+              directConvId
+            });
+          } catch {}
+        }
+        return rpcResp;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        return buildBoundedToolRpcResponse(id, `Tool error: ${message}`, true, DEFAULT_INLINE_MAX_BYTES);
+        return buildBoundedToolRpcResponse(id, `Tool error: ${message}`, true, DEFAULT_INLINE_MAX_BYTES - 1);
       }
     }
     return {
@@ -602,8 +641,110 @@ import { promises as fs2 } from "node:fs";
 import path2 from "node:path";
 
 // src/utils/exec-utils.ts
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+var WINDOWS_CODEPAGE_LABELS = {
+  866: "ibm866",
+  874: "windows-874",
+  936: "gb18030",
+  54936: "gb18030",
+  950: "big5",
+  932: "shift_jis",
+  949: "euc-kr",
+  1250: "windows-1250",
+  1251: "windows-1251",
+  1252: "windows-1252",
+  1253: "windows-1253",
+  1254: "windows-1254",
+  1255: "windows-1255",
+  1256: "windows-1256",
+  1257: "windows-1257",
+  1258: "windows-1258",
+  65001: "utf-8"
+};
+var strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+var cachedWindowsFallbackEncoding;
+var fallbackDecoderCache = /* @__PURE__ */ new Map();
+function parseWindowsCodePage(output) {
+  const match = /\b(\d{3,5})\b/.exec(output);
+  if (!match) return null;
+  const cp = Number.parseInt(match[1], 10);
+  const mapped = WINDOWS_CODEPAGE_LABELS[cp];
+  return mapped && mapped !== "utf-8" ? mapped : null;
+}
+function stripTrailingIncompleteUtf8(buf) {
+  if (buf.length === 0) return buf;
+  let i = buf.length - 1;
+  const minIdx = Math.max(0, buf.length - 4);
+  while (i >= minIdx && (buf[i] & 192) === 128) {
+    i--;
+  }
+  if (i < minIdx) return buf;
+  const lead = buf[i];
+  if ((lead & 128) === 0) return buf;
+  let expectedLen = 0;
+  if ((lead & 224) === 192) expectedLen = 2;
+  else if ((lead & 240) === 224) expectedLen = 3;
+  else if ((lead & 248) === 240) expectedLen = 4;
+  else return buf;
+  return buf.length - i < expectedLen ? buf.subarray(0, i) : buf;
+}
+function getWindowsSystem32Binary(name) {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "";
+  if (systemRoot) {
+    return {
+      bin: path.join(systemRoot, "System32", name),
+      cwd: systemRoot
+    };
+  }
+  return { bin: name, cwd: process.cwd() };
+}
+function getWindowsFallbackEncoding() {
+  if (cachedWindowsFallbackEncoding !== void 0) {
+    return cachedWindowsFallbackEncoding;
+  }
+  try {
+    const { bin: chcpBin, cwd } = getWindowsSystem32Binary("chcp.com");
+    const res = spawnSync(chcpBin, [], {
+      cwd,
+      encoding: "latin1",
+      timeout: 1500,
+      windowsHide: true
+    });
+    if (!res.error && res.status === 0) {
+      const mapped = parseWindowsCodePage(res.stdout || "");
+      if (mapped) {
+        cachedWindowsFallbackEncoding = mapped;
+        return cachedWindowsFallbackEncoding;
+      }
+    }
+  } catch {
+  }
+  cachedWindowsFallbackEncoding = null;
+  return null;
+}
+function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
+  if (buf.length === 0) return "";
+  const candidate = truncated ? stripTrailingIncompleteUtf8(buf) : buf;
+  try {
+    return strictUtf8Decoder.decode(candidate);
+  } catch {
+    const label = fallbackEncoding ?? (process.platform === "win32" ? getWindowsFallbackEncoding() : null);
+    if (!label || label === "utf-8") {
+      return buf.toString("utf8");
+    }
+    try {
+      let decoder = fallbackDecoderCache.get(label);
+      if (!decoder) {
+        decoder = new TextDecoder(label);
+        fallbackDecoderCache.set(label, decoder);
+      }
+      return decoder.decode(buf);
+    } catch {
+      return buf.toString("utf8");
+    }
+  }
+}
 function killChildTree(pid, detached) {
   if (!pid) return;
   if (process.platform === "win32") {
@@ -649,21 +790,239 @@ function killChildTree(pid, detached) {
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
 }
-function runShellCommandAsync(command, options) {
+var WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE = /(?<![\\`])(?:\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE)\b)/i;
+var WINDOWS_PS_UNQUOTED_SYNTAX_RE = /(?<![\\`])\$(?:HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
+var WINDOWS_PS_CMDLET_RE = /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Z][A-Za-z0-9]*\b(?!-)/;
+var EXPLICIT_POWERSHELL_INVOCATION_RE = /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
+var PS_NON_INVOCATION_TAIL_RE = /^(?:[|;&+}=),*?]|(?:[1-6*])?>|-(?:c|i)?(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|replace|split|join|in|notin|contains|notcontains|is|isnot|as|and|or|xor|shl|shr|band|bor|bxor)\b|-f\b|$)/i;
+var PS_UTF8_PREFIX = "try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}; $OutputEncoding = [System.Text.UTF8Encoding]::new($false);";
+function stripQuotedSpans(command, stripDoubleQuotes) {
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    const next = command[i + 1];
+    if (quote === "'") {
+      if (ch === "'") {
+        if (next === "'") {
+          i++;
+        } else {
+          quote = null;
+          out += " ";
+        }
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if ((ch === "\\" || ch === "`") && next === '"') {
+        i++;
+        if (!stripDoubleQuotes) out += ch + next;
+        continue;
+      }
+      if (ch === '"') {
+        if (next === '"') {
+          i++;
+          if (!stripDoubleQuotes) out += '""';
+        } else {
+          quote = null;
+          out += stripDoubleQuotes ? " " : '"';
+        }
+        continue;
+      }
+      if (!stripDoubleQuotes) out += ch;
+      continue;
+    }
+    if (ch === "'") {
+      quote = "'";
+      out += " ";
+      continue;
+    }
+    if (ch === '"') {
+      quote = '"';
+      out += stripDoubleQuotes ? " " : '"';
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+function needsPowerShellOnWindows(command) {
+  if (!command || EXPLICIT_POWERSHELL_INVOCATION_RE.test(command)) {
+    return false;
+  }
+  const withoutSingle = stripQuotedSpans(command, false);
+  if (WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE.test(withoutSingle)) {
+    return true;
+  }
+  const unquoted = stripQuotedSpans(command, true);
+  return WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS_CMDLET_RE.test(unquoted);
+}
+function formatPowerShellCommand(command) {
+  const trimmed = command.trim();
+  if (!trimmed || trimmed[0] !== '"' && trimmed[0] !== "'") {
+    return command;
+  }
+  const quote = trimmed[0];
+  let idx = 1;
+  while (idx < trimmed.length) {
+    if (quote === '"' && trimmed[idx] === "`" && idx + 1 < trimmed.length) {
+      idx += 2;
+      continue;
+    }
+    if (trimmed[idx] === quote) {
+      if (trimmed[idx + 1] === quote) {
+        idx += 2;
+        continue;
+      }
+      const afterQuote = trimmed.slice(idx + 1);
+      if (!/^\s+/.test(afterQuote)) {
+        return command;
+      }
+      const rest = afterQuote.trimStart();
+      if (rest && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
+        return `& ${trimmed}`;
+      }
+      return command;
+    }
+    idx++;
+  }
+  return command;
+}
+function buildPowerShellUtf8Command(command) {
+  return `${PS_UTF8_PREFIX} ${formatPowerShellCommand(command)}`;
+}
+var cachedWindowsPowerShell;
+var cachedWindowsPowerShellExecPath = null;
+var pendingWindowsPowerShellProbe = null;
+async function defaultProbeWindowsShell(bin) {
+  const { bin: whereBin, cwd } = getWindowsSystem32Binary("where.exe");
+  const exeQuery = bin.toLowerCase().endsWith(".exe") ? bin : `${bin}.exe`;
+  const whereRes = await execBinaryAsync(whereBin, [exeQuery], {
+    cwd,
+    timeoutMs: 2e3,
+    maxOutputBytes: 4096
+  });
+  if (!whereRes.error && !whereRes.timedOut) {
+    if (whereRes.exitCode !== 0) return false;
+    const resolved = whereRes.stdout.split(/\r?\n/).map((line) => line.trim()).find((line) => /\.exe$/i.test(line));
+    if (!resolved) return false;
+    cachedWindowsPowerShellExecPath = resolved;
+    return true;
+  }
+  const res = await execBinaryAsync(
+    exeQuery,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+    {
+      cwd,
+      timeoutMs: 3e3,
+      maxOutputBytes: 4096
+    }
+  );
+  if (!res.error && !res.timedOut && res.exitCode === 0) {
+    cachedWindowsPowerShellExecPath = exeQuery;
+    return true;
+  }
+  return false;
+}
+async function resolveWindowsPowerShell(probe = defaultProbeWindowsShell) {
+  if (cachedWindowsPowerShell !== void 0) {
+    return cachedWindowsPowerShell;
+  }
+  if (pendingWindowsPowerShellProbe) {
+    return pendingWindowsPowerShellProbe;
+  }
+  pendingWindowsPowerShellProbe = (async () => {
+    try {
+      cachedWindowsPowerShellExecPath = null;
+      if (await probe("pwsh")) {
+        cachedWindowsPowerShell = "pwsh";
+        return cachedWindowsPowerShell;
+      }
+      cachedWindowsPowerShellExecPath = null;
+      if (await probe("powershell.exe")) {
+        cachedWindowsPowerShell = "powershell.exe";
+        return cachedWindowsPowerShell;
+      }
+      cachedWindowsPowerShellExecPath = null;
+      cachedWindowsPowerShell = null;
+      return null;
+    } finally {
+      pendingWindowsPowerShellProbe = null;
+    }
+  })();
+  return pendingWindowsPowerShellProbe;
+}
+async function runShellCommandAsync(command, options) {
+  if (process.platform === "win32") {
+    if (needsPowerShellOnWindows(command)) {
+      const psBin = await resolveWindowsPowerShell();
+      if (psBin) {
+        const utf8Command = buildPowerShellUtf8Command(command);
+        return spawnAndCollect(
+          cachedWindowsPowerShellExecPath ?? psBin,
+          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
+          false,
+          options
+        );
+      }
+    }
+    return spawnAndCollect(command, [], true, options);
+  }
   return spawnAndCollect(command, [], true, options);
+}
+function captureProcessStream(stream, limit, keepFailureTail) {
+  const chunks = [];
+  let captured = 0;
+  let overflow = 0;
+  // One inline response fits in 8.8 KB. Keep extra space for log filtering.
+  const tailCapacity = Math.min(Math.floor(limit / 2), 16 * 1024);
+  let ring;
+  stream.on("data", chunk => {
+    const take = Math.min(chunk.length, limit - captured);
+    if (take > 0) {
+      chunks.push(chunk.subarray(0, take));
+      captured += take;
+    }
+    const excess = chunk.length - take;
+    if (!excess) return;
+    if (keepFailureTail && tailCapacity) {
+      ring ??= Buffer.allocUnsafe(tailCapacity);
+      const length = Math.min(excess, tailCapacity);
+      const offset = (overflow + excess - length) % tailCapacity;
+      const split = Math.min(length, tailCapacity - offset);
+      chunk.copy(ring, offset, chunk.length - length, chunk.length - length + split);
+      if (split < length) chunk.copy(ring, 0, chunk.length - length + split);
+    }
+    overflow += excess;
+  });
+  return {
+    get truncated() { return overflow > 0; },
+    text(failed) {
+      const head = Buffer.concat(chunks, captured);
+      if (!failed || !ring) return decodeProcessOutput(head, overflow > 0);
+      const cursor = overflow % tailCapacity;
+      const tail = overflow >= tailCapacity
+        ? Buffer.concat([ring.subarray(cursor), ring.subarray(0, cursor)])
+        : Buffer.concat([head.subarray(captured - tailCapacity + overflow), ring.subarray(0, overflow)]);
+      // The split can fall in the middle of a UTF-8 sequence. Only strip the
+      // continuation bytes if the rest decodes as UTF-8 (Windows also uses legacy encodings).
+      let start = 0;
+      while (start < Math.min(3, tail.length) && (tail[start] & 192) === 128) start++;
+      let endText;
+      try { endText = strictUtf8Decoder.decode(tail.subarray(start)); }
+      catch { endText = decodeProcessOutput(tail); }
+      return decodeProcessOutput(head.subarray(0, captured - tailCapacity), true) +
+        "\n... [process output omitted] ...\n" + endText;
+    }
+  };
 }
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const detached = process.platform !== "win32";
   return new Promise((resolve) => {
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let truncated = false;
     let timedOut = false;
     let settled = false;
-    const stdoutChunks = [];
-    const stderrChunks = [];
     let child;
     try {
       child = spawn(commandOrBin, args, {
@@ -687,6 +1046,8 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
       });
       return;
     }
+    const stdout = captureProcessStream(child.stdout, maxOutputBytes, options.keepFailureTail);
+    const stderr = captureProcessStream(child.stderr, maxOutputBytes, options.keepFailureTail);
     let settleFallbackTimer = null;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -709,42 +1070,12 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
-        truncated,
+        stdout: stdout.text(exitCode !== 0 || timedOut),
+        stderr: stderr.text(exitCode !== 0 || timedOut),
+        truncated: stdout.truncated || stderr.truncated,
         error
       });
     };
-    child.stdout?.on("data", (chunk) => {
-      if (stdoutBytes >= maxOutputBytes) {
-        truncated = true;
-        return;
-      }
-      const remaining = maxOutputBytes - stdoutBytes;
-      if (chunk.length > remaining) {
-        stdoutChunks.push(chunk.subarray(0, remaining));
-        stdoutBytes += remaining;
-        truncated = true;
-      } else {
-        stdoutChunks.push(chunk);
-        stdoutBytes += chunk.length;
-      }
-    });
-    child.stderr?.on("data", (chunk) => {
-      if (stderrBytes >= maxOutputBytes) {
-        truncated = true;
-        return;
-      }
-      const remaining = maxOutputBytes - stderrBytes;
-      if (chunk.length > remaining) {
-        stderrChunks.push(chunk.subarray(0, remaining));
-        stderrBytes += remaining;
-        truncated = true;
-      } else {
-        stderrChunks.push(chunk);
-        stderrBytes += chunk.length;
-      }
-    });
     child.on("error", (err) => {
       finish(null, null, err.message);
     });
@@ -1222,14 +1553,21 @@ function isFailureNoiseLine(line) {
   return false;
 }
 var SUMMARY_LINE_PATTERN = /\b(passed|tests?|specs?|suites?|ok|warnings?|errors?|built in|compiled|done in|finished)\b/i;
+function isRecognizedTestCheck(command, cwd) {
+  if (typeof filterRulesMod?.compactPassingTestOutput !== "function") return false;
+  const id = filterRulesMod.matchFilterRule(command, { cwd, builtinOnly: true })?.rule.id;
+  return id === "test-runner" || id === "playwright";
+}
 function formatCompactCommandOutput(params) {
   const out = normalizeTerminalOutput(params.stdout);
   const err = normalizeTerminalOutput(params.stderr);
   const combined = [out, err].filter(Boolean).join("\n");
   if (params.error) {
+    if (params.retainFailureEnds) return `spawn error: ${params.error}`;
     return truncateWithNotice(`spawn error: ${params.error}`, params.maxChars);
   }
   if (params.timedOut) {
+    if (params.retainFailureEnds) return combined ? `TIMED OUT\n${combined}` : "TIMED OUT (no output)";
     const tail = getTailLines(combined, 20);
     return truncateWithNotice(
       tail ? `TIMED OUT
@@ -1239,6 +1577,7 @@ ${tail}` : "TIMED OUT (no output)",
   }
   if (params.exitCode === 0) {
     if (!combined) return "OK";
+    if (params.passingTest) return filterRulesMod.compactPassingTestOutput(combined, params.maxBytes, params.maxChars);
     const lines2 = combined.split("\n").map((l) => l.trim()).filter(Boolean);
     const summaryLines = lines2.filter((l) => SUMMARY_LINE_PATTERN.test(l));
     const picked = summaryLines.length > 0 ? summaryLines.slice(-2) : lines2.length <= 2 ? lines2 : [lines2[lines2.length - 1]];
@@ -1252,6 +1591,7 @@ ${tail}` : "TIMED OUT (no output)",
     return cleanedCombined || `Exited with code ${params.exitCode ?? "unknown"}`;
   }
   const keepIndices = /* @__PURE__ */ new Set();
+  if (params.retainFailureEnds) keepIndices.add(0);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (ROOT_CAUSE_HEADER_PATTERN.test(line)) {
@@ -1278,7 +1618,8 @@ ${tail}` : "TIMED OUT (no output)",
     outLines.push(lines[idx]);
     prev = idx;
   }
-  return truncateWithNotice(outLines.join("\n"), params.maxChars);
+  const diagnostic = outLines.join("\n");
+  return params.retainFailureEnds ? diagnostic : truncateWithNotice(diagnostic, params.maxChars);
 }
 function getTailLines(text, count) {
   if (!text) return "";
@@ -1709,6 +2050,22 @@ async function runApplyEdits(input, options = {}) {
       isError: true
     };
   }
+  let verifySpec;
+  const verify = input.verify;
+  if (typeof verify === "string") {
+    if (verify.trim()) verifySpec = { command: verify };
+  } else if (verify !== undefined) {
+    if (!verify || typeof verify !== "object" || Array.isArray(verify)) {
+      return { text: "Validation failed (0 files modified): 'verify' must be a command string or an object.", isError: true };
+    }
+    if (typeof verify.command !== "string" || !verify.command.trim()) {
+      return { text: "Validation failed (0 files modified): 'verify.command' must be a non-empty string.", isError: true };
+    }
+    if (verify.cwd !== undefined && typeof verify.cwd !== "string") {
+      return { text: "Validation failed (0 files modified): 'verify.cwd' must be a string.", isError: true };
+    }
+    verifySpec = { command: verify.command, cwd: verify.cwd, timeoutSec: verify.timeoutSec };
+  }
   const wsRes = await resolveToolWorkspaceCwd(input.cwd, options.server);
   if (wsRes.error) {
     return { text: wsRes.error, isError: true };
@@ -1926,7 +2283,7 @@ ${summaryLines.join("\n")}`,
       `Failed (fix only these):
 - ${errors.join("\n- ")}`
     ];
-    if (!input.dryRun && input.verify) {
+    if (!input.dryRun && verifySpec) {
       partialParts.push(
         "Verify skipped because failed file(s) remain; fix only the failed file(s) and re-run verify."
       );
@@ -1942,50 +2299,47 @@ ${summaryLines.join("\n")}`,
   const header = input.dryRun ? `Dry run validated ${plans.length} file(s) (0 files modified):` : `Applied edits to ${plans.length} file(s):`;
   const parts = [`${header}
 ${summaryLines.join("\n")}`];
-  if (!input.dryRun && input.verify) {
-    const verifySpec = typeof input.verify === "string" ? { command: input.verify } : input.verify;
-    if (verifySpec.command && verifySpec.command.trim()) {
-      const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
-      const requestedTimeoutMs =
-        clampIntWithDefault(
-          verifySpec.timeoutSec ?? input.verifyTimeoutSec,
-          60,
-          1,
-          MAX_MCP_CALL_BUDGET_SEC
-        ) * 1e3;
-      const remainingMs = callDeadline - perfNode.now();
-      if (remainingMs < 500) {
-        parts.push(
-          `\nVerify [NOT RUN: ${MAX_MCP_CALL_BUDGET_SEC}s MCP call budget exhausted] \`${verifySpec.command}\``
-        );
-      } else {
-        const timeoutMs = Math.max(100, Math.min(requestedTimeoutMs, Math.floor(remainingMs)));
-        const maxVerifyChars = clampIntWithDefault(
-          input.maxVerifyChars,
-          4e3,
-          300,
-          7500
-        );
-        const res = await runShellCommandAsync(verifySpec.command, {
-          cwd: verifyCwd,
-          timeoutMs
-        });
-        BATCH_SEARCH_CACHE.clear();
-        const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
-        const formatted = formatCompactCommandOutput({
-          stdout: res.stdout,
-          stderr: res.stderr,
-          exitCode: res.exitCode,
-          timedOut: res.timedOut,
-          error: res.error,
-          maxChars: maxVerifyChars
-        });
-        parts.push(
-          `
-Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
-${formatted}`
-        );
-      }
+  if (!input.dryRun && verifySpec) {
+    const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
+    const requestedTimeoutMs =
+      clampIntWithDefault(
+        verifySpec.timeoutSec ?? input.verifyTimeoutSec,
+        60,
+        1,
+        MAX_MCP_CALL_BUDGET_SEC
+      ) * 1e3;
+    const remainingMs = callDeadline - perfNode.now();
+    if (remainingMs < 500) {
+      parts.push(
+        `\nVerify [NOT RUN: ${MAX_MCP_CALL_BUDGET_SEC}s MCP call budget exhausted] \`${verifySpec.command}\``
+      );
+    } else {
+      const timeoutMs = Math.max(100, Math.min(requestedTimeoutMs, Math.floor(remainingMs)));
+      const maxVerifyChars = clampIntWithDefault(
+        input.maxVerifyChars,
+        4e3,
+        300,
+        7500
+      );
+      const res = await runShellCommandAsync(verifySpec.command, {
+        cwd: verifyCwd,
+        timeoutMs
+      });
+      BATCH_SEARCH_CACHE.clear();
+      const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
+      const verifyHeader = `\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n`;
+      const verifyBytes = DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(parts.join("\n")) - 1 - Buffer.byteLength(verifyHeader);
+      const formatted = formatCompactCommandOutput({
+        stdout: res.stdout,
+        stderr: res.stderr,
+        exitCode: res.exitCode,
+        timedOut: res.timedOut,
+        error: res.error,
+        maxChars: maxVerifyChars,
+        maxBytes: Math.max(0, verifyBytes),
+        passingTest: res.exitCode === 0 && isRecognizedTestCheck(verifySpec.command, verifyCwd)
+      });
+      parts.push(verifyHeader + formatted);
     }
   }
   const outText = parts.join("\n");
@@ -2362,30 +2716,202 @@ function validateReadonlyGitArgs(pattern) {
   }
   return ["--no-pager", subcmd, ...rest];
 }
+// src/utils/fuzzy-match.ts
+function findContiguousIndex(haystack, needle) {
+  const maxStart = haystack.length - needle.length;
+  for (let start = 0; start <= maxStart; start++) {
+    let matched = true;
+    for (let offset = 0; offset < needle.length; offset++) {
+      if (haystack[start + offset] !== needle[offset]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return start;
+  }
+  return -1;
+}
+function isAscii(text) {
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 127) return false;
+  }
+  return true;
+}
+function subsequenceCost(needle, haystack) {
+  if (!needle) return 2147483647;
+  if (isAscii(needle) && isAscii(haystack)) {
+    const query2 = needle.toLowerCase();
+    const lowered2 = haystack.toLowerCase();
+    const contiguousAt2 = lowered2.indexOf(query2);
+    if (contiguousAt2 >= 0) {
+      return contiguousAt2 === 0 ? -100 : -60 + Math.min(25, contiguousAt2);
+    }
+    let cursor2 = 0;
+    let first2 = -1;
+    let last2 = -1;
+    const hLen = lowered2.length;
+    for (let i = 0; i < query2.length; i++) {
+      const targetCode = query2.charCodeAt(i);
+      while (cursor2 < hLen && lowered2.charCodeAt(cursor2) !== targetCode) cursor2++;
+      if (cursor2 === hLen) return void 0;
+      if (first2 < 0) first2 = cursor2;
+      last2 = cursor2++;
+    }
+    return Math.max(0, last2 - first2 + 1 - query2.length) - (first2 === 0 ? 20 : 0);
+  }
+  const lowered = [...haystack.toLowerCase()];
+  const query = [...needle.toLowerCase()];
+  const contiguousAt = findContiguousIndex(lowered, query);
+  if (contiguousAt >= 0) {
+    return contiguousAt === 0 ? -100 : -60 + Math.min(25, contiguousAt);
+  }
+  let cursor = 0;
+  let first = -1;
+  let last = -1;
+  for (const ch of query) {
+    while (cursor < lowered.length && lowered[cursor] !== ch) cursor++;
+    if (cursor === lowered.length) return void 0;
+    if (first < 0) first = cursor;
+    last = cursor++;
+  }
+  return Math.max(0, last - first + 1 - query.length) - (first === 0 ? 20 : 0);
+}
+function scoreSubsequence(query, target) {
+  const cost = subsequenceCost(query, target);
+  return cost === void 0 ? -1 : Math.max(1, 1e3 - cost);
+}
+function fuzzyScorePath(query, candidatePosix) {
+  const trimmed = query.trim().replace(/\\/g, "/");
+  if (!trimmed) return -1;
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  const slashIdx = candidatePosix.lastIndexOf("/");
+  const basename = slashIdx === -1 ? candidatePosix : candidatePosix.slice(slashIdx + 1);
+  let totalScore = 0;
+  for (const token of tokens) {
+    const fullScore = scoreSubsequence(token, candidatePosix);
+    if (fullScore < 0) return -1;
+    const baseScore = !token.includes("/") ? scoreSubsequence(token, basename) : -1;
+    totalScore += baseScore >= 0 ? Math.max(fullScore, baseScore + 45) : fullScore;
+    if (basename.toLowerCase() === token.toLowerCase()) totalScore += 60;
+  }
+  return totalScore;
+}
+function rankFuzzyPaths(query, candidates, maxResults) {
+  const scored = [];
+  for (const candidate of candidates) {
+    const score = fuzzyScorePath(query, candidate);
+    if (score >= 0) scored.push({ path: candidate, score });
+  }
+  scored.sort((a, b) => b.score - a.score || a.path.length - b.path.length || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return {
+    matches: scored.slice(0, maxResults),
+    totalMatched: scored.length
+  };
+}
+var FILE_TYPE_GLOBS = {
+  ts: ["*.ts", "*.tsx", "*.mts", "*.cts"],
+  typescript: ["*.ts", "*.tsx", "*.mts", "*.cts"],
+  js: ["*.js", "*.jsx", "*.mjs", "*.cjs"],
+  javascript: ["*.js", "*.jsx", "*.mjs", "*.cjs"],
+  py: ["*.py", "*.pyi"],
+  python: ["*.py", "*.pyi"],
+  go: ["*.go"],
+  gd: ["*.gd"],
+  gdscript: ["*.gd"],
+  rust: ["*.rs"],
+  rs: ["*.rs"],
+  java: ["*.java"],
+  kt: ["*.kt", "*.kts"],
+  kotlin: ["*.kt", "*.kts"],
+  c: ["*.c", "*.h"],
+  cpp: ["*.cc", "*.cpp", "*.cxx", "*.hpp", "*.hh", "*.hxx", "*.h"],
+  cs: ["*.cs"],
+  csharp: ["*.cs"],
+  swift: ["*.swift"],
+  rb: ["*.rb"],
+  ruby: ["*.rb"],
+  php: ["*.php"],
+  css: ["*.css", "*.scss", "*.sass", "*.less"],
+  html: ["*.html", "*.htm"],
+  vue: ["*.vue"],
+  svelte: ["*.svelte"],
+  md: ["*.md", "*.mdx", "*.markdown"],
+  markdown: ["*.md", "*.mdx", "*.markdown"],
+  json: ["*.json", "*.jsonc"],
+  yaml: ["*.yml", "*.yaml"],
+  yml: ["*.yml", "*.yaml"],
+  toml: ["*.toml"],
+  xml: ["*.xml"],
+  sql: ["*.sql"],
+  sh: ["*.sh", "*.bash", "*.zsh"],
+  shell: ["*.sh", "*.bash", "*.zsh"]
+};
+function resolveFileTypeGlobs(fileType) {
+  if (fileType === void 0) return null;
+  if (typeof fileType !== "string") throw new Error("fileType must be a string");
+  const key = fileType.trim().toLowerCase().replace(/^\./, "");
+  if (!key) return null;
+  const mapped = FILE_TYPE_GLOBS[key];
+  if (Object.hasOwn(FILE_TYPE_GLOBS, key)) return mapped;
+  if (/^[a-z0-9]+$/i.test(key)) return [`*.${key}`];
+  throw new Error(`Unsupported fileType '${fileType}'`);
+}
+function fileTypeMatcher(fileType) {
+  const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
+  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path3.basename(file)));
+}
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
   const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
-  const args = [
-    "--json",
-    "--no-messages",
-    "--max-filesize",
-    "2M"
-  ];
+  const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
+  const typeGlobs = resolveFileTypeGlobs(query.fileType);
+  const matchesType = fileTypeMatcher(query.fileType);
+  const fileStat = await fs3.stat(searchRoot);
+  const isFileTarget = fileStat.isFile();
+  if (isFileTarget) {
+    if (checkSensitiveFastPath(searchRoot) || (typeGlobs && !matchesType(searchRoot))) {
+      return { files: [], totalMatches: 0, truncated: false };
+    }
+    if (fileStat.size > 2 * 1024 * 1024) {
+      return { files: [], totalMatches: 0, truncated: false };
+    }
+    if (query.glob) {
+      const negated = query.glob.startsWith("!");
+      const rawGlob = negated ? query.glob.slice(1) : query.glob;
+      const globRe = globToRegExp(rawGlob);
+      const relPosix = relativeFile(baseCwd, searchRoot);
+      const matched = globRe.test(relPosix) || globRe.test(path3.basename(searchRoot));
+      if (negated ? matched : !matched) {
+        return { files: [], totalMatches: 0, truncated: false };
+      }
+    }
+    const fh = await fs3.open(searchRoot, "r");
+    try {
+      const head = Buffer.alloc(Math.min(fileStat.size, 8192));
+      const { bytesRead } = await fh.read(head, 0, head.length, 0);
+      if (isLikelyBinary(head.subarray(0, bytesRead))) {
+        return { files: [], totalMatches: 0, truncated: false };
+      }
+    } finally {
+      await fh.close();
+    }
+  }
+  const perFileCap = isFileTarget ? maxResults : Math.min(maxResults, 50);
+  const args = ["--no-config", "--no-messages", "--max-filesize", "2M", "--crlf"];
+  if (query.multiline) args.push("--multiline", "--multiline-dotall");
+  if (typeGlobs) {
+    for (const glob of typeGlobs) args.push("--type-add", `agyfilter:${glob}`);
+    args.push("--type", "agyfilter");
+  }
   if (query.type === "text") {
     args.push("--fixed-strings");
   }
   if (query.caseSensitive === false) {
     args.push("--ignore-case");
   }
-  if (contextLines > 0) {
-    args.push("-C", String(contextLines));
-  }
-  const normalizedGlob = query.glob ? query.glob.replace(/\\/g, "/") : "";
-  if (normalizedGlob) {
-    if (normalizedGlob.startsWith(".") || normalizedGlob.includes("/.")) {
-      args.push("--hidden");
-    }
-    args.push(`--glob=${normalizedGlob}`);
+  if (query.glob) {
+    if (query.glob.startsWith(".") || query.glob.includes("/.")) args.push("--hidden");
+    args.push(`--glob=${query.glob}`);
   }
   const normRoot = toPosixPath(searchRoot);
   for (const dir of [
@@ -2403,171 +2929,364 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
-  const perFileCap = Math.min(maxResults, 50);
-  args.push("--max-count", String(perFileCap + 1));
-  args.push("--", query.pattern, searchRoot);
-  const res = await execBinaryAsync("rg", args, {
-    cwd: baseCwd,
-    timeoutMs: 15e3,
-    maxOutputBytes: 2 * 1024 * 1024
-  });
-  if (res.error) {
-    throw new Error(`rg spawn error: ${res.error}`);
-  }
-  if (res.timedOut) {
-    throw new Error("rg search timed out");
-  }
-  if (res.exitCode === 2) {
-    throw new Error(res.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
-  }
-  const byFile = /* @__PURE__ */ new Map();
-  let totalMatches = 0;
-  let truncated = false;
-  let matchesInCurrentFile = 0;
-  let pendingBeforeContext = [];
-  let lastKeptMatchFile = "";
-  let lastKeptMatchLine = -1;
-  const upsertLine = (relFile, entry) => {
-    let lineMap = byFile.get(relFile);
-    if (!lineMap) {
-      lineMap = /* @__PURE__ */ new Map();
-      byFile.set(relFile, lineMap);
+  const runRg = async (runArgs, opts) => {
+    const res = await execBinaryAsync("rg", runArgs, {
+      cwd: baseCwd,
+      timeoutMs: 15e3,
+      maxOutputBytes: 2 * 1024 * 1024
+    });
+    if (res.error) {
+      throw new Error(`rg spawn error: ${res.error}`);
     }
-    const existing = lineMap.get(entry.lineNumber);
-    if (!existing || entry.isMatch) {
-      lineMap.set(entry.lineNumber, {
-        lineNumber: entry.lineNumber,
-        text: entry.text,
-        isMatch: entry.isMatch || Boolean(existing?.isMatch)
-      });
+    if (res.exitCode === 2 && !(opts?.allowPartialError && !res.stderr.trim())) {
+      throw new Error(res.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
     }
+    return res;
   };
-  for (const rawLine of res.stdout.split("\n")) {
-    if (!rawLine.trim()) continue;
-    let ev;
-    try {
-      ev = JSON.parse(rawLine);
-    } catch {
-      continue;
-    }
-    if (ev.type === "begin" || ev.type === "end") {
-      matchesInCurrentFile = 0;
-      pendingBeforeContext = [];
-      lastKeptMatchFile = "";
-      lastKeptMatchLine = -1;
-      continue;
-    }
-    if (ev.type !== "match" && ev.type !== "context") continue;
-    const rawFile = ev.data?.path?.text ?? (ev.data?.path?.bytes ? Buffer.from(ev.data.path.bytes, "base64").toString("utf8") : void 0);
-    const lineNumber = ev.data?.line_number;
-    const rawText = ev.data?.lines?.text ?? (ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64").toString("utf8") : "");
-    const lineText = rawText.replace(/\r?\n$/, "");
-    if (!rawFile || typeof lineNumber !== "number") continue;
-    const absFile = path3.isAbsolute(rawFile) ? rawFile : path3.resolve(baseCwd, rawFile);
-    if (checkSensitiveFastPath(absFile)) continue;
-    const relFile = toPosixPath(path3.relative(baseCwd, absFile)) || path3.basename(absFile);
-    if (ev.type === "context") {
-      if (lastKeptMatchFile === relFile && lastKeptMatchLine !== -1 && lineNumber > lastKeptMatchLine && lineNumber <= lastKeptMatchLine + contextLines) {
-        upsertLine(relFile, { lineNumber, text: lineText, isMatch: false });
-      } else if (totalMatches < maxResults && matchesInCurrentFile < perFileCap) {
-        pendingBeforeContext.push({ relFile, lineNumber, text: lineText });
+  const cutShort = (res) => res.truncated || res.timedOut || res.exitCode === null;
+  if (summary) {
+    const res = await runRg([
+      ...args,
+      ...query.outputMode === "count" ? [query.multiline ? "--count-matches" : "--count", "--with-filename", "--null"] : ["--files-with-matches", "--null"],
+      "--",
+      query.pattern,
+      searchRoot
+    ]);
+    const files2 = [];
+    const out = res.stdout;
+    let pos = 0;
+    while (pos < out.length) {
+      const nul = out.indexOf("\0", pos);
+      if (nul === -1) break;
+      const rawFile = out.slice(pos, nul);
+      let count = 0;
+      if (query.outputMode === "count") {
+        const nl = out.indexOf("\n", nul + 1);
+        if (nl === -1) break;
+        const rawCount = out.slice(nul + 1, nl).trim();
+        count = Number(rawCount);
+        pos = nl + 1;
+      } else {
+        pos = nul + 1;
       }
-      continue;
+      if (!rawFile || !matchesType(rawFile) || checkSensitiveFastPath(path3.resolve(baseCwd, rawFile))) continue;
+      files2.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number.isFinite(count) ? count : 0 });
     }
-    matchesInCurrentFile += 1;
-    if (matchesInCurrentFile > perFileCap || totalMatches >= maxResults) {
+    files2.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
+    return {
+      files: files2.slice(0, maxResults),
+      totalMatches: 0,
+      truncated: files2.length > maxResults || cutShort(res)
+    };
+  }
+  const maxCountArgs = query.multiline ? [] : ["--max-count", String(perFileCap + 1)];
+  let chosen;
+  let truncated = false;
+  if (isFileTarget) {
+    chosen = [
+      {
+        rawFile: searchRoot,
+        relFile: relativeFile(baseCwd, searchRoot),
+        count: Number.POSITIVE_INFINITY
+      }
+    ];
+  } else {
+    const counts = await runRg([
+      ...args,
+      ...maxCountArgs,
+      "--count",
+      "--with-filename",
+      "--null",
+      "--",
+      query.pattern,
+      searchRoot
+    ]);
+    const counted = [];
+    for (const record of counts.stdout.split("\n").slice(0, -1)) {
+      const sep = record.lastIndexOf("\0");
+      const count = Number(record.slice(sep + 1));
+      if (sep <= 0 || !Number.isInteger(count) || count <= 0) continue;
+      const rawFile = record.slice(0, sep);
+      if (!matchesType(rawFile) || checkSensitiveFastPath(path3.resolve(baseCwd, rawFile))) continue;
+      counted.push({ rawFile, relFile: relativeFile(baseCwd, rawFile), count });
+    }
+    counted.sort((a, b) => a.relFile < b.relFile ? -1 : a.relFile > b.relFile ? 1 : 0);
+    chosen = [];
+    let coveredMatches = 0;
+    for (const item of counted) {
+      if (coveredMatches >= maxResults) break;
+      chosen.push(item);
+      coveredMatches += query.multiline ? item.count : Math.min(item.count, perFileCap);
+    }
+    truncated = cutShort(counts) || chosen.length < counted.length;
+    if (chosen.length === 0) {
+      return { files: [], totalMatches: 0, truncated };
+    }
+  }
+  const toRgArgPath = (rawFile) => {
+    const rel = path3.relative(baseCwd, rawFile);
+    const chosenPath = rel && !rel.startsWith("..") && !path3.isAbsolute(rel) ? rel : rawFile;
+    return chosenPath === "-" ? `.${path3.sep}-` : chosenPath;
+  };
+  const rgChunks = [];
+  let currentChunk = [];
+  let currentChunkChars = 0;
+  const maxArgChars = 2e4;
+  for (const item of chosen) {
+    const argPath = toRgArgPath(item.rawFile);
+    const est = argPath.length + 3;
+    if (currentChunk.length > 0 && currentChunkChars + est > maxArgChars) {
+      rgChunks.push(currentChunk);
+      currentChunk = [];
+      currentChunkChars = 0;
+    }
+    currentChunk.push(argPath);
+    currentChunkChars += est;
+  }
+  if (currentChunk.length > 0) rgChunks.push(currentChunk);
+  const byFile = /* @__PURE__ */ new Map();
+  for (const chunk of rgChunks) {
+    const res = await runRg(
+      [
+        ...args,
+        ...maxCountArgs,
+        "--json",
+        ...contextLines > 0 ? ["-C", String(contextLines)] : [],
+        "--",
+        query.pattern,
+        ...chunk
+      ],
+      { allowPartialError: !isFileTarget }
+    );
+    if (cutShort(res)) truncated = true;
+    for (const rawLine of res.stdout.split("\n")) {
+      if (!rawLine.trim()) continue;
+      let ev;
+      try {
+        ev = JSON.parse(rawLine);
+      } catch {
+        continue;
+      }
+      if (ev.type !== "match" && ev.type !== "context") continue;
+      const rawFile = ev.data?.path?.text ?? (ev.data?.path?.bytes ? Buffer.from(ev.data.path.bytes, "base64").toString("utf8") : void 0);
+      const lineNumber = ev.data?.line_number;
+      const rawBuf = ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64") : null;
+      const rawText = ev.data?.lines?.text ?? (rawBuf ? rawBuf.toString("utf8") : "");
+      if (!rawFile || typeof lineNumber !== "number") continue;
+      const relFile = relativeFile(baseCwd, rawFile);
+      let lineMap = byFile.get(relFile);
+      if (!lineMap) {
+        lineMap = /* @__PURE__ */ new Map();
+        byFile.set(relFile, lineMap);
+      }
+      const isMatch = ev.type === "match";
+      const lineText = rawText.replace(/\r?\n$/, "");
+      const segments = isMatch && query.multiline ? lineText.split(/\r?\n/) : [lineText];
+      // rg's offsets are UTF-8 bytes within the entire event, including CRLF.
+      // Only long matching lines need conversion to JavaScript string offsets.
+      const submatches = ev.data.submatches ?? [];
+      const bytes = isMatch && submatches.length && segments.some(s => s.length > SEARCH_LINE_CHARS)
+        ? rawBuf ?? Buffer.from(rawText)
+        : null;
+      let byteStart = 0;
+      let hitIndex = 0;
+      for (const [offset, text] of segments.entries()) {
+        const line = lineNumber + offset;
+        const entry = { lineNumber: line, text, isMatch };
+        if (bytes) {
+          const lf = bytes.indexOf(10, byteStart);
+          const byteEnd = lf === -1 ? bytes.length : lf;
+          while (hitIndex < submatches.length &&
+                 submatches[hitIndex].start < byteStart && submatches[hitIndex].end <= byteStart) {
+            hitIndex++;
+          }
+          const hit = submatches[hitIndex];
+          if (text.length > SEARCH_LINE_CHARS && hit && hit.start <= byteEnd) {
+            const from = Math.max(byteStart, hit.start);
+            const to = Math.min(byteEnd, hit.end);
+            entry.matchStart = bytes.toString("utf8", byteStart, from).length;
+            entry.matchEnd = entry.matchStart + bytes.toString("utf8", from, to).length;
+          }
+          byteStart = byteEnd + 1;
+        }
+        if (!lineMap.get(line)?.isMatch) lineMap.set(line, entry);
+      }
+    }
+  }
+  const files = [];
+  let totalMatches = 0;
+  for (const { relFile, count } of chosen) {
+    if (totalMatches >= maxResults) {
       truncated = true;
-      pendingBeforeContext = [];
-      continue;
+      break;
     }
-    totalMatches += 1;
-    for (const ctx of pendingBeforeContext) {
-      if (ctx.relFile === relFile) {
-        upsertLine(ctx.relFile, {
-          lineNumber: ctx.lineNumber,
-          text: ctx.text,
-          isMatch: false
+    const fileCap = query.multiline ? maxResults : Math.min(count, perFileCap);
+    const budget = Math.min(fileCap, maxResults - totalMatches);
+    const sorted = [...byFile.get(relFile)?.values() ?? []].sort(
+      (a, b) => a.lineNumber - b.lineNumber
+    );
+    const lines = [];
+    let kept = 0;
+    let lastKeptMatchLine = -1;
+    for (const line of sorted) {
+      if (line.isMatch) {
+        if (kept === budget) {
+          truncated = true;
+          if (lastKeptMatchLine !== -1 && line.lineNumber <= lastKeptMatchLine + contextLines) {
+            lines.push({ lineNumber: line.lineNumber, text: line.text, isMatch: false });
+          }
+          continue;
+        }
+        kept += 1;
+        lastKeptMatchLine = line.lineNumber;
+        lines.push(line);
+      } else if (kept < budget || line.lineNumber <= lastKeptMatchLine + contextLines) {
+        lines.push(line);
+      }
+    }
+    if (kept === 0) continue;
+    files.push({ file: relFile, lines });
+    totalMatches += kept;
+  }
+  return { files, totalMatches, truncated };
+}
+function* multilineMatches(content, regex) {
+  let previousEnd = -1;
+  for (const match of content.matchAll(regex)) {
+    const start = match.index;
+    if (start === content.length && (content.length === 0 || content.endsWith("\n"))) break;
+    if (match[0] === "") {
+      if (start === previousEnd || content[start - 1] === "\r" && content[start] === "\n") continue;
+    }
+    previousEnd = start + match[0].length;
+    yield match;
+  }
+}
+function multilineMatchLines(content, regex, limit) {
+  const results = [];
+  let line = 0;
+  let lineStart = 0;
+  let nextBreak = content.indexOf("\n");
+  for (const match of multilineMatches(content, regex)) {
+    const start = match.index;
+    const end = start + Math.max(0, match[0].length - 1);
+    while (nextBreak !== -1 && nextBreak < start) {
+      line++;
+      lineStart = nextBreak + 1;
+      nextBreak = content.indexOf("\n", lineStart);
+    }
+    while (true) {
+      if (results.at(-1)?.lineIndex !== line) {
+        results.push({
+          lineIndex: line,
+          matchStart: Math.max(0, start - lineStart),
+          matchEnd: Math.max(0, start + match[0].length - lineStart)
         });
       }
+      if (results.length >= limit) return results;
+      if (nextBreak === -1 || nextBreak >= end) break;
+      line++;
+      lineStart = nextBreak + 1;
+      nextBreak = content.indexOf("\n", lineStart);
     }
-    pendingBeforeContext = [];
-    upsertLine(relFile, { lineNumber, text: lineText, isMatch: true });
-    lastKeptMatchFile = relFile;
-    lastKeptMatchLine = lineNumber;
   }
-  const files = [...byFile.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([file, lineMap]) => ({
-    file,
-    lines: [...lineMap.values()].sort((a, b) => a.lineNumber - b.lineNumber)
-  }));
-  return { files, totalMatches, truncated: truncated || res.truncated };
+  return results;
 }
 async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
   const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
-  const caseSensitive = query.caseSensitive !== false;
+  const flags = (query.caseSensitive === false ? "i" : "") + (query.multiline ? "gmsu" : "");
   let regex;
   if (query.type === "regex") {
-    if (!isSafeRegex(query.pattern)) {
-      throw new Error(`Unsafe regex '${query.pattern}': rejected to prevent catastrophic backtracking`);
-    }
+    if (!isSafeRegex(query.pattern)) throw new Error("Unsafe regex: rejected to prevent catastrophic backtracking");
     try {
-      regex = new RegExp(query.pattern, caseSensitive ? "" : "i");
+      regex = new RegExp(query.pattern, flags);
     } catch (err) {
-      throw new Error(
-        `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`
-      );
+      if (flags.includes("u")) {
+        try {
+          regex = new RegExp(query.pattern, flags.replace("u", ""));
+        } catch {
+          throw new Error(
+            `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      } else {
+        throw new Error(
+          `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }
   } else {
     const escaped = query.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    regex = new RegExp(escaped, caseSensitive ? "" : "i");
+    regex = new RegExp(escaped, flags);
   }
-  const normalizedGlob = query.glob ? query.glob.replace(/\\/g, "/") : "";
-  const globRegex = normalizedGlob ? globToRegExp(normalizedGlob) : null;
+  const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
+  const matchesType = fileTypeMatcher(query.fileType);
+  let discoveryTruncated = false;
+  const globNegated = Boolean(query.glob && query.glob.startsWith("!"));
+  const rawGlob = query.glob ? globNegated ? query.glob.slice(1) : query.glob : null;
+  const globRegex = rawGlob ? globToRegExp(rawGlob) : null;
   const globMatchesFile = (relPosix) => {
+    if (!matchesType(relPosix)) return false;
     if (!globRegex) return true;
-    if (globRegex.test(relPosix)) return true;
-    if (!normalizedGlob.includes("/")) {
+    let matched = globRegex.test(relPosix);
+    if (!matched && !rawGlob.includes("/")) {
       const base = relPosix.split("/").pop() ?? relPosix;
-      return globRegex.test(base);
+      matched = globRegex.test(base);
     }
-    return false;
+    return globNegated ? !matched : matched;
   };
   const stat = await fs3.stat(searchRoot);
+  const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
-  let walkTruncated = false;
   if (stat.isFile()) {
     const relPosix = toPosixPath(path3.relative(baseCwd, searchRoot)) || path3.basename(searchRoot);
     targetFiles = globMatchesFile(relPosix) ? [searchRoot] : [];
   } else {
     const includeHidden = Boolean(
-      normalizedGlob && (normalizedGlob.startsWith(".") || normalizedGlob.includes("/."))
+      rawGlob && !globNegated && (rawGlob.startsWith(".") || rawGlob.includes("/."))
     );
     const walked = await walkFiles(searchRoot, {
       maxFiles: 8e3,
       includeHidden,
       fileFilter: globMatchesFile
     });
-    walkTruncated = Boolean(walked.truncated);
+    discoveryTruncated = walked.truncated;
     targetFiles = walked.files.map((rel) => path3.join(searchRoot, rel));
+    targetFiles.sort((a, b) => {
+      const ra = relativeFile(baseCwd, a);
+      const rb = relativeFile(baseCwd, b);
+      return ra < rb ? -1 : ra > rb ? 1 : 0;
+    });
   }
   const files = [];
   let totalMatches = 0;
-  let hitGlobalLimit = false;
-  let anyFileTruncated = false;
-  const perFileCap = Math.min(maxResults, 50);
-  const buildFileMatches = (relFile, allLines, keptIndices) => {
+  let truncated = false;
+  const buildFileMatches = (relFile, allLines, keptMatches) => {
     const lineMap = /* @__PURE__ */ new Map();
-    for (const mIdx of keptIndices) {
+    for (const { lineIndex: mIdx, matchStart, matchEnd } of keptMatches) {
       const from = Math.max(0, mIdx - contextLines);
       const to = Math.min(allLines.length - 1, mIdx + contextLines);
       for (let j = from; j <= to; j++) {
         const ln = j + 1;
         const prev = lineMap.get(ln);
-        lineMap.set(ln, {
-          lineNumber: ln,
-          text: allLines[j],
-          isMatch: j === mIdx || Boolean(prev?.isMatch)
-        });
+        if (j === mIdx) {
+          if (!prev?.isMatch) {
+            lineMap.set(ln, {
+              lineNumber: ln,
+              text: allLines[j],
+              isMatch: true,
+              matchStart,
+              matchEnd
+            });
+          }
+        } else if (!prev) {
+          lineMap.set(ln, {
+            lineNumber: ln,
+            text: allLines[j],
+            isMatch: false
+          });
+        }
       }
     }
     return {
@@ -2576,7 +3295,8 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     };
   };
   const batchSize = 16;
-  for (let i = 0; i < targetFiles.length && !hitGlobalLimit; i += batchSize) {
+  let anyFileTruncated = false;
+  for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
     const batch = targetFiles.slice(i, i + batchSize);
     const results = await Promise.all(
       batch.map(async (absFile) => {
@@ -2586,22 +3306,37 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
           if (st.size > 2 * 1024 * 1024) return null;
           const buf = await fs3.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
-          const lines = buf.toString("utf8").replace(/\r\n/g, "\n").split("\n");
-          const matchedIndices = [];
+          const content = buf.toString("utf8");
+          const lines = content.split(/\r?\n/);
+          if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+          const relFile = relativeFile(baseCwd, absFile);
+          let matchedLines = [];
+          let count = 0;
           let fileTruncated = false;
-          for (let idx = 0; idx < lines.length; idx++) {
-            const candidateLine = lines[idx].length > 8192 ? lines[idx].slice(0, 8192) : lines[idx];
-            if (regex.test(candidateLine)) {
-              if (matchedIndices.length >= perFileCap) {
+          if (query.multiline && summary) {
+            for (const _match of multilineMatches(content, regex)) {
+              count++;
+              if (query.outputMode === "files_with_matches") break;
+            }
+          } else if (query.multiline) {
+            matchedLines = multilineMatchLines(content, regex, maxResults + 1);
+            count = matchedLines.length;
+          } else {
+            for (let idx = 0; idx < lines.length; idx++) {
+              const line = lines[idx];
+              const hit = summary ? regex.test(line) : regex.exec(line);
+              if (!hit) continue;
+              count++;
+              if (query.outputMode === "files_with_matches") break;
+              if (summary) continue;
+              if (matchedLines.length === perFileCap) {
                 fileTruncated = true;
                 break;
               }
-              matchedIndices.push(idx);
+              matchedLines.push({ lineIndex: idx, matchStart: hit.index, matchEnd: hit.index + hit[0].length });
             }
           }
-          if (matchedIndices.length === 0) return null;
-          const relFile = toPosixPath(path3.relative(baseCwd, absFile)) || path3.basename(absFile);
-          return { relFile, lines, matchedIndices, fileTruncated };
+          return count ? { relFile, lines, matchedLines, count, fileTruncated } : null;
         } catch {
           return null;
         }
@@ -2609,22 +3344,52 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     );
     for (const item of results) {
       if (!item) continue;
-      if (item.fileTruncated) anyFileTruncated = true;
-      if (totalMatches + item.matchedIndices.length > maxResults) {
+      if (summary) {
+        if (files.length === maxResults) {
+          truncated = true;
+          break;
+        }
+        files.push({ file: item.relFile, lines: [], count: item.count });
+        continue;
+      }
+      if (item.fileTruncated) {
+        anyFileTruncated = true;
+      }
+      if (totalMatches + item.matchedLines.length > maxResults) {
         const remaining = maxResults - totalMatches;
         if (remaining > 0) {
-          const kept = item.matchedIndices.slice(0, remaining);
+          const kept = item.matchedLines.slice(0, remaining);
           files.push(buildFileMatches(item.relFile, item.lines, kept));
           totalMatches += kept.length;
         }
-        hitGlobalLimit = true;
+        truncated = true;
         break;
       }
-      files.push(buildFileMatches(item.relFile, item.lines, item.matchedIndices));
-      totalMatches += item.matchedIndices.length;
+      files.push(buildFileMatches(item.relFile, item.lines, item.matchedLines));
+      totalMatches += item.matchedLines.length;
     }
   }
-  return { files, totalMatches, truncated: hitGlobalLimit || anyFileTruncated || walkTruncated };
+  return {
+    files,
+    totalMatches,
+    truncated: truncated || anyFileTruncated || (summary || query.multiline === true) && discoveryTruncated
+  };
+}
+function relativeFile(baseCwd, file) {
+  return toPosixPath(path3.relative(baseCwd, path3.resolve(baseCwd, file))) || path3.basename(file);
+}
+async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
+  const pattern = query.pattern.trim();
+  if (!pattern) throw new Error("Fuzzy pattern must not be blank");
+  const matchesType = fileTypeMatcher(query.fileType);
+  const maxResults = clampInt(query.maxResults ?? 30, 1, 200);
+  const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, { maxFiles: 8e3, fileFilter: matchesType });
+  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path3.resolve(searchRoot, file)));
+  const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
+  const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
+  const footer = walked.truncated || totalMatched > maxResults ? `
+... [truncated; showing ${matches.length} files]` : "";
+  return body + footer;
 }
 function buildGlobFallbackPlan(pattern) {
   if (!pattern.includes("{") && pattern.includes("|")) {
@@ -2662,9 +3427,19 @@ function buildGlobFallbackPlan(pattern) {
   }
   return null;
 }
-function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, notePrefix) {
+async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix, statsCtx = null) {
   const relPrefix = toPosixPath(path3.relative(baseCwd, searchRoot));
-  const sortedFiles = [...walked.files].sort((a, b) => a.localeCompare(b));
+  const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
+  if (sortBy === "mtime") {
+    const mtimes = /* @__PURE__ */ new Map();
+    for (let i = 0; i < sortedFiles.length; i += 32) {
+      await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
+        const stat = await fs3.lstat(path3.join(searchRoot, file)).catch(() => void 0);
+        mtimes.set(file, stat?.mtimeMs ?? -Infinity);
+      }));
+    }
+    sortedFiles.sort((a, b) => mtimes.get(b) - mtimes.get(a) || (a < b ? -1 : a > b ? 1 : 0));
+  }
   const items = sortedFiles.slice(0, maxResults).map((f) => {
     if (!relPrefix || relPrefix === ".") return f;
     return `${relPrefix}/${f}`;
@@ -2677,7 +3452,10 @@ function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, notePrefi
   }
   const omitted = sortedFiles.slice(maxResults);
   const dirCounts = /* @__PURE__ */ new Map();
+  let omittedBytes = 0;
+  const relBasePrefix = relPrefix && relPrefix !== "." ? `${relPrefix}/` : "";
   for (const f of omitted) {
+    omittedBytes += Buffer.byteLength(relBasePrefix ? `${relBasePrefix}${f}` : f, "utf8") + 1;
     const slash = f.indexOf("/");
     const bucket = slash === -1 ? "(root)" : `${f.slice(0, slash)}/`;
     dirCounts.set(bucket, (dirCounts.get(bucket) ?? 0) + 1);
@@ -2687,9 +3465,15 @@ function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, notePrefi
   const dirSummary = topDirs.length > 0 ? `; omitted dirs: ${topDirs.join(", ")}` : "";
   const suffix = `
 ... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}]`;
+  if (statsCtx && omitted.length > 0) {
+    const suffixBytes = Buffer.byteLength(suffix, "utf8");
+    if (omittedBytes > suffixBytes) {
+      statsCtx.extraCompactedBytes += omittedBytes - suffixBytes;
+    }
+  }
   return `${header}${items.join("\n")}${suffix}`;
 }
-async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget, trackCtx = null) {
+async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget, trackCtx = null, statsCtx = null) {
   const maxResults = clampInt(query.maxResults ?? 80, 1, 300);
   const pattern = (query.pattern.trim() || "**/*").replace(/\\/g, "/");
   const matcher = globToRegExp(pattern);
@@ -2740,7 +3524,7 @@ ${rel}`;
   });
   if (walked.files.length > 0) {
     recordGlobPaths(walked.files);
-    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults);
+    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, query.sortBy, void 0, statsCtx);
   }
   const fallback = buildGlobFallbackPlan(pattern);
   if (fallback) {
@@ -2759,7 +3543,9 @@ ${rel}`;
         searchRoot,
         baseCwd,
         maxResults,
-        fallback.matchedNote
+        query.sortBy,
+        fallback.matchedNote,
+        statsCtx
       );
     }
     return fallback.emptyMessage;
@@ -2790,7 +3576,28 @@ async function runGitQuery(query, searchRoot) {
   const out = res.stdout.trimEnd();
   return out || "(empty output)";
 }
-function formatFileMatches(files, totalMatches, truncated) {
+const SEARCH_LINE_CHARS = 240;
+
+function formatSearchLine({ text, isMatch, matchStart, matchEnd }) {
+  const prefix = sliceSafeChars(text, SEARCH_LINE_CHARS);
+  if (text.length <= SEARCH_LINE_CHARS) return prefix;
+  if (!isMatch || matchStart === undefined || (matchStart < prefix.length && matchEnd <= prefix.length)) {
+    return prefix + "...";
+  }
+
+  // A multiline span may begin on a newline or continue past the end of this line.
+  const from = Math.min(matchStart, text.length);
+  const span = Math.min(matchEnd, text.length) - from;
+  const lead = Math.max(0, Math.floor((SEARCH_LINE_CHARS - span) / 2));
+  let start = Math.max(0, Math.min(from - lead, text.length - SEARCH_LINE_CHARS));
+  const end = Math.min(text.length, start + SEARCH_LINE_CHARS);
+  const first = text.charCodeAt(start);
+  if (start > 0 && first >= 0xdc00 && first <= 0xdfff) start += start === from ? -1 : 1;
+  const snippet = sliceSafeChars(text.slice(start, end), end - start);
+  return (start ? "..." : "") + snippet + (start + snippet.length < text.length ? "..." : "");
+}
+
+function formatFileMatches(files, totalMatches, truncated, statsCtx = null) {
   if (files.length === 0) {
     return "(no matches)";
   }
@@ -2798,8 +3605,15 @@ function formatFileMatches(files, totalMatches, truncated) {
   for (const fm of files) {
     const lines = fm.lines.map((l) => {
       const sep = l.isMatch ? ":" : "-";
-      const text = l.text.length > 240 ? `${sliceSafeChars(l.text, 240)}...` : sliceSafeChars(l.text, l.text.length);
-      return `  ${l.lineNumber}${sep} ${text}`;
+      const formatted = formatSearchLine(l);
+      if (statsCtx && typeof l.text === "string" && l.text.length > SEARCH_LINE_CHARS) {
+        const rawLineBytes = Buffer.byteLength(l.text, "utf8");
+        const fmtLineBytes = Buffer.byteLength(formatted, "utf8");
+        if (rawLineBytes > fmtLineBytes) {
+          statsCtx.extraCompactedBytes += rawLineBytes - fmtLineBytes;
+        }
+      }
+      return `  ${l.lineNumber}${sep} ${formatted}`;
     });
     blocks.push(`${fm.file}
 ${lines.join("\n")}`);
@@ -3036,12 +3850,22 @@ async function snapshotTrackedFiles(absPathsSet, baseCwd = "") {
   );
   return results.filter(Boolean);
 }
-async function executeSingleQuery(query, index, baseCwd, useRg, trackCtx = null) {
+async function executeSingleQuery(query, index, baseCwd, useRg, trackCtx = null, statsCtx = null) {
   const header = `## Query ${index + 1} [${query.type}] ${query.pattern}${query.path ? ` (in ${query.path})` : ""}`;
   try {
     if (!query.pattern || typeof query.pattern !== "string") {
       throw new Error("Query 'pattern' must be a non-empty string");
     }
+    if (query.multiline !== void 0 && typeof query.multiline !== "boolean") {
+      throw new Error("multiline must be a boolean");
+    }
+    if (query.outputMode !== void 0 && !["content", "files_with_matches", "count"].includes(query.outputMode)) {
+      throw new Error("Invalid outputMode");
+    }
+    if (query.sortBy !== void 0 && !["path", "mtime"].includes(query.sortBy)) {
+      throw new Error("Invalid sortBy");
+    }
+    if (query.glob) query = { ...query, glob: query.glob.replace(/\\/g, "/") };
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
     try {
@@ -3055,8 +3879,12 @@ async function executeSingleQuery(query, index, baseCwd, useRg, trackCtx = null)
       return `${header}
 ${out}`;
     }
+    if (query.type === "fuzzy") {
+      const out = await runFuzzyQuery(query, searchRoot, baseCwd, targetStat.isFile());
+      return `${header}\n${out}`;
+    }
     if (query.type === "glob") {
-      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile(), trackCtx);
+      const out = await runGlobQuery(query, searchRoot, baseCwd, targetStat.isFile(), trackCtx, statsCtx);
       return `${header}
 ${out}`;
     }
@@ -3083,8 +3911,14 @@ ${out}`;
           }
         }
       }
+      if (query.outputMode === "count" || query.outputMode === "files_with_matches") {
+        const lines = res.files.map(({ file, count }) => query.outputMode === "count"
+          ? `${file}: ${count} ${query.multiline ? "matches" : "matching lines"}` : file);
+        if (res.truncated) lines.push(`... [truncated; showing ${res.files.length} files]`);
+        return `${header}\n${lines.join("\n") || "(no matches)"}`;
+      }
       return `${header}
-${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
+${formatFileMatches(res.files, res.totalMatches, res.truncated, statsCtx)}`;
     }
     throw new Error(`Unsupported query type: ${String(query.type)}`);
   } catch (err) {
@@ -3161,10 +3995,17 @@ async function runBatchSearch(input, options = {}) {
   }
   const maxChars = clampInt(input.maxChars ?? 8500, 500, DEFAULT_INLINE_MAX_BYTES);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
-  // Working-tree git queries (status/diff/log) depend on arbitrary tracked/untracked files across subdirs; bypass cache.
-  const hasGitQuery = queriesList.some((q) => q && q.type === "git");
-  const ttlMs = hasGitQuery ? 0 : getSearchCacheTtlMs();
+  // Git state, fuzzy rankings and mtime ordering depend on candidates outside the tracked result set.
+  const bypassCache = queriesList.some((q) => q?.type === "git" || q?.type === "fuzzy" || q?.sortBy === "mtime");
+  const ttlMs = bypassCache ? 0 : getSearchCacheTtlMs();
   let cacheKey = null;
+  const queryTypesKey = [...new Set(queriesList.map((q) => String(q?.type || "text")))].sort().join(",");
+  const queryPathSummary = redactSecrets(
+    queriesList
+      .slice(0, 3)
+      .map((q) => `${q?.type || "text"}:${String(q?.pattern || "").slice(0, 32)}`)
+      .join(", ")
+  ).text.slice(0, 120);
   if (ttlMs > 0) {
     const worktreeFp = await computeWorktreeFingerprint(baseCwd, queriesList);
     const canonicalQueriesJson = JSON.stringify(stableSortObject(queriesList));
@@ -3177,7 +4018,15 @@ async function runBatchSearch(input, options = {}) {
         BATCH_SEARCH_CACHE.set(cacheKey, cached);
         return {
           text: cached.text,
-          isError: false
+          isError: false,
+          telemetry: {
+            kind: "fast_search",
+            key: queryTypesKey,
+            path: queryPathSummary,
+            worktree: baseCwd,
+            rawBytes: cached.rawBytes ?? Buffer.byteLength(cached.text, "utf8"),
+            ok: 1
+          }
         };
       }
       BATCH_SEARCH_CACHE.delete(cacheKey);
@@ -3188,9 +4037,12 @@ async function runBatchSearch(input, options = {}) {
   );
   const useRg = needsTextSearch && !options.forceNodeFallback && await isRipgrepAvailable();
   const trackCtx = ttlMs > 0 ? { matchedAbsPaths: /* @__PURE__ */ new Set(), hasError: false } : null;
+  const statsCtx = { extraCompactedBytes: 0 };
   const sections = await Promise.all(
-    queriesList.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, trackCtx))
+    queriesList.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg, trackCtx, statsCtx))
   );
+  const rawJoinedSectionsBytes = Buffer.byteLength(sections.join("\n\n"), "utf8");
+  const rawSearchBytes = rawJoinedSectionsBytes + statsCtx.extraCompactedBytes;
   const resultText = fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n");
   if (cacheKey && trackCtx && !trackCtx.hasError) {
     try {
@@ -3209,6 +4061,7 @@ async function runBatchSearch(input, options = {}) {
         BATCH_SEARCH_CACHE.set(cacheKey, {
           createdAt: Date.now(),
           text: resultText,
+          rawBytes: rawSearchBytes,
           trackedFiles
         });
       }
@@ -3218,7 +4071,15 @@ async function runBatchSearch(input, options = {}) {
   }
   return {
     text: resultText,
-    isError: false
+    isError: false,
+    telemetry: {
+      kind: "fast_search",
+      key: queryTypesKey,
+      path: queryPathSummary,
+      worktree: baseCwd,
+      rawBytes: rawSearchBytes,
+      ok: 1
+    }
   };
 }
 function clampInt(val, min, max) {
@@ -3232,1633 +4093,8 @@ function clampIntWithDefault(val, def, min, max) {
 }
 
 // src/tools/read-slices.ts
+import { extractSymbolsFromLines, renderOutlineWithinBudget, computeWaterFillBudgets, OUTLINE_SCHEMA_VERSION } from "../context/lib/code-outline.js";
 import path4 from "node:path";
-function isRegexStartContext(line, slashIdx) {
-  let j = slashIdx - 1;
-  while (j >= 0 && /\s/.test(line[j])) j--;
-  if (j < 0) return true;
-  const prev = line[j];
-  if ("=(,:![&|?{};~+-*%^<>".includes(prev)) return true;
-  let k = j;
-  while (k >= 0 && /[A-Za-z0-9_$]/.test(line[k])) k--;
-  const word = line.slice(k + 1, j + 1);
-  return word === "return" || word === "case" || word === "throw" || word === "in" || word === "of" || word === "typeof" || word === "void" || word === "delete" || word === "new";
-}
-function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = false, alreadySeenOpen = false) {
-  let open = 0;
-  let close = 0;
-  let openParen = 0;
-  let closeParen = 0;
-  let parenDepth = state.parenDepth ?? 0;
-  let seenOpen = alreadySeenOpen;
-  let inSingle = false;
-  let inDouble = false;
-  let inRegex = false;
-  let inRegexClass = false;
-  let escape = false;
-  let lastCodeChar = "";
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    const next = line[i + 1];
-    if (state.inBlockComment) {
-      if (ch === "*" && next === "/") {
-        state.inBlockComment = false;
-        i++;
-      }
-      continue;
-    }
-    if (escape) {
-      escape = false;
-      continue;
-    }
-    if (inRegex) {
-      if (ch === "\\") {
-        escape = true;
-      } else if (ch === "[") {
-        inRegexClass = true;
-      } else if (ch === "]") {
-        inRegexClass = false;
-      } else if (ch === "/" && !inRegexClass) {
-        inRegex = false;
-        lastCodeChar = "/";
-      }
-      continue;
-    }
-    if (state.inBacktick) {
-      if (lang === "js" && ch === "\\") {
-        escape = true;
-      } else if (ch === "`") {
-        state.inBacktick = false;
-        lastCodeChar = "`";
-      } else if (lang === "js" && ch === "$" && next === "{") {
-        state.inBacktick = false;
-        state.templateExprStack.push(0);
-        i++;
-      }
-      continue;
-    }
-    if (inSingle) {
-      if (ch === "\\") escape = true;
-      else if (ch === "'") {
-        inSingle = false;
-        lastCodeChar = "'";
-      }
-      continue;
-    }
-    if (inDouble) {
-      if (ch === "\\") escape = true;
-      else if (ch === '"') {
-        inDouble = false;
-        lastCodeChar = '"';
-      }
-      continue;
-    }
-    if (lang === "shell" && ch === "#") break;
-    if ((lang === "js" || lang === "c") && ch === "/" && next === "/") break;
-    if ((lang === "js" || lang === "c") && ch === "/" && next === "*") {
-      state.inBlockComment = true;
-      i++;
-      continue;
-    }
-    if (lang === "js" && ch === "/" && next !== "/" && next !== "*" && isRegexStartContext(line, i)) {
-      inRegex = true;
-      inRegexClass = false;
-      continue;
-    }
-    if (ch === "'" && lang !== "json") {
-      inSingle = true;
-      continue;
-    }
-    if (ch === '"') {
-      inDouble = true;
-      continue;
-    }
-    if (ch === "`" && (lang === "js" || lang === "c")) {
-      state.inBacktick = true;
-      continue;
-    }
-    if (ch === "{") {
-      if (state.templateExprStack.length > 0) {
-        state.templateExprStack[state.templateExprStack.length - 1] += 1;
-      } else if (!(ignoreBracesInParensBeforeOpen && !seenOpen && parenDepth > 0)) {
-        open++;
-        seenOpen = true;
-      }
-      lastCodeChar = "{";
-    } else if (ch === "}") {
-      if (state.templateExprStack.length > 0) {
-        const top = state.templateExprStack[state.templateExprStack.length - 1];
-        if (top === 0) {
-          state.templateExprStack.pop();
-          state.inBacktick = true;
-        } else {
-          state.templateExprStack[state.templateExprStack.length - 1] = top - 1;
-        }
-      } else if (!(ignoreBracesInParensBeforeOpen && !seenOpen && parenDepth > 0)) {
-        close++;
-      }
-      lastCodeChar = "}";
-    } else if (ch === "(") {
-      openParen++;
-      parenDepth++;
-      lastCodeChar = "(";
-    } else if (ch === ")") {
-      closeParen++;
-      parenDepth = Math.max(0, parenDepth - 1);
-      lastCodeChar = ")";
-    } else if (!/\s/.test(ch)) {
-      lastCodeChar = ch;
-    }
-  }
-  state.parenDepth = parenDepth;
-  return {
-    open,
-    close,
-    openParen,
-    closeParen,
-    endsWithSemi: lastCodeChar === ";",
-    lastCodeChar
-  };
-}
-function findBraceBlockEnd(lines, startIdx, lang = "c") {
-  let depth = 0;
-  let seenOpen = false;
-  const state = {
-    inBlockComment: false,
-    templateExprStack: [],
-    inBacktick: false,
-    parenDepth: 0
-  };
-  const maxScan = Math.min(lines.length, startIdx + 2e3);
-  for (let i = startIdx; i < maxScan; i++) {
-    const { open, close, endsWithSemi, lastCodeChar } = scanBracesOnLine(
-      lines[i],
-      state,
-      lang,
-      lang === "js",
-      seenOpen
-    );
-    if (open > 0) seenOpen = true;
-    depth += open - close;
-    if (seenOpen && depth <= 0) {
-      if (lang === "js" && i <= startIdx + 16) {
-        const headerHasGeneric = lines.slice(startIdx, i + 1).some((l) => l.includes("<"));
-        let isGenericContinuation = lastCodeChar === ">" || (state.parenDepth ?? 0) > 0;
-        if (!isGenericContinuation && headerHasGeneric) {
-          if (lastCodeChar === ",") {
-            isGenericContinuation = true;
-          } else {
-            let nextIdx = i + 1;
-            while (nextIdx < maxScan && !lines[nextIdx].trim()) nextIdx++;
-            if (nextIdx < maxScan && lines[nextIdx].trim().startsWith(">")) {
-              isGenericContinuation = true;
-            }
-          }
-        }
-        if (isGenericContinuation) {
-          seenOpen = false;
-          depth = 0;
-          continue;
-        }
-      }
-      return i + 1;
-    }
-    if (!seenOpen && (state.parenDepth ?? 0) <= 0 && endsWithSemi) {
-      return i + 1;
-    }
-    if (!seenOpen && i > startIdx + 40) {
-      return startIdx + 1;
-    }
-  }
-  return seenOpen ? Math.min(lines.length, maxScan) : startIdx + 1;
-}
-function findTypeAliasEnd(lines, startIdx) {
-  const firstLine = lines[startIdx] ?? "";
-  const eqIdx = firstLine.indexOf("=");
-  const rhs = eqIdx >= 0 ? firstLine.slice(eqIdx + 1) : firstLine;
-  const state = {
-    inBlockComment: false,
-    templateExprStack: [],
-    inBacktick: false,
-    parenDepth: 0
-  };
-  const firstScan = scanBracesOnLine(rhs, state, "js");
-  if (firstScan.open > firstScan.close) {
-    return findBraceBlockEnd(lines, startIdx, "js");
-  }
-  if (firstScan.endsWithSemi && firstScan.openParen <= firstScan.closeParen) {
-    return startIdx + 1;
-  }
-  let endIdx = startIdx;
-  let parenBal = firstScan.openParen - firstScan.closeParen;
-  let prevLast = firstScan.lastCodeChar;
-  const maxScan = Math.min(lines.length - 1, startIdx + 40);
-  while (endIdx < maxScan) {
-    const nextLine = lines[endIdx + 1] ?? "";
-    const nextTrim = nextLine.trim();
-    if (!nextTrim) break;
-    const isContinuation = parenBal > 0 || prevLast === "=" || prevLast === "|" || prevLast === "&" || prevLast === "?" || prevLast === ":" || /^[ \t]+(?:[|&?:]|\w+\s*\?*:)/.test(nextLine);
-    if (!isContinuation) break;
-    endIdx++;
-    const scan = scanBracesOnLine(nextLine, state, "js");
-    if (scan.open > scan.close) {
-      return findBraceBlockEnd(lines, endIdx, "js");
-    }
-    parenBal += scan.openParen - scan.closeParen;
-    prevLast = scan.lastCodeChar;
-    if (scan.endsWithSemi && parenBal <= 0) break;
-  }
-  return endIdx + 1;
-}
-function findParenCallEnd(lines, startIdx) {
-  const state = {
-    inBlockComment: false,
-    templateExprStack: [],
-    inBacktick: false,
-    parenDepth: 0
-  };
-  let seenParen = false;
-  const maxScan = Math.min(lines.length, startIdx + 400);
-  for (let i = startIdx; i < maxScan; i++) {
-    const { openParen } = scanBracesOnLine(lines[i], state, "js");
-    if (openParen > 0) seenParen = true;
-    if (seenParen && (state.parenDepth ?? 0) <= 0) {
-      return i + 1;
-    }
-  }
-  return startIdx + 1;
-}
-function hasArrowOrBraceWithin(lines, startIdx, maxLookahead = 12) {
-  const state = { inBlockComment: false, templateExprStack: [], inBacktick: false };
-  let parenDepth = 0;
-  let seenParen = false;
-  let hasArrow = false;
-  const end = Math.min(lines.length, startIdx + maxLookahead);
-  for (let i = startIdx; i < end; i++) {
-    const line = lines[i];
-    const { open, openParen, closeParen, endsWithSemi } = scanBracesOnLine(line, state, "js");
-    if (openParen > 0) seenParen = true;
-    parenDepth += openParen - closeParen;
-    if (line.includes("=>")) hasArrow = true;
-    if (open > 0 && (!seenParen || parenDepth <= 0)) {
-      return { hasArrow, hasBrace: true };
-    }
-    if (seenParen && parenDepth <= 0 && endsWithSemi) {
-      return { hasArrow, hasBrace: false };
-    }
-  }
-  return { hasArrow, hasBrace: false };
-}
-function extractTsJsSymbols(lines) {
-  const symbols = [];
-  const patterns = [
-    {
-      re: /^(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/,
-      kind: "class",
-      nameGroup: 1
-    },
-    {
-      re: /^(?:export\s+)?(?:declare\s+)?interface\s+([A-Za-z_$][\w$]*)/,
-      kind: "interface",
-      nameGroup: 1
-    },
-    {
-      re: /^(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*=/,
-      kind: "type",
-      nameGroup: 1
-    },
-    {
-      re: /^(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+([A-Za-z_$][\w$]*)/,
-      kind: "enum",
-      nameGroup: 1
-    },
-    {
-      re: /^(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:async\s+)?function\*?\s+([A-Za-z_$][\w$]*)/,
-      kind: "function",
-      nameGroup: 1
-    },
-    {
-      re: /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|[A-Za-z_$][\w$]*\s*=>)/,
-      kind: "function",
-      nameGroup: 1
-    }
-  ];
-  const multilineArrowStartRe = /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s+)?\(/;
-  const methodHeaderRe = /^([ \t]{1,4})(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\(/;
-  const controlKeywords = /* @__PURE__ */ new Set([
-    "if",
-    "for",
-    "while",
-    "switch",
-    "catch",
-    "else",
-    "try",
-    "return",
-    "new",
-    "throw",
-    "await",
-    "super",
-    "typeof",
-    "delete"
-  ]);
-  const routeRegisterRe = /^[ \t]{1,6}(?:app|router|server|fastify)\.(get|post|put|patch|delete|all|route)\s*(?:<[^>]*>)?\s*\(\s*['"`]([^'"`]+)['"`]/;
-  const testSuiteRe = /^(?:describe|suite)(?:\.(?:only|skip))?\s*\(\s*['"`]([^'"`]+)['"`]/;
-  const testCaseRe = /^[ \t]{0,4}(?:it|test)(?:\.(?:only|skip))?\s*\(\s*['"`]([^'"`]+)['"`]/;
-  let currentClassEnd = -1;
-  let currentClassIndent = -1;
-  let currentFnEnd = -1;
-  let currentSuiteEnd = -1;
-  const commentState = {
-    inBlockComment: false,
-    templateExprStack: [],
-    inBacktick: false
-  };
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const wasInComment = commentState.inBlockComment;
-    const wasInBacktick = commentState.inBacktick;
-    scanBracesOnLine(line, commentState, "js");
-    if (wasInComment || wasInBacktick) continue;
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*")) {
-      continue;
-    }
-    let matchedTop = false;
-    if (!line.startsWith(" ") && !line.startsWith("	")) {
-      for (const p of patterns) {
-        const m = p.re.exec(line);
-        if (m && m[p.nameGroup]) {
-          const endLine = p.kind === "type" ? findTypeAliasEnd(lines, i) : findBraceBlockEnd(lines, i, "js");
-          symbols.push({
-            kind: p.kind,
-            name: m[p.nameGroup],
-            startLine: i + 1,
-            endLine,
-            depth: 0
-          });
-          if (p.kind === "class") {
-            currentClassEnd = endLine;
-            currentClassIndent = -1;
-          } else if (p.kind === "function" && endLine - (i + 1) >= 40) {
-            currentFnEnd = endLine;
-          }
-          matchedTop = true;
-          break;
-        }
-      }
-      if (!matchedTop) {
-        const ma = multilineArrowStartRe.exec(line);
-        if (ma && ma[1]) {
-          const { hasArrow } = hasArrowOrBraceWithin(lines, i, 12);
-          if (hasArrow) {
-            const endLine = findBraceBlockEnd(lines, i, "js");
-            symbols.push({
-              kind: "function",
-              name: ma[1],
-              startLine: i + 1,
-              endLine,
-              depth: 0
-            });
-            if (endLine - (i + 1) >= 40) {
-              currentFnEnd = endLine;
-            }
-            matchedTop = true;
-          }
-        }
-      }
-      if (!matchedTop) {
-        const ms = testSuiteRe.exec(line);
-        if (ms && ms[1]) {
-          const endLine = findParenCallEnd(lines, i);
-          symbols.push({
-            kind: "suite",
-            name: ms[1].slice(0, 64),
-            startLine: i + 1,
-            endLine,
-            depth: 0
-          });
-          currentSuiteEnd = endLine;
-          matchedTop = true;
-        }
-      }
-    }
-    if (!matchedTop && i + 1 <= currentClassEnd) {
-      const mm = methodHeaderRe.exec(line);
-      if (mm && mm[1] && mm[2] && !controlKeywords.has(mm[2])) {
-        const indentWidth = mm[1].replace(/\t/g, "  ").length;
-        if (currentClassIndent === -1) {
-          currentClassIndent = indentWidth;
-        }
-        if (indentWidth === currentClassIndent) {
-          const { hasBrace } = hasArrowOrBraceWithin(lines, i, 10);
-          if (hasBrace) {
-            const endLine = findBraceBlockEnd(lines, i, "js");
-            symbols.push({
-              kind: "method",
-              name: mm[2],
-              startLine: i + 1,
-              endLine,
-              depth: 1
-            });
-          }
-        }
-      }
-    } else if (!matchedTop && i + 1 <= currentFnEnd) {
-      const mr = routeRegisterRe.exec(line);
-      if (mr && mr[1] && mr[2]) {
-        const endLine = findParenCallEnd(lines, i);
-        symbols.push({
-          kind: "route",
-          name: `${mr[1].toUpperCase()} ${mr[2]}`,
-          startLine: i + 1,
-          endLine,
-          depth: 1
-        });
-      }
-    } else if (!matchedTop) {
-      const mt = testCaseRe.exec(line);
-      if (mt && mt[1]) {
-        const endLine = findParenCallEnd(lines, i);
-        symbols.push({
-          kind: "test",
-          name: mt[1].slice(0, 64),
-          startLine: i + 1,
-          endLine,
-          depth: i + 1 <= currentSuiteEnd ? 1 : 0
-        });
-      }
-    }
-  }
-  return symbols;
-}
-function extractPythonSymbols(lines) {
-  const symbols = [];
-  const re = /^([ \t]*)(async\s+def|def|class)\s+([A-Za-z_]\w*)/;
-  const inTripleString = new Array(lines.length).fill(false);
-  let activeQuote = null;
-  for (let i = 0; i < lines.length; i++) {
-    inTripleString[i] = activeQuote !== null;
-    const line = lines[i];
-    let j = 0;
-    while (j < line.length) {
-      if (activeQuote) {
-        if (line[j] === "\\") {
-          j += 2;
-          continue;
-        }
-        if (line.startsWith(activeQuote, j)) {
-          activeQuote = null;
-          j += 3;
-          continue;
-        }
-        j++;
-      } else {
-        if (line[j] === "#") break;
-        if (line.startsWith('"""', j)) {
-          activeQuote = '"""';
-          j += 3;
-          continue;
-        }
-        if (line.startsWith("'''", j)) {
-          activeQuote = "'''";
-          j += 3;
-          continue;
-        }
-        if (line[j] === '"' || line[j] === "'") {
-          const q = line[j];
-          j++;
-          while (j < line.length && line[j] !== q) {
-            if (line[j] === "\\") j += 2;
-            else j++;
-          }
-          j++;
-          continue;
-        }
-        j++;
-      }
-    }
-  }
-  const raw = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (inTripleString[i]) continue;
-    const m = re.exec(lines[i]);
-    if (!m) continue;
-    const indent = m[1].replace(/\t/g, "    ").length;
-    const kind = m[2] === "class" ? "class" : indent > 0 ? "method" : "function";
-    raw.push({ indent, kind, name: m[3], startIdx: i });
-  }
-  for (let idx = 0; idx < raw.length; idx++) {
-    const item = raw[idx];
-    let headerEndIdx = item.startIdx;
-    let bracketBal = 0;
-    let seenHeaderBracket = false;
-    const maxHeaderScan = Math.min(lines.length - 1, item.startIdx + 40);
-    for (let h = item.startIdx; h <= maxHeaderScan; h++) {
-      if (h > item.startIdx && inTripleString[h]) {
-        headerEndIdx = h;
-        continue;
-      }
-      const hl = lines[h];
-      let q = null;
-      for (let k = 0; k < hl.length; k++) {
-        const ch = hl[k];
-        if (q) {
-          if (ch === "\\") {
-            k++;
-            continue;
-          }
-          if (ch === q) q = null;
-          continue;
-        }
-        if (ch === "#") break;
-        if (ch === '"' || ch === "'") {
-          if (hl.startsWith('"""', k) || hl.startsWith("'''", k)) break;
-          q = ch;
-          continue;
-        }
-        if (ch === "(" || ch === "[" || ch === "{") {
-          bracketBal++;
-          seenHeaderBracket = true;
-        } else if (ch === ")" || ch === "]" || ch === "}") {
-          bracketBal = Math.max(0, bracketBal - 1);
-        }
-      }
-      headerEndIdx = h;
-      if (!seenHeaderBracket || bracketBal === 0) break;
-    }
-    let endIdx = lines.length - 1;
-    for (let j = headerEndIdx + 1; j < lines.length; j++) {
-      if (inTripleString[j]) continue;
-      const l = lines[j];
-      const trimmed = l.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const curIndent = (/^[ \t]*/.exec(l)?.[0] ?? "").replace(/\t/g, "    ").length;
-      if (curIndent <= item.indent) {
-        endIdx = j - 1;
-        break;
-      }
-    }
-    while (endIdx > item.startIdx && !lines[endIdx].trim()) {
-      endIdx--;
-    }
-    symbols.push({
-      kind: item.kind,
-      name: item.name,
-      startLine: item.startIdx + 1,
-      endLine: endIdx + 1,
-      depth: item.indent > 0 ? 1 : 0
-    });
-  }
-  return symbols;
-}
-function stripLeadingGdAnnotations(text) {
-  let rest = text;
-  while (rest.startsWith("@")) {
-    const m = /^@[A-Za-z_]\w*/.exec(rest);
-    if (!m) break;
-    let idx = m[0].length;
-    while (idx < rest.length && (rest[idx] === " " || rest[idx] === "	")) idx++;
-    if (rest[idx] === "(") {
-      let depth = 0;
-      let quote = null;
-      while (idx < rest.length) {
-        const ch = rest[idx];
-        if (quote) {
-          if (ch === "\\") {
-            idx += 2;
-            continue;
-          }
-          if (ch === quote) quote = null;
-        } else {
-          if (ch === '"' || ch === "'") quote = ch;
-          else if (ch === "(") depth++;
-          else if (ch === ")") {
-            depth--;
-            if (depth === 0) {
-              idx++;
-              break;
-            }
-          }
-        }
-        idx++;
-      }
-    }
-    while (idx < rest.length && (rest[idx] === " " || rest[idx] === "	")) idx++;
-    rest = rest.slice(idx);
-  }
-  return rest;
-}
-function extractGdScriptSymbols(rawLines) {
-  const lines = rawLines.map((l, idx) => {
-    const clean = l.endsWith("\r") ? l.slice(0, -1) : l;
-    return idx === 0 ? clean.replace(/^\uFEFF/, "") : clean;
-  });
-  const info = new Array(lines.length);
-  let activeTriple = null;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const startsInTriple = activeTriple !== null;
-    let openBrace = 0;
-    let closeBrace = 0;
-    let openParen = 0;
-    let closeParen = 0;
-    let hasCode = startsInTriple;
-    let j = 0;
-    while (j < line.length) {
-      if (activeTriple) {
-        if (line[j] === "\\") {
-          j += 2;
-          continue;
-        }
-        if (line.startsWith(activeTriple, j)) {
-          activeTriple = null;
-          j += 3;
-          continue;
-        }
-        j++;
-      } else {
-        const ch = line[j];
-        if (ch === "#") break;
-        if (line.startsWith('"""', j) || line.startsWith("'''", j)) {
-          activeTriple = line.startsWith('"""', j) ? '"""' : "'''";
-          hasCode = true;
-          j += 3;
-          continue;
-        }
-        if (ch === '"' || ch === "'") {
-          hasCode = true;
-          j++;
-          while (j < line.length && line[j] !== ch) {
-            if (line[j] === "\\") j += 2;
-            else j++;
-          }
-          if (j < line.length) j++;
-          continue;
-        }
-        if (ch !== " " && ch !== "	") {
-          hasCode = true;
-          if (ch === "{") openBrace++;
-          else if (ch === "}") closeBrace++;
-          else if (ch === "(") openParen++;
-          else if (ch === ")") closeParen++;
-        }
-        j++;
-      }
-    }
-    info[i] = {
-      startsInTriple,
-      openBrace,
-      closeBrace,
-      openParen,
-      closeParen,
-      hasCode
-    };
-  }
-  const raw = [];
-  const classNameRe = /^class_name\s+([A-Za-z_]\w*)\b/;
-  const classRe = /^class\s+([A-Za-z_]\w*)\b/;
-  const funcRe = /^(?:static\s+)?func\s+([A-Za-z_]\w*)\s*\(/;
-  const signalRe = /^signal\s+([A-Za-z_]\w*)\b/;
-  const enumRe = /^enum(?:\s+([A-Za-z_]\w*))?\s*(?:\{|$|#)/;
-  for (let i = 0; i < lines.length; i++) {
-    if (info[i].startsInTriple) continue;
-    const line = lines[i];
-    const indentStr = /^[ \t]*/.exec(line)?.[0] ?? "";
-    const afterIndent = line.slice(indentStr.length);
-    if (!afterIndent || afterIndent.startsWith("#")) continue;
-    const rest = stripLeadingGdAnnotations(afterIndent);
-    if (!rest || rest.startsWith("#")) continue;
-    const indent = indentStr.replace(/\t/g, "    ").length;
-    let m = classNameRe.exec(rest);
-    if (m && m[1]) {
-      raw.push({ indent, rawKind: "class_name", name: m[1], startIdx: i });
-      continue;
-    }
-    m = classRe.exec(rest);
-    if (m && m[1]) {
-      raw.push({ indent, rawKind: "class", name: m[1], startIdx: i });
-      continue;
-    }
-    m = funcRe.exec(rest);
-    if (m && m[1]) {
-      raw.push({ indent, rawKind: "func", name: m[1], startIdx: i });
-      continue;
-    }
-    m = signalRe.exec(rest);
-    if (m && m[1]) {
-      raw.push({ indent, rawKind: "signal", name: m[1], startIdx: i });
-      continue;
-    }
-    m = enumRe.exec(rest);
-    if (m) {
-      if (!m[1] && info[i].openBrace === 0) {
-        let nextCodeIdx = i + 1;
-        while (nextCodeIdx < lines.length && !info[nextCodeIdx].hasCode) {
-          nextCodeIdx++;
-        }
-        if (nextCodeIdx >= lines.length || info[nextCodeIdx].openBrace === 0) {
-          continue;
-        }
-      }
-      raw.push({
-        indent,
-        rawKind: "enum",
-        name: m[1] ?? "<anonymous>",
-        startIdx: i
-      });
-    }
-  }
-  const symbols = [];
-  const classStack = [];
-  for (const item of raw) {
-    let endIdx = item.startIdx;
-    if (item.rawKind === "class_name") {
-      endIdx = item.startIdx;
-    } else if (item.rawKind === "signal") {
-      let parenDepth = info[item.startIdx].openParen - info[item.startIdx].closeParen;
-      const maxSigScan = Math.min(lines.length - 1, item.startIdx + 40);
-      while (parenDepth > 0 && endIdx < maxSigScan) {
-        endIdx++;
-        parenDepth += info[endIdx].openParen - info[endIdx].closeParen;
-      }
-      if (parenDepth > 0) endIdx = item.startIdx;
-    } else if (item.rawKind === "enum") {
-      let braceDepth = 0;
-      let seenOpen = false;
-      const maxEnumScan = Math.min(lines.length - 1, item.startIdx + 500);
-      for (let k = item.startIdx; k <= maxEnumScan; k++) {
-        const li = info[k];
-        if (li.openBrace > 0) seenOpen = true;
-        braceDepth += li.openBrace - li.closeBrace;
-        if (seenOpen && braceDepth <= 0) {
-          endIdx = k;
-          break;
-        }
-        if (!seenOpen && k > item.startIdx && li.hasCode && li.openBrace === 0) {
-          break;
-        }
-      }
-      if (seenOpen && braceDepth > 0) {
-        endIdx = maxEnumScan;
-      }
-    } else {
-      let headerEndIdx = item.startIdx;
-      let parenDepth = info[item.startIdx].openParen - info[item.startIdx].closeParen;
-      const maxHeaderScan = Math.min(lines.length - 1, item.startIdx + 40);
-      while (parenDepth > 0 && headerEndIdx < maxHeaderScan) {
-        headerEndIdx++;
-        parenDepth += info[headerEndIdx].openParen - info[headerEndIdx].closeParen;
-      }
-      if (parenDepth > 0) headerEndIdx = item.startIdx;
-      endIdx = lines.length - 1;
-      for (let j = headerEndIdx + 1; j < lines.length; j++) {
-        if (info[j].startsInTriple) continue;
-        const l = lines[j];
-        const trimmed = l.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const curIndent = (/^[ \t]*/.exec(l)?.[0] ?? "").replace(/\t/g, "    ").length;
-        if (curIndent <= item.indent) {
-          endIdx = j - 1;
-          break;
-        }
-      }
-      while (endIdx > headerEndIdx) {
-        if (info[endIdx].startsInTriple) break;
-        const endLineStr = lines[endIdx];
-        const endTrimmed = endLineStr.trim();
-        if (!endTrimmed) {
-          endIdx--;
-          continue;
-        }
-        if (endTrimmed.startsWith("#")) {
-          const commentIndent = (/^[ \t]*/.exec(endLineStr)?.[0] ?? "").replace(
-            /\t/g,
-            "    "
-          ).length;
-          if (commentIndent <= item.indent) {
-            endIdx--;
-            continue;
-          }
-        }
-        break;
-      }
-    }
-    const startLine = item.startIdx + 1;
-    const endLine = Math.max(startLine, endIdx + 1);
-    while (classStack.length > 0 && (classStack[classStack.length - 1].endLine < startLine || classStack[classStack.length - 1].indent >= item.indent)) {
-      classStack.pop();
-    }
-    const depth = classStack.length > 0 ? classStack.length : item.indent > 0 ? Math.max(1, Math.floor(item.indent / 4)) : 0;
-    const kind = item.rawKind === "func" ? item.indent > 0 ? "method" : "function" : item.rawKind;
-    symbols.push({
-      kind,
-      name: item.name,
-      startLine,
-      endLine,
-      depth
-    });
-    if (item.rawKind === "class") {
-      classStack.push({ indent: item.indent, endLine });
-    }
-  }
-  return symbols;
-}
-function extractGoSymbols(lines) {
-  const symbols = [];
-  const funcRe = /^func\s+(?:\(([^)]+)\)\s+)?([A-Za-z_]\w*)/;
-  const typeRe = /^type\s+([A-Za-z_]\w*)\s+(struct|interface)\b/;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const fm = funcRe.exec(line);
-    if (fm && fm[2]) {
-      const recv = fm[1]?.trim();
-      const name = recv ? `(${recv}) ${fm[2]}` : fm[2];
-      symbols.push({
-        kind: recv ? "method" : "function",
-        name,
-        startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
-        depth: 0
-      });
-      continue;
-    }
-    const tm = typeRe.exec(line);
-    if (tm && tm[1] && tm[2]) {
-      symbols.push({
-        kind: tm[2],
-        name: tm[1],
-        startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
-        depth: 0
-      });
-    }
-  }
-  return symbols;
-}
-function extractRustSymbols(lines) {
-  const symbols = [];
-  const re = /^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern(?:\s+"[^"]*")?)\s+)*(fn|struct|enum|trait|impl|mod)\s+([A-Za-z_][\w:<>,\s]*?)(?:\s*[\({;]|$)/;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.length > 2048) continue;
-    const m = re.exec(line);
-    if (!m || !m[2] || !m[3]) continue;
-    const indent = m[1].length;
-    if (indent > 4) continue;
-    symbols.push({
-      kind: m[2],
-      name: m[3].trim(),
-      startLine: i + 1,
-      endLine: findBraceBlockEnd(lines, i, "c"),
-      depth: indent > 0 ? 1 : 0
-    });
-  }
-  return symbols;
-}
-function extractCLikeSymbols(lines) {
-  const symbols = [];
-  const typeRe = /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|abstract|sealed|data|open|export|partial|base|mixin)\s+)*(class|interface|enum|struct|record|protocol|namespace|mixin|extension)\s+(?:type\s+)?([A-Za-z_]\w*)/;
-  const kwFuncRe = /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|override|virtual|inline|async|suspend|open|mutating)\s+)*(?:fun|func)\s+([A-Za-z_]\w*)/;
-  const cMethodRe = /^([ \t]{0,4})(?:(?:public|private|protected|internal|static|final|abstract|override|virtual|inline|constexpr|extern|async|synchronized|native|unsigned|signed|const|factory|late|covariant|external)\s+)*(?:[A-Za-z_~][\w:<>,?\[\]\s*&]*?\s+)([A-Za-z_~][\w.:]*)\s*(?:<[^{;()]{1,64}>)?\s*\([^;]*(?:=>.*)?$/;
-  const excludedNames = /* @__PURE__ */ new Set([
-    "if",
-    "for",
-    "while",
-    "switch",
-    "catch",
-    "else",
-    "return",
-    "sizeof",
-    "alignof",
-    "decltype",
-    "new",
-    "delete",
-    "throw",
-    "typedef",
-    "using",
-    "case"
-  ]);
-  const commentState = {
-    inBlockComment: false,
-    templateExprStack: [],
-    inBacktick: false
-  };
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const wasInComment = commentState.inBlockComment;
-    scanBracesOnLine(line, commentState, "c");
-    if (wasInComment) continue;
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*") || trimmed.startsWith("#")) {
-      continue;
-    }
-    const tm = typeRe.exec(line);
-    if (tm && tm[2] && tm[3]) {
-      const indented = (tm[1]?.length ?? 0) > 0;
-      symbols.push({
-        kind: tm[2],
-        name: tm[3],
-        startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
-        depth: indented ? 1 : 0
-      });
-      continue;
-    }
-    const fm = kwFuncRe.exec(line);
-    if (fm && fm[2]) {
-      const indented = (fm[1]?.length ?? 0) > 0;
-      symbols.push({
-        kind: indented ? "method" : "function",
-        name: fm[2],
-        startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
-        depth: indented ? 1 : 0
-      });
-      continue;
-    }
-    const cm = cMethodRe.exec(line);
-    if (cm && cm[2] && !excludedNames.has(cm[2]) && !(trimmed.includes("=") && !trimmed.includes("=>"))) {
-      const { hasBrace, hasArrow } = hasArrowOrBraceWithin(lines, i, 8);
-      if (hasBrace || hasArrow) {
-        const indented = (cm[1]?.length ?? 0) > 0;
-        symbols.push({
-          kind: indented ? "method" : "function",
-          name: cm[2],
-          startLine: i + 1,
-          endLine: hasBrace ? findBraceBlockEnd(lines, i, "c") : i + 1,
-          depth: indented ? 1 : 0
-        });
-      }
-    }
-  }
-  return symbols;
-}
-function extractShellSymbols(lines) {
-  const symbols = [];
-  const re = /^(?:function\s+([A-Za-z_][\w-]*)\s*(?:\(\))?|([A-Za-z_][\w-]*)\s*\(\))\s*\{/;
-  for (let i = 0; i < lines.length; i++) {
-    const m = re.exec(lines[i]);
-    if (!m) continue;
-    const name = m[1] || m[2];
-    if (!name) continue;
-    symbols.push({
-      kind: "function",
-      name,
-      startLine: i + 1,
-      endLine: findBraceBlockEnd(lines, i, "shell"),
-      depth: 0
-    });
-  }
-  return symbols;
-}
-function extractMarkdownSymbols(lines) {
-  const raw = [];
-  let inFence = false;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.length <= 1024 && /^\s*(`{3,}|~{3,})/.test(line)) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence || line.length > 1024 || line.charCodeAt(0) !== 35) continue;
-    let level = 0;
-    while (level < line.length && level <= 4 && line.charCodeAt(level) === 35) {
-      level += 1;
-    }
-    if (level < 1 || level > 4 || level >= line.length) continue;
-    const sep = line.charCodeAt(level);
-    if (sep !== 32 && sep !== 9) continue;
-    let start = level + 1;
-    while (start < line.length && (line.charCodeAt(start) === 32 || line.charCodeAt(start) === 9)) start += 1;
-    let end = line.length;
-    while (end > start && (line.charCodeAt(end - 1) === 32 || line.charCodeAt(end - 1) === 9)) end -= 1;
-    let hEnd = end;
-    while (hEnd > start && line.charCodeAt(hEnd - 1) === 35) hEnd -= 1;
-    if (hEnd < end && (hEnd === start || line.charCodeAt(hEnd - 1) === 32 || line.charCodeAt(hEnd - 1) === 9)) {
-      end = hEnd;
-      while (end > start && (line.charCodeAt(end - 1) === 32 || line.charCodeAt(end - 1) === 9)) end -= 1;
-    }
-    if (end > start) {
-      raw.push({ level, name: line.slice(start, end), startLine: i + 1 });
-    }
-  }
-  return raw.map((item, idx) => {
-    let endLine = lines.length;
-    for (let j = idx + 1; j < raw.length; j++) {
-      if (raw[j].level <= item.level) {
-        endLine = raw[j].startLine - 1;
-        break;
-      }
-    }
-    return {
-      kind: `h${item.level}`,
-      name: item.name,
-      startLine: item.startLine,
-      endLine: Math.max(item.startLine, endLine),
-      depth: item.level - 1
-    };
-  });
-}
-function extractJsonYamlSymbols(lines, isJson) {
-  const symbols = [];
-  if (isJson) {
-    let keyIndent = null;
-    for (let i = 0; i < lines.length; i++) {
-      const m = /^([ \t]+)"([^"]+)"\s*:/.exec(lines[i]);
-      if (m && m[1] && m[2]) {
-        if (keyIndent === null) {
-          keyIndent = m[1];
-        }
-        if (m[1] === keyIndent) {
-          symbols.push({
-            kind: "key",
-            name: m[2],
-            startLine: i + 1,
-            endLine: i + 1,
-            depth: 0
-          });
-        }
-      }
-    }
-    for (let idx = 0; idx < symbols.length; idx++) {
-      const cur = symbols[idx];
-      const nextStart = idx + 1 < symbols.length ? symbols[idx + 1].startLine - 1 : lines.length - 1;
-      let endLine = Math.max(cur.startLine, nextStart);
-      while (endLine > cur.startLine && /^\s*[}\]]?,?\s*$/.test(lines[endLine - 1] ?? "") && idx === symbols.length - 1) {
-        endLine--;
-      }
-      cur.endLine = endLine;
-    }
-    return symbols;
-  }
-  const re = /^([A-Za-z0-9_.-]+)\s*:/;
-  for (let i = 0; i < lines.length; i++) {
-    const m = re.exec(lines[i]);
-    if (m && m[1]) {
-      symbols.push({
-        kind: "key",
-        name: m[1],
-        startLine: i + 1,
-        endLine: i + 1,
-        depth: 0
-      });
-    }
-  }
-  for (let idx = 0; idx < symbols.length; idx++) {
-    const cur = symbols[idx];
-    let endLine = idx + 1 < symbols.length ? symbols[idx + 1].startLine - 1 : lines.length;
-    while (endLine > cur.startLine && !(lines[endLine - 1] ?? "").trim()) {
-      endLine--;
-    }
-    cur.endLine = Math.max(cur.startLine, endLine);
-  }
-  return symbols;
-}
-function extractCssSymbols(lines, compactOnly = false) {
-  const symbols = [];
-  const state = {
-    inBlockComment: false,
-    templateExprStack: [],
-    inBacktick: false
-  };
-  let braceDepth = 0;
-  const atRuleRe = /^@(layer|media|keyframes|supports|container|font-face|theme)\b([^{;]*)/i;
-  const tokenBlockRe = /^(:root\b|html(?:\[[^\]]+\]|\.[A-Za-z_-][\w-]*)?(?=\s|[,{])|\[data-theme[^\]]*\]|body\b)[^{;]*\{/;
-  const extractCssSectionComment = (text) => {
-    if (text.length < 6 || text.length > 200) return null;
-    if (!text.startsWith("/*") || !text.endsWith("*/")) return null;
-    const inner = text.slice(2, -2);
-    if (inner.includes("/*") || inner.includes("*/")) return null;
-    const cleaned = inner.replace(/^[\s=\-*#]+/, "").replace(/[\s=\-*#]+$/, "");
-    if (cleaned.length < 2 || cleaned.length > 71) return null;
-    if (/[*/]/.test(cleaned) || cleaned.startsWith("=")) return null;
-    if (!/[A-Za-z0-9\u4e00-\u9fff]/.test(cleaned)) return null;
-    return cleaned.slice(0, 64);
-  };
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-    const wasInComment = state.inBlockComment;
-    if (!wasInComment && braceDepth === 0 && trimmed) {
-      const sectionName = extractCssSectionComment(trimmed);
-      if (sectionName) {
-        symbols.push({
-          kind: "section",
-          name: sectionName,
-          startLine: i + 1,
-          endLine: i + 1,
-          depth: 0
-        });
-      } else {
-        const am = atRuleRe.exec(trimmed);
-        if (am && am[1]) {
-          const endLine = trimmed.includes("{") ? findBraceBlockEnd(lines, i, "c") : i + 1;
-          const rest = (am[2] ?? "").trim().replace(/\s+/g, " ").slice(0, 56);
-          symbols.push({
-            kind: `@${am[1].toLowerCase()}`,
-            name: rest || `@${am[1].toLowerCase()}`,
-            startLine: i + 1,
-            endLine,
-            depth: 0
-          });
-        } else {
-          const tm = tokenBlockRe.exec(trimmed);
-          if (tm && tm[1]) {
-            const endLine = findBraceBlockEnd(lines, i, "c");
-            const header = trimmed.slice(0, trimmed.indexOf("{")).trim().replace(/\s+/g, " ").slice(0, 60);
-            symbols.push({
-              kind: "tokens",
-              name: header || tm[1],
-              startLine: i + 1,
-              endLine,
-              depth: 0
-            });
-          }
-        }
-      }
-    }
-    const { open, close } = scanBracesOnLine(line, state, "c");
-    braceDepth = Math.max(0, braceDepth + open - close);
-  }
-  if (!compactOnly && symbols.length < 10) {
-    const fallbackState = {
-      inBlockComment: false,
-      templateExprStack: [],
-      inBacktick: false
-    };
-    let d = 0;
-    let lastAddedLine = -999;
-    const seen = new Set(symbols.map((s) => s.startLine));
-    for (let i = 0; i < lines.length && symbols.length < 40; i++) {
-      const line = lines[i];
-      const trimmed = line.trim();
-      const wasInComment = fallbackState.inBlockComment;
-      if (!wasInComment && d === 0 && !seen.has(i + 1) && i - lastAddedLine >= 10 && /^[.#\[a-zA-Z*:]/.test(trimmed) && trimmed.includes("{") && !trimmed.startsWith("@")) {
-        const sel = trimmed.slice(0, trimmed.indexOf("{")).trim().replace(/\s+/g, " ").slice(0, 60);
-        if (sel) {
-          const endLine = findBraceBlockEnd(lines, i, "c");
-          symbols.push({
-            kind: "rule",
-            name: sel,
-            startLine: i + 1,
-            endLine,
-            depth: 0
-          });
-          lastAddedLine = i;
-        }
-      }
-      const { open, close } = scanBracesOnLine(line, fallbackState, "c");
-      d = Math.max(0, d + open - close);
-    }
-    symbols.sort((a, b) => a.startLine - b.startLine);
-  }
-  return symbols;
-}
-function dedentBlockLines(blockLines) {
-  let baseIndent = 0;
-  for (const ln of blockLines) {
-    if (!ln || !ln.trim()) continue;
-    const expanded = ln.replace(/\t/g, "  ");
-    baseIndent = expanded.length - expanded.trimStart().length;
-    break;
-  }
-  if (baseIndent <= 0) return blockLines;
-  return blockLines.map((ln) => {
-    if (!ln || !ln.trim()) return "";
-    const expanded = ln.replace(/\t/g, "  ");
-    const lead = expanded.length - expanded.trimStart().length;
-    return expanded.slice(Math.min(lead, baseIndent));
-  });
-}
-function extractHtmlCommentLandmark(text) {
-  if (text.length < 10 || text.length > 200) return null;
-  if (!text.startsWith("<!--") || !text.endsWith("-->")) return null;
-  const inner = text.slice(4, -3);
-  if (inner.includes("<!--") || inner.includes("-->") || inner.includes(">")) return null;
-  const cleaned = inner.replace(/^[\s=\-*#]+/, "").replace(/[\s=\-*#]+$/, "");
-  if (cleaned.length < 3 || cleaned.length > 61) return null;
-  if (cleaned.startsWith("-")) return null;
-  return cleaned;
-}
-function extractSfcSymbols(lines, isHtmlDoc = false) {
-  const symbols = [];
-  const blockOpenRe = /^<(script|template|style)\b([^>]*)>/i;
-  const semanticTagRe = /^<(header|nav|main|aside|section|footer|dialog|form|[A-Z][A-Za-z0-9]*(?:Modal|Drawer|Dialog|Panel))\b([^>]*)>/;
-  let htmlLandmarks = 0;
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    const expanded = line.replace(/\t/g, "  ");
-    const indent = expanded.length - expanded.trimStart().length;
-    const trimmed = line.trim();
-    const m = indent <= 8 ? blockOpenRe.exec(trimmed) : null;
-    if (!m || !m[1]) {
-      if (isHtmlDoc && indent <= 10 && htmlLandmarks < 16 && trimmed) {
-        if (/^<body\b/i.test(trimmed)) {
-          symbols.push({
-            kind: "body",
-            name: "<body>",
-            startLine: i + 1,
-            endLine: i + 1,
-            depth: 0
-          });
-          htmlLandmarks++;
-        } else {
-          const landmarkName = extractHtmlCommentLandmark(trimmed);
-          if (landmarkName) {
-            symbols.push({
-              kind: "section",
-              name: landmarkName,
-              startLine: i + 1,
-              endLine: i + 1,
-              depth: 1
-            });
-            htmlLandmarks++;
-          } else {
-            const sm = semanticTagRe.exec(trimmed);
-            if (sm && sm[1]) {
-              const attrStr = sm[2] ?? "";
-              const idMatch = /(?:data-testid|id|class)=["']([^"']+)["']/.exec(attrStr);
-              const tagDesc = idMatch && idMatch[1] ? `<${sm[1]} ${idMatch[1].slice(0, 36)}>` : `<${sm[1]}>`;
-              symbols.push({
-                kind: "block",
-                name: tagDesc,
-                startLine: i + 1,
-                endLine: i + 1,
-                depth: 1
-              });
-              htmlLandmarks++;
-            }
-          }
-        }
-      }
-      i++;
-      continue;
-    }
-    const tag = m[1].toLowerCase();
-    const attrs = (m[2] ?? "").trim();
-    const startIdx = i;
-    let endIdx = i;
-    if (tag === "template") {
-      let depth = 0;
-      const openTemplateRe = /<template\b[^>]*>/gi;
-      const closeTemplateRe = /<\/template\s*>/gi;
-      for (let j = i; j < lines.length; j++) {
-        const ln = lines[j];
-        const opens = ln.match(openTemplateRe)?.length ?? 0;
-        const closes = ln.match(closeTemplateRe)?.length ?? 0;
-        depth += opens - closes;
-        if (depth <= 0) {
-          endIdx = j;
-          break;
-        }
-        endIdx = j;
-      }
-    } else {
-      const closeRe = new RegExp(`</${tag}\\s*>`, "i");
-      for (let j = i; j < lines.length; j++) {
-        endIdx = j;
-        if (j > i && closeRe.test(lines[j])) break;
-        if (j === i && closeRe.test(trimmed.slice(m[0].length))) break;
-      }
-    }
-    const headerLabel = attrs ? `<${tag} ${attrs.slice(0, 40)}>` : `<${tag}>`;
-    symbols.push({
-      kind: tag,
-      name: headerLabel,
-      startLine: startIdx + 1,
-      endLine: endIdx + 1,
-      depth: 0
-    });
-    const innerStart = startIdx + 1;
-    const innerLines = lines.slice(innerStart, endIdx);
-    if (tag === "script" && innerLines.length > 0) {
-      const innerSyms = extractTsJsSymbols(dedentBlockLines(innerLines));
-      for (const s of innerSyms) {
-        symbols.push({
-          kind: s.kind,
-          name: s.name,
-          startLine: s.startLine + innerStart,
-          endLine: s.endLine + innerStart,
-          depth: s.depth + 1
-        });
-      }
-    } else if (tag === "template" && innerLines.length >= 30) {
-      let landmarks = 0;
-      for (let k = 0; k < innerLines.length && landmarks < 14; k++) {
-        const raw = innerLines[k];
-        const kIndent = raw.length - raw.trimStart().length;
-        if (kIndent > 8) continue;
-        const kTrimmed = raw.trim();
-        const landmarkName = extractHtmlCommentLandmark(kTrimmed);
-        if (landmarkName) {
-          symbols.push({
-            kind: "section",
-            name: landmarkName,
-            startLine: innerStart + k + 1,
-            endLine: innerStart + k + 1,
-            depth: 1
-          });
-          landmarks++;
-          continue;
-        }
-        const sm = semanticTagRe.exec(kTrimmed);
-        if (sm && sm[1]) {
-          const attrStr = sm[2] ?? "";
-          const idMatch = /(?:data-testid|id|class)=["']([^"']+)["']/.exec(attrStr);
-          const tagDesc = idMatch && idMatch[1] ? `<${sm[1]} ${idMatch[1].slice(0, 36)}>` : `<${sm[1]}>`;
-          symbols.push({
-            kind: "block",
-            name: tagDesc,
-            startLine: innerStart + k + 1,
-            endLine: innerStart + k + 1,
-            depth: 1
-          });
-          landmarks++;
-        }
-      }
-    } else if (tag === "style" && innerLines.length > 0) {
-      const cssSyms = extractCssSymbols(dedentBlockLines(innerLines), true).slice(0, 12);
-      for (const s of cssSyms) {
-        symbols.push({
-          kind: s.kind,
-          name: s.name,
-          startLine: s.startLine + innerStart,
-          endLine: s.endLine + innerStart,
-          depth: 1
-        });
-      }
-    }
-    i = endIdx + 1;
-  }
-  return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
-}
-function parseGitDiffPath(line) {
-  if (!line || line.length > 1024) return "";
-  const rest = line.slice(11).trim();
-  if (!rest) return "";
-  const readToken = (str, start, isSecond = false) => {
-    let i = start;
-    while (i < str.length && str[i] === " ") i++;
-    if (i >= str.length) return null;
-    if (str[i] === '"') {
-      let j = i + 1;
-      let val = "";
-      while (j < str.length) {
-        if (str[j] === "\\" && j + 1 < str.length) {
-          val += str[j] + str[j + 1];
-          j += 2;
-          continue;
-        }
-        if (str[j] === '"') {
-          return { val, next: j + 1 };
-        }
-        val += str[j];
-        j++;
-      }
-      return { val, next: j };
-    }
-    if (isSecond) {
-      return { val: str.slice(i), next: str.length };
-    }
-    const nextQuoteB = str.indexOf(' "b/', i);
-    if (nextQuoteB !== -1) {
-      return { val: str.slice(i, nextQuoteB), next: nextQuoteB + 1 };
-    }
-    const nextPlainB = str.indexOf(" b/", i);
-    if (nextPlainB !== -1) {
-      return { val: str.slice(i, nextPlainB), next: nextPlainB + 1 };
-    }
-    const sp = str.indexOf(" ", i);
-    if (sp === -1) return { val: str.slice(i), next: str.length };
-    return { val: str.slice(i, sp), next: sp + 1 };
-  };
-  const first = readToken(rest, 0, false);
-  if (!first) return rest.slice(0, 120);
-  const second = readToken(rest, first.next, true);
-  const chosen = second && second.val ? second.val : first.val;
-  return chosen.replace(/^[ab]\//, "").trim().slice(0, 120);
-}
-function isLikelyGitDiffHeaderFollowup(nextLine) {
-  if (typeof nextLine !== "string") return false;
-  return (
-    nextLine.startsWith("index ") ||
-    nextLine.startsWith("new file mode ") ||
-    nextLine.startsWith("deleted file mode ") ||
-    nextLine.startsWith("old mode ") ||
-    nextLine.startsWith("new mode ") ||
-    nextLine.startsWith("rename from ") ||
-    nextLine.startsWith("copy from ") ||
-    nextLine.startsWith("Binary files ") ||
-    nextLine.startsWith("similarity index ") ||
-    nextLine.startsWith("--- ")
-  );
-}
-function extractDiffSymbols(lines) {
-  const symbols = [];
-  let curFile = null;
-  let curHunk = null;
-  let inHunk = false;
-  let inCommitMsg = false;
-  let sawGitHeaderForFile = false;
-  let sawGitDiffInPatch = false;
-
-  const closeHunk = (endLine) => {
-    if (curHunk) {
-      curHunk.endLine = Math.max(curHunk.startLine, endLine);
-      curHunk = null;
-    }
-  };
-  const closeFile = (endLine) => {
-    closeHunk(endLine);
-    if (curFile) {
-      curFile.endLine = Math.max(curFile.startLine, endLine);
-      curFile.name = `${curFile.rawName} (+${curFile.added}/-${curFile.removed})`;
-      delete curFile.rawName;
-      delete curFile.added;
-      delete curFile.removed;
-      curFile = null;
-    }
-    inHunk = false;
-    sawGitHeaderForFile = false;
-  };
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const lineNum = i + 1;
-
-    if (line.length <= 512 && /^From [0-9a-f]{40}\s/.test(line)) {
-      closeFile(i);
-      inCommitMsg = true;
-      continue;
-    }
-    if (inCommitMsg) {
-      if (line === "---") {
-        inCommitMsg = false;
-        continue;
-      }
-      if (!line.startsWith("diff --git ") || !isLikelyGitDiffHeaderFollowup(lines[i + 1])) continue;
-      inCommitMsg = false;
-    }
-
-    if (line.startsWith("diff --git ")) {
-      closeFile(i);
-      const rawName = parseGitDiffPath(line) || line.slice(11).trim().slice(0, 120);
-      curFile = {
-        kind: "file",
-        name: rawName,
-        rawName,
-        startLine: lineNum,
-        endLine: lineNum,
-        depth: 0,
-        added: 0,
-        removed: 0
-      };
-      symbols.push(curFile);
-      sawGitHeaderForFile = true;
-      sawGitDiffInPatch = true;
-      continue;
-    }
-
-    // Standard `diff -u` header without `diff --git` (never split inside a git-diff hunk on `---`/`+++` code lines)
-    if (
-      !sawGitDiffInPatch &&
-      line.startsWith("--- ") &&
-      i + 1 < lines.length &&
-      lines[i + 1].startsWith("+++ ") &&
-      (!sawGitHeaderForFile && (!inHunk || (i + 2 < lines.length && lines[i + 2].startsWith("@@ "))))
-    ) {
-      closeFile(i);
-      const plusLine = lines[i + 1].slice(4).split("\t")[0].trim();
-      const minusLine = line.slice(4).split("\t")[0].trim();
-      const chosenRaw = plusLine === "/dev/null" && minusLine && minusLine !== "/dev/null" ? minusLine : plusLine;
-      const unquoted = chosenRaw.replace(/^"(.*)"$/, "$1");
-      const rawName = unquoted.replace(/^[ab]\//, "").slice(0, 120) || "patch";
-      curFile = {
-        kind: "file",
-        name: rawName,
-        rawName,
-        startLine: lineNum,
-        endLine: lineNum + 1,
-        depth: 0,
-        added: 0,
-        removed: 0
-      };
-      symbols.push(curFile);
-      i += 1;
-      continue;
-    }
-
-    if (line.startsWith("@@ ")) {
-      closeHunk(i);
-      inHunk = true;
-      sawGitHeaderForFile = false;
-      const hunkLabel = line.trim().slice(0, 88);
-      curHunk = {
-        kind: "hunk",
-        name: hunkLabel,
-        startLine: lineNum,
-        endLine: lineNum,
-        depth: curFile ? 1 : 0
-      };
-      symbols.push(curHunk);
-      if (curFile) curFile.endLine = lineNum;
-      continue;
-    }
-
-    if (inHunk) {
-      if (line === "-- " && (lines[i + 1] === void 0 || /^\d+\.\d+/.test(lines[i + 1].trim()))) {
-        closeHunk(i);
-        inHunk = false;
-        continue;
-      }
-      if (curFile) {
-        if (line.startsWith("+")) curFile.added += 1;
-        else if (line.startsWith("-")) curFile.removed += 1;
-        curFile.endLine = lineNum;
-      }
-      if (curHunk) curHunk.endLine = lineNum;
-    } else if (curFile) {
-      curFile.endLine = lineNum;
-    }
-  }
-
-  closeFile(lines.length);
-  return symbols;
-}
-function extractSymbolsFromLines(filePath, lines) {
-  if (lines.length > 0 && lines[0].startsWith("\uFEFF")) {
-    lines = [lines[0].slice(1), ...lines.slice(1)];
-  }
-  const ext = path4.extname(filePath).toLowerCase();
-  if (ext === ".patch" || ext === ".diff") {
-    return extractDiffSymbols(lines);
-  }
-  if (lines.some((l) => l.length > 2048)) {
-    lines = lines.map((l) => (l.length > 2048 ? "" : l));
-  }
-  switch (ext) {
-    case ".ts":
-    case ".tsx":
-    case ".mts":
-    case ".cts":
-    case ".js":
-    case ".jsx":
-    case ".mjs":
-    case ".cjs":
-      return extractTsJsSymbols(lines);
-    case ".vue":
-    case ".svelte":
-      return extractSfcSymbols(lines, false);
-    case ".html":
-    case ".htm":
-    case ".xhtml":
-    case ".astro":
-      return extractSfcSymbols(lines, true);
-    case ".css":
-    case ".scss":
-    case ".less":
-    case ".pcss":
-      return extractCssSymbols(lines);
-    case ".py":
-      return extractPythonSymbols(lines);
-    case ".gd":
-      return extractGdScriptSymbols(lines);
-    case ".go":
-      return extractGoSymbols(lines);
-    case ".rs":
-      return extractRustSymbols(lines);
-    case ".dart":
-    case ".java":
-    case ".kt":
-    case ".kts":
-    case ".cs":
-    case ".swift":
-    case ".c":
-    case ".cc":
-    case ".cpp":
-    case ".h":
-    case ".hpp":
-      return extractCLikeSymbols(lines);
-    case ".sh":
-    case ".bash":
-    case ".zsh":
-      return extractShellSymbols(lines);
-    case ".md":
-    case ".mdx":
-      return extractMarkdownSymbols(lines);
-    case ".json":
-      return extractJsonYamlSymbols(lines, true);
-    case ".yaml":
-    case ".yml":
-      return extractJsonYamlSymbols(lines, false);
-    case ".patch":
-    case ".diff":
-      return extractDiffSymbols(lines);
-    default:
-      return extractTsJsSymbols(lines);
-  }
-}
 var MAX_OUTLINES = 40;
 var MAX_SLICE_FILES = 30;
 var MAX_OUTLINE_CACHE_ENTRIES = 128;
@@ -4916,6 +4152,129 @@ async function getOutlineDbStore() {
     })();
   }
   return outlineDbInitPromise;
+}
+var fastTelemetryStore = null;
+var fastTelemetryDbPath = "";
+var fastTelemetryInitPromise = null;
+var fastReceiptsModPromise = null;
+function loadFastReceiptsMod() {
+  if (!fastReceiptsModPromise) {
+    fastReceiptsModPromise = import("../context/lib/execution-receipts.js").catch(() => null);
+  }
+  return fastReceiptsModPromise;
+}
+function normalizeFastSessionId(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (
+    !trimmed ||
+    trimmed.length > 128 ||
+    /[\x00-\x1f\x7f\\/]/.test(trimmed) ||
+    /^(?:default|all|app|lifetime|__unbound__)$/i.test(trimmed) ||
+    /^workspace:/i.test(trimmed)
+  ) {
+    return null;
+  }
+  return trimmed;
+}
+async function getFastTelemetryStore() {
+  const targetDbPath = resolveOutlineDbPath();
+  if (outlineDbStore && outlineDbStore.dbPath === targetDbPath) {
+    return outlineDbStore;
+  }
+  if (fastTelemetryStore && fastTelemetryDbPath === targetDbPath) {
+    return fastTelemetryStore;
+  }
+  if (fastTelemetryStore && fastTelemetryDbPath !== targetDbPath) {
+    closeFastTelemetryStore();
+  }
+  if (!fastTelemetryInitPromise) {
+    fastTelemetryInitPromise = (async () => {
+      installSqliteWarningFilter();
+      try {
+        const mod = await import("../context/lib/store.js");
+        const st = new mod.ContextModeStore({ dbPath: targetDbPath, hookMode: true, maxBusyRetries: 4, maxRetryDeadlineMs: 800 });
+        st.open();
+        fastTelemetryStore = st;
+        fastTelemetryDbPath = targetDbPath;
+        return st;
+      } catch {
+        return null;
+      } finally {
+        fastTelemetryInitPromise = null;
+      }
+    })();
+  }
+  return fastTelemetryInitPromise;
+}
+function closeFastTelemetryStore() {
+  if (fastTelemetryStore) {
+    try {
+      fastTelemetryStore.close();
+    } catch {}
+    fastTelemetryStore = null;
+  }
+  fastTelemetryDbPath = "";
+  fastTelemetryInitPromise = null;
+}
+async function recordFastSavingsEvent({ toolName, telemetry, finalText, hostSessionId = null, directConvId = null }) {
+  if (!telemetry || !Number.isFinite(telemetry.rawBytes) || telemetry.rawBytes <= 0) return;
+  const returnedBytes = Buffer.byteLength(typeof finalText === "string" ? finalText : "", "utf8");
+  // Strictly non-inflated: record only when raw input/output genuinely exceeded returned bytes.
+  if (telemetry.rawBytes <= returnedBytes) return;
+  const store = await getFastTelemetryStore();
+  if (!store) return;
+  const worktree = telemetry.worktree || process.cwd();
+  const receiptsMod = await loadFastReceiptsMod();
+  const claimFingerprint =
+    typeof receiptsMod?.fastToolFingerprint === "function"
+      ? receiptsMod.fastToolFingerprint(toolName, finalText)
+      : null;
+  if (hostSessionId) {
+    const rootSid =
+      typeof store.resolveRootSessionId === "function"
+        ? store.resolveRootSessionId(hostSessionId)
+        : hostSessionId;
+    store.recordEvent({
+      sessionId: rootSid,
+      worktree,
+      agent: "antigravity",
+      kind: telemetry.kind,
+      tool: toolName,
+      key: telemetry.key || null,
+      path: telemetry.path || null,
+      ok: telemetry.ok ?? 1,
+      bytes: telemetry.rawBytes,
+      body: "",
+      sandboxBytes: telemetry.rawBytes,
+      returnedBytes,
+      claimFingerprint,
+      claimedConv: directConvId || rootSid
+    });
+    return;
+  }
+  let anonSessionId = "default";
+  if (worktree) {
+    try {
+      const canonicalDir = fsSyncNode.realpathSync.native(worktree);
+      anonSessionId = "workspace:" + createHashNode("sha256").update(canonicalDir).digest("hex");
+    } catch {}
+  }
+  store.recordEvent({
+    sessionId: anonSessionId,
+    worktree,
+    agent: "antigravity",
+    kind: telemetry.kind,
+    tool: toolName,
+    key: telemetry.key || null,
+    path: telemetry.path || null,
+    ok: telemetry.ok ?? 1,
+    bytes: telemetry.rawBytes,
+    body: "",
+    sandboxBytes: telemetry.rawBytes,
+    returnedBytes,
+    claimFingerprint
+  });
 }
 function closeOutlineDbStore() {
   if (outlineDbStore) {
@@ -5006,41 +4365,6 @@ async function invalidateFileCaches(absPaths) {
 }
 var SLICE_TRUNCATION_TIP = "\n[tip: MCP responses are hard-capped <=8.8KB inline; for >150 lines across files, use parallel read_file(StartLine, EndLine) (46KB/call, 0 remote check)]";
 var OUTLINE_BATCH_TIP = "\n[tip: outlining >20 files splits the 8.8KB cap thinly; batch 10-20 files per call for fuller outlines]";
-function computeWaterFillBudgets(itemLengths, totalBudget, _minFloor = 160) {
-  if (!Array.isArray(itemLengths) || itemLengths.length === 0) return [];
-  const n = itemLengths.length;
-  const cap = Math.max(0, Math.floor(Number(totalBudget) || 0));
-  const lens = itemLengths.map((v) => {
-    const num = Number(v);
-    return Number.isFinite(num) && num > 0 ? Math.floor(num) : 0;
-  });
-  const totalLen = lens.reduce((acc, v) => acc + v, 0);
-  if (totalLen <= cap) {
-    return [...lens];
-  }
-  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => lens[a] - lens[b] || a - b);
-  const budgets = new Array(n).fill(0);
-  let remainingBudget = cap;
-  let remainingCount = n;
-  for (let k = 0; k < n; k++) {
-    const idx = order[k];
-    const fair = Math.floor(remainingBudget / remainingCount);
-    if (lens[idx] <= fair) {
-      budgets[idx] = lens[idx];
-      remainingBudget -= lens[idx];
-      remainingCount -= 1;
-    } else {
-      const base = Math.floor(remainingBudget / remainingCount);
-      const extra = remainingBudget - base * remainingCount;
-      const tailIndices = order.slice(k).sort((a, b) => a - b);
-      for (let m = 0; m < tailIndices.length; m++) {
-        budgets[tailIndices[m]] = base + (m < extra ? 1 : 0);
-      }
-      break;
-    }
-  }
-  return budgets;
-}
 function parseFlatLineRangeSpec(rawSpec) {
   if (typeof rawSpec !== "string" || !rawSpec.trim()) {
     throw new Error("lineRanges entry must be a non-empty string in 'path:start-end[,start2-end2]' format");
@@ -5077,63 +4401,6 @@ function parseFlatLineRangeSpec(rawSpec) {
     return [start, end];
   });
   return { path: filePath, ranges };
-}
-function formatSymbolLine(s) {
-  const indent = "  ".repeat(s.depth);
-  const span = s.endLine > s.startLine ? `L${s.startLine}-L${s.endLine}` : `L${s.startLine}`;
-  return `${indent}${span} [${s.kind}] ${s.name}`;
-}
-function renderOutlineWithinBudget(relPath, lineCount, symbols, charBudget, totalOutlinesCount) {
-  const header = `## Outline: ${relPath} (${lineCount} lines)`;
-  if (symbols.length === 0) {
-    return `${header}\n(no top-level symbols detected)`;
-  }
-  const maxHardSymbols = 160;
-  const candidatePool = selectOutlineSymbols(symbols, maxHardSymbols);
-  const formatPicked = (picked) => {
-    const formatted = picked.map(formatSymbolLine);
-    const omitted = symbols.length - picked.length;
-    const extra =
-      omitted > 0
-        ? totalOutlinesCount > 10
-          ? `\n... (+${omitted} more symbols)`
-          : `\n... (${omitted} more symbols omitted; outline this file alone for full list)`
-        : "";
-    return `${header}\n${formatted.join("\n")}${extra}`;
-  };
-  const fullRendered = formatPicked(candidatePool);
-  if (charBudget === null || fullRendered.length <= charBudget) {
-    return fullRendered;
-  }
-  const effBudget = Math.max(160, charBudget);
-  const priorityOrder = [
-    ...candidatePool.map((s, idx) => ({ s, idx })).filter((x) => x.s.depth === 0),
-    ...candidatePool.map((s, idx) => ({ s, idx })).filter((x) => x.s.depth > 0)
-  ];
-  const chosenIndices = [];
-  let runningChars = header.length + 1 + 64;
-  for (const item of priorityOrder) {
-    const lineLen = formatSymbolLine(item.s).length + 1;
-    if (chosenIndices.length > 0 && runningChars + lineLen > effBudget) {
-      continue;
-    }
-    chosenIndices.push(item.idx);
-    runningChars += lineLen;
-  }
-  chosenIndices.sort((a, b) => a - b);
-  const picked = chosenIndices.map((idx) => candidatePool[idx]);
-  return formatPicked(picked);
-}
-function selectOutlineSymbols(symbols, limit) {
-  if (symbols.length <= limit) return symbols;
-  const keptIndices = /* @__PURE__ */ new Set();
-  for (let i = 0; i < symbols.length && keptIndices.size < limit; i++) {
-    if (symbols[i].depth === 0) keptIndices.add(i);
-  }
-  for (let i = 0; i < symbols.length && keptIndices.size < limit; i++) {
-    keptIndices.add(i);
-  }
-  return [...keptIndices].sort((a, b) => a - b).map((idx) => symbols[idx]);
 }
 async function runReadSlices(input, options = {}) {
   const outlinesCoerced = coerceArrayToolField(input.outlines, "outlines", { allowSingleString: true });
@@ -5222,6 +4489,17 @@ async function runReadSlices(input, options = {}) {
     return entry;
   }
   const sections = [];
+  const measuredFiles = /* @__PURE__ */ new Map();
+  const measuredRelPaths = [];
+  const recordMeasuredFile = (cacheKey, size, relPath) => {
+    if (!Number.isFinite(size) || size <= 0) return;
+    if (!measuredFiles.has(cacheKey)) {
+      measuredFiles.set(cacheKey, size);
+      if (relPath && measuredRelPaths.length < 4) measuredRelPaths.push(relPath);
+    } else if (size > measuredFiles.get(cacheKey)) {
+      measuredFiles.set(cacheKey, size);
+    }
+  };
   if (outlines.length > 0) {
     const outlineResults = await Promise.all(
       outlines.map(async (rawPath) => {
@@ -5253,7 +4531,7 @@ async function runReadSlices(input, options = {}) {
             const dbStore = await getOutlineDbStore();
             if (dbStore && !wasEvictedFromL1) {
               try {
-                l2Hit = dbStore.getOutlineCache(absPath, stat.mtimeMs, stat.size);
+                l2Hit = dbStore.getOutlineCache(absPath, stat.mtimeMs, stat.size, OUTLINE_SCHEMA_VERSION);
               } catch {
                 l2Hit = null;
               }
@@ -5281,7 +4559,7 @@ async function runReadSlices(input, options = {}) {
               });
               if (dbStore) {
                 try {
-                  dbStore.setOutlineCache(absPath, effMtime, effSize, lineCount, symbols);
+                  dbStore.setOutlineCache(absPath, effMtime, effSize, lineCount, symbols, { version: OUTLINE_SCHEMA_VERSION });
                 } catch {
                   // Strictly fail-open
                 }
@@ -5289,6 +4567,7 @@ async function runReadSlices(input, options = {}) {
             }
           }
           const fullPreview = renderOutlineWithinBudget(relPath, lineCount, symbols, null, outlines.length);
+          recordMeasuredFile(cacheKey, stat.size, relPath);
           return { ok: true, relPath, lineCount, symbols, fullPreview };
         } catch (err) {
           if (err && err.code === "ENOENT") {
@@ -5310,7 +4589,7 @@ async function runReadSlices(input, options = {}) {
       slices.length > 0
         ? Math.max(600, Math.floor(maxChars * 0.55))
         : Math.max(600, maxChars - Math.max(0, outlines.length - 1) * 2);
-    const naturalLengths = outlineResults.map((r) => r.fullPreview.length);
+    const naturalLengths = outlineResults.map((r) => Buffer.byteLength(r.fullPreview));
     const waterBudgets = computeWaterFillBudgets(naturalLengths, outlinePoolBudget, 160);
     for (let i = 0; i < outlineResults.length; i++) {
       const r = outlineResults[i];
@@ -5343,9 +4622,10 @@ ERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`;
               `Blocked reading sensitive file '${path4.basename(absPath)}' (${sens.reason}) because sensitiveFileGuard is set to 'deny'.`
             );
           }
-          const { lines } = await loadLines(absPath, { useSliceCache: true });
+          const { lines, size } = await loadLines(absPath, { useSliceCache: true });
           const totalLines = lines.length;
           const blocks = [];
+          let validRanges = 0;
           for (const range of req.ranges) {
             if (!Array.isArray(range) || range.length < 2) {
               blocks.push("ERROR: each range must be [startLine, endLine]");
@@ -5378,6 +4658,10 @@ ERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`;
               snippet.push(`${num}: ${lines[ln - 1] ?? ""}`);
             }
             blocks.push(snippet.join("\n"));
+            validRanges += 1;
+          }
+          if (validRanges > 0) {
+            recordMeasuredFile(cacheKey, size, relPath);
           }
           return `## Slice: ${relPath} (${totalLines} lines)
 ${blocks.join("\n")}`;
@@ -5399,6 +4683,19 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
     );
     sections.push(...sliceResults);
   }
+  let fullFileRawBytes = 0;
+  for (const sz of measuredFiles.values()) {
+    fullFileRawBytes += sz;
+  }
+  const sliceModeKey = outlines.length > 0 && slices.length > 0 ? "outline+slice" : outlines.length > 0 ? "outline" : "slice";
+  const sliceTelemetry = {
+    kind: "fast_slice",
+    key: sliceModeKey,
+    path: redactSecrets(measuredRelPaths.join(", ")).text.slice(0, 120),
+    worktree: baseCwd,
+    rawBytes: fullFileRawBytes,
+    ok: 1
+  };
   const rawJoined = sections.join("\n\n");
   const rawBytes = Buffer.byteLength(rawJoined, "utf8");
   const isOverBudget = rawJoined.length > maxChars || rawBytes > maxBytes;
@@ -5413,17 +4710,45 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
     );
     return {
       text: `${body}${activeTip}`,
-      isError: false
+      isError: false,
+      telemetry: sliceTelemetry
     };
   }
   return {
     text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
-    isError: false
+    isError: false,
+    telemetry: sliceTelemetry
   };
 }
 
 // src/tools/run-checks.ts
 import { promises as fs4 } from "node:fs";
+function escapedTextBytes(text) {
+  return Buffer.byteLength(JSON.stringify(text)) - 2;
+}
+function fitCheckText(text, maxChars, maxBytes, keepTail = false) {
+  if (text.length <= maxChars && escapedTextBytes(text) <= maxBytes) return text;
+  const limit = Math.max(0, Math.min(maxChars, maxBytes));
+  const marker = limit >= 64 ? "\n... [truncated] ...\n" : limit >= 6 ? "..." : "";
+  let lo = 0;
+  let hi = Math.min(text.length, limit - marker.length);
+  let fitted = marker;
+  while (lo <= hi) {
+    const size = Math.floor((lo + hi) / 2);
+    const headSize = keepTail ? Math.floor(size / 2) : size;
+    let tailStart = text.length - (size - headSize);
+    const firstUnit = text.charCodeAt(tailStart);
+    if (firstUnit >= 0xdc00 && firstUnit <= 0xdfff) tailStart++;
+    const candidate = sliceSafeChars(text, headSize) + marker + text.slice(tailStart);
+    if (escapedTextBytes(candidate) <= maxBytes) {
+      fitted = candidate;
+      lo = size + 1;
+    } else {
+      hi = size - 1;
+    }
+  }
+  return fitted;
+}
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
   let nextIdx = 0;
@@ -5542,6 +4867,7 @@ async function runChecks(input, options = {}) {
       const effectiveTimeoutMs = Math.max(100, Math.min(spec.timeoutMs, Math.floor(remainingMs)));
       const result = await runShellCommandAsync(spec.command, {
         cwd: spec.cwd,
+        keepFailureTail: true,
         timeoutMs: effectiveTimeoutMs
       });
       const passed = !result.error && !result.timedOut && result.exitCode === 0;
@@ -5577,14 +4903,18 @@ async function runChecks(input, options = {}) {
         naturalLen: headerPrefix.length + rawBody.length
       };
     }
-    const maxProbe = passed ? 300 : usableChars;
+    const passingTest = passed && isRecognizedTestCheck(spec.command, spec.cwd);
+    const maxProbe = passed && !passingTest ? 300 : usableChars;
     const rawCompact = formatCompactCommandOutput({
       stdout: result.stdout,
       stderr: result.stderr,
       exitCode: result.exitCode,
       timedOut: result.timedOut,
       error: result.error,
-      maxChars: maxProbe
+      maxChars: maxProbe,
+      maxBytes,
+      retainFailureEnds: !passed,
+      passingTest
     });
     const headerPrefix = passed
       ? `- [PASS ${result.durationMs}ms] ${spec.name} (\`${spec.command}\`): `
@@ -5595,53 +4925,65 @@ async function runChecks(input, options = {}) {
       badge,
       headerPrefix,
       rawBody: rawCompact,
+      passingTest,
       naturalLen: headerPrefix.length + rawCompact.length
     };
   });
-  const itemBudgets = computeWaterFillBudgets(
-    preFormatted.map((p) => p.naturalLen),
-    usableChars,
-    160
+  const separator = "\n\n";
+  const bodyChars = maxChars - summaryHeader.length - separator.length * outcomes.length;
+  // Quotes, backslashes and line breaks take extra bytes in the final JSON-RPC frame.
+  const rpcOverhead = options.rpcId === undefined ? 0 :
+    Buffer.byteLength(JSON.stringify(makeToolRpcResponse(options.rpcId, "", false))) + 1;
+  const bodyBytes = maxBytes - rpcOverhead - escapedTextBytes(summaryHeader) - escapedTextBytes(separator) * outcomes.length;
+  const charBudgets = computeWaterFillBudgets(preFormatted.map((p) => p.naturalLen), bodyChars);
+  const byteBudgets = computeWaterFillBudgets(
+    preFormatted.map((p) => escapedTextBytes(p.fixedBlock ?? p.headerPrefix + p.rawBody)), bodyBytes
   );
-  const blocks = outcomes.map(({ result }, idx) => {
-    const pre = preFormatted[idx];
-    if (pre.skippedForBudget) return pre.fixedBlock;
-    const bodyAvail = Math.max(160, itemBudgets[idx] - pre.headerPrefix.length);
-    if (outputMode === "full") {
-      const body2 = pre.rawBody.length <= bodyAvail ? pre.rawBody : truncateWithNotice(pre.rawBody, bodyAvail);
-      return `${pre.headerPrefix}${body2}`;
+  const blocks = preFormatted.map((pre, idx) => {
+    const chars = charBudgets[idx];
+    const bytes = byteBudgets[idx];
+    if (pre.skippedForBudget) return fitCheckText(pre.fixedBlock, chars, bytes, true);
+    if (pre.naturalLen <= chars && escapedTextBytes(pre.headerPrefix + pre.rawBody) <= bytes) {
+      return pre.headerPrefix + pre.rawBody;
     }
-    if (pre.rawBody.length <= bodyAvail) {
-      return `${pre.headerPrefix}${pre.rawBody}`;
-    }
-    const fittedBody = formatCompactCommandOutput({
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      error: result.error,
-      maxChars: bodyAvail
-    });
-    return `${pre.headerPrefix}${fittedBody}`;
+    // A long command line should not consume the entire allowance of a failed check.
+    const reservedChars = pre.passed ? 0 : Math.min(Math.floor(chars / 2), pre.rawBody.length);
+    const reservedBytes = pre.passed ? 0 : Math.min(Math.floor(bytes / 2), escapedTextBytes(pre.rawBody));
+    const prefix = fitCheckText(pre.headerPrefix, chars - reservedChars, bytes - reservedBytes);
+    const bodyCharLimit = chars - prefix.length;
+    const bodyByteLimit = bytes - escapedTextBytes(prefix);
+    const body = pre.passingTest ? formatCompactCommandOutput({
+      ...outcomes[idx].result, passingTest: true, maxChars: bodyCharLimit, maxBytes: bodyByteLimit
+    }) : pre.rawBody;
+    return prefix + fitCheckText(body, bodyCharLimit, bodyByteLimit, !pre.passed);
   });
-  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - 2);
-  const bodyByteBudget = maxBytes !== void 0 ? Math.max(0, maxBytes - Buffer.byteLength(summaryHeader, "utf8") - 2) : void 0;
-  const fittedBlocks = fitSectionsToByteBudget(
-    blocks,
-    bodyBudget,
-    bodyByteBudget,
-    "\n\n"
-  );
-  let text = truncateWithNotice(
-    `${summaryHeader}
-
-${fittedBlocks}`,
-    maxChars
-  );
-  if (maxBytes !== void 0) {
-    text = truncateWithByteNotice(text, maxBytes);
+  let totalCheckRawBytes = 0;
+  for (const { skippedForBudget, result } of outcomes) {
+    if (skippedForBudget || result.error) continue;
+    const rawOut = (result.stdout || "").replace(/\r\n/g, "\n");
+    const rawErr = (result.stderr || "").replace(/\r\n/g, "\n");
+    const combinedRaw = rawOut + (rawErr ? (rawOut && !rawOut.endsWith("\n") ? "\n" : "") + rawErr : "");
+    totalCheckRawBytes += Buffer.byteLength(combinedRaw, "utf8");
   }
-  return { text, isError: false };
+  const checkPathSummary = redactSecrets(
+    normalized
+      .slice(0, 3)
+      .map((s) => s.name || s.command)
+      .join(", ")
+  ).text.slice(0, 120);
+  const text = [summaryHeader, ...blocks].join(separator);
+  return {
+    text,
+    isError: false,
+    telemetry: {
+      kind: "fast_check",
+      key: outputMode,
+      path: checkPathSummary,
+      worktree: baseCwd,
+      rawBytes: totalCheckRawBytes,
+      ok: failedCount === 0 ? 1 : 0
+    }
+  };
 }
 function clampInt2(val, min, max) {
   if (!Number.isFinite(val)) return min;
@@ -5658,7 +5000,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "batch_search",
-      description: "Run concurrent text/regex searches, globs, and read-only git queries (<=8.8KB).",
+      description: "Batch file or read-only git searches.",
       inputSchema: {
         type: "object",
         properties: {
@@ -5670,11 +5012,15 @@ function createAgyFastServer() {
             items: {
               type: "object",
               properties: {
-                type: { type: "string", enum: ["text", "regex", "glob", "git"] },
-                pattern: { type: "string", description: "Text, regex, glob (*,{a,b}), or read-only git subcommand" },
+                type: { type: "string", enum: ["text", "regex", "glob", "fuzzy", "git"] },
+                pattern: { type: "string" },
                 path: { type: "string" },
                 glob: { type: "string" },
                 caseSensitive: { type: "boolean" },
+                fileType: { type: "string" },
+                multiline: { type: "boolean" },
+                outputMode: { type: "string", enum: ["content", "files_with_matches", "count"] },
+                sortBy: { type: "string", enum: ["path", "mtime"] },
                 contextLines: { type: "integer", minimum: 0, maximum: 5 },
                 maxResults: { type: "integer", minimum: 1, maximum: 200 }
               },
@@ -5691,7 +5037,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "apply_edits",
-      description: "Atomically apply multi-hunk edits or file creation across files, with optional verify command.",
+      description: "Atomic edits. Group hunks by path. bestEffort skips invalid files. verify runs after writing.",
       inputSchema: {
         type: "object",
         properties: {
@@ -5718,15 +5064,15 @@ function createAgyFastServer() {
                     required: ["target", "replacement"]
                   }
                 },
-                create: { type: "string", description: "Full content instead of hunks" },
+                create: { type: "string" },
                 overwrite: { type: "boolean" }
               },
               required: ["path"]
             }
           },
           dryRun: { type: "boolean" },
-          bestEffort: { type: "boolean", description: "Commit valid files even if others fail" },
-          verify: { type: "string", description: "Post-write shell command" },
+          bestEffort: { type: "boolean" },
+          verify: { type: "string" },
           verifyTimeoutSec: { type: "integer", minimum: 1, maximum: 170 },
           maxVerifyChars: { type: "integer", minimum: 300, maximum: 7500 }
         },
@@ -5738,7 +5084,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "read_slices",
-      description: "Batch-extract symbol outlines (max 40 files) and small 1-based line slices (<=8.8KB).",
+      description: "Outline files or read lineRanges like 'path:1-5,9-12'.",
       inputSchema: {
         type: "object",
         properties: {
@@ -5746,13 +5092,11 @@ function createAgyFastServer() {
           outlines: {
             type: "array",
             maxItems: 40,
-            items: { type: "string" },
-            description: "File paths to outline (prefer 10-20/batch)"
+            items: { type: "string" }
           },
           slices: {
             type: "array",
             maxItems: 30,
-            description: "1-based inclusive [startLine,endLine] ranges",
             items: {
               type: "object",
               properties: {
@@ -5774,8 +5118,7 @@ function createAgyFastServer() {
           lineRanges: {
             type: "array",
             maxItems: 30,
-            items: { type: "string" },
-            description: "Shorthand 'path:start-end,s2-e2'"
+            items: { type: "string" }
           },
           maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
         }
@@ -5786,7 +5129,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "run_checks",
-      description: "Run independent shell checks concurrently (<=8.8KB).",
+      description: "Run independent shell checks concurrently.",
       inputSchema: {
         type: "object",
         properties: {
@@ -5810,8 +5153,7 @@ function createAgyFastServer() {
           timeoutSec: { type: "integer", minimum: 1, maximum: 170 },
           outputMode: {
             type: "string",
-            enum: ["compact", "full"],
-            description: "compact hides pass logs (default)"
+            enum: ["compact", "full"]
           },
           maxChars: { type: "integer", minimum: 500, maximum: 8800 }
         },
@@ -5829,6 +5171,7 @@ function main() {
   const server = createAgyFastServer();
   const exitImmediately = () => {
     closeOutlineDbStore();
+    closeFastTelemetryStore();
     process.exit(0);
   };
   let flushing = false;
@@ -5836,6 +5179,7 @@ function main() {
     if (flushing) return;
     flushing = true;
     closeOutlineDbStore();
+    closeFastTelemetryStore();
     const forceTimer = setTimeout(() => {
       process.exit(0);
     }, 150);
@@ -5856,6 +5200,7 @@ function main() {
   }
   process.on("exit", () => {
     closeOutlineDbStore();
+    closeFastTelemetryStore();
   });
   server.listen(process.stdin, process.stdout, flushAndExit);
 }

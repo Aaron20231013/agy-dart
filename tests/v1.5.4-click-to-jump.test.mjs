@@ -282,6 +282,7 @@ test("v1.5.4-2: WatchdogMonitor 3-popup click callbacks, cross-process SQLite pe
       stallWatchdog: true,
       watchdogPollMs: 5000,
       watchdogDesktopNotify: true,
+      ttlKeepalive: true,
       ttlDesktopNotify: true,
       ttlNotifyLeadSec: 60,
       ttlNotifyMinTokens: 60000,

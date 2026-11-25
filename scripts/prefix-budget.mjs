@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * agy-dart Turn-0 Prefix Budget & Schema Determinism Auditor.
- * Measures the 4 always-loaded prompt prefix blocks:
+ * Measures plugin-authored prefix blocks and the complete tool catalog:
  *   1. brake     (rules/AGENTS.md)
  *   2. reference (skills/agy-dart/SKILL.md YAML frontmatter vs on-demand body)
  *   3. tools     (live JSON-RPC tools/list from fast/mcp-server.mjs & context/server.js + SHA-256 fingerprints)
@@ -514,6 +514,67 @@ export function calibrateFromTranscript(transcriptPathOrSteps) {
   };
 }
 
+const IGNORED_SKILL_AUX_DIRS = new Set(["__pycache__", "node_modules"]);
+const IGNORED_SKILL_AUX_FILE_RE = /\.py[co]$/i;
+
+function measureSkillAuxAssets(skillDir) {
+  let auxFileCount = 0;
+  let auxBytes = 0;
+  let auxTokens = 0;
+  const auxFiles = [];
+
+  if (!fs.existsSync(skillDir)) {
+    return { auxFileCount, auxBytes, auxTokens, auxFiles };
+  }
+
+  const walk = (curDir, relPrefix, depth) => {
+    if (depth > 6) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(curDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const ent of entries) {
+      const lowerName = ent.name.toLowerCase();
+      if (ent.name.startsWith(".") || IGNORED_SKILL_AUX_DIRS.has(lowerName)) continue;
+      if (depth === 0 && lowerName === "skill.md") continue;
+      const full = path.join(curDir, ent.name);
+      let st;
+      try {
+        st = fs.lstatSync(full);
+      } catch {
+        continue;
+      }
+      if (st.isSymbolicLink()) continue;
+      const relPosix = relPrefix ? `${relPrefix}/${ent.name}` : ent.name;
+      if (st.isDirectory()) {
+        walk(full, relPosix, depth + 1);
+      } else if (st.isFile()) {
+        if (IGNORED_SKILL_AUX_FILE_RE.test(ent.name)) continue;
+        auxFileCount += 1;
+        auxFiles.push(relPosix);
+        if (st.size <= 2 * 1024 * 1024) {
+          try {
+            const buf = fs.readFileSync(full);
+            auxBytes += buf.length;
+            const probeLen = Math.min(buf.length, 4096);
+            const isBinary = buf.subarray(0, probeLen).includes(0);
+            auxTokens += isBinary ? estimateTokens(buf.length) : estimateTokens(buf.toString("utf8"));
+            continue;
+          } catch {}
+        }
+        auxBytes += st.size;
+        auxTokens += estimateTokens(st.size);
+      }
+    }
+  };
+
+  walk(skillDir, "", 0);
+  return { auxFileCount, auxBytes, auxTokens, auxFiles };
+}
+
 function splitFrontmatter(markdown) {
   const normalized = String(markdown || "");
   const match = normalized.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
@@ -645,6 +706,21 @@ function runSessionStartHook(rootDir, dbPath, options = {}) {
   return parsed?.injectSteps?.[0]?.systemMessage?.systemMessage || "";
 }
 
+function measurePreloadedSchemas(rootDir, catalogs) {
+  const configPath = path.join(rootDir, "mcp_config.json");
+  if (!fs.existsSync(configPath)) return null;
+  const { mcpServers } = JSON.parse(fs.readFileSync(configPath, "utf8").replace(/^\uFEFF/, ""));
+  let toolCount = 0;
+  let schemaTokens = 0;
+  for (const [server, catalog] of Object.entries(catalogs)) {
+    const entry = mcpServers?.[server];
+    const eager = catalog.filter(({ name }) => entry?.tools?.[name]?.eager ?? entry?.eager ?? false);
+    toolCount += eager.length;
+    if (eager.length) schemaTokens += estimateTokens(JSON.stringify(eager));
+  }
+  return { toolCount, schemaTokens };
+}
+
 export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-prefix-budget-"));
   const tmpDb = path.join(tmpDir, "prefix-budget.db");
@@ -670,9 +746,11 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
     };
 
     // 2. reference: skills/agy-dart/SKILL.md (only YAML frontmatter counts toward Turn-0 resident total)
-    const skillPath = path.join(rootDir, "skills", "agy-dart", "SKILL.md");
+    const skillDir = path.join(rootDir, "skills", "agy-dart");
+    const skillPath = path.join(skillDir, "SKILL.md");
     const skillText = fs.readFileSync(skillPath, "utf8");
     const { frontmatter, body } = splitFrontmatter(skillText);
+    const aux = measureSkillAuxAssets(skillDir);
     const reference = {
       file: "skills/agy-dart/SKILL.md",
       frontmatterBytes: Buffer.byteLength(frontmatter, "utf8"),
@@ -681,6 +759,10 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
       bodyBytes: Buffer.byteLength(body, "utf8"),
       bodyChars: body.length,
       bodyTokens: estimateTokens(body),
+      auxFileCount: aux.auxFileCount,
+      auxBytes: aux.auxBytes,
+      auxTokens: aux.auxTokens,
+      auxFiles: aux.auxFiles,
       totalBytes: Buffer.byteLength(skillText, "utf8"),
       frontmatterSha256: sha256Hex(frontmatter)
     };
@@ -776,6 +858,11 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
     const totalBytes = brake.bytes + reference.frontmatterBytes + tools.bytes + startup.bytes;
     const totalChars = brake.chars + reference.frontmatterChars + tools.chars + startup.chars;
     const totalTokens = brake.tokens + reference.frontmatterTokens + tools.tokens + startup.tokens;
+    const preloaded = measurePreloadedSchemas(rootDir, { fast: fastRes.tools, context: ctxRes.tools });
+    const configuredStartup = preloaded && {
+      ...preloaded,
+      estimatedTokens: brake.tokens + reference.frontmatterTokens + startup.tokens + preloaded.schemaTokens
+    };
     const stableOnlyTokens = brake.tokens + reference.frontmatterTokens + tools.tokens + stableTokens;
     const errorBandPct = ESTIMATOR_ERROR_BAND_PCT;
     const upperBoundTokens = Math.ceil(totalTokens * (1 + errorBandPct / 100));
@@ -783,9 +870,9 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
     const exceedsUpperBound = upperBoundTokens > TOKEN_WARN_LIMIT;
     const warnings = [];
     if (exceedsBudget) {
-      warnings.push(`Turn-0 resident prefix (${totalTokens} est. tokens) exceeds recommended ${TOKEN_WARN_LIMIT}-token budget.`);
+      warnings.push(`Full catalog and prefix (${totalTokens} est. tokens) exceeds recommended ${TOKEN_WARN_LIMIT}-token budget.`);
     } else if (exceedsUpperBound) {
-      warnings.push(`Turn-0 resident prefix upper bound (${upperBoundTokens} tok at +${errorBandPct}%) exceeds ${TOKEN_WARN_LIMIT}-token budget.`);
+      warnings.push(`Full catalog and prefix upper bound (${upperBoundTokens} tok at +${errorBandPct}%) exceeds ${TOKEN_WARN_LIMIT}-token budget.`);
     }
     if (!tools.canonical) {
       warnings.push("MCP tools/list output is not canonically sorted/serialized.");
@@ -794,6 +881,7 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
 
     return stableSortObject({
       rootDir,
+      configuredStartup,
       budgetLimitTokens: TOKEN_WARN_LIMIT,
       stablePrefixOnly,
       stableOnlyTokens,
@@ -823,17 +911,25 @@ export async function auditPrefixBudget(rootDir = REPO_ROOT, options = {}) {
 function formatHumanReport(report) {
   const { brake, reference, tools, startup } = report.blocks;
   const startupModeNote = report.stablePrefixOnly ? " [stable-only]" : "";
+  const auxNote =
+    (reference.auxFileCount || 0) > 0
+      ? `; on-demand aux (${reference.auxFileCount} ${reference.auxFileCount === 1 ? "file" : "files"}): ${reference.auxBytes} B (${reference.auxTokens} tok, excluded)`
+      : "";
   const lines = [
     "# agy-dart Turn-0 Prefix Budget & Determinism Audit",
     "",
     "| Block | Scope | Bytes | Chars | Est. Tokens | Notes |",
     "| :--- | :--- | ---: | ---: | ---: | :--- |",
     `| 1. brake | \`${brake.file}\` | ${brake.bytes} | ${brake.chars} | ${brake.tokens} | sha256:${brake.sha256.slice(0, 12)} |`,
-    `| 2. reference | \`${reference.file}\` (frontmatter) | ${reference.frontmatterBytes} | ${reference.frontmatterChars} | ${reference.frontmatterTokens} | on-demand body: ${reference.bodyBytes} B (${reference.bodyTokens} tok, excluded) |`,
+    `| 2. reference | \`${reference.file}\` (frontmatter) | ${reference.frontmatterBytes} | ${reference.frontmatterChars} | ${reference.frontmatterTokens} | on-demand body: ${reference.bodyBytes} B (${reference.bodyTokens} tok, excluded)${auxNote} |`,
     `| 3. tools (fast) | \`fast/mcp-server.mjs\` (${tools.fast.toolCount} tools) | ${tools.fast.bytes} | ${tools.fast.chars} | ${tools.fast.tokens} | sha256:${tools.fast.sha256.slice(0, 12)} |`,
     `| 3. tools (context) | \`context/server.js\` (${tools.context.toolCount} tools) | ${tools.context.bytes} | ${tools.context.chars} | ${tools.context.tokens} | sha256:${tools.context.sha256.slice(0, 12)} |`,
     `| 4. startup | \`hooks/session-start.mjs\`${startupModeNote} | ${startup.bytes} | ${startup.chars} | ${startup.tokens} | stable: ${startup.stablePct}% (${startup.stableBytes} B) / volatile Git tail: ${startup.volatilePct}% (${startup.volatileBytes} B) |`,
-    `| **TOTAL (Turn-0)** | **Always-loaded prefix** | **${report.totalBytes}** | **${report.totalChars}** | **${report.totalTokens}** | budget <= ${report.budgetLimitTokens} tok (±${report.errorBandPct}% band -> <= ${report.upperBoundTokens} tok; stable-only: ${report.stableOnlyTokens} tok) |`,
+    `| **Full catalog + prefix** | All tool definitions | **${report.totalBytes}** | **${report.totalChars}** | **${report.totalTokens}** | budget <= ${report.budgetLimitTokens} tok (±${report.errorBandPct}% band -> <= ${report.upperBoundTokens} tok; stable-only: ${report.stableOnlyTokens} tok) |`,
+    "",
+    report.configuredStartup
+      ? `Configured Antigravity startup: ~${report.configuredStartup.estimatedTokens} plugin tokens including ${report.configuredStartup.toolCount} preloaded tool definitions. Host wrappers and discovery metadata are excluded.`
+      : "Configured startup estimate unavailable (no mcp_config.json).",
     "",
     `Tools Fingerprint (SHA-256): ${report.toolsFingerprint}`,
     `  - fast    : ${tools.fast.sha256} (canonical=${tools.fast.canonical})`,

@@ -1,0 +1,28 @@
+{
+  "rules": [
+    {
+      "id": "jvm-gradle-maven-build",
+      "match": "^(?:\\.[\\\\/])?(?:gradlew|gradle|mvnw|mvn)(?:\\.bat|\\.cmd)?\\b",
+      "keep": "(?:^w:\\s|error|failure|failed|warning|build success|build fail|tests run:|actionable tasks:)",
+      "drop": "^(?:downloading from|downloaded from|progress \\(|> task [a-z0-9:._-]+ (?:up-to-date|from-cache|no-source|skipped)$)",
+      "maxLines": 80,
+      "preserveTailOnFail": true
+    },
+    {
+      "id": "cmake-ninja-bazel-build",
+      "match": "^(?:cmake(?:\\.exe)?\\s+--build|ninja(?:\\.exe)?|make(?:\\.exe)?|bazel(?:\\.exe)?\\s+(?:build|test))\\b",
+      "keep": "(?:error:|fatal error:|warning:|undefined reference|failed|build completed|elapsed time:)",
+      "drop": "^(?:\\[\\d+/\\d+\\]\\s+(?:building|compiling|generating)|entering directory|leaving directory|info:\\s+analyzing)",
+      "maxLines": 80,
+      "preserveTailOnFail": true
+    },
+    {
+      "id": "docker-registry-transfer",
+      "match": "^docker(?:\\.exe)?(?:\\s+compose)?\\s+(?:pull|push)\\b",
+      "keep": "(?:error|failed|denied|unauthorized|digest:|status:|pull complete|pushed)",
+      "drop": "^(?:[0-9a-f]{12}:\\s+(?:pulling fs layer|waiting|verifying checksum|downloading|extracting|preparing|pushing))",
+      "maxLines": 60,
+      "preserveTailOnFail": true
+    }
+  ]
+}

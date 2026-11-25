@@ -19,11 +19,13 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { getEffectiveConfig, parseUiLang } from "./config.js";
 import { buildHandoffBrief, inferWorkspaceFromStore, isSafeWorkspaceDir } from "./handoff.js";
+import { isSecretRedactionEnabled } from "./security.js";
 import {
   DEFAULT_CACHE_TTL_SEC,
   estimateCalibratedTtl,
   extractStepTokenUsage,
   findTranscriptForConversation,
+  isSafeConversationId,
   isSlashCompactText,
   isSubagentStep,
   readTranscriptTail,
@@ -49,8 +51,10 @@ import {
   formatWorkspaceWindowLabel,
   getToolTimeoutTier,
   getWatchdogLeaseKey,
+  inspectLatestTurnInSteps,
   isHeadlessWorkerPrompt,
   isHighReasoningModel,
+  isKeepaliveTurnFlushedForRound,
   isSameWorkspacePath,
   isSubagentLeasePayload,
   isSummaryMetadataSubagent,
@@ -60,7 +64,9 @@ import {
   lookupConversationTitle,
   normalizeWatchdogLease,
   parseMaybeJsonObj,
+  parseStepPrefillTimestampMs,
   readWatchdogLease,
+  readWatchdogTranscriptTail,
   recordHookLeaseTransition,
   resolveCandidateTranscriptPath,
   sanitizeConversationId,
@@ -73,6 +79,10 @@ import {
 export {
   HEADLESS_FINISH_PROMPT_RE,
   WATCHDOG_LEASE_PREFIX,
+  inspectLatestTurnInSteps,
+  isKeepaliveTurnFlushedForRound,
+  parseStepPrefillTimestampMs,
+  readWatchdogTranscriptTail,
   WATCHDOG_PHASES,
   classifyToolExecutionKind,
   classifyTranscriptGenesisFile,
@@ -110,6 +120,115 @@ export const PENDING_JUMP_META_KEY = "watchdog:pending_jump";
 export const DEFAULT_PENDING_JUMP_TTL_MS = 20_000;
 
 export const DEFAULT_STALE_LEASE_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+const RESERVED_CHECKPOINT_SESSION_IDS = new Set([
+  "default",
+  "all",
+  "lifetime",
+  "app",
+  "__unbound__",
+  "unknown",
+  "none",
+  "null",
+  "undefined"
+]);
+
+/**
+ * Single source of truth for resolving a confirmed conversation's trusted checkpoint sessionId
+ * across multi-hop grandchild -> child -> root lease chains (up to 12 hops with cycle detection)
+ * plus `store.resolveRootSessionId(cursor)`. Rejects unrelated explicit sessionIds and reserved IDs.
+ */
+export function resolveTrustedCheckpointSessionId(
+  store,
+  confirmedConversationId,
+  explicitRawSid = "",
+  { seedLease = null } = {}
+) {
+  const safeConv = typeof confirmedConversationId === "string" ? confirmedConversationId.trim() : "";
+  const isValidTrustedId = (cand) => {
+    const s = typeof cand === "string" ? cand.trim() : "";
+    return Boolean(s && !RESERVED_CHECKPOINT_SESSION_IDS.has(s.toLowerCase()) && isSafeConversationId(s));
+  };
+  if (!isValidTrustedId(safeConv)) {
+    return "";
+  }
+
+  const allowed = new Set([safeConv]);
+  const addAllowed = (cand) => {
+    const s = typeof cand === "string" ? cand.trim() : "";
+    if (isValidTrustedId(s)) {
+      allowed.add(s);
+    }
+  };
+
+  let resolvedRoot = safeConv;
+  const readLeaseAt = (id, depth) => {
+    if (depth === 0 && seedLease && typeof seedLease === "object") {
+      const seedId = typeof seedLease.conversationId === "string" ? seedLease.conversationId.trim() : "";
+      if (!seedId || seedId === id) {
+        return seedLease;
+      }
+    }
+    if (!store) return null;
+    try {
+      return readWatchdogLease(store, id);
+    } catch {
+      return null;
+    }
+  };
+
+  let cursor = safeConv;
+  const visited = new Set([cursor]);
+  for (let depth = 0; depth < 12; depth++) {
+    const lease = readLeaseAt(cursor, depth);
+    if (!lease) break;
+    addAllowed(lease.rootSessionId);
+    addAllowed(lease.parentConversationId);
+    const rawRoot = typeof lease.rootSessionId === "string" ? lease.rootSessionId.trim() : "";
+    const rawParent = typeof lease.parentConversationId === "string" ? lease.parentConversationId.trim() : "";
+    let next = "";
+    if (rawRoot && rawRoot !== cursor && !visited.has(rawRoot) && isValidTrustedId(rawRoot)) {
+      next = rawRoot;
+    } else if (rawParent && rawParent !== cursor && !visited.has(rawParent) && isValidTrustedId(rawParent)) {
+      next = rawParent;
+    }
+    if (!next) break;
+    visited.add(next);
+    addAllowed(next);
+    cursor = next;
+  }
+
+  if (cursor !== safeConv) {
+    resolvedRoot = cursor;
+  }
+
+  if (store && typeof store.resolveRootSessionId === "function") {
+    try {
+      const rootFromCursor = store.resolveRootSessionId(cursor);
+      const trimmedRoot = typeof rootFromCursor === "string" ? rootFromCursor.trim() : "";
+      if (isValidTrustedId(trimmedRoot)) {
+        resolvedRoot = trimmedRoot;
+        addAllowed(resolvedRoot);
+      }
+    } catch {}
+    if (cursor !== safeConv) {
+      try {
+        const rootFromStart = store.resolveRootSessionId(safeConv);
+        const trimmedStart = typeof rootFromStart === "string" ? rootFromStart.trim() : "";
+        if (isValidTrustedId(trimmedStart)) {
+          addAllowed(trimmedStart);
+        }
+      } catch {}
+    }
+  }
+
+  const trimmedExplicit = typeof explicitRawSid === "string" ? explicitRawSid.trim() : "";
+  if (trimmedExplicit && allowed.has(trimmedExplicit)) {
+    return trimmedExplicit;
+  }
+  return resolvedRoot;
+}
+
 export const DEFAULT_ORPHAN_TURN0_MS = 15 * 60 * 1000; // 15 minutes
 const MAX_IDLE_LEASE_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
 const TERMINAL_STOP_REASON_RE =
@@ -466,6 +585,7 @@ export function inspectTranscriptTailForWatchdog(steps = [], options = {}) {
     hasAssistantSteps: false,
     detectedSubagent: Boolean(treatAsSubagent || genesisSubagent),
     lastStepTs: null,
+    lastPlannerPrefillTs: 0,
     lastStepType: "",
     isTerminal: false,
     terminalReason: "",
@@ -578,6 +698,8 @@ export function inspectTranscriptTailForWatchdog(steps = [], options = {}) {
       lastPlannerActiveCalls = activeCalls;
       lastPlannerOnlyFinish = allFinish;
       onlyToolResultsAfterPlanner = true;
+      const pTs = parseStepPrefillTimestampMs(step);
+      if (pTs > 0) result.lastPlannerPrefillTs = pTs;
       completedCallIds.clear();
       completedResultsAfterPlanner = 0;
     } else {
@@ -1193,6 +1315,13 @@ export function buildWindowFocusCommand({
   return { cmd, args, env, safeConvId, safeCwd, safeWsLabel, safeConvTitle, platform };
 }
 
+function isRunningInNodeTestRunner(env = process.env, execArgv = process.execArgv) {
+  return Boolean(
+    (typeof env?.NODE_TEST_CONTEXT === "string" && env.NODE_TEST_CONTEXT.trim() !== "") ||
+      (Array.isArray(execArgv) && execArgv.includes("--test"))
+  );
+}
+
 /**
  * Safe, zero-dependency, fail-open OS window foreground activator for cross-window jumps.
  */
@@ -1202,7 +1331,8 @@ export function focusDesktopConversationWindow({
   workspaceLabel = "",
   convTitle = "",
   platform = process.platform,
-  spawnFn = spawn
+  spawnFn = spawn,
+  baseEnv = process.env
 } = {}) {
   try {
     const spec = buildWindowFocusCommand({
@@ -1210,10 +1340,18 @@ export function focusDesktopConversationWindow({
       cwd,
       workspaceLabel,
       convTitle,
-      platform
+      platform,
+      baseEnv
     });
     if (!spec.cmd) {
       return { dispatched: false, platform };
+    }
+    const disableFlag = String(baseEnv?.AGY_DART_DISABLE_OS_FOCUS || "").trim().toLowerCase();
+    if (
+      spawnFn === spawn &&
+      (disableFlag === "1" || disableFlag === "true" || isRunningInNodeTestRunner(baseEnv))
+    ) {
+      return { dispatched: false, platform, suppressed: true };
     }
     const child = spawnFn(spec.cmd, spec.args, {
       stdio: "ignore",
@@ -1437,6 +1575,7 @@ export class WatchdogMonitor {
     this.nowFn = options.nowFn || (() => Date.now());
     this.monoNsFn = options.monoNsFn || (() => process.hrtime.bigint());
     this.statFn = options.statFn || ((p) => fs.statSync(p));
+    this._hasCustomReadTail = typeof options.readTailFn === "function";
     this.readTailFn = options.readTailFn || ((p, bytes) => readTranscriptTail(p, bytes, { minUsageSteps: 1 }));
     this._hasCustomFindTranscript = typeof options.findTranscriptFn === "function";
     this.findTranscriptFn =
@@ -1452,6 +1591,7 @@ export class WatchdogMonitor {
     this.keepaliveSendFn = typeof options.keepaliveSendFn === "function" ? options.keepaliveSendFn : null;
     this.focusWindowFn = options.focusWindowFn || focusDesktopConversationWindow;
     this.buildHandoffFn = options.buildHandoffFn || buildHandoffBrief;
+    this.brainRoots = Array.isArray(options.brainRoots) ? options.brainRoots : [];
     this.pendingJumpTtlMs =
       Number.isFinite(options.pendingJumpTtlMs) && options.pendingJumpTtlMs > 0
         ? Math.floor(options.pendingJumpTtlMs)
@@ -1477,6 +1617,7 @@ export class WatchdogMonitor {
     this._convState = new Map();
     this._lastEvaluated = new Map();
     this._ttlNotifiedKeys = new Map();
+    this._turn0BackfillChecked = new Map();
     this._keepaliveInFlight = new Set();
     this._subagentIdentityCache = new Map();
     this._lastTtlNotifyGlobalTs = 0;
@@ -1753,7 +1894,6 @@ export class WatchdogMonitor {
     const expiresTs = isDefinitive ? Number.POSITIVE_INFINITY : Number(nowMs || 0) + 15_000;
     this._subagentIdentityCache.set(conversationId, {
       isSubagent: boolVal,
-      definitive: isDefinitive,
       expiresTs
     });
   }
@@ -1791,22 +1931,19 @@ export class WatchdogMonitor {
         this._rememberSubagentIdentity(cleanId, true, { definitive: true });
         return true;
       }
-      if (lease.convTitle) {
-        this._rememberSubagentIdentity(cleanId, false, { definitive: true });
-        return false;
-      }
     }
 
     const nowMs = this.nowFn();
     const cached = this._subagentIdentityCache.get(cleanId);
-    if (cached && nowMs < cached.expiresTs && (cached.definitive || !requireDefinitive)) {
+    // A child can gain its official parent link after its title and transcript exist.
+    // Only a positive worker identity may bypass the final pre-send check.
+    if (cached && nowMs < cached.expiresTs && (cached.isSubagent || !requireDefinitive)) {
       return Boolean(cached.isSubagent);
     }
 
     let detected = false;
     let definitive = false;
     let discoveredParent = "";
-    let discoveredTitle = "";
     const allowDefaultDb = this._shouldAllowDefaultSummaryDb(store);
     let txPath = lease?.transcriptPath || "";
     if (!txPath) {
@@ -1839,15 +1976,12 @@ export class WatchdogMonitor {
             detected = true;
             definitive = true;
           }
-          if (summary.title) {
-            discoveredTitle = summary.title;
-            if (!detected) definitive = true;
-          }
+          if (summary.title) definitive = true;
         }
       } catch {}
     }
 
-    if (!detected && !discoveredTitle && txPath) {
+    if (!detected && txPath) {
       try {
         const genesisCls = classifyTranscriptGenesisFile(txPath);
         if (genesisCls === "subagent") {
@@ -1944,26 +2078,16 @@ export class WatchdogMonitor {
       const metaGlobal = store.getGlobalTtlKeepaliveMaxCount();
       return metaGlobal === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : metaGlobal;
     }
-    if (this._hasCustomConfig) {
-      if (cfg.ttlKeepalive === false && !kaEnvOn) return 0;
-      const rawCfgMax = cfg.ttlKeepaliveMaxCount;
-      if (
-        rawCfgMax !== undefined &&
-        rawCfgMax !== null &&
-        Number.isFinite(Number(rawCfgMax)) &&
-        Number(rawCfgMax) >= 0
-      ) {
-        const clampedCfg = clampGlobal(rawCfgMax);
-        return clampedCfg === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : clampedCfg;
-      }
-      return 3;
-    }
-    if (store && typeof store.getGlobalTtlKeepaliveMaxCount === "function") {
+    if (!this._hasCustomConfig && store && typeof store.getGlobalTtlKeepaliveMaxCount === "function") {
       return store.getGlobalTtlKeepaliveMaxCount();
     }
     if (cfg.ttlKeepalive === false && !kaEnvOn) return 0;
-    const clampedDefault = clampGlobal(cfg.ttlKeepaliveMaxCount ?? 3);
-    return clampedDefault === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : clampedDefault;
+    const fallbackCount = cfg.ttlKeepalive === true || kaEnvOn ? 1 : 0;
+    const configuredCount = Number(cfg.ttlKeepaliveMaxCount ?? fallbackCount);
+    const count = Number.isFinite(configuredCount) && configuredCount >= 0
+      ? clampGlobal(configuredCount)
+      : fallbackCount;
+    return count === 0 && kaEnvOn ? this._resolveFallbackTtlKeepaliveMaxCount(store, cfg) : count;
   }
 
   _resolveFallbackTtlKeepaliveMaxCount(store, cfg) {
@@ -1982,7 +2106,54 @@ export class WatchdogMonitor {
     ) {
       return Math.min(20, Math.max(1, Math.floor(Number(rawCfgMax))));
     }
-    return 3;
+    return 1;
+  }
+
+  _resolveGlobalTtlKeepaliveMinContextPct(store, cfg) {
+    const clampPct = (v) => Math.min(100, Math.max(0, Math.floor(Number(v))));
+    const envRaw = process.env.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT;
+    if (typeof envRaw === "string" && envRaw.trim() !== "") {
+      const n = Number(envRaw.trim());
+      if (Number.isFinite(n) && n >= 0) return clampPct(n);
+    }
+    if (
+      store &&
+      typeof store.hasExplicitGlobalTtlKeepaliveMinContextPct === "function" &&
+      store.hasExplicitGlobalTtlKeepaliveMinContextPct()
+    ) {
+      return store.getGlobalTtlKeepaliveMinContextPct();
+    }
+    if (this._hasCustomConfig) {
+      const rawCfgPct = cfg?.ttlKeepaliveMinContextPct;
+      if (
+        rawCfgPct !== undefined &&
+        rawCfgPct !== null &&
+        Number.isFinite(Number(rawCfgPct)) &&
+        Number(rawCfgPct) >= 0
+      ) {
+        return clampPct(rawCfgPct);
+      }
+      if (store && typeof store.getGlobalTtlKeepaliveMinContextPct === "function") {
+        return store.getGlobalTtlKeepaliveMinContextPct();
+      }
+      return 15;
+    }
+    if (store && typeof store.getGlobalTtlKeepaliveMinContextPct === "function") {
+      return store.getGlobalTtlKeepaliveMinContextPct();
+    }
+    return clampPct(cfg?.ttlKeepaliveMinContextPct ?? 15);
+  }
+
+  _resolveLeaseKeepaliveMinContext(store, cfg, lease = null, { isCustomOverride = false } = {}) {
+    const globalPct = this._resolveGlobalTtlKeepaliveMinContextPct(store, cfg);
+    const profile = resolveModelProfile(lease?.model || null);
+    const windowTokens =
+      Number.isFinite(Number(lease?.windowTokens)) && Number(lease.windowTokens) > 0
+        ? Math.floor(Number(lease.windowTokens))
+        : profile?.windowTokens || 200_000;
+    const effectivePct = isCustomOverride ? 0 : globalPct;
+    const pctMinTokens = effectivePct > 0 ? Math.round((windowTokens * effectivePct) / 100) : 0;
+    return { globalPct, effectivePct, windowTokens, pctMinTokens };
   }
 
   _resolveTtlKeepaliveEnabled(store, cfg, conversationId = "", lease = null) {
@@ -2027,7 +2198,7 @@ export class WatchdogMonitor {
   }
 
   _resolveTtlKeepaliveMaxCount(store, cfg, conversationId = "") {
-    const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 3)));
+    const clampMax = (v) => Math.min(20, Math.max(1, Math.floor(Number(v) || 1)));
     if (conversationId && store && typeof store.getTtlKeepaliveState === "function") {
       try {
         const kaState = store.getTtlKeepaliveState(conversationId);
@@ -2152,7 +2323,10 @@ export class WatchdogMonitor {
       rawMinTok !== undefined && rawMinTok !== null && Number.isFinite(Number(rawMinTok))
         ? Math.min(500000, Math.max(0, Math.floor(Number(rawMinTok))))
         : 0;
-    const leadSec = Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30)));
+    const leadSec = Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 60)));
+    const deliveryMs =
+      typeof store.getTtlKeepaliveDeliveryMs === "function" ? store.getTtlKeepaliveDeliveryMs() : 0;
+    const deliveryCompSec = deliveryMs > 0 ? Math.min(20, Math.ceil(deliveryMs / 1000)) : 0;
 
     if (sleepJumpMs !== 0) {
       return { coveredConvIds, exhaustedConvMap };
@@ -2175,24 +2349,94 @@ export class WatchdogMonitor {
       ) {
         continue;
       }
-      if (minTokens > 0 && Number(lease.contextTokens || 0) < minTokens) continue;
       if (!this._resolveTtlKeepaliveEnabled(store, cfg, lease.conversationId, lease)) continue;
+      const isCustomOverride = Boolean(store.hasCustomTtlKeepaliveOverride?.(lease.conversationId));
+      let { pctMinTokens } = this._resolveLeaseKeepaliveMinContext(store, cfg, lease, { isCustomOverride });
+      let effectiveMinTokens = isCustomOverride ? 0 : Math.max(minTokens, pctMinTokens);
+      let leaseContextTokens = Number(lease.contextTokens || 0);
+      if (effectiveMinTokens > 0 && leaseContextTokens > 0 && leaseContextTokens < effectiveMinTokens) continue;
+      if (effectiveMinTokens > 0 && leaseContextTokens === 0 && !lease.transcriptPath) continue;
       const maxCount = this._resolveTtlKeepaliveMaxCount(store, cfg, lease.conversationId);
 
       const effectiveTtlSec = this._resolveLeaseEffectiveTtlSec(store, lease, cfg, nowWallMs);
       const effectiveLeadSec = Math.min(leadSec, Math.max(5, Math.floor(effectiveTtlSec * 0.5)));
       if (!(effectiveTtlSec > effectiveLeadSec)) continue;
+      const effectiveTriggerLeadSec = Math.min(
+        Math.max(5, Math.floor(effectiveTtlSec * 0.75)),
+        effectiveLeadSec + deliveryCompSec
+      );
 
       const idleAnchorTs = lease.idleAnchorTs || lease.phaseChangedTs || lease.updatedTs || 0;
       if (idleAnchorTs <= 0 || nowWallMs < idleAnchorTs) continue;
-      const idleSec = Math.floor((nowWallMs - idleAnchorTs) / 1000);
-      const remSec = effectiveTtlSec - idleSec;
+      let originTs =
+        lease.cacheOriginTs > 0 &&
+        lease.cacheOriginTs <= idleAnchorTs &&
+        idleAnchorTs - lease.cacheOriginTs <= 30 * 60 * 1000
+          ? lease.cacheOriginTs
+          : idleAnchorTs;
+      let idleSec = Math.floor((nowWallMs - originTs) / 1000);
+      let remSec = effectiveTtlSec - idleSec;
       if (remSec <= 0) continue;
 
       const kaState =
         typeof store.getTtlKeepaliveState === "function"
           ? store.getTtlKeepaliveState(lease.conversationId)
-          : { usedCount: 0, lastIdleAnchorTs: 0, lastSentTs: 0, pendingAck: false };
+          : {
+              usedCount: 0,
+              lastIdleAnchorTs: 0,
+              lastSentTs: 0,
+              pendingAck: false,
+              coldMissTripped: false,
+              lastColdCheckUsed: 0
+            };
+
+      if (kaState.coldMissTripped) continue;
+
+      // Lazy Turn-0 post-Stop flush backfill (0 fs.statSync): if Stop ran before the first
+      // PLANNER_RESPONSE flushed to disk, inspect the tail once when entering the trigger window.
+      if (
+        effectiveMinTokens > 0 &&
+        leaseContextTokens === 0 &&
+        lease.transcriptPath &&
+        kaState.usedCount < maxCount &&
+        remSec <= effectiveTriggerLeadSec &&
+        this._turn0BackfillChecked.get(lease.conversationId) !== idleAnchorTs
+      ) {
+        this._turn0BackfillChecked.set(lease.conversationId, idleAnchorTs);
+        try {
+          this.tailReadCount += 1;
+          const tailSteps = this._hasCustomReadTail
+            ? this.readTailFn(lease.transcriptPath, 32768)
+            : readWatchdogTranscriptTail(lease.transcriptPath, 32768).steps;
+          const info = inspectLatestTurnInSteps(tailSteps);
+          if (info.hasPlanner && !info.hasPromptAfterLastPlanner && info.contextTokens > 0) {
+            leaseContextTokens = info.contextTokens;
+            const nextBackfilledOrigin =
+              info.prefillTs > 0 &&
+              info.prefillTs <= idleAnchorTs &&
+              idleAnchorTs - info.prefillTs <= 30 * 60 * 1000
+                ? info.prefillTs
+                : lease.cacheOriginTs || idleAnchorTs;
+            const enrichedLease = {
+              ...lease,
+              contextTokens: info.contextTokens,
+              ...(info.maxTokens > 0 ? { windowTokens: info.maxTokens } : {}),
+              ...(info.model ? { model: info.model } : {}),
+              cacheOriginTs: nextBackfilledOrigin
+            };
+            writeWatchdogLeaseIfUnchanged(store, lease.updatedTs, lease.phase, enrichedLease);
+            ({ pctMinTokens } = this._resolveLeaseKeepaliveMinContext(store, cfg, enrichedLease, {
+              isCustomOverride
+            }));
+            effectiveMinTokens = isCustomOverride ? 0 : Math.max(minTokens, pctMinTokens);
+            originTs = nextBackfilledOrigin;
+            idleSec = Math.floor((nowWallMs - originTs) / 1000);
+            remSec = effectiveTtlSec - idleSec;
+          }
+        } catch {}
+      }
+      if (remSec <= 0) continue;
+      if (effectiveMinTokens > 0 && leaseContextTokens < effectiveMinTokens) continue;
 
       const sentOnCurrentIdleCycle =
         kaState.lastIdleAnchorTs === idleAnchorTs ||
@@ -2211,11 +2455,42 @@ export class WatchdogMonitor {
       }
 
       if (kaState.usedCount >= maxCount) continue;
-      if (remSec > effectiveLeadSec) continue;
+      if (remSec > effectiveTriggerLeadSec) continue;
 
       if (this._keepaliveInFlight.has(lease.conversationId)) continue;
       if (kaState.lastIdleAnchorTs === idleAnchorTs) continue;
       if (kaState.lastSentTs > 0 && nowWallMs - kaState.lastSentTs < 25_000) continue;
+
+      // Layer-3 cold-miss circuit breaker (0 fs.statSync): if a prior keepalive round's transcript
+      // flushed AFTER Stop hook ran, verify its cache_read_tokens before firing round 2+.
+      if (
+        kaState.usedCount >= 1 &&
+        (kaState.lastColdCheckUsed || 0) < kaState.usedCount &&
+        lease.transcriptPath &&
+        typeof this.readTailFn === "function"
+      ) {
+        let coldTrippedNow = false;
+        try {
+          this.tailReadCount += 1;
+          const tailSteps = this._hasCustomReadTail
+            ? this.readTailFn(lease.transcriptPath, 32768)
+            : readWatchdogTranscriptTail(lease.transcriptPath, 32768).steps;
+          const info = inspectLatestTurnInSteps(tailSteps);
+          if (isKeepaliveTurnFlushedForRound(info, kaState)) {
+            coldTrippedNow = info.cacheReadTokens === 0;
+            store.setTtlKeepaliveState?.(lease.conversationId, {
+              coldMissTripped: coldTrippedNow,
+              lastColdCheckUsed: kaState.usedCount,
+              updatedTs: nowWallMs
+            });
+          }
+        } catch {}
+        if (coldTrippedNow) {
+          coveredConvIds.delete(lease.conversationId);
+          continue;
+        }
+      }
+
       if (
         this._isConversationSubagent(store, lease.conversationId, lease, { requireDefinitive: true }) ||
         this._isConversationKilled(store, lease.conversationId, lease)
@@ -2248,6 +2523,7 @@ export class WatchdogMonitor {
             ? store.getTtlKeepaliveState(convId)
             : kaState;
         if (
+          freshKa.coldMissTripped ||
           freshKa.usedCount >= maxCount ||
           freshKa.lastIdleAnchorTs === idleAnchorTs ||
           Boolean(freshKa.pendingAck && freshKa.lastSentTs > 0 && nowWallMs - freshKa.lastSentTs < 60_000) ||
@@ -2377,13 +2653,7 @@ export class WatchdogMonitor {
       activeChildParents = null
     }
   ) {
-    const envNotifyRaw = process.env.AGY_DART_TTL_DESKTOP_NOTIFY;
-    const explicitlyMutedByEnv =
-      typeof envNotifyRaw === "string" && /^(?:0|false|no|off)$/i.test(envNotifyRaw.trim());
-    const hasExhaustedKeepalive = Boolean(
-      exhaustedConvMap && exhaustedConvMap.size > 0 && !explicitlyMutedByEnv
-    );
-    if ((!ttlDesktopNotifyEnabled && !hasExhaustedKeepalive) || !Array.isArray(leases) || leases.length === 0) {
+    if (!ttlDesktopNotifyEnabled || !Array.isArray(leases) || leases.length === 0) {
       return;
     }
     const minTokens = Math.min(500000, Math.max(4000, Math.floor(Number(cfg.ttlNotifyMinTokens) || 60000)));
@@ -2422,9 +2692,7 @@ export class WatchdogMonitor {
       if (/^(?:EXECUTOR_TERMINATION_REASON_)?(?:USER_CANCELED|USER_CANCELLED|CANCELED|CANCELLED|ABORTED|ERROR)\b/i.test(stopReason)) {
         continue;
       }
-      const exhaustedInfo =
-        !explicitlyMutedByEnv && exhaustedConvMap ? exhaustedConvMap.get(lease.conversationId) || null : null;
-      if (!exhaustedInfo && !ttlDesktopNotifyEnabled) continue;
+      const exhaustedInfo = exhaustedConvMap?.get(lease.conversationId);
 
       const ctxTokens = Number(lease.contextTokens || 0);
       if (!exhaustedInfo && ctxTokens < minTokens) continue;
@@ -2444,6 +2712,8 @@ export class WatchdogMonitor {
       if (this._isConversationKilled(store, lease.conversationId, lease)) continue;
 
       const ttlAlertMetaKey = `cache_alert:${lease.conversationId}:ttl_desktop`;
+      // Resolve per-window overrides before claiming either kind of TTL popup.
+      if (!this._resolveTtlKeepaliveEnabled(store, cfg, lease.conversationId, lease)) continue;
       if (store && (typeof store.getTimedMeta === "function" || typeof store.getMeta === "function")) {
         const claimTtlPopup = () => {
           const prev =
@@ -2645,6 +2915,7 @@ export class WatchdogMonitor {
     const ttlDesktopNotifyEnabled = this._resolveTtlDesktopNotifyEnabled(store, cfg);
     const globalTtlKeepaliveMaxCount = this._resolveGlobalTtlKeepaliveMaxCount(store, cfg);
     const fallbackTtlKeepaliveMaxCount = this._resolveFallbackTtlKeepaliveMaxCount(store, cfg);
+    const globalTtlKeepaliveMinContextPct = this._resolveGlobalTtlKeepaliveMinContextPct(store, cfg);
     const ttlKeepaliveEnabled = this._resolveTtlKeepaliveEnabled(store, cfg);
     const ttlKeepaliveMaxCount = this._resolveTtlKeepaliveMaxCount(store, cfg);
     const ttlKeepaliveActive = Boolean(
@@ -2671,6 +2942,7 @@ export class WatchdogMonitor {
         ttlKeepaliveMaxCount,
         globalTtlKeepaliveMaxCount,
         fallbackTtlKeepaliveMaxCount,
+        globalTtlKeepaliveMinContextPct,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -2715,6 +2987,9 @@ export class WatchdogMonitor {
       for (const id of this._ttlNotifiedKeys.keys()) {
         if (!liveIds.has(id)) this._ttlNotifiedKeys.delete(id);
       }
+      for (const id of this._turn0BackfillChecked.keys()) {
+        if (!liveIds.has(id)) this._turn0BackfillChecked.delete(id);
+      }
       const { coveredConvIds, exhaustedConvMap } = this._evaluateIdleTtlKeepalive(store, leases, {
         nowWallMs,
         cfg,
@@ -2747,6 +3022,7 @@ export class WatchdogMonitor {
         ttlKeepaliveMaxCount,
         globalTtlKeepaliveMaxCount,
         fallbackTtlKeepaliveMaxCount,
+        globalTtlKeepaliveMinContextPct,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -2785,6 +3061,9 @@ export class WatchdogMonitor {
       for (const id of this._ttlNotifiedKeys.keys()) {
         if (!liveIds.has(id)) this._ttlNotifiedKeys.delete(id);
       }
+      for (const id of this._turn0BackfillChecked.keys()) {
+        if (!liveIds.has(id)) this._turn0BackfillChecked.delete(id);
+      }
       const { coveredConvIds, exhaustedConvMap } = this._evaluateIdleTtlKeepalive(store, leases, {
         nowWallMs,
         cfg,
@@ -2817,6 +3096,7 @@ export class WatchdogMonitor {
         ttlKeepaliveMaxCount,
         globalTtlKeepaliveMaxCount,
         fallbackTtlKeepaliveMaxCount,
+        globalTtlKeepaliveMinContextPct,
         watermarkDesktopNotifyEnabled,
         uiLang,
         uiLangSource: langInfo.source,
@@ -2935,6 +3215,9 @@ export class WatchdogMonitor {
     for (const id of this._ttlNotifiedKeys.keys()) {
       if (!seenIds.has(id)) this._ttlNotifiedKeys.delete(id);
     }
+    for (const id of this._turn0BackfillChecked.keys()) {
+      if (!seenIds.has(id)) this._turn0BackfillChecked.delete(id);
+    }
 
     const idleLeases = leases.filter((l) => l.phase === WATCHDOG_PHASES.IDLE);
     const { coveredConvIds, exhaustedConvMap } = this._evaluateIdleTtlKeepalive(store, idleLeases, {
@@ -2975,6 +3258,7 @@ export class WatchdogMonitor {
       ttlKeepaliveMaxCount,
       globalTtlKeepaliveMaxCount,
       fallbackTtlKeepaliveMaxCount,
+      globalTtlKeepaliveMinContextPct,
       watermarkDesktopNotifyEnabled,
       uiLang,
       uiLangSource: langInfo.source,
@@ -3269,6 +3553,12 @@ export class WatchdogMonitor {
         this._applyTailEnrichment(lease, tailInfo, tailIsFreshForEnrich);
 
         if (tailInfo.isTerminal && tailIsFreshForHeal) {
+          const healedOriginTs =
+            tailInfo.lastPlannerPrefillTs > 0 && tailInfo.lastPlannerPrefillTs <= nowWallMs + 5_000
+              ? Math.min(nowWallMs, tailInfo.lastPlannerPrefillTs)
+              : lease.lastLlmStartTs > 0 && lease.lastLlmStartTs <= nowWallMs
+                ? lease.lastLlmStartTs
+                : nowWallMs;
           const healedLease = {
             ...lease,
             phase: WATCHDOG_PHASES.IDLE,
@@ -3283,6 +3573,9 @@ export class WatchdogMonitor {
             transcriptMtimeMs: curMtimeMs,
             transcriptSize: curSize,
             phaseChangedTs: nowWallMs,
+            idleAnchorTs: nowWallMs,
+            cacheOriginTs: healedOriginTs,
+            lastLlmStartTs: 0,
             updatedTs: nowWallMs,
             lastHeartbeatTs: nowWallMs,
             hookEvent: "SidecarHeal",
@@ -3428,14 +3721,26 @@ export class WatchdogMonitor {
       diagnosis = diagnoseStallCause(lease, { platform: this.platform });
     }
 
+    const incidentKey =
+      rawSeverity === "suspect" || rawSeverity === "stalled"
+        ? `${lease.conversationId}:${lease.phaseChangedTs || lease.updatedTs}:${lease.phase}:${rawSeverity}:${diagnosis?.causeId || "unknown"}`
+        : "";
+
+    const secretRedactionEnabled = isSecretRedactionEnabled();
     if (rawSeverity === "stalled") {
-      const incidentKey = `${lease.conversationId}:${lease.phaseChangedTs || lease.updatedTs}:${lease.phase}:${diagnosis?.causeId || "unknown"}`;
-      if (st.rescueBriefKey === incidentKey && st.rescueBrief) {
+      if (
+        st.rescueBriefKey === incidentKey &&
+        st.rescueBrief &&
+        st.rescueBrief.secretRedactionEnabled === secretRedactionEnabled
+      ) {
         rescueBrief = st.rescueBrief;
       } else {
         try {
+          const checkpointSessionId =
+            resolveTrustedCheckpointSessionId(store, lease.conversationId, "", { seedLease: lease }) ||
+            lease.conversationId;
           const safeLeaseCwd = isSafeWorkspaceDir(lease.cwd) ? lease.cwd : "";
-          const workDir = safeLeaseCwd || inferWorkspaceFromStore(store, lease.rootSessionId || lease.conversationId);
+          const workDir = safeLeaseCwd || inferWorkspaceFromStore(store, checkpointSessionId);
           const stallContext = {
             severity: "stalled",
             phase: lease.phase,
@@ -3454,17 +3759,34 @@ export class WatchdogMonitor {
           };
           const brief = this.buildHandoffFn({
             store,
-            sessionId: lease.rootSessionId || lease.conversationId,
+            mode: "agent",
+            conversationId: lease.conversationId,
+            conversationConfirmed: true,
+            scope: "conversation",
+            sessionId: checkpointSessionId,
             cwd: workDir,
             cacheDiag: null,
             maxBytes: 5800,
-            stallContext
+            stallContext,
+            brainRoots: this.brainRoots,
+            nowFn: () => nowWallMs
           });
           rescueBrief = {
+            mode: brief.mode || "agent",
+            confirmedConversation: brief.confirmedConversation !== false,
+            conversationId: lease.conversationId,
+            sessionId: checkpointSessionId,
+            secretRedactionEnabled:
+              typeof brief.secretRedactionEnabled === "boolean"
+                ? brief.secretRedactionEnabled
+                : secretRedactionEnabled,
             markdown: brief.markdown,
             summary: brief.summary,
             bytes: brief.bytes,
             truncated: brief.truncated,
+            anchors: brief.anchors || null,
+            resumeCommand: brief.resumeCommand || "",
+            sampledAt: brief.sampledAt || brief.anchors?.sampledAt || "",
             generatedAt: nowWallMs,
             incidentKey
           };
@@ -3556,12 +3878,13 @@ export class WatchdogMonitor {
       selfHealed: false,
       transcriptGrowing,
       snoozedUntilTs: isSnoozed ? lease.ackedUntilTs : 0,
+      incidentKey,
       diagnosis,
       rescueBrief
     };
   }
 
-  getStatus({ conversationId = "", scope = "conversation", refresh = true } = {}) {
+  getStatus({ conversationId = "", scope = "conversation", refresh = true, includeRichRescue = true } = {}) {
     const tickRes = refresh ? this.tick() : null;
     const nowWallMs = tickRes ? tickRes.serverNowMs : this.nowFn();
     const cfg = this.getConfig() || {};
@@ -3579,6 +3902,9 @@ export class WatchdogMonitor {
     const fallbackTtlKeepaliveMaxCount = tickRes
       ? tickRes.fallbackTtlKeepaliveMaxCount
       : this._resolveFallbackTtlKeepaliveMaxCount(store, cfg);
+    const globalTtlKeepaliveMinContextPct = tickRes
+      ? tickRes.globalTtlKeepaliveMinContextPct
+      : this._resolveGlobalTtlKeepaliveMinContextPct(store, cfg);
     const ttlKeepaliveEnabled = tickRes
       ? tickRes.ttlKeepaliveEnabled
       : this._resolveTtlKeepaliveEnabled(store, cfg);
@@ -3596,7 +3922,7 @@ export class WatchdogMonitor {
       : this._resolveUiLangInfo(store, cfg);
     const ttlNotifyLeadSec = Math.min(300, Math.max(15, Math.floor(Number(cfg.ttlNotifyLeadSec) || 60)));
     const ttlNotifyMinTokens = Math.min(500000, Math.max(4000, Math.floor(Number(cfg.ttlNotifyMinTokens) || 60000)));
-    const ttlKeepaliveLeadSec = Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 30)));
+    const ttlKeepaliveLeadSec = Math.min(180, Math.max(10, Math.floor(Number(cfg.ttlKeepaliveLeadSec) || 60)));
 
     const sessions = Array.from(this._lastEvaluated.values()).sort((a, b) => {
       const rankDiff = severityRank(b.severity) - severityRank(a.severity);
@@ -3673,7 +3999,7 @@ export class WatchdogMonitor {
     const kaState =
       !isKaTargetSubagent && kaTargetConvId && store && typeof store.getTtlKeepaliveState === "function"
         ? store.getTtlKeepaliveState(kaTargetConvId)
-        : { usedCount: 0, lastSentTs: 0, lastError: "" };
+        : { usedCount: 0, coldMissTripped: false, lastSentTs: 0, lastError: "" };
     const convKeepaliveEnabled = isKaTargetSubagent
       ? false
       : kaTargetConvId
@@ -3689,12 +4015,48 @@ export class WatchdogMonitor {
         typeof store.hasCustomTtlKeepaliveOverride === "function" &&
         store.hasCustomTtlKeepaliveOverride(kaTargetConvId)
     );
+    const targetLeaseForCtx =
+      (kaTargetConvId && this._lastEvaluated.get(kaTargetConvId)) ||
+      (kaTargetConvId && store ? readWatchdogLease(store, kaTargetConvId) : null) ||
+      current ||
+      null;
+    const minCtxInfo = this._resolveLeaseKeepaliveMinContext(store, cfg, targetLeaseForCtx, {
+      isCustomOverride
+    });
+    const deliveryLatencyMs =
+      store && typeof store.getTtlKeepaliveDeliveryMs === "function"
+        ? store.getTtlKeepaliveDeliveryMs()
+        : 0;
 
     const alertingSessions = sessions.filter((s) => s.severity === "stalled" || s.severity === "suspect");
     const activeCount = sessions.filter((s) => s.phase !== WATCHDOG_PHASES.IDLE).length;
     const suspectCount = sessions.filter((s) => s.severity === "suspect").length;
     const stalledCount = sessions.filter((s) => s.severity === "stalled").length;
     const pendingJump = this.getPendingConversationJump(nowWallMs);
+
+    // Project external views without mutating internal per-conversation rescueBrief cache:
+    // - `sessions` and `alertingSessions` expose overview metadata only (no per-window `lastUserInput` or `rescueBrief`).
+    // - `current` only exposes `lastUserInput` and `rescueBrief` when scope is `conversation` AND target is a confirmed matching session.
+    const projectOverviewEntry = (entry) => (entry ? { ...entry, lastUserInput: "", rescueBrief: null } : null);
+    const isReservedRescueTarget =
+      !safeConvId ||
+      ["default", "all", "lifetime", "app", "__unbound__", "unknown", "none", "null", "undefined"].includes(
+        safeConvId.toLowerCase()
+      );
+    const canIncludeRichRescue = Boolean(
+      includeRichRescue !== false &&
+        scope === "conversation" &&
+        !isReservedRescueTarget &&
+        current &&
+        current.conversationId === safeConvId
+    );
+    const projectedCurrent = current
+      ? canIncludeRichRescue
+        ? { ...current }
+        : projectOverviewEntry(current)
+      : null;
+    const projectedSessions = sessions.slice(0, 20).map(projectOverviewEntry);
+    const projectedAlertingSessions = alertingSessions.slice(0, 10).map(projectOverviewEntry);
 
     return {
       ok: true,
@@ -3703,6 +4065,7 @@ export class WatchdogMonitor {
       ttlDesktopNotifyEnabled,
       globalTtlKeepaliveMaxCount,
       fallbackTtlKeepaliveMaxCount,
+      globalTtlKeepaliveMinContextPct,
       ttlKeepalive: {
         conversationId: kaTargetConvId,
         enabled: convKeepaliveEnabled,
@@ -3711,8 +4074,13 @@ export class WatchdogMonitor {
         maxCount: convKeepaliveMaxCount,
         globalMaxCount: globalTtlKeepaliveMaxCount,
         fallbackMaxCount: fallbackTtlKeepaliveMaxCount,
+        minContextPct: globalTtlKeepaliveMinContextPct,
+        minContextTokens: minCtxInfo.pctMinTokens,
+        windowTokens: minCtxInfo.windowTokens,
         isCustomOverride,
         usedCount: kaState.usedCount,
+        coldMissTripped: Boolean(kaState.coldMissTripped),
+        deliveryLatencyMs,
         leadSec: ttlKeepaliveLeadSec,
         lastSentTs: kaState.lastSentTs || 0,
         lastError: kaState.lastError || ""
@@ -3741,9 +4109,9 @@ export class WatchdogMonitor {
         lastJumpMs: this._lastSleepJumpMs
       },
       pendingJump,
-      current,
-      sessions: sessions.slice(0, 20),
-      alertingSessions: alertingSessions.slice(0, 10),
+      current: projectedCurrent,
+      sessions: projectedSessions,
+      alertingSessions: projectedAlertingSessions,
       stats: {
         totalTracked: sessions.length,
         activeCount,
@@ -3955,7 +4323,7 @@ export class WatchdogMonitor {
     };
   }
 
-  getStallContextForConversation(conversationId) {
+  getStallContextForConversation(conversationId, { includeUserInput = true } = {}) {
     const safeId = sanitizeConversationId(conversationId);
     if (!safeId) return null;
     const item = this._lastEvaluated.get(safeId);
@@ -3963,6 +4331,7 @@ export class WatchdogMonitor {
       return null;
     }
     return {
+      conversationId: item.conversationId,
       severity: item.rawSeverity,
       phase: item.phase,
       subphase: item.subphase,
@@ -3971,12 +4340,13 @@ export class WatchdogMonitor {
       activeTool: item.activeTool,
       activeToolSummary: item.activeToolSummary,
       lastCompletedTool: item.lastCompletedTool,
-      lastUserInput: item.lastUserInput,
+      lastUserInput: includeUserInput ? item.lastUserInput : "",
       contextTokens: item.contextTokens || 0,
       model: item.model || "",
       causeId: item.diagnosis?.causeId || "",
       causeLabel: item.diagnosis?.label || "",
-      tips: item.diagnosis?.tips || []
+      tips: item.diagnosis?.tips || [],
+      incidentKey: item.incidentKey || item.rescueBrief?.incidentKey || ""
     };
   }
 
@@ -3987,7 +4357,7 @@ export class WatchdogMonitor {
       return (b.lastActivityTs || 0) - (a.lastActivityTs || 0);
     });
     const top = sessions.find((s) => s.rawSeverity === "stalled" || s.rawSeverity === "suspect");
-    return top ? this.getStallContextForConversation(top.conversationId) : null;
+    return top ? this.getStallContextForConversation(top.conversationId, { includeUserInput: false }) : null;
   }
 
   acknowledge(conversationId, snoozeSec = 300) {

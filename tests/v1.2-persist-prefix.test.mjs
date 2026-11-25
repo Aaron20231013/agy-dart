@@ -40,6 +40,7 @@ function runSessionStart(payload, dbPath, extraEnv = {}) {
     env: {
       ...cleanEnv,
       AGY_DART_DB_PATH: dbPath,
+      AGY_DART_CONFIG_PATH: path.join(path.dirname(dbPath), "nonexistent-config.json"),
       AGY_DART_DISABLE_COMPILE_CACHE: "1",
       ...extraEnv
     }
@@ -323,7 +324,8 @@ test("P1-5B: SessionStart stable-prefix-only & subagent payloads stay byte-ident
     const largeCleanSub = runSessionStart({ ...largePayload, subagent: true }, tmpDb);
     assert.equal(largeCleanSub, largeCleanStable);
     assert.ok(!largeCleanStable.includes("Git:"));
-    assert.ok(largeCleanStable.includes("Layout (2 levels):"));
+    assert.ok(largeCleanStable.includes("Layout (top level):"));
+    assert.ok(!largeCleanStable.includes("component_0_impl.js"), "Start with a directory map; discover child files on demand");
 
     // Modify 6 tracked files across subdirectories so gitSummary would normally grow by >250 chars
     for (let d = 0; d < 6; d++) {
@@ -360,7 +362,11 @@ test("P1-5B: SessionStart stable-prefix-only & subagent payloads stay byte-ident
 });
 
 test("P1-5C: prefix-budget.mjs --stable-only --json reports volatileBytes===0 & stablePct===100 with intact schema", async () => {
-  const cleanEnv = { ...process.env, AGY_DART_DISABLE_COMPILE_CACHE: "1" };
+  const cleanEnv = {
+    ...process.env,
+    AGY_DART_CONFIG_PATH: path.join(os.tmpdir(), `agy-dart-nonexistent-config-${process.pid}.json`),
+    AGY_DART_DISABLE_COMPILE_CACHE: "1"
+  };
   delete cleanEnv.AGY_DART_STABLE_PREFIX_ONLY;
 
   const defCli = spawnSync(process.execPath, [path.join(ROOT, "scripts", "prefix-budget.mjs"), "--json"], {
@@ -740,7 +746,7 @@ test("P1-8C: batch_search short-TTL worktree-fingerprinted cache hits on repeat,
 
   try {
     // 1. Default 15s TTL: cache hit, canonical query key order, apply_edits invalidation, external edit invalidation
-    const client = createPersistentMcpClient(serverPath, { AGY_DART_DISABLE_OUTLINE_DB: "1" });
+    const client = createPersistentMcpClient(serverPath, { AGY_DART_DISABLE_OUTLINE_DB: "1", AGY_DART_DB_PATH: path.join(tmpDir, "search-cache.db") });
     try {
       await client.request("initialize", {
         protocolVersion: "2024-11-05",
@@ -886,6 +892,7 @@ test("P1-8C: batch_search short-TTL worktree-fingerprinted cache hits on repeat,
 
     const cTtl = createPersistentMcpClient(serverPath, {
       AGY_DART_DISABLE_OUTLINE_DB: "1",
+      AGY_DART_DB_PATH: path.join(tmpDir, "search-ttl.db"),
       AGY_DART_SEARCH_CACHE_TTL_MS: "90"
     });
     try {
@@ -934,6 +941,7 @@ test("P1-8C: batch_search short-TTL worktree-fingerprinted cache hits on repeat,
 
     const cOptOut = createPersistentMcpClient(serverPath, {
       AGY_DART_DISABLE_OUTLINE_DB: "1",
+      AGY_DART_DB_PATH: path.join(tmpDir, "search-optout.db"),
       AGY_DART_SEARCH_CACHE_TTL_MS: "0"
     });
     try {
@@ -993,7 +1001,7 @@ test("P1-8C: batch_search short-TTL worktree-fingerprinted cache hits on repeat,
     gitBig(["add", "."]);
     gitBig(["commit", "-m", "seed 30 files"]);
 
-    const cBig = createPersistentMcpClient(serverPath, { AGY_DART_DISABLE_OUTLINE_DB: "1" });
+    const cBig = createPersistentMcpClient(serverPath, { AGY_DART_DISABLE_OUTLINE_DB: "1", AGY_DART_DB_PATH: path.join(tmpDir, "search-big.db") });
     try {
       await cBig.request("initialize", {
         protocolVersion: "2024-11-05",

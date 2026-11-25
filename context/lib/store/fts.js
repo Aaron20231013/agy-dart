@@ -40,6 +40,25 @@ function parseMarkdownHeadingLinear(line) {
 }
 
 export class FtsMethods {
+  // Older MCP clients stored anonymous data under one shared ID. Only these rows
+  // carry a per-operation worktree; the shared checkpoint and caches can be mixed.
+  adoptLegacyWorkspaceData(worktree, sessionId) {
+    this.open();
+    const match = "session_id = 'default' AND worktree = ?";
+    const sources = "SELECT id FROM sources WHERE " + match;
+    const hasSources = this.db.prepare(sources + " LIMIT 1").get(worktree);
+    const hasEvents = this.db.prepare("SELECT 1 FROM events WHERE " + match + " LIMIT 1").get(worktree);
+    if (!hasSources && !hasEvents) return;
+    this._withWriteTx(() => {
+      if (hasSources) {
+        this.db.prepare("UPDATE chunks SET session_id = ? WHERE " + match).run(sessionId, worktree);
+        this.db.prepare("UPDATE chunks_tri SET session_id = ? WHERE session_id = 'default' AND source_id IN (" + sources + ")").run(sessionId, worktree);
+        this.db.prepare("UPDATE sources SET session_id = ? WHERE " + match).run(sessionId, worktree);
+      }
+      this.db.prepare("UPDATE events SET session_id = ? WHERE " + match).run(sessionId, worktree);
+    });
+  }
+
   /** Safely split an oversized single line into <= maxBytes UTF-8 slices */
   _splitOversizedLine(line, maxBytes) {
     const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 1;
@@ -358,6 +377,15 @@ export class FtsMethods {
     const effScope = scope === "all" ? "all" : scope === "worktree" ? "worktree" : "session";
     const effSid = typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : "default";
     const effWorktree = typeof worktree === "string" && worktree.trim() ? worktree.trim() : "";
+    const isAnonSid = effSid === "default" || effSid.startsWith("workspace:");
+    const rootSid =
+      effScope === "session" && !isAnonSid && typeof this.resolveRootSessionId === "function"
+        ? this.resolveRootSessionId(effSid)
+        : effSid;
+    const familyIds =
+      effScope === "session" && !isAnonSid && typeof this.getSessionFamilyIds === "function"
+        ? this.getSessionFamilyIds(rootSid)
+        : [rootSid];
 
     const scores = new Map();
 
@@ -380,8 +408,16 @@ export class FtsMethods {
           params.push(sourceId);
         }
         if (effScope === "session") {
-          sql += " AND session_id = ?";
-          params.push(effSid);
+          if (isAnonSid) {
+            sql += " AND (session_id = ? OR source_id IN (SELECT id FROM sources WHERE origin_session_id = ? AND (? = '' OR worktree = ?)))";
+            params.push(effSid, effSid, effWorktree, effWorktree);
+          } else if (familyIds.length > 1) {
+            sql += ` AND session_id IN (${familyIds.map(() => "?").join(",")})`;
+            params.push(...familyIds);
+          } else {
+            sql += " AND session_id = ?";
+            params.push(rootSid);
+          }
         } else if (effScope === "worktree") {
           if (effWorktree) {
             sql += " AND worktree = ?";
@@ -437,8 +473,16 @@ export class FtsMethods {
           paramsTri.push(sourceId);
         }
         if (effScope === "session") {
-          sqlTri += " AND t.session_id = ?";
-          paramsTri.push(effSid);
+          if (isAnonSid) {
+            sqlTri += " AND (t.session_id = ? OR (s.origin_session_id = ? AND (? = '' OR s.worktree = ?)))";
+            paramsTri.push(effSid, effSid, effWorktree, effWorktree);
+          } else if (familyIds.length > 1) {
+            sqlTri += ` AND t.session_id IN (${familyIds.map(() => "?").join(",")})`;
+            paramsTri.push(...familyIds);
+          } else {
+            sqlTri += " AND t.session_id = ?";
+            paramsTri.push(rootSid);
+          }
         } else if (effScope === "worktree") {
           if (effWorktree) {
             sqlTri += " AND s.worktree = ?";
@@ -538,14 +582,18 @@ export class FtsMethods {
     body = "",
     turn = 0,
     sandboxBytes = 0,
-    returnedBytes = 0
+    returnedBytes = 0,
+    executionReceipt = null,
+    sourceId = null,
+    claimFingerprint = null,
+    claimedConv = null
   }) {
     this.open();
     const now = new Date().toISOString();
     const insert = this.db.prepare(`
       INSERT INTO events (
-        session_id, worktree, agent, kind, tool, key, path, ok, exit_code, bytes, body, turn, sandbox_bytes, returned_bytes, created_at, accessed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        session_id, worktree, agent, kind, tool, key, path, ok, exit_code, bytes, body, turn, sandbox_bytes, returned_bytes, execution_receipt, source_id, claim_fingerprint, claimed_conv, created_at, accessed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const result = this._withBusyRetry(() =>
@@ -564,12 +612,307 @@ export class FtsMethods {
         turn,
         sandboxBytes,
         returnedBytes,
+        executionReceipt,
+        sourceId || null,
+        claimFingerprint || null,
+        claimedConv || null,
         now,
         now
       )
     );
 
     return { seq: result.lastInsertRowid };
+  }
+
+  _resolveValidClaimOwner(sessionId) {
+    const raw = typeof sessionId === "string" ? sessionId.trim() : "";
+    if (
+      !raw ||
+      raw.length > 128 ||
+      /[\x00-\x1f\x7f\\/]/.test(raw) ||
+      /^(?:default|all|app|lifetime|__unbound__)$/i.test(raw) ||
+      /^workspace:/i.test(raw)
+    ) {
+      return "";
+    }
+    this.open();
+    const resolved = typeof this.resolveRootSessionId === "function" ? this.resolveRootSessionId(raw) : raw;
+    if (
+      resolved &&
+      resolved.length <= 128 &&
+      !/[\x00-\x1f\x7f\\/]/.test(resolved) &&
+      !/^(?:default|all|app|lifetime|__unbound__)$/i.test(resolved) &&
+      !/^workspace:/i.test(resolved)
+    ) {
+      return resolved;
+    }
+    return raw;
+  }
+
+  claimExecutionReceipts(sessionId, receipts) {
+    if (!Array.isArray(receipts) || !receipts.length) return;
+    const owner = this._resolveValidClaimOwner(sessionId);
+    if (!owner) return;
+
+    const findPending = this.db.prepare(
+      "SELECT seq, source_id FROM events WHERE execution_receipt = ? " +
+      "AND (session_id = 'default' OR session_id GLOB 'workspace:*') " +
+      "AND ((tool = 'ctx_execute' AND kind = 'execution') OR (tool = 'ctx_index' AND kind = 'index') OR (tool = 'ctx_batch' AND kind = 'batch'))"
+    );
+    const claimEvent = this.db.prepare(
+      "UPDATE events SET session_id = ?, execution_receipt = NULL WHERE seq = ? AND execution_receipt = ?"
+    );
+    const claimSource = this.db.prepare(
+      "UPDATE sources SET session_id = ?, origin_session_id = COALESCE(origin_session_id, session_id) " +
+      "WHERE id = ? AND (session_id = 'default' OR session_id GLOB 'workspace:*')"
+    );
+    const claimChunks = this.db.prepare(
+      "UPDATE chunks SET session_id = ? WHERE source_id = ? AND (session_id = 'default' OR session_id GLOB 'workspace:*')"
+    );
+    const claimChunksTri = this.db.prepare(
+      "UPDATE chunks_tri SET session_id = ? WHERE source_id = ? AND (session_id = 'default' OR session_id GLOB 'workspace:*')"
+    );
+
+    for (const receipt of receipts) {
+      if (typeof receipt !== "string" || !receipt) continue;
+      const row = findPending.get(receipt);
+      if (!row) continue;
+      this._withWriteTx(() => {
+        const res = claimEvent.run(owner, row.seq, receipt);
+        if (res.changes > 0 && row.source_id) {
+          claimSource.run(owner, row.source_id);
+          claimChunks.run(owner, row.source_id);
+          claimChunksTri.run(owner, row.source_id);
+        }
+      });
+    }
+  }
+
+  claimFastToolEvent(sessionId, { fingerprint = "", tool = "", worktree = "", directConvId = "" } = {}) {
+    if (typeof fingerprint !== "string" || !fingerprint) return 0;
+    const owner = this._resolveValidClaimOwner(sessionId);
+    if (!owner) return 0;
+    const rawDirect = typeof directConvId === "string" ? directConvId.trim() : "";
+    const claimantConv =
+      rawDirect && rawDirect.length <= 128 && !/[\x00-\x1f\x7f\\/]/.test(rawDirect) && !/^(?:default|all|app|lifetime|__unbound__)$/i.test(rawDirect)
+        ? rawDirect
+        : owner;
+    const normWt = typeof worktree === "string" ? worktree.trim() : "";
+    const toolFilter = typeof tool === "string" && ["read_slices", "run_checks", "batch_search"].includes(tool) ? tool : "";
+
+    let candidate;
+    if (toolFilter) {
+      candidate = this.db
+        .prepare(
+          "SELECT seq FROM events WHERE claim_fingerprint = ? AND tool = ? " +
+          "AND (session_id = 'default' OR session_id GLOB 'workspace:*') " +
+          "ORDER BY CASE WHEN ? != '' AND lower(worktree) = lower(?) THEN 0 ELSE 1 END ASC, seq DESC LIMIT 1"
+        )
+        .get(fingerprint, toolFilter, normWt, normWt);
+    } else {
+      candidate = this.db
+        .prepare(
+          "SELECT seq FROM events WHERE claim_fingerprint = ? AND tool IN ('read_slices', 'run_checks', 'batch_search') " +
+          "AND (session_id = 'default' OR session_id GLOB 'workspace:*') " +
+          "ORDER BY CASE WHEN ? != '' AND lower(worktree) = lower(?) THEN 0 ELSE 1 END ASC, seq DESC LIMIT 1"
+        )
+        .get(fingerprint, normWt, normWt);
+    }
+    if (!candidate) return 0;
+    let claimed = 0;
+    this._withWriteTx(() => {
+      const res = this.db
+        .prepare(
+          "UPDATE events SET session_id = ?, claimed_conv = ? WHERE seq = ? AND (session_id = 'default' OR session_id GLOB 'workspace:*')"
+        )
+        .run(owner, claimantConv, candidate.seq);
+      claimed = res.changes || 0;
+    });
+    return claimed;
+  }
+
+  claimFastToolClaims(sessionId, claims, { directConvId = "", windowStartIso = "", isFullTranscript = null } = {}) {
+    if (!Array.isArray(claims) || !claims.length) return 0;
+    const owner = this._resolveValidClaimOwner(sessionId);
+    if (!owner) return 0;
+    const rawDirect = typeof directConvId === "string" ? directConvId.trim() : "";
+    const claimantConv =
+      rawDirect && rawDirect.length <= 128 && !/[\x00-\x1f\x7f\\/]/.test(rawDirect) && !/^(?:default|all|app|lifetime|__unbound__)$/i.test(rawDirect)
+        ? rawDirect
+        : owner;
+    const safeWindowIso = typeof windowStartIso === "string" ? windowStartIso.trim() : "";
+    const fullMode = typeof isFullTranscript === "boolean" ? isFullTranscript : !safeWindowIso;
+
+    const byFp = new Map();
+    for (const item of claims) {
+      if (!item || typeof item.fingerprint !== "string" || !item.fingerprint) continue;
+      const list = byFp.get(item.fingerprint) || [];
+      list.push(item);
+      byFp.set(item.fingerprint, list);
+    }
+    if (byFp.size === 0) return 0;
+
+    const listOwnedStmt =
+      claimantConv === owner
+        ? this.db.prepare(
+            "SELECT seq, created_at FROM events WHERE claim_fingerprint = ? " +
+            "AND (claimed_conv = ? OR (claimed_conv IS NULL AND session_id = ?)) " +
+            "ORDER BY seq ASC"
+          )
+        : this.db.prepare(
+            "SELECT seq, created_at FROM events WHERE claim_fingerprint = ? " +
+            "AND claimed_conv = ? ORDER BY seq ASC"
+          );
+    const listPendingStmt = this.db.prepare(
+      "SELECT seq, tool, created_at FROM events WHERE claim_fingerprint = ? " +
+      "AND tool IN ('read_slices', 'run_checks', 'batch_search') " +
+      "AND (session_id = 'default' OR session_id GLOB 'workspace:*') " +
+      "ORDER BY seq ASC"
+    );
+    const updateSeqStmt = this.db.prepare(
+      "UPDATE events SET session_id = ?, claimed_conv = ? WHERE seq = ? AND (session_id = 'default' OR session_id GLOB 'workspace:*')"
+    );
+
+    const pickClosestRow = (rows, anchorMs, winLo = -Infinity, winHi = Infinity) => {
+      let pickIdx = -1;
+      let bestDiff = Infinity;
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        if (r.used) continue;
+        if (winLo > -Infinity || winHi < Infinity) {
+          if (!Number.isFinite(r.ts) || r.ts < winLo || r.ts > winHi) continue;
+        }
+        if (Number.isFinite(anchorMs) && Number.isFinite(r.ts)) {
+          const diff = Math.abs(r.ts - anchorMs);
+          if (diff < bestDiff) {
+            bestDiff = diff;
+            pickIdx = i;
+          }
+        } else if (pickIdx === -1) {
+          pickIdx = i;
+        }
+      }
+      return pickIdx;
+    };
+
+    let totalClaimed = 0;
+    for (const [fp, entries] of byFp.entries()) {
+      const pendingRows = listPendingStmt.all(fp).map((r) => ({
+        seq: r.seq,
+        ts: Date.parse(r.created_at),
+        created_at: r.created_at,
+        used: false
+      }));
+      if (!pendingRows.length) continue;
+
+      const ownedRaw =
+        claimantConv === owner
+          ? listOwnedStmt.all(fp, claimantConv, owner)
+          : listOwnedStmt.all(fp, claimantConv);
+      const ownedRows = ownedRaw.map((r) => ({
+        seq: r.seq,
+        ts: Date.parse(r.created_at),
+        created_at: r.created_at,
+        used: false
+      }));
+
+      const selectedSeqs = [];
+      if (fullMode) {
+        const needed = entries.length - ownedRows.length;
+        if (needed <= 0) continue;
+
+        const unmatched = entries.map((entry) => ({
+          entry,
+          anchor: Number.isFinite(entry.completedAtMs)
+            ? entry.completedAtMs
+            : Number.isFinite(entry.createdAtMs)
+              ? entry.createdAtMs
+              : NaN
+        }));
+        for (const owned of ownedRows) {
+          if (unmatched.length === 0) break;
+          let matchIdx = 0;
+          if (Number.isFinite(owned.ts)) {
+            let bestDiff = Infinity;
+            for (let i = 0; i < unmatched.length; i++) {
+              const diff = Number.isFinite(unmatched[i].anchor)
+                ? Math.abs(unmatched[i].anchor - owned.ts)
+                : Infinity;
+              if (diff < bestDiff) {
+                bestDiff = diff;
+                matchIdx = i;
+              }
+            }
+          }
+          unmatched.splice(matchIdx, 1);
+        }
+
+        for (const item of unmatched) {
+          const pickIdx = pickClosestRow(pendingRows, item.anchor);
+          if (pickIdx === -1) break;
+          pendingRows[pickIdx].used = true;
+          selectedSeqs.push(pendingRows[pickIdx].seq);
+        }
+      } else {
+        const timed = [];
+        const untimed = [];
+        for (const entry of entries) {
+          if (Number.isFinite(entry.createdAtMs) || Number.isFinite(entry.completedAtMs)) {
+            timed.push(entry);
+          } else {
+            untimed.push(entry);
+          }
+        }
+        for (const entry of timed) {
+          const hasStart = Number.isFinite(entry.createdAtMs);
+          const hasEnd = Number.isFinite(entry.completedAtMs);
+          const anchor = hasEnd ? entry.completedAtMs : entry.createdAtMs;
+          const winLo = hasStart && hasEnd
+            ? Math.min(entry.createdAtMs, entry.completedAtMs) - 5000
+            : anchor - 15000;
+          const winHi = hasStart && hasEnd
+            ? Math.max(entry.createdAtMs, entry.completedAtMs) + 5000
+            : anchor + 5000;
+
+          const ownedIdx = pickClosestRow(ownedRows, anchor, winLo, winHi);
+          if (ownedIdx !== -1) {
+            ownedRows[ownedIdx].used = true;
+            continue;
+          }
+          const pendIdx = pickClosestRow(pendingRows, anchor, winLo, winHi);
+          if (pendIdx !== -1) {
+            pendingRows[pendIdx].used = true;
+            selectedSeqs.push(pendingRows[pendIdx].seq);
+          }
+        }
+        if (untimed.length > 0) {
+          const ownedInWin = ownedRows.filter(
+            (r) => !r.used && (!safeWindowIso || r.created_at >= safeWindowIso)
+          ).length;
+          let neededUntimed = untimed.length - ownedInWin;
+          if (neededUntimed > 0) {
+            for (const r of pendingRows) {
+              if (neededUntimed <= 0) break;
+              if (r.used) continue;
+              if (safeWindowIso && r.created_at < safeWindowIso) continue;
+              r.used = true;
+              selectedSeqs.push(r.seq);
+              neededUntimed -= 1;
+            }
+          }
+        }
+      }
+
+      if (selectedSeqs.length > 0) {
+        this._withWriteTx(() => {
+          for (const seq of selectedSeqs) {
+            const res = updateSeqStmt.run(owner, claimantConv, seq);
+            totalClaimed += res.changes || 0;
+          }
+        });
+      }
+    }
+    return totalClaimed;
   }
 
   /** Retrieve compaction / state resume block */
@@ -619,24 +962,28 @@ export class FtsMethods {
         `)
         .all(sinceIso, limit);
     } else {
+      const rootSid = typeof this.resolveRootSessionId === "function" ? this.resolveRootSessionId(sid) : sid;
+      const familyIds = typeof this.getSessionFamilyIds === "function" ? this.getSessionFamilyIds(rootSid) : [rootSid];
+      const inClause = familyIds.length > 1 ? `IN (${familyIds.map(() => "?").join(",")})` : "= ?";
+      const sidParams = familyIds.length > 1 ? familyIds : [rootSid];
       sources = this.db
         .prepare(`
           SELECT id, label, kind, bytes_total, chunk_count, created_at
           FROM sources
-          WHERE session_id = ?
+          WHERE session_id ${inClause}
           ORDER BY created_ts DESC
           LIMIT ?
         `)
-        .all(sid, limit);
+        .all(...sidParams, limit);
       events = this.db
         .prepare(`
           SELECT seq, tool, kind, key, path, ok, sandbox_bytes, returned_bytes, agent, created_at
           FROM events
-          WHERE session_id = ?
+          WHERE session_id ${inClause}
           ORDER BY seq DESC
           LIMIT ?
         `)
-        .all(sid, limit);
+        .all(...sidParams, limit);
     }
 
     return {
@@ -653,7 +1000,11 @@ export class FtsMethods {
     const numSeq = typeof seq === "object" && seq !== null ? Number(seq.seq) : Number(seq);
     if (!Number.isInteger(numSeq) || numSeq <= 0) return null;
     if (sessionId && sessionId !== "all" && sessionId !== "lifetime" && sessionId !== "app") {
-      const row = this.db.prepare("SELECT * FROM events WHERE seq = ? AND session_id = ?").get(numSeq, sessionId);
+      const rootSid = typeof this.resolveRootSessionId === "function" ? this.resolveRootSessionId(sessionId) : sessionId;
+      const familyIds = typeof this.getSessionFamilyIds === "function" ? this.getSessionFamilyIds(rootSid) : [rootSid];
+      const inClause = familyIds.length > 1 ? `IN (${familyIds.map(() => "?").join(",")})` : "= ?";
+      const sidParams = familyIds.length > 1 ? familyIds : [rootSid];
+      const row = this.db.prepare(`SELECT * FROM events WHERE seq = ? AND session_id ${inClause}`).get(numSeq, ...sidParams);
       return row || null;
     }
     if (sessionId === "app") {

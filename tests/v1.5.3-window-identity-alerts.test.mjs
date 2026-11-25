@@ -220,6 +220,7 @@ test("v1.5.3-3: Critical watermark + TTL expiring + Stalled desktop alerts (ZH &
       stallWatchdog: true,
       watchdogPollMs: 5000,
       watchdogDesktopNotify: true,
+      ttlKeepalive: true,
       ttlDesktopNotify: true,
       ttlNotifyLeadSec: 60,
       ttlNotifyMinTokens: 60000,

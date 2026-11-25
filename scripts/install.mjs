@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 import "../hooks/compile-cache.mjs";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fsSync, { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { guardPath, read, writeFileAtomicSync } from "./targets/shared.mjs";
+import { disableCliStatusLineBridge } from "../context/lib/quota.js";
 
 const __selfPath = path.resolve(fileURLToPath(import.meta.url));
 const __dirname = path.dirname(__selfPath);
 const REPO_ROOT = path.resolve(__dirname, "..");
 const PLUGIN_NAME = "agy-dart";
 
-export const GITHUB_REPO_URL = "https://github.com/zou172866/agy-dart";
-export const GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/agy-dart";
+export const GITHUB_REPO_URL = "https://github.com/zou172866/Antigravity-agy-dart";
+export const GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/Antigravity-agy-dart";
 export const GH_AUTH_CHECK_TIMEOUT_MS = 1500;
 
 export function isGhCliAuthenticated({
@@ -192,12 +195,18 @@ export const RUNTIME_FILES = Object.freeze([
   "assets/architecture-dark.zh-CN.svg",
   "assets/architecture-light.zh-CN.svg",
   "assets/demo-comparison.zh-CN.svg",
+  "agents/dart-coder.md",
+  "agents/dart-reviewer.md",
   "rules/AGENTS.md",
   "skills/agy-dart/SKILL.md",
+  "skills/agy-dart/references/error-playbook.md",
+  "skills/agy-dart/examples/filters.json",
+  "skills/agy-dart/examples/ctx_trace_summary.py",
   "fast/mcp-server.mjs",
   "fast/session-start.mjs",
   "context/server.js",
   "context/lib/config.js",
+  "context/lib/code-outline.js",
   "context/lib/store.js",
   "context/lib/store/schema.js",
   "context/lib/store/fts.js",
@@ -206,6 +215,7 @@ export const RUNTIME_FILES = Object.freeze([
   "context/lib/store/settings-maintenance.js",
   "context/lib/executor.js",
   "context/lib/tools.js",
+  "context/lib/execution-receipts.js",
   "context/lib/cache/profiles.js",
   "context/lib/cache-analyzer.js",
   "context/lib/repo-skeleton.js",
@@ -214,6 +224,7 @@ export const RUNTIME_FILES = Object.freeze([
   "context/lib/text-diff.js",
   "context/lib/json-crusher.js",
   "context/lib/handoff.js",
+  "context/lib/quota.js",
   "context/lib/watchdog-lease.js",
   "context/lib/watchdog.js",
   "hooks/compile-cache.mjs",
@@ -222,16 +233,23 @@ export const RUNTIME_FILES = Object.freeze([
   "hooks/post-tool-use.mjs",
   "hooks/pre-invocation.mjs",
   "hooks/stop.mjs",
+  "hooks/statusline.mjs",
   "hooks/cli-filter.mjs",
   "hooks/filter-rules.mjs",
   "sidecars/dashboard/sidecar.json",
   "sidecars/dashboard/server.mjs",
   "sidecars/dashboard/index.html",
   "sidecars/dashboard/custom-theme.css",
-  "scripts/install.mjs"
+  "scripts/install.mjs",
+  "scripts/targets/shared.mjs",
+  "scripts/targets/antigravity.mjs",
+  "scripts/targets/codex.mjs",
+  "scripts/targets/claude-code.mjs",
+  "scripts/targets/index.mjs"
 ]);
 
 export const DEVTOOLS_FILES = Object.freeze([
+  "bin/agy-dart.mjs",
   "fast/benchmark.mjs",
   "context/lib/cache-simulator.js",
   "scripts/cache-audit.mjs",
@@ -252,10 +270,16 @@ function getGlobalPluginsRoot() {
   return path.join(getHomeDir(), ".gemini", "config", "plugins");
 }
 
-function checkNodeAndSqlite() {
-  const major = Number.parseInt(process.versions.node.split(".")[0] || "0", 10);
-  if (major < 22) {
-    throw new Error(`Node.js >= 22 (with built-in node:sqlite) is required. Current: v${process.versions.node}`);
+export async function checkNodeAndSqlite() {
+  let db;
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    db = new DatabaseSync(":memory:");
+    db.exec("CREATE VIRTUAL TABLE probe USING fts5(body, tokenize='trigram')");
+  } catch (error) {
+    throw new Error(`agy-dart requires node:sqlite with FTS5 and its trigram tokenizer. Install Node.js 22.16+ (22.x) or 24+. Current: v${process.versions.node} (${error.message})`, { cause: error });
+  } finally {
+    db?.close();
   }
   return process.versions.node;
 }
@@ -495,7 +519,7 @@ async function applyMode(targetDir, modeKey, skipDb = false, { explicitMode = tr
       ],
       PostToolUse: [
         {
-          matcher: "run_command|edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|.*apply_edits|.*run_checks|.*ctx_resume|call_mcp_tool",
+          matcher: "run_command|edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|.*apply_edits|.*run_checks|.*read_slices|.*batch_search|.*ctx_resume|.*ctx_execute|.*ctx_index|.*ctx_batch|call_mcp_tool",
           hooks: [
             {
               type: "command",
@@ -620,7 +644,7 @@ try {
   return true;
 }
 
-async function verifyMcpServer(scriptPath, extraEnv = {}) {
+export async function verifyMcpServer(scriptPath, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [scriptPath], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -719,8 +743,7 @@ async function verifySessionStart(hookScript, sampleDir, dbPath, { hooksJsonPath
 }
 
 async function runDoctor(targetDir, { json = false, showStarHint = true } = {}) {
-  const nodeVer = checkNodeAndSqlite();
-  await import("node:sqlite");
+  const nodeVer = await checkNodeAndSqlite();
   const exists = await pathExists(targetDir);
   if (!exists) {
     if (json) {
@@ -1129,28 +1152,32 @@ function realpathCanonicalSync(p) {
   return stripWinExtendedPrefix(real);
 }
 
-function normalizeComparePath(p) {
+function canonicalPath(p) {
   const stripped = stripWinExtendedPrefix(String(p || ""));
   const resolved = path.resolve(stripped);
   if (isUncOrDevicePath(p) || isLexicalFilesystemRoot(stripped)) {
-    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    return resolved;
   }
   let cur = resolved;
   const tail = [];
   while (true) {
     try {
       const real = realpathCanonicalSync(cur);
-      const joined = tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
-      return process.platform === "win32" ? joined.toLowerCase() : joined;
+      return path.join(real, ...tail.reverse());
     } catch {
       const parent = path.dirname(cur);
       if (!parent || parent === cur) {
-        return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+        return resolved;
       }
       tail.push(path.basename(cur));
       cur = parent;
     }
   }
+}
+
+function normalizeComparePath(p) {
+  const canonical = canonicalPath(p);
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
 }
 
 function isPathSameOrInside(candidate, ancestor) {
@@ -1258,7 +1285,119 @@ export function discoverExtraHostPluginTargets({
   return found;
 }
 
-async function copyManifestToTargetDir(srcRoot, dstRoot, manifest) {
+const SYNC_MARKER = ".agy-dart-sync.json";
+
+function syncReceiptDir() {
+  return path.join(canonicalPath(getHomeDir()), ".agy-dart", "synced-hosts");
+}
+
+function syncReceiptName(primary, target) {
+  return createHash("sha256").update(JSON.stringify([primary, target])).digest("hex") + ".json";
+}
+
+function getSyncMarker(target, primary) {
+  const raw = read(path.join(target, SYNC_MARKER));
+  if (!raw) return null;
+  const marker = JSON.parse(raw);
+  if (marker.primary !== normalizeComparePath(primary) || marker.target !== target) return null;
+  if (!Array.isArray(marker.files) || !marker.files.every(rel =>
+    typeof rel === "string" && rel.split("/").every(part => /^[\w.-]+$/.test(part) && part !== "." && part !== "..")
+  )) throw new Error(`Invalid synced file list at ${target}`);
+  const plugin = read(path.join(target, "plugin.json"));
+  if (plugin !== null && JSON.parse(plugin.replace(/^\uFEFF/, "")).name !== PLUGIN_NAME) {
+    throw new Error(`Secondary host at ${target} now contains a different plugin`);
+  }
+  return marker;
+}
+
+function reportUntrackedHost(target) {
+  if (fsSync.existsSync(path.join(target, SYNC_MARKER))) {
+    console.log(`  - Kept secondary host owned by another installation at ${target}`);
+    return;
+  }
+  console.log(`  - Kept untracked secondary host at ${target}. To remove this copy explicitly, run: node scripts/install.mjs uninstall --target "${target}"`);
+}
+
+async function prepareHostSync(target, primary, manifest) {
+  const previous = getSyncMarker(target, primary);
+  if (!previous && (await pathExists(target)) && (await fs.readdir(target)).length) {
+    if (await hasValidPluginManifest(target)) reportUntrackedHost(target);
+    else console.log(`  - Kept non-empty secondary host directory at ${target}`);
+    return null;
+  }
+  // Record intent before copying so an interrupted sync can be retried or uninstalled.
+  const owner = normalizeComparePath(primary);
+  const receipt = path.join(syncReceiptDir(), syncReceiptName(owner, target));
+  writeFileAtomicSync(receipt, JSON.stringify({ primary: owner, target }));
+  const marker = {
+    primary: owner, target, files: [...new Set([...(previous?.files ?? []), ...manifest])]
+  };
+  writeFileAtomicSync(path.join(target, SYNC_MARKER), JSON.stringify(marker));
+  return marker;
+}
+
+async function removeSyncedFiles(target, files) {
+  const parents = new Set();
+  for (const rel of files) {
+    const file = path.join(target, rel);
+    guardPath(file);
+    await fs.rm(file, { force: true });
+    for (let dir = path.dirname(file); dir !== target; dir = path.dirname(dir)) parents.add(dir);
+  }
+  for (const dir of [...parents].sort((a, b) => b.length - a.length)) await removeEmptyDir(dir);
+}
+
+async function uninstallSyncedHosts(primary) {
+  const owner = normalizeComparePath(primary);
+  const receipts = syncReceiptDir();
+  guardPath(receipts);
+  const known = new Set();
+  const entries = await fs.readdir(receipts).catch(err => {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  });
+  for (const entry of entries.filter(name => /^[a-f0-9]{64}\.json$/.test(name))) {
+    const receipt = path.join(receipts, entry);
+    const raw = read(receipt);
+    if (raw === null) continue;
+    const record = JSON.parse(raw);
+    if (record.primary !== owner) continue;
+    const target = record.target;
+    if (typeof target !== "string" || !path.isAbsolute(target) || path.basename(target) !== PLUGIN_NAME ||
+        path.basename(path.dirname(target)) !== "plugins" || syncReceiptName(owner, target) !== entry ||
+        canonicalPath(target) !== target || isProtectedTargetDir(target, REPO_ROOT, { allowInstalledSelf: true })) {
+      throw new Error(`Invalid secondary host target in ${receipt}`);
+    }
+    known.add(normalizeComparePath(target));
+    const marker = getSyncMarker(target, primary);
+    if (marker) {
+      // Only remove files installed here. Leave local rules and other user-owned files.
+      await removeSyncedFiles(target, marker.files);
+      // Retain the inert marker alongside local rules so a reinstall recognizes ownership.
+      if ((await fs.readdir(target)).every(name => name === SYNC_MARKER)) {
+        await fs.rm(path.join(target, SYNC_MARKER), { force: true });
+        await removeEmptyDir(target);
+      }
+      console.log(`Removed agy-dart from secondary host at ${target}`);
+    } else if (await hasValidPluginManifest(target)) {
+      reportUntrackedHost(target);
+    }
+    await fs.rm(receipt, { force: true });
+  }
+  await removeEmptyDir(receipts);
+  for (const target of discoverExtraHostPluginTargets({ primaryTargetDir: primary })) {
+    if (!known.has(normalizeComparePath(target)) && await hasValidPluginManifest(target)) reportUntrackedHost(target);
+  }
+}
+
+async function removeEmptyDir(dir) {
+  try { await fs.rmdir(dir); }
+  catch (err) {
+    if (err.code !== "ENOENT" && err.code !== "ENOTEMPTY" && err.code !== "EEXIST") throw err;
+  }
+}
+
+async function copyManifestToTargetDir(srcRoot, dstRoot, manifest, syncMarker = null) {
   let dstStat = null;
   try {
     dstStat = await fs.stat(dstRoot);
@@ -1273,29 +1412,32 @@ async function copyManifestToTargetDir(srcRoot, dstRoot, manifest) {
       throw new Error(`Refusing to install into non-directory path: ${dstRoot}`);
     }
     const entries = await fs.readdir(dstRoot);
-    if (entries.length > 0 && !(await hasValidPluginManifest(dstRoot))) {
+    if (entries.length > 0 && !syncMarker && !(await hasValidPluginManifest(dstRoot))) {
       throw new Error(
         `Refusing to install into non-empty directory ${dstRoot}: directory does not contain an '${PLUGIN_NAME}' plugin.json manifest.`
       );
     }
-    await purgeSymlinksInsideDir(dstRoot);
+    if (!syncMarker) await purgeSymlinksInsideDir(dstRoot);
   }
   await fs.mkdir(dstRoot, { recursive: true });
   const keepRelSet = new Set();
   for (const rel of manifest) {
     const src = path.join(srcRoot, rel);
     const dst = path.join(dstRoot, rel);
+    if (syncMarker) guardPath(dst);
     await fs.mkdir(path.dirname(dst), { recursive: true });
     await fs.copyFile(src, dst);
     const normRel = rel.replace(/\\/g, "/");
     keepRelSet.add(process.platform === "win32" ? normRel.toLowerCase() : normRel);
   }
-  return pruneStaleEntries(dstRoot, keepRelSet);
+  if (!syncMarker) return pruneStaleEntries(dstRoot, keepRelSet);
+  await removeSyncedFiles(dstRoot, syncMarker.files.filter(rel => !manifest.includes(rel)));
+  writeFileAtomicSync(path.join(dstRoot, SYNC_MARKER), JSON.stringify({ ...syncMarker, files: manifest }));
+  return [];
 }
 
 async function runInstall(opts) {
-  checkNodeAndSqlite();
-  await import("node:sqlite");
+  await checkNodeAndSqlite();
 
   const srcRoot = path.resolve(REPO_ROOT);
   const dstRoot = path.resolve(opts.targetDir);
@@ -1336,19 +1478,22 @@ async function runInstall(opts) {
 
   if (!opts.isCustomTarget && !opts.isProject && opts.syncHosts !== false) {
     const extraTargets = discoverExtraHostPluginTargets({ primaryTargetDir: dstRoot });
-    for (const extraDst of extraTargets) {
+    const failures = [];
+    for (const discovered of extraTargets) {
       try {
-        await assertNotSymlinkTarget(extraDst);
-        await copyManifestToTargetDir(srcRoot, extraDst, manifest);
+        await assertNotSymlinkTarget(discovered);
+        const extraDst = canonicalPath(discovered);
+        const marker = await prepareHostSync(extraDst, dstRoot, manifest);
+        if (!marker) continue;
+        await copyManifestToTargetDir(srcRoot, extraDst, manifest, marker);
         await applyToolLoading(extraDst, effectiveToolLoading);
         await applyMode(extraDst, opts.mode, true, { explicitMode: opts.explicitMode });
         console.log(`  - Synced secondary host plugin dir: ${extraDst}`);
       } catch (syncErr) {
-        console.log(
-          `  - Note          : Skipped secondary host sync at ${extraDst} (${syncErr instanceof Error ? syncErr.message : String(syncErr)})`
-        );
+        failures.push(`${discovered}: ${syncErr instanceof Error ? syncErr.message : String(syncErr)}`);
       }
     }
+    if (failures.length) throw new Error(`Secondary host sync incomplete:\n${failures.join("\n")}`);
   }
 
   if (opts.installRg) {
@@ -1389,7 +1534,7 @@ async function main() {
       if (!opts.isCustomTarget && !opts.isProject && opts.syncHosts !== false) {
         for (const extraDst of discoverExtraHostPluginTargets({ primaryTargetDir: targetResolved })) {
           try {
-            if ((await pathExists(extraDst)) && (await hasValidPluginManifest(extraDst))) {
+            if (getSyncMarker(canonicalPath(extraDst), targetResolved) && await hasValidPluginManifest(extraDst)) {
               await assertNotSymlinkTarget(extraDst);
               await applyMode(extraDst, opts.mode, true, { explicitMode: true });
             }
@@ -1420,7 +1565,7 @@ async function main() {
       if (!opts.isCustomTarget && !opts.isProject && opts.syncHosts !== false) {
         for (const extraDst of discoverExtraHostPluginTargets({ primaryTargetDir: targetResolved })) {
           try {
-            if ((await pathExists(extraDst)) && (await hasValidPluginManifest(extraDst))) {
+            if (getSyncMarker(canonicalPath(extraDst), targetResolved) && await hasValidPluginManifest(extraDst)) {
               await assertNotSymlinkTarget(extraDst);
               await applyToolLoading(extraDst, eff);
             }
@@ -1442,11 +1587,26 @@ async function main() {
         throw new Error(`Refusing to delete protected directory: ${targetResolved}`);
       }
       await assertNotSymlinkTarget(targetResolved, opts.projectDir);
-      if (await pathExists(targetResolved)) {
-        // Verify target actually contains an agy-dart plugin.json manifest before recursive deletion
-        if (!(await hasValidPluginManifest(targetResolved))) {
-          throw new Error(`Refusing to delete ${targetResolved}: directory does not contain an '${PLUGIN_NAME}' plugin.json manifest.`);
+      const installed = await pathExists(targetResolved);
+      if (installed && !(await hasValidPluginManifest(targetResolved))) {
+        throw new Error(`Refusing to delete ${targetResolved}: directory does not contain an '${PLUGIN_NAME}' plugin.json manifest.`);
+      }
+      if (!opts.isCustomTarget && !opts.isProject && opts.syncHosts) await uninstallSyncedHosts(targetResolved);
+      if (!opts.isCustomTarget && !opts.isProject) {
+        try {
+          const slRes = disableCliStatusLineBridge({ pluginRoot: targetResolved });
+          if (slRes.ok && slRes.changed) {
+            console.log(
+              slRes.restored
+                ? `Restored previous CLI statusLine in ${slRes.settingsPath}`
+                : `Removed agy-dart CLI statusLine from ${slRes.settingsPath}`
+            );
+          }
+        } catch {
+          // Best-effort cleanup: never block plugin uninstall
         }
+      }
+      if (installed) {
         if (isPathSameOrInside(process.cwd(), targetResolved)) {
           try {
             process.chdir(path.dirname(targetResolved));

@@ -6,3 +6,5 @@ Thumbs.db
 *.db-wal
 *.db-shm
 .idea/
+__pycache__/
+*.py[cod]

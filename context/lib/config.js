@@ -26,6 +26,7 @@ export const CONFIG_DEFAULTS = Object.freeze({
   diffReadMaxTurns: 12,
   diffReadMaxAgeMs: 15 * 60 * 1000,
   maxReadBytes: null,
+  inlineOutlineMaxBytes: 524288,
   noiseMaxReadBytes: 16384,
   reviewMaxReadBytes: 131072,
   shellDumpMaxBytes: 16384,
@@ -62,9 +63,10 @@ export const CONFIG_DEFAULTS = Object.freeze({
   ttlDesktopNotify: false,
   ttlNotifyLeadSec: 60,
   ttlNotifyMinTokens: 60000,
-  ttlKeepalive: true,
-  ttlKeepaliveMaxCount: 3,
-  ttlKeepaliveLeadSec: 30,
+  ttlKeepalive: false,
+  ttlKeepaliveMaxCount: 1,
+  ttlKeepaliveLeadSec: 60,
+  ttlKeepaliveMinContextPct: 15,
   ttlKeepaliveMinTokens: 0,
   watermarkDesktopNotify: null,
   toolLoading: "fast-eager",
@@ -362,6 +364,7 @@ export function getConfigSnapshot(options = {}) {
     parseNonNegativeInt(env?.AGY_DART_MAX_READ_BYTES) ?? parseNonNegativeInt(env?.CONTEXT_MODE_MAX_READ_BYTES),
     parseNonNegativeInt(cfg.maxReadBytes)
   );
+  pick("inlineOutlineMaxBytes", parseNonNegativeInt(env?.AGY_DART_INLINE_OUTLINE_MAX_BYTES), parseNonNegativeInt(cfg.inlineOutlineMaxBytes));
   pick(
     "noiseMaxReadBytes",
     parseNonNegativeInt(env?.AGY_DART_NOISE_MAX_READ_BYTES),
@@ -534,16 +537,23 @@ export function getConfigSnapshot(options = {}) {
       parseEnvBool(env?.AGY_DART_TTL_KEEPALIVE) ??
       parseDisableEnvFlag(env?.AGY_DART_DISABLE_TTL_KEEPALIVE);
   }
-  pick("ttlKeepalive", ttlKeepaliveEnv, cfgBool("ttlKeepalive"));
+  const configuredKeepaliveCount = clampInt(parseNonNegativeInt(cfg.ttlKeepaliveMaxCount), 0, 20);
+  // Existing configs can opt in with a positive count alone.
+  pick("ttlKeepalive", ttlKeepaliveEnv, cfgBool("ttlKeepalive") ?? (configuredKeepaliveCount > 0 ? true : undefined));
   pick(
     "ttlKeepaliveMaxCount",
     clampInt(parseNonNegativeInt(env?.AGY_DART_TTL_KEEPALIVE_MAX_COUNT), 0, 20),
-    clampInt(parseNonNegativeInt(cfg.ttlKeepaliveMaxCount), 0, 20)
+    configuredKeepaliveCount
   );
   pick(
     "ttlKeepaliveLeadSec",
     clampInt(parsePositiveInt(env?.AGY_DART_TTL_KEEPALIVE_LEAD_SEC), 10, 180),
     clampInt(parsePositiveInt(cfg.ttlKeepaliveLeadSec), 10, 180)
+  );
+  pick(
+    "ttlKeepaliveMinContextPct",
+    clampInt(parseNonNegativeInt(env?.AGY_DART_TTL_KEEPALIVE_MIN_CONTEXT_PCT), 0, 100),
+    clampInt(parseNonNegativeInt(cfg.ttlKeepaliveMinContextPct), 0, 100)
   );
   pick(
     "ttlKeepaliveMinTokens",
@@ -623,7 +633,7 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra
     .join(", ");
   lines.push(
     `  - Read guard    : mode=${values.readGuardMode} (${sources.readGuardMode}), source=${fmtKb(effSourceCutoff)} (${effSourceProv}), ` +
-      `noise=${fmtKb(values.noiseMaxReadBytes)}, review=${fmtKb(values.reviewMaxReadBytes)}, shellDump=${fmtKb(values.shellDumpMaxBytes)}` +
+      `inlineOutlineMaxBytes=${values.inlineOutlineMaxBytes}, noise=${fmtKb(values.noiseMaxReadBytes)}, review=${fmtKb(values.reviewMaxReadBytes)}, shellDump=${fmtKb(values.shellDumpMaxBytes)}` +
       (exemptSummary ? `, ${exemptSummary}` : "")
   );
   lines.push(
@@ -642,7 +652,7 @@ export function formatEffectiveConfigLines(snapshot = getConfigSnapshot(), extra
   lines.push(
     `  - TTL alert     : desktopNotify=${values.ttlDesktopNotify} (${sources.ttlDesktopNotify}), ` +
       `watermarkNotify=${wmNotifyDisplay} (${sources.watermarkDesktopNotify}), ` +
-      `keepalive=${values.ttlKeepalive} (${sources.ttlKeepalive}, max=${values.ttlKeepaliveMaxCount}, lead=${values.ttlKeepaliveLeadSec}s), ` +
+      `keepalive=${values.ttlKeepalive} (${sources.ttlKeepalive}, max=${values.ttlKeepaliveMaxCount}, lead=${values.ttlKeepaliveLeadSec}s, minCtx=${values.ttlKeepaliveMinContextPct}%), ` +
       `lead=${values.ttlNotifyLeadSec}s, minTokens=${values.ttlNotifyMinTokens}, lang=${values.uiLang} (${sources.uiLang})`
   );
 
