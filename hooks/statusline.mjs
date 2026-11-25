@@ -24,6 +24,8 @@ import { enableVersionedCompileCache, suppressSqliteExperimentalWarning } from "
 import {
   buildStatusLineSetupInfo,
   collectLocalRollingUsage,
+  disableCliStatusLineBridge,
+  enableCliStatusLineBridge,
   formatResetDuration,
   formatStatusLineOutput,
   MAX_STATUSLINE_STDIN_BYTES,
@@ -229,17 +231,21 @@ export function forwardStatusLineToChainScript(rawInput, chainScriptPath, { time
   return { ok: false, stdout: "" };
 }
 
-function parseChainScriptArg(args) {
+function parseFlagValue(args, flagName) {
   for (let i = 0; i < args.length; i += 1) {
     const a = args[i];
-    if (a === "--chain-script" && i + 1 < args.length) {
+    if (a === flagName && i + 1 < args.length) {
       return args[i + 1];
     }
-    if (a.startsWith("--chain-script=")) {
-      return a.slice("--chain-script=".length);
+    if (a.startsWith(`${flagName}=`)) {
+      return a.slice(flagName.length + 1);
     }
   }
   return "";
+}
+
+function parseChainScriptArg(args) {
+  return parseFlagValue(args, "--chain-script");
 }
 
 const isDirectRun =
@@ -247,12 +253,52 @@ const isDirectRun =
 
 if (isDirectRun) {
   const args = process.argv.slice(2);
+  const settingsPathOpt = parseFlagValue(args, "--settings-path") || undefined;
+  const receiptPathOpt = parseFlagValue(args, "--receipt-path") || undefined;
+  const asJson = args.includes("--json");
+
   if (args.includes("--setup-snippet")) {
-    const setup = buildStatusLineSetupInfo(PLUGIN_ROOT);
+    const setup = buildStatusLineSetupInfo(PLUGIN_ROOT, { settingsPath: settingsPathOpt });
     process.stdout.write(setup.snippetJson + "\n");
+  } else if (args.includes("--enable")) {
+    const res = enableCliStatusLineBridge({
+      pluginRoot: PLUGIN_ROOT,
+      ...(settingsPathOpt ? { settingsPath: settingsPathOpt } : {}),
+      ...(receiptPathOpt ? { receiptPath: receiptPathOpt } : {}),
+      force: args.includes("--force")
+    });
+    if (asJson) {
+      process.stdout.write(JSON.stringify(res, null, 2) + "\n");
+    } else if (res.ok) {
+      const chainNote = res.chainedScriptPath ? ` (chained with ${res.chainedScriptPath})` : "";
+      process.stdout.write(`Enabled agy-dart CLI statusLine in ${res.settingsPath}${chainNote}\n`);
+    } else {
+      process.stderr.write((res.message || res.error || "Failed to enable statusLine") + "\n");
+    }
+    if (!res.ok) process.exitCode = 1;
+  } else if (args.includes("--disable")) {
+    const res = disableCliStatusLineBridge({
+      pluginRoot: PLUGIN_ROOT,
+      ...(settingsPathOpt ? { settingsPath: settingsPathOpt } : {}),
+      ...(receiptPathOpt ? { receiptPath: receiptPathOpt } : {})
+    });
+    if (asJson) {
+      process.stdout.write(JSON.stringify(res, null, 2) + "\n");
+    } else if (res.ok) {
+      if (!res.changed) {
+        process.stdout.write(`No agy-dart statusLine entry to remove in ${res.settingsPath}\n`);
+      } else if (res.restored) {
+        process.stdout.write(`Disabled agy-dart statusLine and restored previous statusLine in ${res.settingsPath}\n`);
+      } else {
+        process.stdout.write(`Removed agy-dart statusLine from ${res.settingsPath}\n`);
+      }
+    } else {
+      process.stderr.write((res.message || res.error || "Failed to disable statusLine") + "\n");
+    }
+    if (!res.ok) process.exitCode = 1;
   } else if (args.includes("--report") || args.includes("--quota")) {
     const report = await buildQuotaReport();
-    if (args.includes("--json")) {
+    if (asJson) {
       process.stdout.write(JSON.stringify(report, null, 2) + "\n");
     } else {
       process.stdout.write(formatQuotaReportText(report) + "\n");
@@ -262,7 +308,7 @@ if (isDirectRun) {
     const res = await handleStatusLineInput(raw);
     const chainScript = parseChainScriptArg(args);
     const chained = chainScript ? forwardStatusLineToChainScript(raw, chainScript) : { ok: false, stdout: "" };
-    if (args.includes("--json")) {
+    if (asJson) {
       process.stdout.write(
         JSON.stringify({ ok: res.ok, saved: res.saved, chained: chained.ok, official: res.projected }, null, 2) + "\n"
       );

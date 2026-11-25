@@ -433,33 +433,485 @@ export function formatStatusLineOutput(snapshot, { nowMs = Date.now() } = {}) {
   return parts.join(" | ").replace(/[\r\n]+/g, " ");
 }
 
+export function getDefaultCliSettingsPath() {
+  return path.join(os.homedir(), ".gemini", "antigravity-cli", "settings.json");
+}
+
+export function getDefaultStatusLineBackupPath() {
+  return path.join(os.homedir(), ".agy-dart", "statusline-backup.json");
+}
+
+function normalizePosixSlashes(p) {
+  return String(p || "").replace(/\\/g, "/");
+}
+
+function expandLeadingTilde(p) {
+  if (typeof p !== "string") return "";
+  const s = p.trim();
+  if (s === "~") return os.homedir();
+  if (s.startsWith("~/") || s.startsWith("~\\")) {
+    return path.join(os.homedir(), s.slice(2));
+  }
+  return s;
+}
+
+function sameFsPath(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || !a.trim() || !b.trim()) return false;
+  const na = path.resolve(a.trim());
+  const nb = path.resolve(b.trim());
+  return process.platform === "win32" ? na.toLowerCase() === nb.toLowerCase() : na === nb;
+}
+
+function splitSimpleCommandTokens(commandStr) {
+  if (typeof commandStr !== "string" || !commandStr.trim()) return [];
+  const tokens = [];
+  let cur = "";
+  let quote = "";
+  for (let i = 0; i < commandStr.length; i += 1) {
+    const ch = commandStr[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"' && i + 1 < commandStr.length && (commandStr[i + 1] === '"' || commandStr[i + 1] === "\\")) {
+        cur += commandStr[i + 1];
+        i += 1;
+        continue;
+      }
+      if (ch === quote) {
+        quote = "";
+        continue;
+      }
+      cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (cur.length > 0) {
+        tokens.push(cur);
+        cur = "";
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.length > 0) tokens.push(cur);
+  return tokens;
+}
+
+function isNodeExecutableToken(tok) {
+  if (typeof tok !== "string" || !tok.trim()) return false;
+  const base = path.basename(tok.trim()).toLowerCase();
+  return base === "node" || base === "node.exe";
+}
+
+function isAgyDartStatusLinePath(scriptPath, pluginRoot = null) {
+  if (typeof scriptPath !== "string" || !scriptPath.trim()) return false;
+  const expanded = expandLeadingTilde(scriptPath);
+  if (pluginRoot) {
+    const expected = path.join(path.resolve(pluginRoot), "hooks", "statusline.mjs");
+    if (sameFsPath(expanded, expected)) return true;
+  }
+  const posix = normalizePosixSlashes(path.resolve(expanded)).toLowerCase();
+  return posix.endsWith("/agy-dart/hooks/statusline.mjs");
+}
+
+function parseNodeStatusLineCommand(commandStr, pluginRoot = null) {
+  const tokens = splitSimpleCommandTokens(commandStr);
+  if (tokens.length < 2 || !isNodeExecutableToken(tokens[0])) {
+    return { isNode: false, isAgyDart: false, scriptPath: "", chainedScriptPath: "" };
+  }
+  const rawScript = tokens[1];
+  if (!rawScript || rawScript.startsWith("-")) {
+    return { isNode: false, isAgyDart: false, scriptPath: "", chainedScriptPath: "" };
+  }
+  const scriptPath = path.resolve(expandLeadingTilde(rawScript));
+  const isAgyDart = isAgyDartStatusLinePath(scriptPath, pluginRoot);
+  let chainedScriptPath = "";
+  const extraTokens = tokens.slice(2);
+  if (isAgyDart) {
+    for (let i = 0; i < extraTokens.length; i += 1) {
+      const arg = extraTokens[i];
+      if (arg === "--chain-script" && i + 1 < extraTokens.length) {
+        chainedScriptPath = path.resolve(expandLeadingTilde(extraTokens[i + 1]));
+        break;
+      }
+      if (arg.startsWith("--chain-script=")) {
+        chainedScriptPath = path.resolve(expandLeadingTilde(arg.slice("--chain-script=".length)));
+        break;
+      }
+    }
+    return { isNode: true, isAgyDart: true, scriptPath, chainedScriptPath };
+  }
+  // Only auto-chain simple single-script Node statusLine commands (`node <script>`) without extra custom flags
+  if (extraTokens.length > 0) {
+    return { isNode: false, isAgyDart: false, scriptPath: "", chainedScriptPath: "" };
+  }
+  return { isNode: true, isAgyDart: false, scriptPath, chainedScriptPath: "" };
+}
+
+/**
+ * Inspect an existing Antigravity CLI `settings.json` statusLine entry without modifying disk.
+ */
+export function inspectExistingCliStatusLine(settingsPath = getDefaultCliSettingsPath(), { pluginRoot = null } = {}) {
+  const resolvedSettings = path.resolve(expandLeadingTilde(settingsPath || getDefaultCliSettingsPath()));
+  if (!fs.existsSync(resolvedSettings)) {
+    return {
+      exists: false,
+      parseError: null,
+      settingsPath: resolvedSettings,
+      rawSettings: null,
+      statusLine: null,
+      kind: "none",
+      existingCommand: "",
+      existingScriptPath: "",
+      chainedScriptPath: ""
+    };
+  }
+  let parsed;
+  try {
+    const rawText = fs.readFileSync(resolvedSettings, "utf8").replace(/^\uFEFF/, "");
+    parsed = rawText.trim() ? JSON.parse(rawText) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("settings.json root must be a JSON object");
+    }
+  } catch (err) {
+    return {
+      exists: true,
+      parseError: err instanceof Error ? err.message : String(err),
+      settingsPath: resolvedSettings,
+      rawSettings: null,
+      statusLine: null,
+      kind: "invalid_json",
+      existingCommand: "",
+      existingScriptPath: "",
+      chainedScriptPath: ""
+    };
+  }
+
+  const sl = parsed.statusLine && typeof parsed.statusLine === "object" && !Array.isArray(parsed.statusLine)
+    ? parsed.statusLine
+    : null;
+  const cmd = typeof sl?.command === "string" ? sl.command.trim() : "";
+  if (!sl || !cmd) {
+    return {
+      exists: true,
+      parseError: null,
+      settingsPath: resolvedSettings,
+      rawSettings: parsed,
+      statusLine: sl,
+      kind: "none",
+      existingCommand: cmd,
+      existingScriptPath: "",
+      chainedScriptPath: ""
+    };
+  }
+
+  const nodeInfo = parseNodeStatusLineCommand(cmd, pluginRoot);
+  if (nodeInfo.isAgyDart) {
+    return {
+      exists: true,
+      parseError: null,
+      settingsPath: resolvedSettings,
+      rawSettings: parsed,
+      statusLine: sl,
+      kind: "agy_dart",
+      existingCommand: cmd,
+      existingScriptPath: nodeInfo.scriptPath,
+      chainedScriptPath: nodeInfo.chainedScriptPath
+    };
+  }
+  if (nodeInfo.isNode && nodeInfo.scriptPath) {
+    return {
+      exists: true,
+      parseError: null,
+      settingsPath: resolvedSettings,
+      rawSettings: parsed,
+      statusLine: sl,
+      kind: "other_node",
+      existingCommand: cmd,
+      existingScriptPath: nodeInfo.scriptPath,
+      chainedScriptPath: ""
+    };
+  }
+  return {
+    exists: true,
+    parseError: null,
+    settingsPath: resolvedSettings,
+    rawSettings: parsed,
+    statusLine: sl,
+    kind: "other_command",
+    existingCommand: cmd,
+    existingScriptPath: "",
+    chainedScriptPath: ""
+  };
+}
+
+function writeJsonFileAtomic(targetPath, obj) {
+  const resolved = path.resolve(targetPath);
+  fs.mkdirSync(path.dirname(resolved), { recursive: true });
+  const tmpPath = `${resolved}.tmp.${process.pid}.${Date.now()}`;
+  const serialized = JSON.stringify(obj, null, 2) + "\n";
+  try {
+    fs.writeFileSync(tmpPath, serialized, "utf8");
+    fs.renameSync(tmpPath, resolved);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {}
+    throw err;
+  }
+}
+
 /**
  * Build a ready-to-copy `~/.gemini/antigravity-cli/settings.json` snippet pointing to `hooks/statusline.mjs`.
+ * Automatically detects an existing Node statusLine plugin and produces a non-destructive `--chain-script` snippet.
  */
-export function buildStatusLineSetupInfo(pluginRoot) {
+export function buildStatusLineSetupInfo(pluginRoot, { settingsPath = null } = {}) {
   const resolvedRoot =
     typeof pluginRoot === "string" && pluginRoot.trim()
       ? path.resolve(pluginRoot.trim())
       : path.join(os.homedir(), ".gemini", "config", "plugins", "agy-dart");
   const scriptPath = path.join(resolvedRoot, "hooks", "statusline.mjs");
-  const quotedPath = scriptPath.replace(/\\/g, "/");
-  const command = `node "${quotedPath}"`;
-  const settingsPath = path.join(os.homedir(), ".gemini", "antigravity-cli", "settings.json");
+  const quotedPath = normalizePosixSlashes(scriptPath);
+  const effectiveSettingsPath = settingsPath || getDefaultCliSettingsPath();
+  const inspected = inspectExistingCliStatusLine(effectiveSettingsPath, { pluginRoot: resolvedRoot });
+
+  let mode = "standalone";
+  let chainedScriptPath = "";
+  let stackWithDefault = true;
+  let padding = undefined;
+
+  if (inspected.kind === "agy_dart") {
+    mode = "already_configured";
+    chainedScriptPath = inspected.chainedScriptPath || "";
+    if (typeof inspected.statusLine?.stack_with_default === "boolean") {
+      stackWithDefault = inspected.statusLine.stack_with_default;
+    }
+    if (Number.isInteger(inspected.statusLine?.padding) && inspected.statusLine.padding >= 0) {
+      padding = inspected.statusLine.padding;
+    }
+  } else if (inspected.kind === "other_node" && inspected.existingScriptPath) {
+    mode = "chain";
+    chainedScriptPath = inspected.existingScriptPath;
+    if (typeof inspected.statusLine?.stack_with_default === "boolean") {
+      stackWithDefault = inspected.statusLine.stack_with_default;
+    }
+    if (Number.isInteger(inspected.statusLine?.padding) && inspected.statusLine.padding >= 0) {
+      padding = inspected.statusLine.padding;
+    }
+  } else if (inspected.kind === "other_command") {
+    mode = "manual_non_node";
+  }
+
+  const command = chainedScriptPath
+    ? `node "${quotedPath}" --chain-script "${normalizePosixSlashes(chainedScriptPath)}"`
+    : `node "${quotedPath}"`;
   const snippetObj = {
     statusLine: {
       type: "command",
       command,
       enabled: true,
-      stack_with_default: true
+      ...(padding !== undefined ? { padding } : {}),
+      stack_with_default: stackWithDefault
     }
   };
   return {
-    settingsPath,
+    settingsPath: inspected.settingsPath,
     scriptPath,
     command,
+    mode,
+    alreadyConfigured: inspected.kind === "agy_dart",
+    chainedScriptPath,
+    existingCommand: inspected.existingCommand || "",
+    enableCommand: `node "${quotedPath}" --enable`,
+    disableCommand: `node "${quotedPath}" --disable`,
     snippetJson: JSON.stringify(snippetObj, null, 2),
     appHint: "Settings > Models",
     cliHint: "/usage"
+  };
+}
+
+/**
+ * Enable the official Antigravity CLI `statusLine` bridge in `~/.gemini/antigravity-cli/settings.json`.
+ * Preserves unrelated settings keys, backs up any prior `statusLine` entry, and auto-chains existing Node statusLine scripts.
+ */
+export function enableCliStatusLineBridge({
+  pluginRoot = null,
+  settingsPath = getDefaultCliSettingsPath(),
+  receiptPath = getDefaultStatusLineBackupPath(),
+  force = false
+} = {}) {
+  const resolvedRoot =
+    typeof pluginRoot === "string" && pluginRoot.trim()
+      ? path.resolve(pluginRoot.trim())
+      : path.join(os.homedir(), ".gemini", "config", "plugins", "agy-dart");
+  const scriptPath = path.join(resolvedRoot, "hooks", "statusline.mjs");
+  const quotedPath = normalizePosixSlashes(scriptPath);
+  const resolvedReceipt = path.resolve(expandLeadingTilde(receiptPath || getDefaultStatusLineBackupPath()));
+  const inspected = inspectExistingCliStatusLine(settingsPath, { pluginRoot: resolvedRoot });
+
+  if (inspected.parseError) {
+    return {
+      ok: false,
+      error: "invalid_settings_json",
+      settingsPath: inspected.settingsPath,
+      message: `Cannot parse ${inspected.settingsPath}: ${inspected.parseError}`
+    };
+  }
+
+  if (inspected.kind === "other_command" && !force) {
+    return {
+      ok: false,
+      error: "existing_non_node_statusline",
+      settingsPath: inspected.settingsPath,
+      existingCommand: inspected.existingCommand,
+      message:
+        `Existing custom non-Node statusLine detected (${inspected.existingCommand}). ` +
+        `Re-run with --force to replace it (a lossless backup will be saved for --disable).`
+    };
+  }
+
+  let chainedScriptPath = "";
+  let mode = "standalone";
+  if (inspected.kind === "agy_dart") {
+    mode = "already_configured";
+    chainedScriptPath = inspected.chainedScriptPath || "";
+  } else if (inspected.kind === "other_node" && inspected.existingScriptPath) {
+    mode = "chain";
+    chainedScriptPath = inspected.existingScriptPath;
+  } else if (inspected.kind === "other_command" && force) {
+    mode = "replaced_with_backup";
+  }
+
+  // Save original statusLine backup once before taking ownership (idempotent across repeated --enable)
+  if (inspected.kind !== "agy_dart") {
+    let keepExistingReceipt = false;
+    try {
+      if (fs.existsSync(resolvedReceipt)) {
+        const prev = JSON.parse(fs.readFileSync(resolvedReceipt, "utf8"));
+        if (prev && sameFsPath(prev.settingsPath, inspected.settingsPath) && prev.version === 1) {
+          keepExistingReceipt = true;
+        }
+      }
+    } catch {}
+    if (!keepExistingReceipt) {
+      writeJsonFileAtomic(resolvedReceipt, {
+        version: 1,
+        savedAt: new Date().toISOString(),
+        settingsPath: inspected.settingsPath,
+        hadStatusLine: Boolean(inspected.statusLine),
+        previousStatusLine: inspected.statusLine ? { ...inspected.statusLine } : null
+      });
+    }
+  }
+
+  const command = chainedScriptPath
+    ? `node "${quotedPath}" --chain-script "${normalizePosixSlashes(chainedScriptPath)}"`
+    : `node "${quotedPath}"`;
+
+  const prevSl = inspected.statusLine || {};
+  const nextStatusLine = {
+    ...prevSl,
+    type: "command",
+    command,
+    enabled: true,
+    stack_with_default:
+      typeof prevSl.stack_with_default === "boolean"
+        ? prevSl.stack_with_default
+        : mode === "standalone" || mode === "replaced_with_backup"
+  };
+
+  const nextSettings = {
+    ...(inspected.rawSettings || {}),
+    statusLine: nextStatusLine
+  };
+  writeJsonFileAtomic(inspected.settingsPath, nextSettings);
+
+  return {
+    ok: true,
+    mode,
+    alreadyConfigured: inspected.kind === "agy_dart",
+    settingsPath: inspected.settingsPath,
+    receiptPath: resolvedReceipt,
+    command,
+    chainedScriptPath
+  };
+}
+
+/**
+ * Disable the agy-dart CLI `statusLine` bridge and losslessly restore any previously configured `statusLine`.
+ * Refuses to modify `settings.json` if `statusLine` is currently owned by another tool.
+ */
+export function disableCliStatusLineBridge({
+  pluginRoot = null,
+  settingsPath = getDefaultCliSettingsPath(),
+  receiptPath = getDefaultStatusLineBackupPath()
+} = {}) {
+  const resolvedRoot =
+    typeof pluginRoot === "string" && pluginRoot.trim()
+      ? path.resolve(pluginRoot.trim())
+      : null;
+  const resolvedReceipt = path.resolve(expandLeadingTilde(receiptPath || getDefaultStatusLineBackupPath()));
+  const inspected = inspectExistingCliStatusLine(settingsPath, { pluginRoot: resolvedRoot });
+
+  if (!inspected.exists) {
+    return { ok: true, changed: false, reason: "settings_missing", settingsPath: inspected.settingsPath };
+  }
+  if (inspected.parseError) {
+    return {
+      ok: false,
+      changed: false,
+      error: "invalid_settings_json",
+      settingsPath: inspected.settingsPath,
+      message: `Cannot parse ${inspected.settingsPath}: ${inspected.parseError}`
+    };
+  }
+  if (inspected.kind !== "agy_dart") {
+    return { ok: true, changed: false, reason: "not_managed_by_agy_dart", settingsPath: inspected.settingsPath };
+  }
+
+  let receipt = null;
+  try {
+    if (fs.existsSync(resolvedReceipt)) {
+      const parsed = JSON.parse(fs.readFileSync(resolvedReceipt, "utf8"));
+      if (parsed && parsed.version === 1 && sameFsPath(parsed.settingsPath, inspected.settingsPath)) {
+        receipt = parsed;
+      }
+    }
+  } catch {}
+
+  const nextSettings = { ...(inspected.rawSettings || {}) };
+  let restored = false;
+
+  if (receipt) {
+    if (receipt.hadStatusLine && receipt.previousStatusLine && typeof receipt.previousStatusLine === "object") {
+      nextSettings.statusLine = { ...receipt.previousStatusLine };
+      restored = true;
+    } else {
+      delete nextSettings.statusLine;
+    }
+  } else if (inspected.chainedScriptPath) {
+    nextSettings.statusLine = {
+      ...(inspected.statusLine || {}),
+      type: "command",
+      command: `node "${normalizePosixSlashes(inspected.chainedScriptPath)}"`
+    };
+    restored = true;
+  } else {
+    delete nextSettings.statusLine;
+  }
+
+  writeJsonFileAtomic(inspected.settingsPath, nextSettings);
+  try {
+    if (fs.existsSync(resolvedReceipt)) fs.unlinkSync(resolvedReceipt);
+  } catch {}
+
+  return {
+    ok: true,
+    changed: true,
+    restored,
+    settingsPath: inspected.settingsPath
   };
 }
 

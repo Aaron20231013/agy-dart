@@ -11,7 +11,10 @@ import { fileURLToPath } from "node:url";
 import {
   buildStatusLineSetupInfo,
   collectLocalRollingUsage,
+  disableCliStatusLineBridge,
+  enableCliStatusLineBridge,
   formatStatusLineOutput,
+  inspectExistingCliStatusLine,
   MAX_QUOTA_BUCKETS,
   normalizeStatusLineQuotaPayload,
   projectQuotaSnapshot,
@@ -618,4 +621,140 @@ test("v1.7.4-5: Sidecar /api/quota enforces CSRF + POST-only SidecarApp parity a
     assert.doesNotThrow(() => new vm.Script(src));
   }
   assert.ok(buildStatusLineSetupInfo(ROOT).scriptPath.endsWith(path.join("hooks", "statusline.mjs")));
+});
+
+test("v1.7.4-6: smart statusLine coexistence snippet, lossless --enable/--disable, non-Node guard, and idempotent backup", (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-dart-sl-manage-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const settingsPath = path.join(tmpDir, "antigravity-cli", "settings.json");
+  const receiptPath = path.join(tmpDir, "agy-dart", "statusline-backup.json");
+  const otherPluginScript = path.join(tmpDir, "usage-monitor", "cli-statusline.mjs");
+  fs.mkdirSync(path.dirname(otherPluginScript), { recursive: true });
+  fs.writeFileSync(otherPluginScript, "process.stdout.write('other\\n');\n", "utf8");
+
+  // 1. Fresh standalone setup (settings.json absent) -> enable -> preserves unrelated keys -> disable removes statusLine cleanly
+  const setupFresh = buildStatusLineSetupInfo(ROOT, { settingsPath });
+  assert.equal(setupFresh.mode, "standalone");
+  assert.equal(setupFresh.chainedScriptPath, "");
+
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, JSON.stringify({ theme: "dark", customFlag: 42 }, null, 2) + "\n", "utf8");
+
+  const enFresh = enableCliStatusLineBridge({ pluginRoot: ROOT, settingsPath, receiptPath });
+  assert.equal(enFresh.ok, true);
+  assert.equal(enFresh.mode, "standalone");
+  const afterFreshEnable = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  assert.equal(afterFreshEnable.theme, "dark");
+  assert.equal(afterFreshEnable.customFlag, 42);
+  assert.equal(afterFreshEnable.statusLine.enabled, true);
+  assert.ok(afterFreshEnable.statusLine.command.includes("hooks/statusline.mjs"));
+  assert.ok(!afterFreshEnable.statusLine.command.includes("--chain-script"));
+
+  const disFresh = disableCliStatusLineBridge({ pluginRoot: ROOT, settingsPath, receiptPath });
+  assert.equal(disFresh.ok, true);
+  assert.equal(disFresh.changed, true);
+  assert.equal(disFresh.restored, false);
+  const afterFreshDisable = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  assert.equal(afterFreshDisable.statusLine, undefined);
+  assert.equal(afterFreshDisable.theme, "dark");
+  assert.equal(fs.existsSync(receiptPath), false);
+
+  // 2. Existing Node statusLine plugin (e.g. usage-monitor) -> auto-chain snippet + lossless enable/re-enable/disable restore
+  const origOtherStatusLine = {
+    type: "command",
+    command: `node "${otherPluginScript.replace(/\\/g, "/")}"`,
+    enabled: true,
+    padding: 0,
+    stack_with_default: false
+  };
+  fs.writeFileSync(
+    settingsPath,
+    JSON.stringify({ keepMe: true, statusLine: origOtherStatusLine }, null, 2) + "\n",
+    "utf8"
+  );
+
+  const inspectedBefore = inspectExistingCliStatusLine(settingsPath, { pluginRoot: ROOT });
+  assert.equal(inspectedBefore.kind, "other_node");
+  const setupChain = buildStatusLineSetupInfo(ROOT, { settingsPath });
+  assert.equal(setupChain.mode, "chain");
+  assert.ok(setupChain.command.includes("--chain-script"));
+  assert.equal(JSON.parse(setupChain.snippetJson).statusLine.stack_with_default, false);
+  assert.equal(JSON.parse(setupChain.snippetJson).statusLine.padding, 0);
+
+  // Subprocess CLI `--enable --json`
+  const cliEnable = spawnSync(
+    process.execPath,
+    [
+      path.join(ROOT, "hooks", "statusline.mjs"),
+      "--enable",
+      "--json",
+      "--settings-path",
+      settingsPath,
+      "--receipt-path",
+      receiptPath
+    ],
+    { encoding: "utf8", windowsHide: true }
+  );
+  assert.equal(cliEnable.status, 0);
+  assert.equal(cliEnable.stderr, "");
+  const cliEnableJson = JSON.parse(cliEnable.stdout);
+  assert.equal(cliEnableJson.ok, true);
+  assert.equal(cliEnableJson.mode, "chain");
+  assert.ok(cliEnableJson.command.includes("--chain-script"));
+
+  // Repeated `--enable` is idempotent and does NOT overwrite original backup receipt
+  const enAgain = enableCliStatusLineBridge({ pluginRoot: ROOT, settingsPath, receiptPath });
+  assert.equal(enAgain.ok, true);
+  assert.equal(enAgain.alreadyConfigured, true);
+  const receiptObj = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+  assert.deepEqual(receiptObj.previousStatusLine, origOtherStatusLine);
+
+  // Subprocess CLI `--disable --json` restores exact original plugin statusLine & preserves unrelated keys
+  const cliDisable = spawnSync(
+    process.execPath,
+    [
+      path.join(ROOT, "hooks", "statusline.mjs"),
+      "--disable",
+      "--json",
+      "--settings-path",
+      settingsPath,
+      "--receipt-path",
+      receiptPath
+    ],
+    { encoding: "utf8", windowsHide: true }
+  );
+  assert.equal(cliDisable.status, 0);
+  assert.equal(cliDisable.stderr, "");
+  const cliDisableJson = JSON.parse(cliDisable.stdout);
+  assert.equal(cliDisableJson.ok, true);
+  assert.equal(cliDisableJson.changed, true);
+  assert.equal(cliDisableJson.restored, true);
+  const afterRestore = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  assert.equal(afterRestore.keepMe, true);
+  assert.deepEqual(afterRestore.statusLine, origOtherStatusLine);
+
+  // Calling disable when not owned by agy-dart is a safe no-op
+  const noopDis = disableCliStatusLineBridge({ pluginRoot: ROOT, settingsPath, receiptPath });
+  assert.equal(noopDis.ok, true);
+  assert.equal(noopDis.changed, false);
+  assert.equal(noopDis.reason, "not_managed_by_agy_dart");
+
+  // 3. Existing custom non-Node command (e.g. bash script): refused without --force, allowed with --force and restorable
+  const customBashSl = { type: "command", command: "~/.gemini/antigravity-cli/my-custom.sh", enabled: true };
+  fs.writeFileSync(settingsPath, JSON.stringify({ statusLine: customBashSl }, null, 2) + "\n", "utf8");
+
+  const refused = enableCliStatusLineBridge({ pluginRoot: ROOT, settingsPath, receiptPath });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error, "existing_non_node_statusline");
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf8")).statusLine, customBashSl);
+
+  const forced = enableCliStatusLineBridge({ pluginRoot: ROOT, settingsPath, receiptPath, force: true });
+  assert.equal(forced.ok, true);
+  assert.equal(forced.mode, "replaced_with_backup");
+
+  const restoredBash = disableCliStatusLineBridge({ pluginRoot: ROOT, settingsPath, receiptPath });
+  assert.equal(restoredBash.ok, true);
+  assert.equal(restoredBash.restored, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf8")).statusLine, customBashSl);
 });

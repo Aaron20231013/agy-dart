@@ -2444,8 +2444,12 @@
       <div id="quota-setup-drawer" class="quota-setup-drawer hidden">
         <div class="sub-head">
           <span id="quota-setup-desc" class="muted-note" data-i18n="quotaSetupDesc">Paste into ~/.gemini/antigravity-cli/settings.json to feed official Antigravity CLI quota buckets into this panel:</span>
-          <button id="quota-setup-copy-btn" onclick="copyQuotaSetupSnippet()" class="btn btn-secondary btn-sm" data-i18n="quotaCopySnippetBtn">Copy Config</button>
+          <div class="band-actions">
+            <button id="quota-enable-cmd-btn" onclick="copyQuotaEnableCommand()" class="btn btn-primary btn-sm" data-i18n="quotaCopyEnableBtn" data-i18n-title="quotaCopyEnableTip" title="Copy one-line command to safely enable CLI statusLine (auto-chains existing Node plugins &amp; saves lossless backup)">Copy Enable Cmd</button>
+            <button id="quota-setup-copy-btn" onclick="copyQuotaSetupSnippet()" class="btn btn-secondary btn-sm" data-i18n="quotaCopySnippetBtn">Copy Config</button>
+          </div>
         </div>
+        <div id="quota-setup-mode-note" class="muted-note hidden"></div>
         <pre id="quota-setup-pre" class="quota-setup-pre custom-scrollbar"></pre>
         <div id="quota-setup-hints" class="muted-note"></div>
       </div>
@@ -3136,6 +3140,13 @@
         quotaSetupDesc: 'Paste into ~/.gemini/antigravity-cli/settings.json to sync official Antigravity CLI quota buckets into this panel:',
         quotaCopySnippetBtn: 'Copy Config',
         quotaCopiedBtn: 'Copied!',
+        quotaCopyEnableBtn: 'Copy Enable Cmd',
+        quotaCopyEnableTip: 'Copy one-line command to safely enable CLI statusLine (auto-chains existing Node plugins & saves lossless backup)',
+        quotaEnableCopiedBtn: 'Cmd Copied!',
+        quotaSetupModeChain: 'Detected another Node statusLine plugin — the config & one-line enable command automatically chain both without overwriting it.',
+        quotaSetupModeConfiguredChain: 'Already enabled in settings.json (chained with your existing statusLine plugin). Run agy CLI to refresh.',
+        quotaSetupModeConfigured: 'Already enabled in settings.json. Run agy CLI to refresh.',
+        quotaSetupModeManual: 'Detected a custom non-Node statusLine command. Review before merging, or run the enable command with --force (saves a lossless backup).',
         quotaCopyPromptBtn: 'Copy Prompt',
         quotaCopyPromptTip: 'Copy a ready-to-paste chat prompt to check quota & 5h/7d spend in any Antigravity window',
         quotaPromptCopiedBtn: 'Prompt Copied!',
@@ -3535,6 +3546,13 @@
         quotaSetupDesc: '粘贴到 ~/.gemini/antigravity-cli/settings.json，即可把官方 CLI 额度实时同步到此面板：',
         quotaCopySnippetBtn: '复制配置',
         quotaCopiedBtn: '已复制',
+        quotaCopyEnableBtn: '复制一键启用命令',
+        quotaCopyEnableTip: '复制一行命令安全启用官方 CLI statusLine（自动串联已有 Node 插件并无损备份，卸载自动还原）',
+        quotaEnableCopiedBtn: '已复制命令',
+        quotaSetupModeChain: '已检测到其他 Node statusLine 插件：下方配置与一键启用命令会自动串联共存，不会顶掉原插件。',
+        quotaSetupModeConfiguredChain: '已在 settings.json 中启用（并已串联你原有的 statusLine 插件），运行 agy CLI 即可自动刷新。',
+        quotaSetupModeConfigured: '已在 settings.json 中启用，运行 agy CLI 即可自动刷新。',
+        quotaSetupModeManual: '检测到自定义非 Node statusLine 命令：建议确认后再合并，或在启用命令后加 --force（会自动保存原配置备份）。',
         quotaCopyPromptBtn: '复制查额度提示词',
         quotaCopyPromptTip: '复制一段可直接粘贴到任意 Antigravity 对话窗口查看额度与 5h/7d 消耗的提示词',
         quotaPromptCopiedBtn: '已复制提示词',
@@ -3718,6 +3736,7 @@
     let quotaLiveTimer = null;
     let quotaCopyResetTimer = null;
     let quotaPromptCopyResetTimer = null;
+    let quotaEnableCopyResetTimer = null;
 
     function getNativeHostConversationId() {
       try {
@@ -9336,6 +9355,21 @@
       if (drawer) drawer.classList.toggle('hidden', !quotaSetupDrawerOpen);
     }
 
+    async function copyQuotaEnableCommand() {
+      const cmd = cachedQuota?.setup?.enableCommand || '';
+      if (!cmd) return;
+      const btn = document.getElementById('quota-enable-cmd-btn');
+      const ok = await copyTextToClipboard(cmd);
+      if (btn && ok) {
+        btn.textContent = t('quotaEnableCopiedBtn');
+        if (quotaEnableCopyResetTimer !== null) clearTimeout(quotaEnableCopyResetTimer);
+        quotaEnableCopyResetTimer = setTimeout(() => {
+          quotaEnableCopyResetTimer = null;
+          if (btn) btn.textContent = t('quotaCopyEnableBtn');
+        }, 1800);
+      }
+    }
+
     async function copyQuotaSetupSnippet() {
       const text = cachedQuota?.setup?.snippetJson || '';
       if (!text) return;
@@ -9587,8 +9621,28 @@
       cachedQuota = q;
       const preEl = document.getElementById('quota-setup-pre');
       const hintsEl = document.getElementById('quota-setup-hints');
+      const modeNoteEl = document.getElementById('quota-setup-mode-note');
       if (preEl && q.setup?.snippetJson) {
         preEl.textContent = q.setup.snippetJson;
+      }
+      if (modeNoteEl && q.setup) {
+        let note = '';
+        if (q.setup.mode === 'chain') {
+          note = t('quotaSetupModeChain');
+        } else if (q.setup.mode === 'already_configured') {
+          note = q.setup.chainedScriptPath
+            ? t('quotaSetupModeConfiguredChain')
+            : t('quotaSetupModeConfigured');
+        } else if (q.setup.mode === 'manual_non_node') {
+          note = t('quotaSetupModeManual');
+        }
+        if (note) {
+          modeNoteEl.textContent = note;
+          modeNoteEl.classList.remove('hidden');
+        } else {
+          modeNoteEl.textContent = '';
+          modeNoteEl.classList.add('hidden');
+        }
       }
       if (hintsEl && q.setup) {
         hintsEl.textContent = t('quotaSetupHints', {
@@ -9716,6 +9770,10 @@
       if (quotaPromptCopyResetTimer !== null) {
         clearTimeout(quotaPromptCopyResetTimer);
         quotaPromptCopyResetTimer = null;
+      }
+      if (quotaEnableCopyResetTimer !== null) {
+        clearTimeout(quotaEnableCopyResetTimer);
+        quotaEnableCopyResetTimer = null;
       }
     });
   </script>
