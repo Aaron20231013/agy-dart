@@ -9355,8 +9355,16 @@
       if (drawer) drawer.classList.toggle('hidden', !quotaSetupDrawerOpen);
     }
 
+    function buildQuotaEnableCommandText() {
+      if (cachedQuota?.setup?.enableCommand) return String(cachedQuota.setup.enableCommand);
+      const scriptPath = cachedQuota?.setup?.scriptPath
+        ? String(cachedQuota.setup.scriptPath).replace(/\\/g, '/')
+        : '~/.gemini/config/plugins/agy-dart/hooks/statusline.mjs';
+      return `node "${scriptPath}" --enable`;
+    }
+
     async function copyQuotaEnableCommand() {
-      const cmd = cachedQuota?.setup?.enableCommand || '';
+      const cmd = buildQuotaEnableCommandText();
       if (!cmd) return;
       const btn = document.getElementById('quota-enable-cmd-btn');
       const ok = await copyTextToClipboard(cmd);
@@ -9371,7 +9379,8 @@
     }
 
     async function copyQuotaSetupSnippet() {
-      const text = cachedQuota?.setup?.snippetJson || '';
+      const preEl = document.getElementById('quota-setup-pre');
+      const text = cachedQuota?.setup?.snippetJson || preEl?.textContent || '';
       if (!text) return;
       const btn = document.getElementById('quota-setup-copy-btn');
       const ok = await copyTextToClipboard(text);
