@@ -227,6 +227,7 @@ export const RUNTIME_FILES = Object.freeze([
   "sidecars/dashboard/sidecar.json",
   "sidecars/dashboard/server.mjs",
   "sidecars/dashboard/index.html",
+  "sidecars/dashboard/custom-theme.css",
   "scripts/install.mjs"
 ]);
 

@@ -45,6 +45,7 @@ const { ContextModeStore, FILE_CATEGORIES } = await import("../../context/lib/st
 const __selfPath = path.resolve(fileURLToPath(import.meta.url));
 const __dirname = path.dirname(__selfPath);
 const HTML_FILE = path.join(__dirname, "index.html");
+const CUSTOM_THEME_CSS_FILE = path.join(__dirname, "custom-theme.css");
 export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 const SIDECAR_CSRF_TOKEN = crypto.randomBytes(24).toString("hex");
 
@@ -435,6 +436,24 @@ function scheduleOversizedSocketClose(req, res) {
 
 let cachedPkgVersion = null;
 let cachedHtmlTemplate = { mtimeMs: -1, size: -1, withVer: "" };
+let cachedCustomThemeCss = { mtimeMs: -1, size: -1, css: "" };
+
+function getCustomThemeCss() {
+  try {
+    const st = fs.statSync(CUSTOM_THEME_CSS_FILE);
+    if (st.mtimeMs !== cachedCustomThemeCss.mtimeMs || st.size !== cachedCustomThemeCss.size) {
+      cachedCustomThemeCss = {
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        css: fs.readFileSync(CUSTOM_THEME_CSS_FILE, "utf8")
+      };
+    }
+    return cachedCustomThemeCss.css;
+  } catch {
+    cachedCustomThemeCss = { mtimeMs: -1, size: -1, css: "" };
+    return "";
+  }
+}
 
 function getPackageVersion() {
   if (cachedPkgVersion) return cachedPkgVersion;
@@ -463,7 +482,9 @@ function getRenderedHtml(csrfToken = SIDECAR_CSRF_TOKEN) {
     const ver = getPackageVersion();
     withVer = raw.replace('id="dashboard-version">--</span>', `id="dashboard-version">v${ver}</span>`);
   }
-  const tokenMeta = `  <meta name="agy-dart-token" content="${csrfToken}">\n</head>`;
+  const customCss = getCustomThemeCss();
+  const customStyleTag = customCss ? `  <style id="agy-custom-theme">\n${customCss}\n  </style>\n` : "";
+  const tokenMeta = `${customStyleTag}  <meta name="agy-dart-token" content="${csrfToken}">\n</head>`;
   return withVer.includes("</head>") ? withVer.replace("</head>", tokenMeta) : withVer;
 }
 
