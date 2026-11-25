@@ -1,5 +1,7 @@
 <div align="center">
 
+**简体中文** · [English](README.md)
+
 <img src="assets/logo.svg" alt="agy-dart logo" width="80" />
 
 # agy-dart
@@ -13,7 +15,7 @@
 [![Security Policy](https://img.shields.io/badge/Security-Policy-818cf8.svg)](SECURITY.md)
 [![Glama MCP](https://glama.ai/mcp/servers/zou172866/agy-dart/badges/score.svg)](https://glama.ai/mcp/servers/zou172866/agy-dart)
 
-简体中文 · [English](README.md) · [怎么安装](#怎么安装) · [更新日志](#更新日志) · [安全说明](SECURITY.md) · [开源致谢](THIRD_PARTY_NOTICES.md)
+[怎么安装](#怎么安装) · [更新日志](#更新日志) · [安全说明](SECURITY.md) · [开源致谢](THIRD_PARTY_NOTICES.md)
 
 </div>
 

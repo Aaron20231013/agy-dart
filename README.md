@@ -1,5 +1,7 @@
 <div align="center">
 
+[简体中文](README.zh-CN.md) · **English**
+
 <img src="assets/logo.svg" alt="agy-dart logo" width="80" />
 
 # agy-dart
@@ -13,7 +15,7 @@ No extra dependencies · Works automatically in the background · Built-in Sidec
 [![Security Policy](https://img.shields.io/badge/Security-Policy-818cf8.svg)](SECURITY.md)
 [![Glama MCP](https://glama.ai/mcp/servers/zou172866/agy-dart/badges/score.svg)](https://glama.ai/mcp/servers/zou172866/agy-dart)
 
-[简体中文](README.zh-CN.md) · English · [How to Install](#how-to-install) · [Changelog](#changelog) · [Security](SECURITY.md) · [Third-Party Notices](THIRD_PARTY_NOTICES.md)
+[How to Install](#how-to-install) · [Changelog](#changelog) · [Security](SECURITY.md) · [Third-Party Notices](THIRD_PARTY_NOTICES.md)
 
 </div>
 
