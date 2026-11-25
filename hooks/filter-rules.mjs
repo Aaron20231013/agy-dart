@@ -27,16 +27,411 @@ const MAX_CUSTOM_MATCH_CMD_CHARS = 2048;
 const MAX_CUSTOM_FILTER_MS = 150;
 const CUSTOM_RULE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,47}$/;
 const FAIL_ERROR_LINE_RE =
-  /(?:(?:^|\b)(?:error|err!|fail(?:ed|ure)?|fatal|panic|exception|traceback|assertionerror|syntaxerror|typeerror|referenceerror|rangeerror|enoent|eacces|econnrefused|not ok|segmentation fault|segfault)(?:\b|:|$)|(?:^|\s)[✖✗](?:\s|$)|\bERR_[A-Z0-9_]{3,}\b)/i;
+  /(?:(?:^|\b)(?:error|err!|fail(?:ed|ure)?|fatal|panic|exception|traceback|assertionerror|syntaxerror|typeerror|referenceerror|rangeerror|enoent|eacces|econnrefused|not\s+ok|segmentation fault|segfault)(?:\b|:|$)|(?:^|\s)[✖✗](?:\s|$)|\bERR_[A-Z0-9_]{3,}\b)/i;
 const PASCAL_ERROR_CLASS_RE = /\b[A-Z][A-Za-z0-9_]*(?:Error|Exception)\b(?:\s*[:\[(]|$)/;
 const ZERO_ERROR_CLAUSE_RE =
-  /\b(?:0\s+(?:errors?|fail(?:ed|ures?)?)|(?:errors?|fail(?:ed|ures?)?)\s*[:=]?\s*0)\b/gi;
+  /\b(?:0\s+(?:errors?|fail(?:ed|ures?)?)\b|(?:errors?|fail(?:ed|ures?)?)\s*[:=]?\s*0(?=$|\.(?=\s|$)|\s*[,;)\]\}|/(]|\s+(?:pass(?:ed)?|fail(?:ed|ures?)?|errors?|warnings?|skipped?|ignored|todo|total|ok|tests?|suites?|assertions?|duration)\b|\s*$))/gi;
+const FAILURE_EXCERPT_TIMEOUT_RE = /\btimed\s+out\b/i;
 
-function isFailureAnchorLine(line) {
-  if (!line || !line.trim()) return false;
+export function isFailureAnchorLine(line, { includeTimeout = false } = {}) {
+  if (typeof line !== "string" || !line.trim()) return false;
   const cleaned = line.replace(ZERO_ERROR_CLAUSE_RE, " ");
   if (!cleaned.trim()) return false;
-  return FAIL_ERROR_LINE_RE.test(cleaned) || PASCAL_ERROR_CLASS_RE.test(cleaned);
+  return (
+    FAIL_ERROR_LINE_RE.test(cleaned) ||
+    PASCAL_ERROR_CLASS_RE.test(cleaned) ||
+    Boolean(includeTimeout && FAILURE_EXCERPT_TIMEOUT_RE.test(cleaned))
+  );
+}
+
+const FAILURE_EXCERPT_PASS_NOISE_RE =
+  /^\s*(?:PASS\b|---\s*PASS\b|ok(?:\s+\d+\b|\s+-)|[✓✔](?:\s|$)|-\s*\[PASS\b|##\s*\[PASS\b|\[PASS\b|\$\s+)/i;
+const FAILURE_EXCERPT_PASS_LINE_TAIL_RE = /(?:\bPASSED\b(?:\s*\[[^\]]*\])?|\.\.\.\s*ok)\s*$/i;
+const FAILURE_EXCERPT_NON_ANCHOR_RE = /^\s*#\s*Subtest\s*:/i;
+const FAILURE_EXCERPT_SUITE_START_RE = /^\s*▶(?:\s|$)/;
+const FAILURE_EXCERPT_TAP_META_NOISE_RE =
+  /^\s*(?:---|\.\.\.|duration_ms\s*:.*|type\s*:\s*['"]?(?:test|suite)['"]?|location\s*:.*|failureType\s*:.*|operator\s*:.*|stack\s*:\s*(?:[|>][+-]?\d*|[|>]\d*[+-]?)?)\s*$/i;
+const TAP_NOT_OK_RE = /^\s*not\s+ok\b/i;
+const TAP_OK_RE = /^\s*ok(?:\s+\d+\b|\s+-|\s*#\s*(?:SKIP|TODO)\b|\s*$)/i;
+const TAP_DIRECTIVE_PREFIX_RE = /^\s*(?:not\s+ok(?=\s|#)|ok(?=\s+(?:\d+\b|-(?:\s|$)|[^:=,\s])|\s*#))/i;
+const TAP_DIRECTIVE_TAG_RE = /^#\s*(?:TODO|SKIP)\b/i;
+const TAP_STRUCTURAL_BOUNDARY_RE =
+  /^(?:(?:not\s+)?ok(?:\s|#|$)|\d+\.\.\d+$|#\s*Subtest\s*:|TAP\s+version\s+\d+$|Bail\s+out!)/i;
+const TAP_YAML_BLOCK_SCALAR_RE = /^(?:[|>][+-]?\d*|[|>]\d*[+-]?)$/;
+const TAP_YAML_SKIP_KEYS = new Set(["duration_ms", "type", "location", "failuretype", "operator"]);
+const TAP_YAML_SUPPLEMENT_KEYS = new Set(["code", "name", "expected", "actual"]);
+
+export function isTapDirectiveResultLine(line) {
+  if (typeof line !== "string" || !line) return false;
+  const prefixMatch = line.match(TAP_DIRECTIVE_PREFIX_RE);
+  if (!prefixMatch) return false;
+  const rest = line.slice(prefixMatch[0].length);
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] !== "#") continue;
+    let backslashes = 0;
+    for (let p = i - 1; p >= 0 && rest[p] === "\\"; p--) {
+      backslashes += 1;
+    }
+    if (backslashes % 2 === 1) continue; // Escaped literal `\#` in TAP description
+    if (TAP_DIRECTIVE_TAG_RE.test(rest.slice(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function skipTapYamlBlock(entries, resultIdx) {
+  const result = entries[resultIdx];
+  if (!result) return resultIdx;
+  const yamlStartIdx = resultIdx + 1;
+  if (yamlStartIdx >= entries.length) return resultIdx;
+  const yamlStart = entries[yamlStartIdx];
+  if (yamlStart.text !== "---" || yamlStart.indent < result.indent) {
+    return resultIdx;
+  }
+  const yamlIndent = yamlStart.indent;
+  let j = yamlStartIdx + 1;
+  while (j < entries.length) {
+    const entry = entries[j];
+    if (entry.indent < yamlIndent) {
+      return j - 1;
+    }
+    if (entry.text === "..." && entry.indent <= yamlIndent) {
+      return j;
+    }
+    if (entry.indent === yamlIndent && TAP_STRUCTURAL_BOUNDARY_RE.test(entry.text)) {
+      return j - 1;
+    }
+    j += 1;
+  }
+  return entries.length - 1;
+}
+
+export function stripTapDirectiveBlocks(text) {
+  if (!text || typeof text !== "string") return "";
+  const rawLines = text.split(/\r?\n/);
+  const entries = [];
+  for (const rawLine of rawLines) {
+    const leadMatch = rawLine.match(/^([ \t]*)/);
+    const indent = leadMatch ? leadMatch[1].replace(/\t/g, "  ").length : 0;
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    entries.push({ text: trimmed, raw: rawLine, indent });
+  }
+  if (entries.length === 0) return "";
+  const kept = [];
+  for (let i = 0; i < entries.length; i++) {
+    if (isTapDirectiveResultLine(entries[i].text)) {
+      i = skipTapYamlBlock(entries, i);
+      continue;
+    }
+    kept.push(entries[i].raw);
+  }
+  return kept.join("\n");
+}
+
+function unquoteSimpleYamlScalar(val) {
+  const s = typeof val === "string" ? val.trim() : "";
+  if (s.length >= 2 && s.startsWith("'") && s.endsWith("'")) {
+    return s.slice(1, -1).replace(/''/g, "'");
+  }
+  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+    return s.slice(1, -1).replace(/\\"/g, '"');
+  }
+  return s;
+}
+
+function extractTapYamlDiagnosticLines(entries, anchorIdx, lineCap) {
+  const anchor = entries[anchorIdx];
+  if (!anchor || !TAP_NOT_OK_RE.test(anchor.text) || isTapDirectiveResultLine(anchor.text)) return null;
+  const yamlStartIdx = anchorIdx + 1;
+  if (yamlStartIdx >= entries.length || entries[yamlStartIdx].text !== "---") return null;
+  const yamlIndent = entries[yamlStartIdx].indent;
+  if (yamlIndent < anchor.indent) return null;
+
+  const diagLines = [];
+  const supplementLines = [];
+  const fallbackStackLines = [];
+  const otherLines = [];
+
+  for (let j = yamlStartIdx + 1; j < entries.length; j++) {
+    const entry = entries[j];
+    if (entry.indent < yamlIndent) break;
+    if (entry.text === "..." && entry.indent <= yamlIndent) break;
+    if (entry.indent === yamlIndent && TAP_STRUCTURAL_BOUNDARY_RE.test(entry.text)) break;
+    if (entry.indent !== yamlIndent) continue;
+
+    const kvMatch = entry.text.match(/^([A-Za-z0-9_.-]+)\s*:\s*(.*)$/);
+    if (!kvMatch) {
+      otherLines.push(entry.text);
+      continue;
+    }
+    const rawKey = kvMatch[1];
+    const key = rawKey.toLowerCase();
+    const val = kvMatch[2].trim();
+
+    if (TAP_YAML_BLOCK_SCALAR_RE.test(val)) {
+      const blockLines = [];
+      let k = j + 1;
+      while (k < entries.length && entries[k].indent > yamlIndent) {
+        blockLines.push(entries[k].text);
+        k += 1;
+      }
+      j = k - 1;
+      if (blockLines.length === 0) continue;
+      if (key === "error" || key === "message") {
+        diagLines.push(`${rawKey}: ${blockLines[0]}`);
+        for (let b = 1; b < blockLines.length; b++) {
+          diagLines.push(blockLines[b]);
+        }
+      } else if (TAP_YAML_SUPPLEMENT_KEYS.has(key)) {
+        supplementLines.push(`${rawKey}: ${blockLines[0]}`);
+      } else if (key === "stack") {
+        const userFrame = blockLines.find((l) => !/\(node:/.test(l)) || blockLines[0];
+        if (userFrame) fallbackStackLines.push(userFrame);
+      }
+      continue;
+    }
+
+    if (TAP_YAML_SKIP_KEYS.has(key)) {
+      continue;
+    }
+    if (key === "stack") {
+      const cleanedStack = unquoteSimpleYamlScalar(val);
+      if (cleanedStack) {
+        if (!/\(node:/.test(cleanedStack)) {
+          fallbackStackLines.unshift(cleanedStack);
+        } else {
+          fallbackStackLines.push(cleanedStack);
+        }
+      }
+      continue;
+    }
+    if (key === "error" || key === "message") {
+      const quoteChar = val.startsWith("'") ? "'" : val.startsWith('"') ? '"' : "";
+      const isClosedQuote = (seg, isFirst) => {
+        const body = isFirst ? seg.slice(1) : seg;
+        if (!body.endsWith(quoteChar)) return false;
+        if (quoteChar === "'") {
+          let trailing = 0;
+          for (let p = body.length - 1; p >= 0 && body[p] === "'"; p--) trailing += 1;
+          return trailing % 2 === 1;
+        }
+        let bs = 0;
+        for (let p = body.length - 2; p >= 0 && body[p] === "\\"; p--) bs += 1;
+        return bs % 2 === 0;
+      };
+      if (quoteChar && !isClosedQuote(val, true)) {
+        const quotedLines = [val.slice(1)];
+        let k = j + 1;
+        while (k < entries.length && entries[k].indent > yamlIndent) {
+          const seg = entries[k].text;
+          quotedLines.push(seg);
+          k += 1;
+          if (isClosedQuote(seg, false)) {
+            break;
+          }
+        }
+        j = k - 1;
+        const lastIdx = quotedLines.length - 1;
+        if (lastIdx >= 0 && quotedLines[lastIdx].endsWith(quoteChar)) {
+          quotedLines[lastIdx] = quotedLines[lastIdx].slice(0, -1);
+        }
+        const cleanedQuoted = quotedLines
+          .map((l) => (quoteChar === "'" ? l.replace(/''/g, "'") : l.replace(/\\"/g, '"')).trim())
+          .filter(Boolean);
+        if (cleanedQuoted.length > 0) {
+          diagLines.push(`${rawKey}: ${cleanedQuoted[0]}`);
+          for (let q = 1; q < cleanedQuoted.length; q++) {
+            diagLines.push(cleanedQuoted[q]);
+          }
+        }
+        continue;
+      }
+      const cleanedVal = unquoteSimpleYamlScalar(val);
+      if (cleanedVal) {
+        diagLines.push(`${rawKey}: ${cleanedVal}`);
+      }
+    } else if (TAP_YAML_SUPPLEMENT_KEYS.has(key)) {
+      if (val) {
+        supplementLines.push(`${rawKey}: ${val}`);
+      }
+    } else if (val) {
+      otherLines.push(entry.text);
+    }
+  }
+
+  const chosen = [anchor.text];
+  const pushUnique = (list) => {
+    for (const line of list) {
+      if (chosen.length >= lineCap) break;
+      if (!line || chosen.includes(line)) continue;
+      chosen.push(line);
+    }
+  };
+  pushUnique(diagLines);
+  pushUnique(supplementLines);
+  if (chosen.length === 1) {
+    pushUnique(otherLines);
+    pushUnique(fallbackStackLines);
+  }
+  return chosen;
+}
+const FAILURE_EXCERPT_CASE_HEADER_RE =
+  /^\s*(?:●|❯|▶|×|✖|---\s*FAIL\b|FAIL(?:ED)?\b|not ok\b|File\s+"|In file\b|Test\s+\S|Suite\s+\S)/i;
+const FAILURE_EXCERPT_DETAIL_ANCHOR_RE =
+  /^\s*(?:AssertionError|TypeError|SyntaxError|ReferenceError|RangeError|Error\s*:|Expected\s*:|Actual\s*:|E\s{2,})/i;
+
+export function isPassingNoiseLine(line) {
+  if (!line) return false;
+  if (isTapDirectiveResultLine(line)) return true;
+  if (TAP_NOT_OK_RE.test(line)) return false;
+  if (TAP_OK_RE.test(line)) return true;
+  return FAILURE_EXCERPT_PASS_NOISE_RE.test(line) || FAILURE_EXCERPT_PASS_LINE_TAIL_RE.test(line);
+}
+
+/**
+ * Extract a concise, bounded failure excerpt (case name, first real error, and immediate context)
+ * from failed test/build output. Reuses `isFailureAnchorLine()` (so `0 failed` / `0 errors` are
+ * ignored), skips passing-test lines (e.g. `✔ handles error cases`, `PASS ...`, `... PASSED`,
+ * `--- PASS:`, `... ok`), and returns `""` when no real error anchor exists so callers clear
+ * stale excerpts.
+ */
+export function extractFailureExcerpt(text, { maxLines = 5, maxBytes = 500 } = {}) {
+  if (!text || typeof text !== "string") return "";
+  const lineCap = Number.isFinite(Number(maxLines)) && Number(maxLines) > 0 ? Math.floor(Number(maxLines)) : 5;
+  const byteCap = Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0 ? Math.floor(Number(maxBytes)) : 500;
+  const cleanedText = stripAnsiAndProgress(text);
+  const rawLines = cleanedText.split("\n");
+  const entries = [];
+  for (const rawLine of rawLines) {
+    const cleanedRaw = rawLine.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, " ");
+    const leadMatch = cleanedRaw.match(/^([ \t]*)/);
+    const indent = leadMatch ? leadMatch[1].replace(/\t/g, "  ").length : 0;
+    let line = cleanedRaw.replace(/\t+/g, " ").trim();
+    if (typeof line.toWellFormed === "function") {
+      line = line.toWellFormed();
+    }
+    if (!line) continue;
+    if (line.startsWith("[agy-dart cli-filter:")) continue;
+    entries.push({ text: line, indent });
+  }
+  if (entries.length === 0) return "";
+  const lines = entries.map((e) => e.text);
+
+  const skippedTapIndices = new Set();
+  let firstAnchorIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (isTapDirectiveResultLine(line)) {
+      const skipEnd = skipTapYamlBlock(entries, i);
+      for (let s = i; s <= skipEnd; s++) skippedTapIndices.add(s);
+      i = skipEnd;
+      continue;
+    }
+    if (
+      isPassingNoiseLine(line) ||
+      FAILURE_EXCERPT_NON_ANCHOR_RE.test(line) ||
+      FAILURE_EXCERPT_SUITE_START_RE.test(line)
+    ) {
+      continue;
+    }
+    if (isFailureAnchorLine(line, { includeTimeout: true })) {
+      firstAnchorIdx = i;
+      break;
+    }
+  }
+  if (firstAnchorIdx < 0) return "";
+
+  let selectedLines = extractTapYamlDiagnosticLines(entries, firstAnchorIdx, lineCap);
+  let anchorPosInSelected = 0;
+
+  if (!selectedLines) {
+    const chosenIndices = [];
+    const prevIdx = firstAnchorIdx - 1;
+    const prevLine = prevIdx >= 0 ? lines[prevIdx] : "";
+    const shouldIncludePrev =
+      prevIdx >= 0 &&
+      !skippedTapIndices.has(prevIdx) &&
+      !isPassingNoiseLine(prevLine) &&
+      !FAILURE_EXCERPT_NON_ANCHOR_RE.test(prevLine) &&
+      !FAILURE_EXCERPT_TAP_META_NOISE_RE.test(prevLine) &&
+      (FAILURE_EXCERPT_CASE_HEADER_RE.test(prevLine) ||
+        FAILURE_EXCERPT_DETAIL_ANCHOR_RE.test(lines[firstAnchorIdx]) ||
+        firstAnchorIdx === lines.length - 1);
+
+    if (shouldIncludePrev && lineCap > 1) {
+      chosenIndices.push(prevIdx);
+      anchorPosInSelected = 1;
+    }
+    chosenIndices.push(firstAnchorIdx);
+    for (let i = firstAnchorIdx + 1; i < lines.length && chosenIndices.length < lineCap; i++) {
+      if (isTapDirectiveResultLine(lines[i])) {
+        i = skipTapYamlBlock(entries, i);
+        continue;
+      }
+      if (
+        isPassingNoiseLine(lines[i]) ||
+        FAILURE_EXCERPT_NON_ANCHOR_RE.test(lines[i]) ||
+        FAILURE_EXCERPT_TAP_META_NOISE_RE.test(lines[i])
+      ) {
+        continue;
+      }
+      chosenIndices.push(i);
+    }
+    selectedLines = chosenIndices.map((idx) => lines[idx]);
+  }
+
+  const clipSafe = (str, cap) => {
+    if (cap <= 0) return "";
+    if (Buffer.byteLength(str, "utf8") <= cap) return str;
+    const suffix = cap >= 24 ? "..." : "";
+    const innerCap = Math.max(0, cap - Buffer.byteLength(suffix, "utf8"));
+    let cut = truncateUtf8Safe(str, innerCap);
+    if (cut.length > 0) {
+      const lastCode = cut.charCodeAt(cut.length - 1);
+      if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+        cut = cut.slice(0, -1);
+      }
+    }
+    return suffix && cut ? `${cut}${suffix}` : cut;
+  };
+
+  const fullJoined = selectedLines.join("\n");
+  if (Buffer.byteLength(fullJoined, "utf8") <= byteCap) {
+    return fullJoined;
+  }
+
+  const out = [];
+  let usedBytes = 0;
+  const perLineSoftCap =
+    selectedLines.length > 1 ? Math.min(byteCap, Math.max(120, Math.floor(byteCap * 0.6))) : byteCap;
+
+  for (let i = 0; i < selectedLines.length; i++) {
+    const sepBytes = out.length > 0 ? 1 : 0;
+    const rem = byteCap - usedBytes - sepBytes;
+    if (rem <= 0) break;
+    const isAnchorPos = i === anchorPosInSelected;
+    const lineBudget = Math.min(rem, isAnchorPos && out.length === 0 ? Math.max(perLineSoftCap, Math.floor(byteCap * 0.7)) : perLineSoftCap);
+    const rawLine = selectedLines[i];
+    if (Buffer.byteLength(rawLine, "utf8") <= lineBudget) {
+      out.push(rawLine);
+      usedBytes += sepBytes + Buffer.byteLength(rawLine, "utf8");
+    } else if (rem >= 24 || out.length === 0) {
+      const clipped = clipSafe(rawLine, Math.min(rem, lineBudget));
+      if (!clipped) break;
+      out.push(clipped);
+      usedBytes += sepBytes + Buffer.byteLength(clipped, "utf8");
+    } else {
+      break;
+    }
+  }
+
+  let result = out.join("\n");
+  if (Buffer.byteLength(result, "utf8") > byteCap) {
+    result = clipSafe(result, byteCap);
+  }
+  return result;
 }
 
 const projectRulesCache = new Map();
@@ -51,25 +446,63 @@ export function resolveCdTargetCwd(baseCwd, cdPath) {
   return path.resolve(baseCwd || process.cwd(), expanded);
 }
 
-/** Truncate string strictly by UTF-8 byte length without breaking multi-byte characters */
+/** Truncate string strictly by UTF-8 byte length without breaking multi-byte characters or stripping legitimate U+FFFD */
 export function truncateUtf8Safe(text, maxBytes) {
   if (!text) return "";
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  const sliced = Buffer.from(text, "utf8").subarray(0, Math.max(0, maxBytes)).toString("utf8");
-  return sliced.replace(/\uFFFD+$/, "");
+  const limit = Number.isFinite(Number(maxBytes)) ? Math.max(0, Math.floor(Number(maxBytes))) : 0;
+  if (limit === 0) return "";
+  const str = String(text);
+  const buf = Buffer.from(str, "utf8");
+  if (buf.length <= limit) return str;
+  let cut = limit;
+  while (cut > 0 && (buf[cut] & 0xc0) === 0x80) {
+    cut -= 1;
+  }
+  if (cut > 0) {
+    let lastLead = cut - 1;
+    while (lastLead > 0 && (buf[lastLead] & 0xc0) === 0x80) {
+      lastLead -= 1;
+    }
+    const lead = buf[lastLead];
+    let expectedLen = 1;
+    if ((lead & 0xe0) === 0xc0) expectedLen = 2;
+    else if ((lead & 0xf0) === 0xe0) expectedLen = 3;
+    else if ((lead & 0xf8) === 0xf0) expectedLen = 4;
+    if (cut - lastLead < expectedLen) {
+      cut = lastLead;
+    }
+  }
+  let out = buf.subarray(0, cut).toString("utf8");
+  if (out.length > 0) {
+    const lastCode = out.charCodeAt(out.length - 1);
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+      out = out.slice(0, -1);
+    }
+  }
+  return out;
 }
 
-/** Take strictly the last <= maxBytes UTF-8 bytes without splitting a leading multi-byte character */
+/** Take strictly the last <= maxBytes UTF-8 bytes without splitting a leading multi-byte character or stripping legitimate U+FFFD */
 export function truncateTailUtf8Safe(text, maxBytes) {
   if (!text) return "";
-  const buf = Buffer.from(text, "utf8");
-  if (buf.length <= maxBytes) return text;
-  let start = Math.max(0, buf.length - Math.max(0, maxBytes));
-  // Advance past any UTF-8 continuation bytes (10xxxxxx)
+  const limit = Number.isFinite(Number(maxBytes)) ? Math.max(0, Math.floor(Number(maxBytes))) : 0;
+  if (limit === 0) return "";
+  const str = String(text);
+  const buf = Buffer.from(str, "utf8");
+  if (buf.length <= limit) return str;
+  let start = Math.max(0, buf.length - limit);
+  // Advance past any UTF-8 continuation bytes (10xxxxxx) to land strictly on a UTF-8 lead byte
   while (start < buf.length && (buf[start] & 0xc0) === 0x80) {
     start += 1;
   }
-  return buf.subarray(start).toString("utf8").replace(/^\uFFFD+/, "");
+  let out = buf.subarray(start).toString("utf8");
+  if (out.length > 0) {
+    const firstCode = out.charCodeAt(0);
+    if (firstCode >= 0xdc00 && firstCode <= 0xdfff) {
+      out = out.slice(1);
+    }
+  }
+  return out;
 }
 
 /** Preserve both head context (~35%) and failure tail/summary (~65%) within <= maxBytes UTF-8 */

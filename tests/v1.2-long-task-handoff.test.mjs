@@ -1473,18 +1473,34 @@ test("Audit Red-Team 9: Windows PATH shim precedence, .cmd grandchild teardown, 
         JSON.stringify({ mcpServers: { hang_cmd_srv: { command: hangCmd, args: [] } } }),
         "utf8"
       );
+      const auditStartNs = process.hrtime.bigint();
       const auditRun = spawnSync(
         process.execPath,
-        [path.join(ROOT, "scripts", "cache-audit.mjs"), "--workspace", auditWs, "--config-dir", fakeCfgDir, "--timeout", "400", "--json"],
+        [path.join(ROOT, "scripts", "cache-audit.mjs"), "--workspace", auditWs, "--config-dir", fakeCfgDir, "--timeout", "600", "--json"],
         { encoding: "utf8", windowsHide: true }
       );
+      const auditElapsedMs = Number(process.hrtime.bigint() - auditStartNs) / 1e6;
+      const grandExistsImmediately = fs.existsSync(grandPidPath);
+      const leakedPid = grandExistsImmediately
+        ? Number.parseInt(fs.readFileSync(grandPidPath, "utf8").trim(), 10)
+        : NaN;
+      const aliveAtExitMoment = Number.isInteger(leakedPid) && leakedPid > 0 ? isPidAlive(leakedPid) : null;
       const parsedAudit = JSON.parse(auditRun.stdout);
       assert.ok(parsedAudit && typeof parsedAudit === "object");
-      if (fs.existsSync(grandPidPath)) {
-        const leakedPid = Number.parseInt(fs.readFileSync(grandPidPath, "utf8").trim(), 10);
-        await new Promise((r) => setTimeout(r, 400));
-        assert.equal(isPidAlive(leakedPid), false, `cache-audit.mjs must kill grandchild node.exe PID ${leakedPid}`);
-      }
+      assert.equal(
+        grandExistsImmediately,
+        true,
+        `grandchild PID file must exist so P1-14 teardown is verified (not silently skipped); elapsed=${auditElapsedMs.toFixed(1)}ms`
+      );
+      assert.ok(Number.isInteger(leakedPid) && leakedPid > 0, `expected valid grandchild PID, got ${leakedPid}`);
+      assert.equal(
+        aliveAtExitMoment,
+        false,
+        `cache-audit.mjs must already have killed grandchild node.exe PID ${leakedPid} immediately on exit (0ms wait); elapsed=${auditElapsedMs.toFixed(1)}ms`
+      );
+      const hangServerProbe = parsedAudit?.mcp?.servers?.find?.((s) => s.name === "hang_cmd_srv");
+      assert.equal(hangServerProbe?.status, "timeout", "hanging .cmd MCP probe must record timeout status");
+      assert.ok(Number.isFinite(auditElapsedMs) && auditElapsedMs >= 0);
     }
 
     // 2. P1-05 & P1-06: install.mjs junction escape prevention, .git clone protection, --project doctor & self-uninstall

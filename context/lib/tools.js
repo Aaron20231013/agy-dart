@@ -1031,6 +1031,9 @@ export function createTools({
         for (const k of ["lastTest", "lastBuild"]) {
           const item = resumePayload.sessionCheckpoint[k];
           if (!item) continue;
+          if (typeof item.failureExcerpt === "string") {
+            item.failureExcerpt = truncateUtf8(item.failureExcerpt, 240);
+          }
           if (typeof item.summary === "string") item.summary = truncateUtf8(item.summary, 180);
           if (typeof item.command === "string") item.command = truncateUtf8(item.command, 120);
         }
@@ -1039,8 +1042,18 @@ export function createTools({
         for (const k of ["lastTest", "lastBuild"]) {
           const item = resumePayload.sessionCheckpoint[k];
           if (!item) continue;
+          if (typeof item.failureExcerpt === "string") {
+            item.failureExcerpt = truncateUtf8(item.failureExcerpt, 100);
+          }
           if (typeof item.summary === "string") item.summary = truncateUtf8(item.summary, 64);
           if (typeof item.command === "string") item.command = truncateUtf8(item.command, 64);
+        }
+      }
+      if (jsonBytes() > MAX_RESUME_JSON_BYTES && resumePayload.sessionCheckpoint) {
+        for (const k of ["lastTest", "lastBuild"]) {
+          const item = resumePayload.sessionCheckpoint[k];
+          if (!item) continue;
+          if ("failureExcerpt" in item) delete item.failureExcerpt;
         }
       }
 

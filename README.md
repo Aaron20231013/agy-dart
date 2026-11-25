@@ -142,6 +142,14 @@ node scripts/install.mjs tool-loading lazy          # All 12 tools lazy-loaded
 node scripts/install.mjs tool-loading eager         # All 12 tools eager-loaded
 ```
 
+> **Troubleshooting (`ide-tools` duplicate `/required` error):** If Antigravity fails during toolbox initialization with `building toolbox: tool "mcp_ide-tools_mcp_agy-dart_fast_apply_edits" advertises an invalid parameter schema ... at '/required': items at 1 and 2 are equal`, the host's `ide-tools` bridge is re-wrapping already-eager `mcp_agy-dart_fast_*` tools and appending `toolSummary` to `/required` a second time without deduplicating (`agy-dart` itself only declares `"required": ["edits"]`). Switch to lazy loading and restart Antigravity:
+>
+> ```bash
+> node ~/.gemini/config/plugins/agy-dart/scripts/install.mjs tool-loading lazy
+> ```
+>
+> (Or remove `"tools"` / `"eager": true` under `mcpServers.fast` in `~/.gemini/config/plugins/agy-dart/mcp_config.json` and restart. See [skills/agy-dart/references/error-playbook.md](skills/agy-dart/references/error-playbook.md) for diagnostics.)
+
 ---
 
 ## Changelog

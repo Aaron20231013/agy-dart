@@ -636,6 +636,37 @@ function extractToolResponseText(payload = {}) {
   return "";
 }
 
+function extractRunChecksFailureSection(responseText) {
+  if (!responseText || typeof responseText !== "string") return "";
+  const normalized = responseText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const lines = normalized.split("\n");
+  const failingLines = [];
+  let inFailingBlock = false;
+  let justEnteredBlock = false;
+
+  for (const line of lines) {
+    if (/^## \[(FAIL|TIMEOUT|ERROR)\b/i.test(line)) {
+      inFailingBlock = true;
+      justEnteredBlock = true;
+      continue;
+    }
+    if (/^## \[/i.test(line) || /^- \[PASS\b/i.test(line)) {
+      inFailingBlock = false;
+      justEnteredBlock = false;
+      continue;
+    }
+    if (!inFailingBlock) continue;
+    // Skip echoed `$ <command>` line immediately under a failing check heading so command args never create false error anchors
+    if (justEnteredBlock && /^\$\s+/.test(line.trim())) {
+      justEnteredBlock = false;
+      continue;
+    }
+    justEnteredBlock = false;
+    failingLines.push(line);
+  }
+  return failingLines.join("\n").trim();
+}
+
 export function extractVerificationSignal(toolName, args = {}, responseText = "") {
   if (!responseText || typeof responseText !== "string") return null;
 
@@ -673,18 +704,22 @@ export function extractVerificationSignal(toolName, args = {}, responseText = ""
   }
 
   if (verifyCmd) {
-    const m = responseText.match(/Verify \[(PASS|FAIL|TIMEOUT)[^\]]*\]\s*`?([^`\n]*)`?:/i);
+    const m = responseText.match(/Verify \[(PASS|FAIL|TIMEOUT)[^\]]*\]\s*[^\n]*:/i);
     if (m) {
       const status = m[1].toUpperCase();
       const passed = status === "PASS";
       const isBuild = /\b(?:build|tsc|typecheck|lint|eslint|biome|webpack|vite|clippy)\b/i.test(verifyCmd);
+      const failureSection = !passed
+        ? responseText.slice((m.index || 0) + m[0].length).trim()
+        : "";
       return {
         kind: isBuild ? "build" : "test",
         command: verifyCmd,
         ruleId: "apply_edits_verify",
         exitCode: passed ? 0 : 1,
         passed,
-        summary: m[0].slice(0, 180)
+        summary: m[0].slice(0, 180),
+        failureSection
       };
     }
   }
@@ -699,13 +734,15 @@ export function extractVerificationSignal(toolName, args = {}, responseText = ""
       const isBuild =
         /\b(?:build|tsc|typecheck|lint|eslint|biome|check)\b/i.test(runChecksCmd) &&
         !/\btest\b/i.test(runChecksCmd);
+      const failureSection = !passed ? extractRunChecksFailureSection(responseText) : "";
       return {
         kind: isBuild ? "build" : "test",
         command: runChecksCmd || "run_checks",
         ruleId: "run_checks",
         exitCode: passed ? 0 : 1,
         passed,
-        summary: m[0]
+        summary: m[0],
+        failureSection
       };
     }
   }
@@ -773,10 +810,13 @@ async function main() {
   if (clearAllSession || paths.length > 0 || verifySignal || shouldTouchWatchdog || receipt || fastFingerprint) {
     let store = null;
     try {
-      const [{ ContextModeStore }, { redactSecrets }, watchdogLeaseMod] = await Promise.all([
+      const [{ ContextModeStore }, { redactSecrets }, watchdogLeaseMod, filterRulesMod] = await Promise.all([
         import("../context/lib/store.js"),
         import("../context/lib/security.js"),
-        shouldTouchWatchdog ? import("../context/lib/watchdog-lease.js") : Promise.resolve(null)
+        shouldTouchWatchdog ? import("../context/lib/watchdog-lease.js") : Promise.resolve(null),
+        verifySignal && !verifySignal.passed && verifySignal.failureSection
+          ? import("./filter-rules.mjs")
+          : Promise.resolve(null)
       ]);
       store = new ContextModeStore({ hookMode: true, maxBusyRetries: 4, maxRetryDeadlineMs: 800 });
       const rawClaimOwner = sessionId !== "default" ? sessionId : directConvId;
@@ -869,10 +909,17 @@ async function main() {
       if (verifySignal) {
         const safeCommand = redactSecrets(verifySignal.command || "").text;
         const safeSummary = redactSecrets(verifySignal.summary || "").text;
+        const rawFailureSection = !verifySignal.passed ? verifySignal.failureSection || "" : "";
+        const safeFailureExcerpt =
+          rawFailureSection && typeof filterRulesMod?.extractFailureExcerpt === "function"
+            ? filterRulesMod.extractFailureExcerpt(redactSecrets(rawFailureSection).text)
+            : "";
+        const { failureSection: _ignoredSection, ...cleanVerifySignal } = verifySignal;
         store.recordVerificationResult(effectiveRootSessionId, {
-          ...verifySignal,
+          ...cleanVerifySignal,
           command: safeCommand,
           summary: safeSummary,
+          failureExcerpt: safeFailureExcerpt,
           worktree: cwd
         });
       }

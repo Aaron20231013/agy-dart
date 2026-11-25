@@ -1,8 +1,69 @@
 import path from "node:path";
+import { redactSecrets } from "../security.js";
 import {
   MAX_OUTLINE_CACHE_DB_ENTRIES,
   MAX_OUTLINE_JSON_BYTES
 } from "./schema.js";
+
+const MAX_FAILURE_EXCERPT_LINES = 5;
+const MAX_FAILURE_EXCERPT_BYTES = 500;
+
+function truncateExcerptUtf8Safe(text, maxBytes) {
+  if (!text) return "";
+  const limit = Number.isFinite(Number(maxBytes)) ? Math.max(0, Math.floor(Number(maxBytes))) : 0;
+  if (limit === 0) return "";
+  const str = String(text);
+  const buf = Buffer.from(str, "utf8");
+  if (buf.length <= limit) return str;
+  let cut = limit;
+  while (cut > 0 && (buf[cut] & 0xc0) === 0x80) {
+    cut -= 1;
+  }
+  if (cut > 0) {
+    let lastLead = cut - 1;
+    while (lastLead > 0 && (buf[lastLead] & 0xc0) === 0x80) {
+      lastLead -= 1;
+    }
+    const lead = buf[lastLead];
+    let expectedLen = 1;
+    if ((lead & 0xe0) === 0xc0) expectedLen = 2;
+    else if ((lead & 0xf0) === 0xe0) expectedLen = 3;
+    else if ((lead & 0xf8) === 0xf0) expectedLen = 4;
+    if (cut - lastLead < expectedLen) {
+      cut = lastLead;
+    }
+  }
+  let out = buf.subarray(0, cut).toString("utf8");
+  if (out.length > 0) {
+    const lastCode = out.charCodeAt(out.length - 1);
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+      out = out.slice(0, -1);
+    }
+  }
+  return out;
+}
+
+function normalizeFailureExcerpt(rawExcerpt) {
+  if (typeof rawExcerpt !== "string" || !rawExcerpt.trim()) return "";
+  const redacted = redactSecrets(rawExcerpt).text;
+  const lines = redacted
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => {
+      let clean = line.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, " ").trim();
+      if (typeof clean.toWellFormed === "function") clean = clean.toWellFormed();
+      return clean;
+    })
+    .filter(Boolean)
+    .slice(0, MAX_FAILURE_EXCERPT_LINES);
+  if (lines.length === 0) return "";
+  const joined = lines.join("\n");
+  if (Buffer.byteLength(joined, "utf8") <= MAX_FAILURE_EXCERPT_BYTES) {
+    return joined;
+  }
+  return truncateExcerptUtf8Safe(joined, MAX_FAILURE_EXCERPT_BYTES).trimEnd();
+}
 
 export class CheckpointMethods {
   /** Record modified file paths into the session's structured compaction checkpoint ledger */
@@ -106,7 +167,17 @@ export class CheckpointMethods {
   /** Record latest test or build verification status into the session checkpoint ledger */
   recordVerificationResult(
     sessionId,
-    { kind = "test", command = "", ruleId = "", exitCode = 0, passed = null, summary = "", sourceId = null, worktree = "" } = {}
+    {
+      kind = "test",
+      command = "",
+      ruleId = "",
+      exitCode = 0,
+      passed = null,
+      summary = "",
+      failureExcerpt = "",
+      sourceId = null,
+      worktree = ""
+    } = {}
   ) {
     this.open();
     const sid = sessionId || "default";
@@ -122,7 +193,8 @@ export class CheckpointMethods {
         ? Number(exitCode)
         : null;
     const ok = passed !== null && passed !== undefined ? Boolean(passed) : parsedExitCode === 0;
-    const payload = JSON.stringify({
+    const normalizedExcerpt = !ok ? normalizeFailureExcerpt(failureExcerpt) : "";
+    const payloadObj = {
       command: String(command || "").trim().slice(0, 140),
       ruleId: String(ruleId || ""),
       ok,
@@ -130,7 +202,11 @@ export class CheckpointMethods {
       summary: String(summary || "").trim().slice(0, 220),
       sourceId: sourceId || null,
       at: nowIso
-    });
+    };
+    if (normalizedExcerpt) {
+      payloadObj.failureExcerpt = normalizedExcerpt;
+    }
+    const payload = JSON.stringify(payloadObj);
 
     this._withBusyRetry(() => {
       if (isBuild) {

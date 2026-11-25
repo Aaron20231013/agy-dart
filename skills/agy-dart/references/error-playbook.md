@@ -1,6 +1,6 @@
 # agy-dart Error & Troubleshooting Playbook
 
-Read this file on demand when hitting a guard block, edit rollback, rejected project filter rule, KV-cache hit drop, or platform/timeout error.
+Read this file on demand when hitting a guard block, edit rollback, rejected project filter rule, KV-cache hit drop, toolbox schema error, or platform/timeout error.
 
 ## Quick Triage Matrix
 
@@ -11,6 +11,7 @@ Read this file on demand when hitting a guard block, edit rollback, rejected pro
 | `apply_edits` aborted (`0 files modified`) or rolled back | Stale/mismatched `target`, ambiguous multi-line match, or write error | Re-read exact target slice (`read_slices`), pass `startLine`/`endLine` or wider anchor lines, preview with `dryRun: true` |
 | KV-cache hit rate drops or Turn-0 prefix grows | Bloated rules/skill frontmatter, non-deterministic MCP `tools/list`, conflicting legacy plugin, or dynamic `systemMessage` hook | Run `npm run cache:audit -- --workspace . --no-live` and `node bin/agy-dart.mjs audit skills --workspace .` |
 | Slow search, Windows encoding garble, or `run_checks` timeout | Missing `rg`, complex shell quoting, or `> 60s` job run inside `run_checks` | Install `rg` (`--install-rg`), use `ctx_execute` script file for heavy parsing, route `> 60s`/daemon jobs to native `run_command` (`WaitMsBeforeAsync <= 2000`) |
+| `building toolbox: tool "mcp_ide-tools_mcp_agy-dart_fast_apply_edits" ... at '/required': items at 1 and 2 are equal` | Antigravity `ide-tools` bridge re-wraps eager `mcp_agy-dart_fast_*` tools and appends `toolSummary` to `/required` twice without deduplicating | Run `node ~/.gemini/config/plugins/agy-dart/scripts/install.mjs tool-loading lazy` (or remove `eager: true` under `mcpServers.fast`) and restart Antigravity |
 
 ---
 
@@ -110,3 +111,30 @@ Project-specific CLI output filters live in `<workspace>/.agy-dart/filters.json`
 - **Long tasks & daemons (`run_checks` vs `run_command`)**:
   - Use `agy-dart_fast` `run_checks` for short foreground checks (`<= 60s`).
   - For builds, full integration suites (`> 60s`), watchers, or dev servers, use native `run_command` with `WaitMsBeforeAsync <= 2000` (plus `IsDaemon: true` for servers) and monitor with `manage_task`. Commands with `WaitMsBeforeAsync <= 2000` bypass foreground CLI filtering (`cliFilterAsyncBypassMs: 2000`).
+
+---
+
+## 6. Antigravity `ide-tools` Toolbox Schema Error (Duplicate `/required`)
+
+### Symptom
+Before a turn starts, Antigravity fails to initialize the agent toolbox with a JSON Schema Draft 2020-12 error on a double-prefixed tool name:
+```text
+agent executor error: building toolbox: tool "mcp_ide-tools_mcp_agy-dart_fast_apply_edits" advertises an invalid parameter schema: ...
+• at '': 'allOf' failed
+    • at '/required': items at 1 and 2 are equal
+```
+
+### Root cause
+- `fast/mcp-server.mjs` only declares a single top-level required field for `apply_edits` (`"required": ["edits"]`) and no duplicate `required` entries across any tool.
+- In the default `fast-eager` mode, Antigravity registers `apply_edits` eagerly as `mcp_agy-dart_fast_apply_edits` and injects its synthetic `toolSummary` parameter into `/required` (`["edits", "toolSummary"]`).
+- When Antigravity's `ide-tools` bridge re-exposes `mcp_agy-dart_fast_apply_edits` as `mcp_ide-tools_mcp_agy-dart_fast_apply_edits`, the executor appends `"toolSummary"` a second time without deduplicating (`["edits", "toolSummary", "toolSummary"]`), violating Draft 2020-12 `uniqueItems: true` at 0-based indices `1` and `2`. `apply_edits` fails first because it sorts first alphabetically among the 4 eager `fast` tools.
+
+### Recovery & verification
+1. **Workaround (switch to lazy loading and restart Antigravity)**:
+   ```bash
+   node ~/.gemini/config/plugins/agy-dart/scripts/install.mjs tool-loading lazy
+   ```
+   (Or remove `"tools"` / `"eager": true` under `mcpServers.fast` in `~/.gemini/config/plugins/agy-dart/mcp_config.json` and restart.)
+2. **Inspect / confirm**:
+   - Raw server schemas cached on disk live under `~/.gemini/antigravity/mcp/agy-dart_fast/apply_edits.json` (App/IDE) or `~/.gemini/antigravity-cli/mcp/agy-dart_fast/apply_edits.json` (CLI) and show `"required": ["edits"]`; if `ide-tools` caches schemas on disk, check `~/.gemini/antigravity*/mcp/ide-tools/`.
+   - Leaving only `read_slices` with `"eager": true` (which declares no top-level `required` array in `fast/mcp-server.mjs`) shifts the error to `mcp_ide-tools_mcp_agy-dart_fast_read_slices` with `at '/required': items at 0 and 1 are equal`, confirming both duplicates are injected by the host bridge.

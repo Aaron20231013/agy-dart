@@ -723,6 +723,203 @@ export function readTranscriptTail(filePath, maxBytes = 131072, options = {}) {
   }
 }
 
+const UTF8_FATAL_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+/**
+ * Fixed-window head + tail reader for handoff brief intent extraction.
+ * Strictly reads at most `headBytes` (default 64 KiB) from the start and `tailBytes`
+ * (default 128 KiB) from the end without ever widening up to 2 MiB.
+ * Drops partial boundary lines on raw Buffers before UTF-8 decoding so only complete
+ * JSONL records are parsed and split multi-byte characters never corrupt output.
+ */
+export function readTranscriptHeadTailFixed(filePath, { headBytes = 65536, tailBytes = 131072 } = {}) {
+  const empty = {
+    headSteps: [],
+    tailSteps: [],
+    headBytesRead: 0,
+    tailBytesRead: 0,
+    totalBytesRead: 0,
+    fileSize: 0,
+    overlapped: true
+  };
+  if (!filePath || typeof filePath !== "string") return empty;
+  const headCap = Number.isFinite(Number(headBytes)) && Number(headBytes) >= 0 ? Math.floor(Number(headBytes)) : 65536;
+  const tailCap = Number.isFinite(Number(tailBytes)) && Number(tailBytes) >= 0 ? Math.floor(Number(tailBytes)) : 131072;
+  if (headCap === 0 && tailCap === 0) return empty;
+
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size <= 0) return empty;
+
+    const readChunkExact = (length, position) => {
+      if (length <= 0) return Buffer.alloc(0);
+      const buf = Buffer.allocUnsafe(length);
+      let total = 0;
+      while (total < length) {
+        const n = fs.readSync(fd, buf, total, length - total, position + total);
+        if (n <= 0) break;
+        total += n;
+      }
+      return total === length ? buf : buf.subarray(0, total);
+    };
+
+    const parseStrictUtf8JsonlLine = (lineBuf, { requireBraces = false } = {}) => {
+      if (!lineBuf || lineBuf.length === 0) return null;
+      let end = lineBuf.length;
+      if (end > 0 && lineBuf[end - 1] === 0x0d) {
+        end -= 1;
+      }
+      if (end === 0) return null;
+      const slice = end === lineBuf.length ? lineBuf : lineBuf.subarray(0, end);
+      if ((slice[0] & 0xc0) === 0x80) return null;
+      try {
+        const decoded = UTF8_FATAL_DECODER.decode(slice);
+        const trimmed = decoded.trim();
+        if (!trimmed) return null;
+        if (requireBraces && !(trimmed.startsWith("{") && trimmed.endsWith("}"))) {
+          return null;
+        }
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed;
+        }
+      } catch {
+        // Invalid UTF-8 bytes or malformed JSON -> drop ONLY this line
+      }
+      return null;
+    };
+
+    const parseStrictUtf8JsonlBuffer = (buf) => {
+      if (!buf || buf.length === 0) return [];
+      const steps = [];
+      let lineStart = 0;
+      while (lineStart < buf.length) {
+        const nlIdx = buf.indexOf(0x0a, lineStart);
+        const lineEnd = nlIdx >= 0 ? nlIdx : buf.length;
+        if (lineEnd > lineStart) {
+          const parsed = parseStrictUtf8JsonlLine(buf.subarray(lineStart, lineEnd));
+          if (parsed) steps.push(parsed);
+        }
+        if (nlIdx < 0) break;
+        lineStart = nlIdx + 1;
+      }
+      return steps;
+    };
+
+    const parseHeadSlice = (buf, reachedEof) => {
+      if (!buf || buf.length === 0) return [];
+      if (reachedEof) {
+        return parseStrictUtf8JsonlBuffer(buf);
+      }
+      // Drop trailing incomplete line at raw byte boundary before strict per-line UTF-8 decode
+      const lastNl = buf.lastIndexOf(0x0a);
+      if (lastNl < 0) return [];
+      return parseStrictUtf8JsonlBuffer(buf.subarray(0, lastNl + 1));
+    };
+
+    const parseTailSliceExact = (buf, offset, prevByte) => {
+      if (!buf || buf.length === 0) return [];
+      if (offset === 0 || prevByte === 0x0a) {
+        return parseStrictUtf8JsonlBuffer(buf);
+      }
+      // Drop leading incomplete line at raw byte boundary before strict per-line UTF-8 decode
+      const firstNl = buf.indexOf(0x0a);
+      if (firstNl < 0 || firstNl + 1 >= buf.length) return [];
+      return parseStrictUtf8JsonlBuffer(buf.subarray(firstNl + 1));
+    };
+
+    const parseTailSliceLarge = (buf, offset) => {
+      if (!buf || buf.length === 0) return [];
+      if (offset === 0) {
+        return parseStrictUtf8JsonlBuffer(buf);
+      }
+      const firstNl = buf.indexOf(0x0a);
+      const firstLineBuf = firstNl >= 0 ? buf.subarray(0, firstNl) : buf;
+      const restBuf = firstNl >= 0 && firstNl + 1 < buf.length ? buf.subarray(firstNl + 1) : null;
+      const steps = [];
+      // Verify whether the tail window begins cleanly on a complete JSONL object line without
+      // performing any extra probe read before `tailOffset`. Any strict proper suffix of a valid
+      // JSON object carries unmatched outer closing braces and fails `JSON.parse`.
+      const parsedFirst = parseStrictUtf8JsonlLine(firstLineBuf, { requireBraces: true });
+      if (parsedFirst) {
+        steps.push(parsedFirst);
+      }
+      if (restBuf && restBuf.length > 0) {
+        steps.push(...parseStrictUtf8JsonlBuffer(restBuf));
+      }
+      return steps;
+    };
+
+    const fileSize = stat.size;
+    // Overlapping fast path: read once without duplicate I/O, but still parse head <= headCap
+    // and tail <= tailCap strictly along their raw byte boundaries.
+    if (fileSize <= headCap + tailCap) {
+      const fullBuf = readChunkExact(fileSize, 0);
+      const bytesRead = fullBuf.length;
+      const headLen = Math.min(headCap, bytesRead);
+      const headSteps = headLen > 0 ? parseHeadSlice(fullBuf.subarray(0, headLen), headLen === bytesRead) : [];
+
+      let tailSteps = [];
+      let tailLen = 0;
+      if (tailCap > 0) {
+        tailLen = Math.min(tailCap, bytesRead);
+        const tailOffset = Math.max(0, bytesRead - tailLen);
+        const prevByte = tailOffset > 0 ? fullBuf[tailOffset - 1] : 0x0a;
+        tailSteps = parseTailSliceExact(fullBuf.subarray(tailOffset, bytesRead), tailOffset, prevByte);
+      }
+
+      return {
+        headSteps,
+        tailSteps,
+        headBytesRead: headLen,
+        tailBytesRead: tailLen,
+        totalBytesRead: bytesRead,
+        fileSize,
+        overlapped: true
+      };
+    }
+
+    // Large file path: strictly <= headCap head read + strictly <= tailCap tail read (no extra probe byte)
+    let headSteps = [];
+    let headBytesRead = 0;
+    if (headCap > 0) {
+      const headBuf = readChunkExact(Math.min(headCap, fileSize), 0);
+      headBytesRead = headBuf.length;
+      headSteps = parseHeadSlice(headBuf, headBytesRead === fileSize);
+    }
+
+    let tailSteps = [];
+    let tailBytesRead = 0;
+    if (tailCap > 0) {
+      const tailLen = Math.min(tailCap, fileSize);
+      const tailOffset = Math.max(0, fileSize - tailLen);
+      const tailBuf = readChunkExact(tailLen, tailOffset);
+      tailBytesRead = tailBuf.length;
+      tailSteps = parseTailSliceLarge(tailBuf, tailOffset);
+    }
+
+    return {
+      headSteps,
+      tailSteps,
+      headBytesRead,
+      tailBytesRead,
+      totalBytesRead: headBytesRead + tailBytesRead,
+      fileSize,
+      overlapped: false
+    };
+  } catch {
+    return empty;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
 function getCallArgs(call) {
   if (!call || typeof call !== "object") return null;
   const raw = call.args ?? call.arguments ?? call.input;
@@ -2894,6 +3091,246 @@ export function analyzeMultipleSessionsCache(sessions, options = {}) {
     topContextDeltas,
     recentBusts: sortedBusts.slice(-15)
   };
+}
+
+const RESERVED_BRAIN_CONV_IDS = new Set([
+  "default",
+  "all",
+  "lifetime",
+  "app",
+  "__unbound__",
+  "unknown",
+  "none",
+  "null",
+  "undefined"
+]);
+
+function isUncPathLocal(p) {
+  if (!p || typeof p !== "string") return false;
+  return /^[\\/]{2}/.test(p.trim());
+}
+
+function resolveCanonicalPathLocal(p) {
+  const real =
+    typeof fs.realpathSync.native === "function" ? fs.realpathSync.native(p) : fs.realpathSync(p);
+  if (process.platform === "win32") {
+    const driveMatch = real.match(/^\\\\\?\\([a-zA-Z]:\\.*)$/);
+    if (driveMatch) return driveMatch[1];
+  }
+  return real;
+}
+
+function isStrictPathInside(childPath, parentPath) {
+  if (!childPath || !parentPath) return false;
+  const nc = process.platform === "win32" ? childPath.toLowerCase() : childPath;
+  const np = process.platform === "win32" ? parentPath.toLowerCase() : parentPath;
+  const rel = path.relative(np, nc);
+  return Boolean(
+    rel &&
+      rel !== "." &&
+      rel !== ".." &&
+      !rel.startsWith(`..${path.sep}`) &&
+      !rel.startsWith("../") &&
+      !path.isAbsolute(rel)
+  );
+}
+
+/**
+ * Return allowed Antigravity brain root directories (extra roots first, then default user roots).
+ */
+export function getAntigravityBrainRoots(extraRoots = []) {
+  const home = os.homedir();
+  const rawList = [
+    ...(Array.isArray(extraRoots) ? extraRoots : []),
+    path.join(home, ".gemini", "antigravity", "brain"),
+    path.join(home, ".gemini", "antigravity-ide", "brain"),
+    path.join(home, ".gemini", "antigravity-cli", "brain")
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const r of rawList) {
+    if (typeof r !== "string") continue;
+    const trimmed = r.trim();
+    if (!trimmed || trimmed.includes("\0") || isUncPathLocal(trimmed) || !path.isAbsolute(trimmed)) continue;
+    const resolved = path.resolve(trimmed);
+    if (isUncPathLocal(resolved)) continue;
+    const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(resolved);
+  }
+  return out;
+}
+
+const PREFERRED_TRANSCRIPT_REL_PATHS = Object.freeze([
+  [".system_generated", "logs", "transcript.jsonl"],
+  [".system_generated", "transcript.jsonl"],
+  ["transcript.jsonl"],
+  [".system_generated", "logs", "transcript_full.jsonl"],
+  [".system_generated", "transcript_full.jsonl"],
+  ["transcript_full.jsonl"]
+]);
+const CONVERSATION_ARTIFACT_REL_PATHS = Object.freeze([
+  ["task.md"],
+  ["implementation_plan.md"],
+  ["walkthrough.md"]
+]);
+
+function inspectConversationDirOwnership(convDirInfo) {
+  let hasOwnedFile = false;
+  let hasSuspiciousEscape = false;
+  const allCandidates = [...PREFERRED_TRANSCRIPT_REL_PATHS, ...CONVERSATION_ARTIFACT_REL_PATHS];
+
+  for (const segs of allCandidates) {
+    if (resolveConversationOwnedFile(convDirInfo, segs)) {
+      hasOwnedFile = true;
+      break;
+    }
+    const candPath = path.join(convDirInfo.dir, ...segs);
+    try {
+      fs.lstatSync(candPath);
+      // Candidate entry exists on disk in a supported slot yet failed strict ownership validation
+      // (e.g. symlink/junction escaping the conversation dir). Lock onto this root instead of hopping.
+      hasSuspiciousEscape = true;
+    } catch {
+      // Missing slot -> normal
+    }
+  }
+
+  if (!hasOwnedFile && !hasSuspiciousEscape) {
+    // Also detect escaping `.system_generated` or `.system_generated/logs` junctions
+    for (const dirSegs of [[".system_generated"], [".system_generated", "logs"]]) {
+      const dirCand = path.join(convDirInfo.dir, ...dirSegs);
+      try {
+        const st = fs.lstatSync(dirCand);
+        if (st.isSymbolicLink()) {
+          hasSuspiciousEscape = true;
+          break;
+        }
+        const realSub = resolveCanonicalPathLocal(dirCand);
+        if (isUncPathLocal(realSub) || !isStrictPathInside(realSub, convDirInfo.dir)) {
+          hasSuspiciousEscape = true;
+          break;
+        }
+      } catch {
+        // Missing subdir -> normal
+      }
+    }
+  }
+
+  return { hasOwnedFile, hasSuspiciousEscape };
+}
+
+/**
+ * Resolve and canonically validate a single conversation's owned brain directory.
+ * Blocks `..`, UNC paths, symlinks/Windows junctions escaping the brain root, and
+ * junctions redirecting a conversation directory to a sibling conversation.
+ * Across multiple brain roots (`extraRoots` > `antigravity` > `antigravity-ide` > `antigravity-cli`),
+ * locks onto the first root containing any valid owned transcript/artifact (or suspicious escape),
+ * skipping empty placeholder directories so they do not shadow a real session in a later root.
+ */
+export function resolveConversationBrainDir(conversationId, extraRoots = []) {
+  if (typeof conversationId !== "string") return null;
+  const safeId = conversationId.trim();
+  if (!safeId || RESERVED_BRAIN_CONV_IDS.has(safeId.toLowerCase()) || !isSafeConversationId(safeId)) {
+    return null;
+  }
+  const roots = getAntigravityBrainRoots(extraRoots);
+  let firstEmptyValid = null;
+  for (const resolvedRoot of roots) {
+    let realRoot;
+    try {
+      const rootStat = fs.statSync(resolvedRoot);
+      if (!rootStat.isDirectory()) continue;
+      realRoot = resolveCanonicalPathLocal(resolvedRoot);
+      if (isUncPathLocal(realRoot)) continue;
+    } catch {
+      continue;
+    }
+    const expectedDir = path.join(realRoot, safeId);
+    try {
+      const lstat = fs.lstatSync(expectedDir);
+      // Reject symlink or Windows junction at conversation root (prevents sibling-session redirection)
+      if (lstat.isSymbolicLink() || !lstat.isDirectory()) continue;
+      const realCand = resolveCanonicalPathLocal(expectedDir);
+      if (isUncPathLocal(realCand)) continue;
+      const cmpCand = process.platform === "win32" ? realCand.toLowerCase() : realCand;
+      const cmpExpected = process.platform === "win32" ? expectedDir.toLowerCase() : expectedDir;
+      if (cmpCand !== cmpExpected || !isStrictPathInside(realCand, realRoot)) continue;
+      const info = {
+        root: resolvedRoot,
+        realRoot,
+        dir: realCand,
+        conversationId: safeId
+      };
+      const ownership = inspectConversationDirOwnership(info);
+      if (ownership.hasOwnedFile || ownership.hasSuspiciousEscape) {
+        return info;
+      }
+      if (!firstEmptyValid) {
+        firstEmptyValid = info;
+      }
+    } catch {
+      // Missing or inaccessible in this brain root -> try next root
+    }
+  }
+  return firstEmptyValid;
+}
+
+/**
+ * Independently verify that a candidate regular file inside a validated conversation brain dir
+ * remains canonically owned by that exact conversation (blocks sibling-session links, junctions, UNC).
+ */
+export function resolveConversationOwnedFile(convDirInfo, relativeSegments = []) {
+  if (!convDirInfo || typeof convDirInfo.dir !== "string" || !convDirInfo.dir) return null;
+  if (!Array.isArray(relativeSegments) || relativeSegments.length === 0) return null;
+  for (const seg of relativeSegments) {
+    if (
+      typeof seg !== "string" ||
+      !seg ||
+      seg === "." ||
+      seg === ".." ||
+      seg.includes("\0") ||
+      seg.includes("/") ||
+      seg.includes("\\")
+    ) {
+      return null;
+    }
+  }
+  const candPath = path.join(convDirInfo.dir, ...relativeSegments);
+  if (isUncPathLocal(candPath) || !isStrictPathInside(candPath, convDirInfo.dir)) {
+    return null;
+  }
+  try {
+    // Must exist on disk
+    fs.lstatSync(candPath);
+    const realFile = resolveCanonicalPathLocal(candPath);
+    if (isUncPathLocal(realFile)) return null;
+    if (!isStrictPathInside(realFile, convDirInfo.dir)) return null;
+    const stat = fs.statSync(realFile);
+    if (!stat.isFile()) return null;
+    return { path: realFile, stat };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Strictly locate the preferred transcript for a confirmed conversationId inside its own
+ * verified brain directory: prefers `transcript.jsonl` and falls back to the SAME session's
+ * `transcript_full.jsonl`. Never falls back across sessions.
+ */
+export function findPreferredTranscriptForConversation(
+  conversationId,
+  { extraRoots = [], convDirInfo = null } = {}
+) {
+  const dirInfo = convDirInfo || resolveConversationBrainDir(conversationId, extraRoots);
+  if (!dirInfo) return null;
+  for (const segs of PREFERRED_TRANSCRIPT_REL_PATHS) {
+    const owned = resolveConversationOwnedFile(dirInfo, segs);
+    if (owned) return owned.path;
+  }
+  return null;
 }
 
 /**

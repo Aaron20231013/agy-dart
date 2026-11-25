@@ -19,11 +19,13 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { getEffectiveConfig, parseUiLang } from "./config.js";
 import { buildHandoffBrief, inferWorkspaceFromStore, isSafeWorkspaceDir } from "./handoff.js";
+import { isSecretRedactionEnabled } from "./security.js";
 import {
   DEFAULT_CACHE_TTL_SEC,
   estimateCalibratedTtl,
   extractStepTokenUsage,
   findTranscriptForConversation,
+  isSafeConversationId,
   isSlashCompactText,
   isSubagentStep,
   readTranscriptTail,
@@ -118,6 +120,115 @@ export const PENDING_JUMP_META_KEY = "watchdog:pending_jump";
 export const DEFAULT_PENDING_JUMP_TTL_MS = 20_000;
 
 export const DEFAULT_STALE_LEASE_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+const RESERVED_CHECKPOINT_SESSION_IDS = new Set([
+  "default",
+  "all",
+  "lifetime",
+  "app",
+  "__unbound__",
+  "unknown",
+  "none",
+  "null",
+  "undefined"
+]);
+
+/**
+ * Single source of truth for resolving a confirmed conversation's trusted checkpoint sessionId
+ * across multi-hop grandchild -> child -> root lease chains (up to 12 hops with cycle detection)
+ * plus `store.resolveRootSessionId(cursor)`. Rejects unrelated explicit sessionIds and reserved IDs.
+ */
+export function resolveTrustedCheckpointSessionId(
+  store,
+  confirmedConversationId,
+  explicitRawSid = "",
+  { seedLease = null } = {}
+) {
+  const safeConv = typeof confirmedConversationId === "string" ? confirmedConversationId.trim() : "";
+  const isValidTrustedId = (cand) => {
+    const s = typeof cand === "string" ? cand.trim() : "";
+    return Boolean(s && !RESERVED_CHECKPOINT_SESSION_IDS.has(s.toLowerCase()) && isSafeConversationId(s));
+  };
+  if (!isValidTrustedId(safeConv)) {
+    return "";
+  }
+
+  const allowed = new Set([safeConv]);
+  const addAllowed = (cand) => {
+    const s = typeof cand === "string" ? cand.trim() : "";
+    if (isValidTrustedId(s)) {
+      allowed.add(s);
+    }
+  };
+
+  let resolvedRoot = safeConv;
+  const readLeaseAt = (id, depth) => {
+    if (depth === 0 && seedLease && typeof seedLease === "object") {
+      const seedId = typeof seedLease.conversationId === "string" ? seedLease.conversationId.trim() : "";
+      if (!seedId || seedId === id) {
+        return seedLease;
+      }
+    }
+    if (!store) return null;
+    try {
+      return readWatchdogLease(store, id);
+    } catch {
+      return null;
+    }
+  };
+
+  let cursor = safeConv;
+  const visited = new Set([cursor]);
+  for (let depth = 0; depth < 12; depth++) {
+    const lease = readLeaseAt(cursor, depth);
+    if (!lease) break;
+    addAllowed(lease.rootSessionId);
+    addAllowed(lease.parentConversationId);
+    const rawRoot = typeof lease.rootSessionId === "string" ? lease.rootSessionId.trim() : "";
+    const rawParent = typeof lease.parentConversationId === "string" ? lease.parentConversationId.trim() : "";
+    let next = "";
+    if (rawRoot && rawRoot !== cursor && !visited.has(rawRoot) && isValidTrustedId(rawRoot)) {
+      next = rawRoot;
+    } else if (rawParent && rawParent !== cursor && !visited.has(rawParent) && isValidTrustedId(rawParent)) {
+      next = rawParent;
+    }
+    if (!next) break;
+    visited.add(next);
+    addAllowed(next);
+    cursor = next;
+  }
+
+  if (cursor !== safeConv) {
+    resolvedRoot = cursor;
+  }
+
+  if (store && typeof store.resolveRootSessionId === "function") {
+    try {
+      const rootFromCursor = store.resolveRootSessionId(cursor);
+      const trimmedRoot = typeof rootFromCursor === "string" ? rootFromCursor.trim() : "";
+      if (isValidTrustedId(trimmedRoot)) {
+        resolvedRoot = trimmedRoot;
+        addAllowed(resolvedRoot);
+      }
+    } catch {}
+    if (cursor !== safeConv) {
+      try {
+        const rootFromStart = store.resolveRootSessionId(safeConv);
+        const trimmedStart = typeof rootFromStart === "string" ? rootFromStart.trim() : "";
+        if (isValidTrustedId(trimmedStart)) {
+          addAllowed(trimmedStart);
+        }
+      } catch {}
+    }
+  }
+
+  const trimmedExplicit = typeof explicitRawSid === "string" ? explicitRawSid.trim() : "";
+  if (trimmedExplicit && allowed.has(trimmedExplicit)) {
+    return trimmedExplicit;
+  }
+  return resolvedRoot;
+}
+
 export const DEFAULT_ORPHAN_TURN0_MS = 15 * 60 * 1000; // 15 minutes
 const MAX_IDLE_LEASE_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
 const TERMINAL_STOP_REASON_RE =
@@ -1204,6 +1315,13 @@ export function buildWindowFocusCommand({
   return { cmd, args, env, safeConvId, safeCwd, safeWsLabel, safeConvTitle, platform };
 }
 
+function isRunningInNodeTestRunner(env = process.env, execArgv = process.execArgv) {
+  return Boolean(
+    (typeof env?.NODE_TEST_CONTEXT === "string" && env.NODE_TEST_CONTEXT.trim() !== "") ||
+      (Array.isArray(execArgv) && execArgv.includes("--test"))
+  );
+}
+
 /**
  * Safe, zero-dependency, fail-open OS window foreground activator for cross-window jumps.
  */
@@ -1213,7 +1331,8 @@ export function focusDesktopConversationWindow({
   workspaceLabel = "",
   convTitle = "",
   platform = process.platform,
-  spawnFn = spawn
+  spawnFn = spawn,
+  baseEnv = process.env
 } = {}) {
   try {
     const spec = buildWindowFocusCommand({
@@ -1221,10 +1340,18 @@ export function focusDesktopConversationWindow({
       cwd,
       workspaceLabel,
       convTitle,
-      platform
+      platform,
+      baseEnv
     });
     if (!spec.cmd) {
       return { dispatched: false, platform };
+    }
+    const disableFlag = String(baseEnv?.AGY_DART_DISABLE_OS_FOCUS || "").trim().toLowerCase();
+    if (
+      spawnFn === spawn &&
+      (disableFlag === "1" || disableFlag === "true" || isRunningInNodeTestRunner(baseEnv))
+    ) {
+      return { dispatched: false, platform, suppressed: true };
     }
     const child = spawnFn(spec.cmd, spec.args, {
       stdio: "ignore",
@@ -1464,6 +1591,7 @@ export class WatchdogMonitor {
     this.keepaliveSendFn = typeof options.keepaliveSendFn === "function" ? options.keepaliveSendFn : null;
     this.focusWindowFn = options.focusWindowFn || focusDesktopConversationWindow;
     this.buildHandoffFn = options.buildHandoffFn || buildHandoffBrief;
+    this.brainRoots = Array.isArray(options.brainRoots) ? options.brainRoots : [];
     this.pendingJumpTtlMs =
       Number.isFinite(options.pendingJumpTtlMs) && options.pendingJumpTtlMs > 0
         ? Math.floor(options.pendingJumpTtlMs)
@@ -3593,14 +3721,26 @@ export class WatchdogMonitor {
       diagnosis = diagnoseStallCause(lease, { platform: this.platform });
     }
 
+    const incidentKey =
+      rawSeverity === "suspect" || rawSeverity === "stalled"
+        ? `${lease.conversationId}:${lease.phaseChangedTs || lease.updatedTs}:${lease.phase}:${rawSeverity}:${diagnosis?.causeId || "unknown"}`
+        : "";
+
+    const secretRedactionEnabled = isSecretRedactionEnabled();
     if (rawSeverity === "stalled") {
-      const incidentKey = `${lease.conversationId}:${lease.phaseChangedTs || lease.updatedTs}:${lease.phase}:${diagnosis?.causeId || "unknown"}`;
-      if (st.rescueBriefKey === incidentKey && st.rescueBrief) {
+      if (
+        st.rescueBriefKey === incidentKey &&
+        st.rescueBrief &&
+        st.rescueBrief.secretRedactionEnabled === secretRedactionEnabled
+      ) {
         rescueBrief = st.rescueBrief;
       } else {
         try {
+          const checkpointSessionId =
+            resolveTrustedCheckpointSessionId(store, lease.conversationId, "", { seedLease: lease }) ||
+            lease.conversationId;
           const safeLeaseCwd = isSafeWorkspaceDir(lease.cwd) ? lease.cwd : "";
-          const workDir = safeLeaseCwd || inferWorkspaceFromStore(store, lease.rootSessionId || lease.conversationId);
+          const workDir = safeLeaseCwd || inferWorkspaceFromStore(store, checkpointSessionId);
           const stallContext = {
             severity: "stalled",
             phase: lease.phase,
@@ -3619,17 +3759,34 @@ export class WatchdogMonitor {
           };
           const brief = this.buildHandoffFn({
             store,
-            sessionId: lease.rootSessionId || lease.conversationId,
+            mode: "agent",
+            conversationId: lease.conversationId,
+            conversationConfirmed: true,
+            scope: "conversation",
+            sessionId: checkpointSessionId,
             cwd: workDir,
             cacheDiag: null,
             maxBytes: 5800,
-            stallContext
+            stallContext,
+            brainRoots: this.brainRoots,
+            nowFn: () => nowWallMs
           });
           rescueBrief = {
+            mode: brief.mode || "agent",
+            confirmedConversation: brief.confirmedConversation !== false,
+            conversationId: lease.conversationId,
+            sessionId: checkpointSessionId,
+            secretRedactionEnabled:
+              typeof brief.secretRedactionEnabled === "boolean"
+                ? brief.secretRedactionEnabled
+                : secretRedactionEnabled,
             markdown: brief.markdown,
             summary: brief.summary,
             bytes: brief.bytes,
             truncated: brief.truncated,
+            anchors: brief.anchors || null,
+            resumeCommand: brief.resumeCommand || "",
+            sampledAt: brief.sampledAt || brief.anchors?.sampledAt || "",
             generatedAt: nowWallMs,
             incidentKey
           };
@@ -3721,12 +3878,13 @@ export class WatchdogMonitor {
       selfHealed: false,
       transcriptGrowing,
       snoozedUntilTs: isSnoozed ? lease.ackedUntilTs : 0,
+      incidentKey,
       diagnosis,
       rescueBrief
     };
   }
 
-  getStatus({ conversationId = "", scope = "conversation", refresh = true } = {}) {
+  getStatus({ conversationId = "", scope = "conversation", refresh = true, includeRichRescue = true } = {}) {
     const tickRes = refresh ? this.tick() : null;
     const nowWallMs = tickRes ? tickRes.serverNowMs : this.nowFn();
     const cfg = this.getConfig() || {};
@@ -3876,6 +4034,30 @@ export class WatchdogMonitor {
     const stalledCount = sessions.filter((s) => s.severity === "stalled").length;
     const pendingJump = this.getPendingConversationJump(nowWallMs);
 
+    // Project external views without mutating internal per-conversation rescueBrief cache:
+    // - `sessions` and `alertingSessions` expose overview metadata only (no per-window `lastUserInput` or `rescueBrief`).
+    // - `current` only exposes `lastUserInput` and `rescueBrief` when scope is `conversation` AND target is a confirmed matching session.
+    const projectOverviewEntry = (entry) => (entry ? { ...entry, lastUserInput: "", rescueBrief: null } : null);
+    const isReservedRescueTarget =
+      !safeConvId ||
+      ["default", "all", "lifetime", "app", "__unbound__", "unknown", "none", "null", "undefined"].includes(
+        safeConvId.toLowerCase()
+      );
+    const canIncludeRichRescue = Boolean(
+      includeRichRescue !== false &&
+        scope === "conversation" &&
+        !isReservedRescueTarget &&
+        current &&
+        current.conversationId === safeConvId
+    );
+    const projectedCurrent = current
+      ? canIncludeRichRescue
+        ? { ...current }
+        : projectOverviewEntry(current)
+      : null;
+    const projectedSessions = sessions.slice(0, 20).map(projectOverviewEntry);
+    const projectedAlertingSessions = alertingSessions.slice(0, 10).map(projectOverviewEntry);
+
     return {
       ok: true,
       enabled,
@@ -3927,9 +4109,9 @@ export class WatchdogMonitor {
         lastJumpMs: this._lastSleepJumpMs
       },
       pendingJump,
-      current,
-      sessions: sessions.slice(0, 20),
-      alertingSessions: alertingSessions.slice(0, 10),
+      current: projectedCurrent,
+      sessions: projectedSessions,
+      alertingSessions: projectedAlertingSessions,
       stats: {
         totalTracked: sessions.length,
         activeCount,
@@ -4141,7 +4323,7 @@ export class WatchdogMonitor {
     };
   }
 
-  getStallContextForConversation(conversationId) {
+  getStallContextForConversation(conversationId, { includeUserInput = true } = {}) {
     const safeId = sanitizeConversationId(conversationId);
     if (!safeId) return null;
     const item = this._lastEvaluated.get(safeId);
@@ -4149,6 +4331,7 @@ export class WatchdogMonitor {
       return null;
     }
     return {
+      conversationId: item.conversationId,
       severity: item.rawSeverity,
       phase: item.phase,
       subphase: item.subphase,
@@ -4157,12 +4340,13 @@ export class WatchdogMonitor {
       activeTool: item.activeTool,
       activeToolSummary: item.activeToolSummary,
       lastCompletedTool: item.lastCompletedTool,
-      lastUserInput: item.lastUserInput,
+      lastUserInput: includeUserInput ? item.lastUserInput : "",
       contextTokens: item.contextTokens || 0,
       model: item.model || "",
       causeId: item.diagnosis?.causeId || "",
       causeLabel: item.diagnosis?.label || "",
-      tips: item.diagnosis?.tips || []
+      tips: item.diagnosis?.tips || [],
+      incidentKey: item.incidentKey || item.rescueBrief?.incidentKey || ""
     };
   }
 
@@ -4173,7 +4357,7 @@ export class WatchdogMonitor {
       return (b.lastActivityTs || 0) - (a.lastActivityTs || 0);
     });
     const top = sessions.find((s) => s.rawSeverity === "stalled" || s.rawSeverity === "suspect");
-    return top ? this.getStallContextForConversation(top.conversationId) : null;
+    return top ? this.getStallContextForConversation(top.conversationId, { includeUserInput: false }) : null;
   }
 
   acknowledge(conversationId, snoozeSec = 300) {

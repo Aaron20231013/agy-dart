@@ -1266,6 +1266,49 @@
       gap: 8px;
     }
 
+    .handoff-warmth-hint {
+      font-size: 11px;
+      line-height: 1.4;
+      padding: 4px 8px;
+      border-radius: var(--radius-sm);
+      background: var(--bg-inset);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+    }
+
+    .handoff-warmth-hint.is-warn {
+      background: var(--warn-soft);
+      border-color: var(--warn-border);
+      color: var(--warn-text);
+    }
+
+    .handoff-warmth-hint.is-danger {
+      background: var(--danger-soft);
+      border-color: var(--danger-border);
+      color: var(--danger-text);
+    }
+
+    .handoff-dual-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      width: 100%;
+    }
+
+    .handoff-action-btn {
+      width: 100%;
+      justify-content: center;
+      text-align: center;
+      white-space: normal;
+      line-height: 1.3;
+      min-height: 30px;
+    }
+
+    .handoff-action-btn:disabled {
+      opacity: 0.48;
+      cursor: not-allowed;
+    }
+
     .handoff-preview {
       margin: 0;
       padding: 10px 12px;
@@ -2096,10 +2139,14 @@
               <span id="kv-handoff-meta" class="band-sub mono truncate">--</span>
             </div>
             <div class="band-actions">
-              <button id="kv-handoff-refresh-btn" onclick="loadHandoffBrief()" class="btn btn-ghost btn-sm" data-i18n="refreshBtn" data-i18n-title="handoffRefreshTip" title="Regenerate brief from latest workspace &amp; checkpoint state">Refresh</button>
-              <button id="kv-handoff-copy-btn" onclick="copyHandoffBrief()" class="btn btn-primary btn-sm" data-i18n="copyBriefBtn" data-i18n-title="handoffCopyTip" title="Copy Markdown handoff brief to clipboard">Copy Brief</button>
+              <button id="kv-handoff-refresh-btn" onclick="loadHandoffBrief({ forceRefresh: true })" class="btn btn-ghost btn-sm" data-i18n="refreshBtn" data-i18n-title="handoffRefreshTip" title="Regenerate brief from latest workspace &amp; checkpoint state">Refresh</button>
               <button id="kv-handoff-close-btn" onclick="toggleHandoffDrawer(false)" class="btn btn-ghost btn-sm" data-i18n-title="handoffCloseTip" title="Close Handoff Brief preview">×</button>
             </div>
+          </div>
+          <div id="kv-handoff-warmth-hint" class="handoff-warmth-hint"></div>
+          <div class="handoff-dual-actions">
+            <button id="kv-handoff-copy-btn" onclick="copyHandoffBrief()" class="btn btn-primary btn-sm handoff-action-btn" data-i18n="copyBriefBtn" data-i18n-title="handoffCopyTip" title="Copy deterministic factual Markdown handoff brief to clipboard" disabled>Copy Fact Brief</button>
+            <button id="kv-handoff-prompt-btn" onclick="copyHandoffPrompt()" class="btn btn-secondary btn-sm handoff-action-btn" data-i18n="copyPromptBtn" data-i18n-title="handoffPromptTip" title="Copy semantic handoff instruction with factual anchors to send to the current window" disabled>Copy Handoff Prompt</button>
           </div>
           <pre id="kv-handoff-preview" class="handoff-preview custom-scrollbar" data-i18n="handoffPlaceholder">Click Handoff Brief to generate snapshot...</pre>
         </div>
@@ -2512,14 +2559,26 @@
         noTranscriptUsage: 'No transcript token usage recorded yet.',
         refreshBtn: 'Refresh',
         handoffRefreshTip: 'Regenerate brief from latest workspace & checkpoint state',
-        copyBriefBtn: 'Copy Brief',
+        copyBriefBtn: 'Copy Fact Brief',
+        copyPromptBtn: 'Copy Handoff Prompt',
         copiedBtn: 'Copied!',
+        handoffPromptCopiedBtn: 'Prompt Copied!',
         copyFailedBtn: 'Copy failed',
-        handoffCopyTip: 'Copy Markdown handoff brief to clipboard',
+        handoffCopyTip: 'Copy deterministic factual Markdown handoff brief to clipboard',
+        handoffPromptTip: 'Copy semantic handoff instruction with factual anchors to send to the current window',
+        handoffPromptDisabledOverview: 'Select a specific conversation in the switcher to generate a window handoff prompt',
+        handoffWarmthStall: 'Stalled — copy the Fact Brief directly to recover in a fresh window.',
+        handoffWarmthOverview: 'Overview mode — select a specific conversation in the switcher for user intent, tasks & failure excerpts.',
+        handoffWarmthAlertEnded: 'This alert incident has ended — click Handoff Brief to open the current overview.',
+        handoffWarmthCold: 'Cache is cold — copy the Fact Brief directly before /compact or opening a new window.',
+        handoffWarmthWarm: 'Cache is still warm — if switching windows, copy the Handoff Prompt for the current model.',
+        handoffWarmthDefault: 'Copy the Fact Brief for deterministic state, or the Handoff Prompt to have the current model summarize.',
         handoffCloseTip: 'Close Handoff Brief preview',
         handoffPlaceholder: 'Click Handoff Brief to generate snapshot...',
         handoffGenerating: 'Generating...',
         handoffGeneratingBody: 'Generating cache-friendly handoff brief...',
+        handoffAlertEndedMeta: 'Incident ended',
+        handoffAlertEndedBody: 'This alert incident has ended. Open Handoff Brief to view the current overview, or select another active alert card.',
         handoffEmpty: '(empty handoff brief)',
         handoffTruncated: 'truncated',
         handoffError: 'Error',
@@ -2859,14 +2918,26 @@
         noTranscriptUsage: '暂未记录到会话 Token 用量。',
         refreshBtn: '刷新',
         handoffRefreshTip: '基于最新工作区与检查点重新生成简报',
-        copyBriefBtn: '复制简报',
+        copyBriefBtn: '复制事实简报',
+        copyPromptBtn: '复制给当前窗口的交接指令',
         copiedBtn: '已复制',
+        handoffPromptCopiedBtn: '指令已复制',
         copyFailedBtn: '复制失败',
-        handoffCopyTip: '复制 Markdown 交接简报到剪贴板',
+        handoffCopyTip: '复制由本地事实确定的 Markdown 交接简报到剪贴板',
+        handoffPromptTip: '复制含本次快照事实锚点的语义交接指令，发给当前窗口模型生成交接单',
+        handoffPromptDisabledOverview: '请先在切换器选择具体会话，再复制给当前窗口的交接指令',
+        handoffWarmthStall: '当前窗口疑似卡住 — 优先直接复制「事实简报」到新窗口恢复。',
+        handoffWarmthOverview: '当前为概览视图 — 请先在切换器选择具体会话以获取原话、任务与失败摘录。',
+        handoffWarmthAlertEnded: '该告警事件已结束 — 如需查看当前概览，请点击右上角「交接简报」。',
+        handoffWarmthCold: '缓存已冷 — 优先直接复制「事实简报」用于 /compact 或新窗口接手。',
+        handoffWarmthWarm: '缓存尚热 — 准备换窗时可复制「给当前窗口的交接指令」让当前模型总结。',
+        handoffWarmthDefault: '可直接复制「事实简报」，或在换窗前复制「交接指令」给当前模型整理。',
         handoffCloseTip: '收起交接简报预览',
         handoffPlaceholder: '点击右上角「交接简报」生成当前会话快照...',
         handoffGenerating: '生成中...',
         handoffGeneratingBody: '正在生成交接简报...',
+        handoffAlertEndedMeta: '事件已结束',
+        handoffAlertEndedBody: '该告警事件已结束。如需查看当前概览，请点击右上角「交接简报」，或切换到其他活跃告警卡重新查看。',
         handoffEmpty: '（空交接简报）',
         handoffTruncated: '已截断',
         handoffError: '出错',
@@ -3255,6 +3326,8 @@
     let lastFlashedPillEl = null;
     let jumpActionSeq = 0;
     let cachedHandoffData = null;
+    let cachedHandoffSnapshot = null;
+    let handoffLoading = false;
     let cachedWatchdog = null;
     let wdLiveState = null;
     let wdLiveTimer = null;
@@ -3266,7 +3339,10 @@
     let handoffDrawerOpen = false;
     let lastHandoffMarkdown = '';
     let handoffCopyResetTimer = null;
+    let handoffPromptCopyResetTimer = null;
     let handoffFetchSeq = 0;
+    let rescueCopySeq = 0;
+    let lastObservedWatchdogIncidentKey = '';
     let refreshSeq = 0;
     let watchdogActionSeq = 0;
     let inFlightWatchdogActionCount = 0;
@@ -3292,17 +3368,79 @@
     }
 
     let lastSeenNativeConvId = getNativeHostConversationId();
+    let hostSwitchEpoch = 0;
+    let handoffInFlightRequest = null;
+    let pendingServerAheadSync = null;
+    let handoffDrawerTargetedAlert = false;
+    let handoffDrawerTargetedConvId = '';
+    let handoffDrawerTargetedEnded = false;
+    let handoffDrawerSelectionSeq = 0;
 
-    function getActiveConversationId() {
+    function resetHandoffDrawerTargetMode({ bumpSelection = true } = {}) {
+      handoffDrawerTargetedAlert = false;
+      handoffDrawerTargetedConvId = '';
+      handoffDrawerTargetedEnded = false;
+      if (bumpSelection) {
+        ++handoffDrawerSelectionSeq;
+      }
+    }
+    const RESERVED_SWITCHER_CONV_IDS = new Set([
+      '',
+      'default',
+      'all',
+      'lifetime',
+      'app',
+      '__unbound__',
+      'unknown',
+      'none',
+      'null',
+      'undefined'
+    ]);
+
+    function isSpecificConversationId(id) {
+      if (typeof id !== 'string') return false;
+      const trimmed = id.trim();
+      if (!trimmed || trimmed.length > 128) return false;
+      if (trimmed === '.' || trimmed === '..' || trimmed.includes('..')) return false;
+      if (RESERVED_SWITCHER_CONV_IDS.has(trimmed.toLowerCase())) return false;
+      return /^[A-Za-z0-9._-]+$/.test(trimmed);
+    }
+
+    function isValidSwitcherConvId(id) {
+      return isSpecificConversationId(id);
+    }
+
+    function getConfirmedConversationId() {
+      if (isSpecificConversationId(selectedConvOverride)) {
+        return selectedConvOverride.trim();
+      }
+      const nativeId = getNativeHostConversationId();
+      if (isSpecificConversationId(nativeId)) {
+        return nativeId;
+      }
+      return '';
+    }
+
+    function isCurrentConversationConfirmed() {
+      return currentScope === 'conversation' && Boolean(getConfirmedConversationId());
+    }
+
+    function syncNativeHostConversation({ reloadIfOpen = handoffDrawerOpen } = {}) {
       const nativeId = getNativeHostConversationId();
       if (nativeId !== lastSeenNativeConvId) {
         const prevNative = lastSeenNativeConvId;
         lastSeenNativeConvId = nativeId;
+        ++hostSwitchEpoch;
         selectedConvOverride = '';
         inferredFallbackConvId = '';
         pendingCustomOverrideConvId = '';
         sawOutOfOrderWatchdogAction = false;
+        lastObservedWatchdogIncidentKey = '';
+        resetHandoffDrawerTargetMode();
         ++watchdogActionSeq;
+        clearHandoffSnapshot({ resetPreview: true, reloadIfOpen });
+        updateWatchdogIncidentButtons();
+        renderSessionSwitcher(cachedWatchdog);
         if (!prevNative && nativeId) {
           const gm = cachedGlobalKeepalive.globalMaxCount;
           const fm = cachedGlobalKeepalive.fallbackMaxCount;
@@ -3317,6 +3455,11 @@
           };
         }
       }
+      return nativeId;
+    }
+
+    function getActiveConversationId() {
+      const nativeId = syncNativeHostConversation({ reloadIfOpen: handoffDrawerOpen });
       return selectedConvOverride || nativeId || (!window.sidecar ? inferredFallbackConvId : '');
     }
 
@@ -3740,7 +3883,7 @@
         }
       }
       if (cachedWatchdog) {
-        renderWatchdogCard(cachedWatchdog);
+        renderWatchdogCard(cachedWatchdog, { preserveEpoch: true });
         if (
           !shouldAcceptKeepalivePayload(cachedWatchdog.ttlKeepalive) &&
           !shouldAcceptKeepalivePayload(cachedKv?.ttlKeepalive)
@@ -3769,13 +3912,20 @@
           statusHint.textContent = t('wdHintIdle');
           statusHint.classList.remove('hidden');
         }
+        renderSessionSwitcher(null);
       }
-      if (cachedHandoffData) {
-        renderHandoffMeta();
-      }
-      const previewEl = document.getElementById('kv-handoff-preview');
-      if (previewEl && lastHandoffMarkdown) {
-        previewEl.textContent = lastHandoffMarkdown;
+      if (handoffDrawerOpen && handoffDrawerTargetedAlert && handoffDrawerTargetedEnded && !cachedHandoffData) {
+        renderTargetedHandoffAlertEndedUi();
+      } else {
+        if (cachedHandoffData) {
+          renderHandoffMeta();
+        }
+        renderHandoffWarmthHint();
+        updateHandoffActionButtons();
+        const previewEl = document.getElementById('kv-handoff-preview');
+        if (previewEl && lastHandoffMarkdown) {
+          previewEl.textContent = lastHandoffMarkdown;
+        }
       }
       if (cachedStats && cachedStats.starPrompt) {
         renderStarMilestoneBanner(cachedStats.starPrompt);
@@ -3949,7 +4099,7 @@
       }
     }
 
-    function setScope(scope) {
+    function applyScopeSelection(scope) {
       currentScope = scope;
       const convBtn = document.getElementById('scope-conv-btn');
       const appBtn = document.getElementById('scope-app-btn');
@@ -3965,18 +4115,17 @@
         updateCutoffDropdown(cachedStats);
         updateExemptionsList(cachedStats);
       }
+    }
 
-      cachedHandoffData = null;
-      lastHandoffMarkdown = '';
-      ++handoffFetchSeq;
-      if (handoffDrawerOpen) {
-        loadHandoffBrief();
-      } else {
-        const previewEl = document.getElementById('kv-handoff-preview');
-        const metaEl = document.getElementById('kv-handoff-meta');
-        if (previewEl) previewEl.textContent = t('handoffPlaceholder');
-        if (metaEl) metaEl.textContent = '--';
-      }
+    function setScope(scope) {
+      applyScopeSelection(scope);
+
+      ++watchdogActionSeq;
+      lastObservedWatchdogIncidentKey = '';
+      resetHandoffDrawerTargetMode();
+      clearHandoffSnapshot({ resetPreview: true, reloadIfOpen: handoffDrawerOpen });
+      updateWatchdogIncidentButtons();
+      renderSessionSwitcher(cachedWatchdog);
 
       refreshData(true);
     }
@@ -4473,22 +4622,58 @@
     }
 
     let autoRefreshInFlight = false;
+    let autoRefreshPromise = null;
 
-    async function refreshData(manual = false) {
-      if (!manual && autoRefreshInFlight) return;
+    function refreshData(manual = false) {
+      if (!manual && autoRefreshInFlight && autoRefreshPromise) return autoRefreshPromise;
       if (!manual) autoRefreshInFlight = true;
+      let followUpAutoRefresh = false;
+      const run = executeRefreshData(manual, () => {
+        followUpAutoRefresh = true;
+      }).finally(() => {
+        if (!manual) {
+          autoRefreshInFlight = false;
+          if (autoRefreshPromise === run) autoRefreshPromise = null;
+        }
+        if (followUpAutoRefresh) {
+          queueMicrotask(() => refreshData(false));
+        }
+      });
+      if (!manual) autoRefreshPromise = run;
+      return run;
+    }
+
+    async function executeRefreshData(manual = false, scheduleFollowUpAutoRefresh = null) {
       const reqSeq = ++refreshSeq;
       const reqScope = currentScope;
-      const isStale = () => reqSeq !== refreshSeq || currentScope !== reqScope;
+      let reqNativeId = getNativeHostConversationId();
+      let reqConfirmedConv = getConfirmedConversationId();
+      let reqHostEpoch = hostSwitchEpoch;
+      const isStale = () => {
+        if (getNativeHostConversationId() !== reqNativeId) {
+          syncNativeHostConversation({ reloadIfOpen: handoffDrawerOpen });
+          return true;
+        }
+        return (
+          reqSeq !== refreshSeq ||
+          hostSwitchEpoch !== reqHostEpoch ||
+          currentScope !== reqScope ||
+          getConfirmedConversationId() !== reqConfirmedConv
+        );
+      };
       const refreshIcon = document.getElementById('refresh-icon');
       if (manual && refreshIcon) refreshIcon.classList.add('spinning');
 
       try {
         const convId = getActiveConversationId();
+        reqNativeId = getNativeHostConversationId();
+        reqConfirmedConv = getConfirmedConversationId();
+        reqHostEpoch = hostSwitchEpoch;
+        const confirmedConv = isCurrentConversationConfirmed();
         cachedConvId = convId;
-        const scopeBody = JSON.stringify({ scope: reqScope, conversationId: convId });
+        const scopeBody = JSON.stringify({ scope: reqScope, conversationId: convId, conversationConfirmed: confirmedConv });
         const kaScopeBody = window.sidecar
-          ? JSON.stringify({ scope: reqScope, conversationId: convId, fromSidecarHost: true })
+          ? JSON.stringify({ scope: reqScope, conversationId: convId, conversationConfirmed: confirmedConv, fromSidecarHost: true })
           : scopeBody;
 
         const [statsRes, docRes, kvRes, wdRes, resumeRes] = await Promise.all([
@@ -4496,7 +4681,7 @@
           apiFetch('/api/doctor', { method: 'POST', body: '{}' }).catch(() => null),
           apiFetch('/api/cache-diag', { method: 'POST', body: kaScopeBody }).catch(() => null),
           apiFetch('/api/watchdog', { method: 'POST', body: kaScopeBody }).catch(() => null),
-          apiFetch('/api/resume', { method: 'POST', body: scopeBody }).catch(() => null)
+          apiFetch('/api/resume', { method: 'POST', body: kaScopeBody }).catch(() => null)
         ]);
         if (!statsRes.ok) throw new Error(`Stats HTTP ${statsRes.status}`);
         const s = await statsRes.json();
@@ -4598,7 +4783,12 @@
               inferredFallbackConvId !== preferredFallbackConvId
             ) {
               inferredFallbackConvId = preferredFallbackConvId;
-              queueMicrotask(() => refreshData(false));
+              renderSessionSwitcher(cachedWatchdog);
+              if (typeof scheduleFollowUpAutoRefresh === 'function') {
+                scheduleFollowUpAutoRefresh();
+              } else {
+                queueMicrotask(() => refreshData(false));
+              }
             }
             renderKvCacheCard(kv);
           }
@@ -4612,8 +4802,8 @@
               if (cachedKv) cachedKv.conversationActive = false;
               if (kvTtlState) kvTtlState.conversationActive = false;
             }
-            cachedWatchdog = wd;
-            renderWatchdogCard(wd);
+            wd._hostEpoch = reqHostEpoch;
+            renderWatchdogCard(wd, { expectedEpoch: reqHostEpoch });
           }
         } catch {}
 
@@ -4636,7 +4826,6 @@
         cachedDisconnectedErr = err.message;
         renderTelemetryBanner();
       } finally {
-        if (!manual) autoRefreshInFlight = false;
         if (refreshIcon && reqSeq === refreshSeq) {
           setTimeout(() => refreshIcon.classList.remove('spinning'), 400);
         }
@@ -5115,64 +5304,8 @@
       }
     }
 
-    async function loadHandoffBrief() {
-      const previewEl = document.getElementById('kv-handoff-preview');
-      const metaEl = document.getElementById('kv-handoff-meta');
-      const reqSeq = ++handoffFetchSeq;
-      if (metaEl) metaEl.textContent = t('handoffGenerating');
-      if (previewEl && !lastHandoffMarkdown) {
-        previewEl.textContent = t('handoffGeneratingBody');
-      }
-      try {
-        const explicitConv = getActiveConversationId();
-        const convId =
-          explicitConv ||
-          (currentScope !== 'conversation' &&
-          (cachedWatchdog?.current?.severity === 'stalled' || cachedWatchdog?.current?.severity === 'suspect')
-            ? cachedWatchdog.current.conversationId || ''
-            : '');
-        const res = await apiFetch('/api/handoff', {
-          method: 'POST',
-          body: JSON.stringify({ scope: currentScope, conversationId: convId })
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        if (reqSeq !== handoffFetchSeq) return;
-        cachedHandoffData = data;
-        lastHandoffMarkdown = typeof data.markdown === 'string' ? data.markdown : '';
-        if (previewEl) {
-          previewEl.textContent = lastHandoffMarkdown || t('handoffEmpty');
-        }
-        renderHandoffMeta();
-      } catch (err) {
-        if (reqSeq !== handoffFetchSeq) return;
-        cachedHandoffData = null;
-        lastHandoffMarkdown = '';
-        if (metaEl) metaEl.textContent = t('handoffError');
-        if (previewEl) previewEl.textContent = t('handoffFailBody', { msg: err?.message || String(err) });
-      }
-    }
-
-    function toggleHandoffDrawer(forceState) {
-      const drawer = document.getElementById('kv-handoff-drawer');
-      if (!drawer) return;
-      const nextOpen = typeof forceState === 'boolean' ? forceState : !handoffDrawerOpen;
-      handoffDrawerOpen = nextOpen;
-      if (handoffDrawerOpen) {
-        drawer.classList.remove('hidden');
-        loadHandoffBrief();
-        if (typeof drawer.scrollIntoView === 'function') {
-          drawer.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-        }
-      } else {
-        drawer.classList.add('hidden');
-      }
-    }
-
-    async function copyHandoffBrief() {
-      const btn = document.getElementById('kv-handoff-copy-btn');
-      const text = lastHandoffMarkdown || '';
-      if (!text) return;
+    async function copyTextToClipboard(text) {
+      if (!text) return false;
       let copied = false;
       if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
         try {
@@ -5183,13 +5316,15 @@
       if (!copied) {
         const ta = document.createElement('textarea');
         ta.value = text;
-        ta.setAttribute('readonly', '');
+        if (typeof ta.setAttribute === 'function') {
+          ta.setAttribute('readonly', '');
+        }
         ta.style.position = 'fixed';
         ta.style.top = '-9999px';
         ta.style.left = '-9999px';
         document.body.appendChild(ta);
-        ta.focus();
-        ta.select();
+        if (typeof ta.focus === 'function') ta.focus();
+        if (typeof ta.select === 'function') ta.select();
         try {
           copied = Boolean(document.execCommand('copy'));
         } catch {
@@ -5198,12 +5333,1117 @@
           document.body.removeChild(ta);
         }
       }
+      return copied;
+    }
+
+    function hasHandoffConfirmMeta(data) {
+      return Boolean(
+        data &&
+          typeof data === 'object' &&
+          (data.confirmedConversation !== undefined ||
+            data.anchors !== undefined ||
+            data.mode === 'agent')
+      );
+    }
+
+    const CLIENT_CONV_ID_SECRET_RULES = [
+      { re: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g, replacement: '[REDACTED:ANTHROPIC_KEY]' },
+      { re: /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}\b/g, replacement: '[REDACTED:OPENAI_KEY]' },
+      { re: /\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b/g, replacement: '[REDACTED:STRIPE_KEY]' },
+      { re: /\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})\b/g, replacement: '[REDACTED:GITHUB_TOKEN]' },
+      { re: /\bAIza[0-9A-Za-z_-]{30,}\b/g, replacement: '[REDACTED:GOOGLE_API_KEY]' },
+      { re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, replacement: '[REDACTED:AWS_ACCESS_KEY]' },
+      { re: /\bxox[baprs]-[0-9A-Za-z-]{10,}\b/g, replacement: '[REDACTED:SLACK_TOKEN]' },
+      { re: /\bhf_[A-Za-z0-9]{25,}\b/g, replacement: '[REDACTED:HF_TOKEN]' },
+      { re: /\bnpm_[A-Za-z0-9]{30,}\b/g, replacement: '[REDACTED:NPM_TOKEN]' },
+      { re: /\bpypi-[A-Za-z0-9_-]{30,}\b/g, replacement: '[REDACTED:PYPI_TOKEN]' },
+      { re: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, replacement: '[REDACTED:JWT]' }
+    ];
+
+    function redactConvIdForDisplayAnchor(id) {
+      let out = String(id ?? '');
+      for (const rule of CLIENT_CONV_ID_SECRET_RULES) {
+        out = out.replace(rule.re, rule.replacement);
+      }
+      return out;
+    }
+
+    function flattenDisplayAnchorClient(val, maxBytes = 96) {
+      if (val === null || val === undefined) return '';
+      let s = String(val);
+      if (typeof s.toWellFormed === 'function') {
+        s = s.toWellFormed();
+      }
+      const flat = s
+        .replace(/[\r\n\t\x00-\x1f\x7f-\x9f]+/g, ' ')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+      if (!flat) return '';
+      // Confirmed conversationIds (^[A-Za-z0-9._-]+$) and [REDACTED:...] markers are pure ASCII.
+      if (flat.length <= maxBytes) return flat;
+      const suffix = maxBytes >= 16 ? '...' : '';
+      const bodyCap = Math.max(0, maxBytes - suffix.length);
+      return `${flat.slice(0, bodyCap)}${suffix}`;
+    }
+
+    function isConversationDisplayAnchorValid(anchorConvId, targetConv, redactionEnabled = true) {
+      if (typeof anchorConvId !== 'string' || !anchorConvId) return false;
+      if (!isSpecificConversationId(targetConv)) return false;
+      const expectedRedacted = flattenDisplayAnchorClient(redactConvIdForDisplayAnchor(targetConv), 96);
+      const expectedRaw = flattenDisplayAnchorClient(targetConv, 96);
+      if (redactionEnabled === false) {
+        return anchorConvId === expectedRaw;
+      }
+      return anchorConvId === expectedRedacted;
+    }
+
+    function isHandoffPayloadAttributionValid(
+      rawData,
+      {
+        expectedScope = currentScope,
+        expectedConfirmed = isCurrentConversationConfirmed(),
+        expectedConfirmedConv = getConfirmedConversationId(),
+        requireScope = false,
+        requireDisplayAnchor = false
+      } = {}
+    ) {
+      if (!rawData || typeof rawData !== 'object' || rawData.ok === false) {
+        return false;
+      }
+      const targetScope = typeof expectedScope === 'string' && expectedScope ? expectedScope : currentScope;
+      if (rawData.scope === undefined) {
+        if (requireScope) {
+          return false;
+        }
+      } else if (typeof rawData.scope !== 'string' || !rawData.scope || rawData.scope !== targetScope) {
+        return false;
+      }
+      const expectConfirmed = Boolean(expectedConfirmed);
+      const targetConv = expectConfirmed && typeof expectedConfirmedConv === 'string' ? expectedConfirmedConv : '';
+      if (expectConfirmed && (targetScope !== 'conversation' || !isSpecificConversationId(targetConv))) {
+        return false;
+      }
+      const anchorsObj = rawData.anchors && typeof rawData.anchors === 'object' ? rawData.anchors : null;
+      const bothConfirmed =
+        rawData.confirmedConversation === true &&
+        Boolean(anchorsObj && anchorsObj.confirmed === true);
+      if (expectConfirmed) {
+        if (!bothConfirmed) {
+          return false;
+        }
+        // 1. Full attribution ID check: exact match on payload's own conversationId required;
+        //    display anchors and outer context can never substitute for a missing full ID.
+        if (typeof rawData.conversationId !== 'string' || rawData.conversationId !== targetConv) {
+          return false;
+        }
+        // 2. Display anchor check: validate against generator's active redaction setting + 96-byte truncation rules.
+        const redactionEnabled = rawData.secretRedactionEnabled !== false;
+        if (anchorsObj && anchorsObj.conversationId !== undefined) {
+          if (!isConversationDisplayAnchorValid(anchorsObj.conversationId, targetConv, redactionEnabled)) {
+            return false;
+          }
+        } else if (requireDisplayAnchor) {
+          return false;
+        }
+        return true;
+      }
+      // Unconfirmed / aggregate / overview expectation: reject any confirmation claim or conversation anchor,
+      // while preserving legacy anchorless (pre-agent) brief compatibility.
+      if (
+        Boolean(rawData.confirmedConversation) ||
+        Boolean(anchorsObj?.confirmed) ||
+        Boolean(anchorsObj?.conversationId)
+      ) {
+        return false;
+      }
+      return true;
+    }
+
+    function getMatchingRescueBrief() {
+      if (currentScope !== 'conversation') return null;
+      if (!cachedWatchdog || cachedWatchdog.enabled === false || cachedWatchdog._hostEpoch !== hostSwitchEpoch) {
+        return null;
+      }
+      if (
+        cachedWatchdog.scope !== undefined &&
+        (typeof cachedWatchdog.scope !== 'string' || cachedWatchdog.scope !== 'conversation')
+      ) {
+        return null;
+      }
+      const cur = cachedWatchdog.current || null;
+      const brief = cur?.rescueBrief || null;
+      if (!brief || typeof brief !== 'object' || typeof brief.markdown !== 'string' || !brief.markdown) return null;
+      const confirmedId = getConfirmedConversationId();
+      if (confirmedId) {
+        if (!cur.conversationId || cur.conversationId !== confirmedId) {
+          return null;
+        }
+        if (
+          !isHandoffPayloadAttributionValid(brief, {
+            expectedScope: 'conversation',
+            expectedConfirmed: true,
+            expectedConfirmedConv: confirmedId,
+            requireScope: false,
+            requireDisplayAnchor: true
+          })
+        ) {
+          return null;
+        }
+        return {
+          ...brief,
+          conversationId: brief.conversationId,
+          hasStallContext: true,
+          confirmedConversation: true
+        };
+      }
+      // Without a confirmed conversation, never expose rich v1.7.3 rescue briefs,
+      // unbound host-tab briefs, explicit reserved/unsafe native IDs, or inferred-only fallback briefs.
+      const nativeId = getNativeHostConversationId();
+      const isRichBrief = hasHandoffConfirmMeta(brief);
+      if (window.sidecar || (nativeId && !isSpecificConversationId(nativeId)) || inferredFallbackConvId || isRichBrief) {
+        return null;
+      }
+      if (
+        !isHandoffPayloadAttributionValid(brief, {
+          expectedScope: 'conversation',
+          expectedConfirmed: false,
+          expectedConfirmedConv: '',
+          requireScope: false,
+          requireDisplayAnchor: false
+        })
+      ) {
+        return null;
+      }
+      // Legacy v1.4 standalone fallback (pre-agent brief without anchors)
+      return {
+        ...brief,
+        conversationId: brief.conversationId || cur.conversationId || '',
+        hasStallContext: true,
+        confirmedConversation: false
+      };
+    }
+
+    function renderHandoffWarmthHint() {
+      const hintEl = document.getElementById('kv-handoff-warmth-hint');
+      if (!hintEl) return;
+      if (handoffDrawerTargetedAlert && handoffDrawerTargetedEnded) {
+        hintEl.className = 'handoff-warmth-hint is-warn';
+        hintEl.textContent = t('handoffWarmthAlertEnded');
+        return;
+      }
+      const curWd = cachedWatchdog?.current || null;
+      const alignedStall = Boolean(
+        isWatchdogIncidentAlignedWithTarget({ requireActive: true }) &&
+          curWd &&
+          (curWd.severity === 'stalled' || curWd.severity === 'suspect')
+      );
+      const snapCurrent = isHandoffSnapshotCurrent(cachedHandoffSnapshot);
+      const isStalled = Boolean(
+        alignedStall ||
+          (snapCurrent &&
+            (cachedHandoffSnapshot?.hasStallContext || cachedHandoffSnapshot?.anchors?.stallSummary))
+      );
+      const isConfirmed = Boolean(
+        cachedHandoffSnapshot
+          ? cachedHandoffSnapshot.confirmedConversation === true
+          : isCurrentConversationConfirmed()
+      );
+      let temp = cachedKv?.cacheTemperature || '';
+      if (kvTtlState) {
+        const snap = computeLocalTtlSnapshot(kvTtlState, Date.now());
+        if (snap && snap.cacheTemperature) temp = snap.cacheTemperature;
+      }
+      if (isStalled) {
+        hintEl.className = 'handoff-warmth-hint is-danger';
+        hintEl.textContent = t('handoffWarmthStall');
+      } else if (!isConfirmed) {
+        hintEl.className = 'handoff-warmth-hint is-warn';
+        hintEl.textContent = t('handoffWarmthOverview');
+      } else if (temp === 'cold') {
+        hintEl.className = 'handoff-warmth-hint';
+        hintEl.textContent = t('handoffWarmthCold');
+      } else if (temp === 'hot' || temp === 'warm') {
+        hintEl.className = 'handoff-warmth-hint';
+        hintEl.textContent = t('handoffWarmthWarm');
+      } else {
+        hintEl.className = 'handoff-warmth-hint';
+        hintEl.textContent = t('handoffWarmthDefault');
+      }
+    }
+
+    function computeWatchdogIncidentKey(cur) {
+      if (!cur || typeof cur !== 'object' || cur.phase === 'IDLE') return '';
+      const sev = cur.rawSeverity || cur.severity || '';
+      if (sev !== 'suspect' && sev !== 'stalled') return '';
+      if (typeof cur.incidentKey === 'string' && cur.incidentKey) {
+        return cur.incidentKey;
+      }
+      if (typeof cur.rescueBrief?.incidentKey === 'string' && cur.rescueBrief.incidentKey) {
+        return cur.rescueBrief.incidentKey;
+      }
+      const cid = typeof cur.conversationId === 'string' ? cur.conversationId : '';
+      const ts = cur.phaseChangedTs || cur.startedTs || '';
+      const phase = cur.phase || '';
+      const cause = cur.diagnosis?.causeId || 'unknown';
+      return cid ? `${cid}:${ts}:${phase}:${sev}:${cause}` : '';
+    }
+
+    function getCurrentWatchdogIncidentKey() {
+      if (!cachedWatchdog || cachedWatchdog.enabled === false) return '';
+      if (!isWatchdogIncidentAlignedWithTarget({ requireActive: false })) return '';
+      return computeWatchdogIncidentKey(cachedWatchdog.current || null);
+    }
+
+    function getCurrentWatchdogCardConversationId() {
+      if (!cachedWatchdog || cachedWatchdog.enabled === false) return '';
+      if (!isWatchdogIncidentAlignedWithTarget({ requireActive: false })) return '';
+      const cid = cachedWatchdog.current?.conversationId;
+      return typeof cid === 'string' ? cid : '';
+    }
+
+    function isWatchdogIncidentAlignedWithTarget({ requireActive = false } = {}) {
+      if (!cachedWatchdog || cachedWatchdog.enabled === false || cachedWatchdog._hostEpoch !== hostSwitchEpoch) {
+        return false;
+      }
+      const cur = cachedWatchdog.current || null;
+      if (!cur || !cur.conversationId) return false;
+      if (requireActive && cur.phase === 'IDLE') return false;
+      if (currentScope !== 'conversation') {
+        const wdScope = typeof cachedWatchdog.scope === 'string' && cachedWatchdog.scope ? cachedWatchdog.scope : 'conversation';
+        return wdScope === currentScope;
+      }
+      if (
+        cachedWatchdog.scope !== undefined &&
+        (typeof cachedWatchdog.scope !== 'string' || cachedWatchdog.scope !== 'conversation')
+      ) {
+        return false;
+      }
+      const confirmedId = getConfirmedConversationId();
+      if (confirmedId) {
+        return cur.conversationId === confirmedId;
+      }
+      if (window.sidecar) {
+        return false;
+      }
+      const nativeId = getNativeHostConversationId();
+      if (nativeId && !isSpecificConversationId(nativeId)) {
+        return false;
+      }
+      const activeId = selectedConvOverride || inferredFallbackConvId || '';
+      return !activeId || cur.conversationId === activeId;
+    }
+
+    function getActiveWatchdogCardTarget() {
+      if (!isWatchdogIncidentAlignedWithTarget({ requireActive: true })) {
+        return { stallConversationId: '', incidentKey: '' };
+      }
+      const stallConversationId = getCurrentWatchdogCardConversationId();
+      const incidentKey = getCurrentWatchdogIncidentKey();
+      if (!stallConversationId || !incidentKey) {
+        return { stallConversationId: '', incidentKey: '' };
+      }
+      return { stallConversationId, incidentKey };
+    }
+
+    function updateWatchdogIncidentButtons() {
+      const aligned = isWatchdogIncidentAlignedWithTarget({ requireActive: true });
+      for (const id of ['wd-copy-rescue-btn', 'wd-open-rescue-btn', 'wd-snooze-btn', 'wd-clear-btn']) {
+        const el = document.getElementById(id);
+        if (el) el.disabled = !aligned;
+      }
+    }
+
+    function isHandoffSnapshotCurrent(snap) {
+      if (handoffLoading || !snap || typeof snap !== 'object') return false;
+      if (typeof snap.markdown !== 'string' || !snap.markdown) return false;
+      if (snap._hostEpoch !== undefined && snap._hostEpoch !== hostSwitchEpoch) return false;
+      const expectedConfirmed = isCurrentConversationConfirmed();
+      const expectedConv = getConfirmedConversationId();
+      if (
+        !isHandoffPayloadAttributionValid(snap, {
+          expectedScope: currentScope,
+          expectedConfirmed,
+          expectedConfirmedConv: expectedConv,
+          requireScope: true,
+          requireDisplayAnchor: true
+        })
+      ) {
+        return false;
+      }
+      const snapScope = typeof snap.scope === 'string' && snap.scope ? snap.scope : 'conversation';
+      if (snapScope !== currentScope) return false;
+      if (snap.confirmedConversation !== expectedConfirmed) return false;
+      const curIncident = getCurrentWatchdogIncidentKey();
+      if (snapScope !== 'conversation') {
+        if (snap.stallConversationId) {
+          if (!isWatchdogIncidentAlignedWithTarget({ requireActive: true })) return false;
+          if (!curIncident) return false;
+          if (getCurrentWatchdogCardConversationId() !== snap.stallConversationId) return false;
+          if ((snap.incidentKey || '') !== curIncident) return false;
+          return true;
+        }
+        if (snap._cardIncidentKey !== undefined && (snap._cardIncidentKey || '') !== curIncident) {
+          return false;
+        }
+        return true;
+      }
+      if ((snap.incidentKey || '') !== curIncident) {
+        return false;
+      }
+      return true;
+    }
+
+    function updateHandoffActionButtons() {
+      const copyBtn = document.getElementById('kv-handoff-copy-btn');
+      const promptBtn = document.getElementById('kv-handoff-prompt-btn');
+      const snap = cachedHandoffSnapshot;
+      const hasFact = isHandoffSnapshotCurrent(snap);
+      const hasPrompt =
+        hasFact &&
+        snap.confirmedConversation === true &&
+        Boolean(snap.anchors && snap.anchors.confirmed === true);
+      if (copyBtn) {
+        copyBtn.disabled = !hasFact;
+        copyBtn.title = t('handoffCopyTip');
+        if (handoffCopyResetTimer === null) {
+          copyBtn.textContent = t('copyBriefBtn');
+        }
+      }
+      if (promptBtn) {
+        promptBtn.disabled = !hasPrompt;
+        promptBtn.title = hasPrompt ? t('handoffPromptTip') : t('handoffPromptDisabledOverview');
+        if (handoffPromptCopyResetTimer === null) {
+          promptBtn.textContent = t('copyPromptBtn');
+        }
+      }
+    }
+
+    function isPendingServerAheadSyncMatch(nextIncidentKey, nextStallConvId = '') {
+      const pending = pendingServerAheadSync;
+      if (!pending || pending.seq !== handoffFetchSeq) return false;
+      return (
+        currentScope === pending.scope &&
+        hostSwitchEpoch === pending.hostEpoch &&
+        isCurrentConversationConfirmed() === pending.confirmed &&
+        getConfirmedConversationId() === pending.confirmedConv &&
+        (!pending.stallConversationId || nextStallConvId === pending.stallConversationId) &&
+        nextIncidentKey === pending.incidentKey
+      );
+    }
+
+    function renderTargetedHandoffAlertEndedUi() {
+      const previewEl = document.getElementById('kv-handoff-preview');
+      const metaEl = document.getElementById('kv-handoff-meta');
+      if (previewEl) {
+        previewEl.textContent = t('handoffAlertEndedBody');
+      }
+      if (metaEl) {
+        metaEl.textContent = t('handoffAlertEndedMeta');
+      }
+      renderHandoffWarmthHint();
+      updateHandoffActionButtons();
+    }
+
+    function markTargetedHandoffAlertEnded() {
+      ++handoffFetchSeq;
+      ++rescueCopySeq;
+      handoffLoading = false;
+      handoffInFlightRequest = null;
+      pendingServerAheadSync = null;
+      cachedHandoffSnapshot = null;
+      cachedHandoffData = null;
+      lastHandoffMarkdown = '';
+      if (handoffCopyResetTimer !== null) {
+        clearTimeout(handoffCopyResetTimer);
+        handoffCopyResetTimer = null;
+      }
+      if (handoffPromptCopyResetTimer !== null) {
+        clearTimeout(handoffPromptCopyResetTimer);
+        handoffPromptCopyResetTimer = null;
+      }
+      handoffDrawerTargetedAlert = true;
+      handoffDrawerTargetedEnded = true;
+      renderTargetedHandoffAlertEndedUi();
+    }
+
+    function clearHandoffSnapshot({ resetPreview = true, reloadIfOpen = false } = {}) {
+      ++handoffFetchSeq;
+      ++rescueCopySeq;
+      handoffLoading = false;
+      handoffInFlightRequest = null;
+      pendingServerAheadSync = null;
+      cachedHandoffSnapshot = null;
+      cachedHandoffData = null;
+      lastHandoffMarkdown = '';
+      if (handoffCopyResetTimer !== null) {
+        clearTimeout(handoffCopyResetTimer);
+        handoffCopyResetTimer = null;
+      }
+      if (handoffPromptCopyResetTimer !== null) {
+        clearTimeout(handoffPromptCopyResetTimer);
+        handoffPromptCopyResetTimer = null;
+      }
+      const isTargetedAggregateDrawer = Boolean(
+        handoffDrawerOpen && handoffDrawerTargetedAlert && currentScope !== 'conversation'
+      );
+      const nextTarget = isTargetedAggregateDrawer
+        ? getActiveWatchdogCardTarget()
+        : { stallConversationId: '', incidentKey: '' };
+      if (isTargetedAggregateDrawer && !nextTarget.stallConversationId) {
+        handoffDrawerTargetedEnded = true;
+        if (resetPreview) {
+          renderTargetedHandoffAlertEndedUi();
+        } else {
+          renderHandoffWarmthHint();
+          updateHandoffActionButtons();
+        }
+        return;
+      }
+      if (isTargetedAggregateDrawer && nextTarget.stallConversationId) {
+        handoffDrawerTargetedConvId = nextTarget.stallConversationId;
+        handoffDrawerTargetedEnded = false;
+      } else {
+        handoffDrawerTargetedEnded = false;
+      }
+      if (resetPreview) {
+        const previewEl = document.getElementById('kv-handoff-preview');
+        const metaEl = document.getElementById('kv-handoff-meta');
+        if (previewEl) {
+          previewEl.textContent = reloadIfOpen ? t('handoffGeneratingBody') : t('handoffPlaceholder');
+        }
+        if (metaEl) {
+          metaEl.textContent = reloadIfOpen ? t('handoffGenerating') : '--';
+        }
+      }
+      renderHandoffWarmthHint();
+      updateHandoffActionButtons();
+      if (reloadIfOpen && handoffDrawerOpen) {
+        if (isTargetedAggregateDrawer) {
+          loadHandoffBrief({
+            forceRefresh: true,
+            stallConversationId: nextTarget.stallConversationId,
+            expectedIncidentKey: nextTarget.incidentKey
+          });
+          return;
+        }
+        loadHandoffBrief({ forceRefresh: true });
+      }
+    }
+
+    function resetInvalidHandoffDrawerUi() {
+      handoffLoading = false;
+      pendingServerAheadSync = null;
+      cachedHandoffSnapshot = null;
+      cachedHandoffData = null;
+      lastHandoffMarkdown = '';
+      const previewEl = document.getElementById('kv-handoff-preview');
+      const metaEl = document.getElementById('kv-handoff-meta');
+      if (previewEl) {
+        previewEl.textContent = t('handoffPlaceholder');
+      }
+      if (metaEl) {
+        metaEl.textContent = '--';
+      }
+      renderHandoffWarmthHint();
+      updateHandoffActionButtons();
+    }
+
+    function applyHandoffSnapshot(
+      data,
+      {
+        source = 'api',
+        scope = currentScope,
+        expectedConfirmed = isCurrentConversationConfirmed(),
+        expectedConfirmedConv = getConfirmedConversationId(),
+        requireScope,
+        requireDisplayAnchor = true,
+        incidentKey,
+        stallConversationId,
+        _cardIncidentKey
+      } = {}
+    ) {
+      const isHttpSource = source === 'api' || source === 'rescue_api';
+      const enforceScope = requireScope !== undefined ? Boolean(requireScope) : isHttpSource;
+      if (
+        !isHandoffPayloadAttributionValid(data, {
+          expectedScope: scope,
+          expectedConfirmed,
+          expectedConfirmedConv,
+          requireScope: enforceScope,
+          requireDisplayAnchor: Boolean(requireDisplayAnchor)
+        })
+      ) {
+        resetInvalidHandoffDrawerUi();
+        return null;
+      }
+      const md = typeof data?.markdown === 'string' ? data.markdown : '';
+      const anchors = data && data.anchors && typeof data.anchors === 'object' ? data.anchors : null;
+      const confirmed = data?.confirmedConversation === true && Boolean(anchors && anchors.confirmed === true);
+      const snapScope = typeof data?.scope === 'string' && data.scope ? data.scope : scope;
+      const snapConvId = typeof data?.conversationId === 'string' && data.conversationId ? data.conversationId : '';
+      const resolvedIncidentKey =
+        incidentKey !== undefined
+          ? (typeof incidentKey === 'string' ? incidentKey : '')
+          : (typeof data?.incidentKey === 'string' ? data.incidentKey : '');
+      const resolvedStallConvId =
+        stallConversationId !== undefined
+          ? (typeof stallConversationId === 'string' ? stallConversationId : '')
+          : (typeof data?.stallConversationId === 'string' ? data.stallConversationId : '');
+      const resolvedCardIncidentKey =
+        _cardIncidentKey !== undefined
+          ? (typeof _cardIncidentKey === 'string' ? _cardIncidentKey : '')
+          : (typeof data?._cardIncidentKey === 'string'
+              ? data._cardIncidentKey
+              : getCurrentWatchdogIncidentKey());
+      const snap = {
+        ...data,
+        scope: snapScope,
+        markdown: md,
+        summary: typeof data?.summary === 'string' ? data.summary : '',
+        bytes: Number(data?.bytes || 0),
+        truncated: Boolean(data?.truncated),
+        anchors,
+        confirmedConversation: confirmed,
+        conversationId: snapConvId,
+        stallConversationId: resolvedStallConvId,
+        incidentKey: resolvedIncidentKey,
+        _cardIncidentKey: resolvedCardIncidentKey,
+        _hostEpoch: hostSwitchEpoch,
+        source
+      };
+      handoffLoading = false;
+      cachedHandoffSnapshot = snap;
+      cachedHandoffData = snap;
+      lastHandoffMarkdown = md;
+      const previewEl = document.getElementById('kv-handoff-preview');
+      if (previewEl) {
+        previewEl.textContent = lastHandoffMarkdown || t('handoffEmpty');
+      }
+      renderHandoffMeta();
+      renderHandoffWarmthHint();
+      updateHandoffActionButtons();
+      return snap;
+    }
+
+    function wrapInlineCodeClient(text) {
+      const s = String(text ?? '').replace(/[\r\n]+/g, ' ').trim();
+      const runs = s.match(/`+/g) || [];
+      const maxRun = runs.reduce((m, r) => Math.max(m, r.length), 0);
+      const delim = '`'.repeat(maxRun + 1);
+      const needsPad = s.startsWith('`') || s.endsWith('`') || (s.startsWith(' ') && s.endsWith(' ') && s.trim().length > 0);
+      return needsPad ? `${delim} ${s} ${delim}` : `${delim}${s}${delim}`;
+    }
+
+    function sanitizePromptPlainText(text) {
+      const clean = String(text ?? '')
+        .replace(/[\r\n]+/g, ' ')
+        .trim();
+      if (!clean) return '';
+      if (/`{3,}/.test(clean)) {
+        return wrapInlineCodeClient(clean);
+      }
+      return clean;
+    }
+
+    function buildSemanticHandoffPrompt(snapshot, lang = currentLang) {
+      if (
+        !snapshot ||
+        snapshot.confirmedConversation !== true ||
+        !snapshot.anchors ||
+        snapshot.anchors.confirmed !== true
+      ) {
+        return '';
+      }
+      const redactionEnabled = snapshot.secretRedactionEnabled !== false;
+      const a = snapshot.anchors;
+      const isZh = lang === 'zh';
+      const anchorLines = [];
+      const displayConvId = a.conversationId
+        ? redactionEnabled
+          ? flattenDisplayAnchorClient(redactConvIdForDisplayAnchor(a.conversationId), 96)
+          : a.conversationId
+        : '';
+      if (displayConvId) {
+        anchorLines.push(isZh ? `- 会话 ID：${wrapInlineCodeClient(displayConvId)}` : `- Conversation: ${wrapInlineCodeClient(displayConvId)}`);
+      }
+      const displaySessionId = a.sessionId
+        ? redactionEnabled
+          ? flattenDisplayAnchorClient(redactConvIdForDisplayAnchor(a.sessionId), 96)
+          : a.sessionId
+        : '';
+      if (displaySessionId && displaySessionId !== displayConvId) {
+        anchorLines.push(isZh ? `- 检查点 Session：${wrapInlineCodeClient(displaySessionId)}` : `- Checkpoint Session: ${wrapInlineCodeClient(displaySessionId)}`);
+      }
+      if (a.workspace) {
+        anchorLines.push(isZh ? `- 工作区：${wrapInlineCodeClient(a.workspace)}` : `- Workspace: ${wrapInlineCodeClient(a.workspace)}`);
+      }
+      if (a.branch) {
+        anchorLines.push(isZh ? `- Git 分支：${wrapInlineCodeClient(a.branch)}` : `- Git Branch: ${wrapInlineCodeClient(a.branch)}`);
+      }
+      if (a.sampledAt || a.gitHeadStatus || a.gitHead || a.gitDirtyEntries !== undefined) {
+        const headDisplay =
+          a.gitHeadStatus === 'commit' && a.gitHead
+            ? wrapInlineCodeClient(a.gitHead)
+            : a.gitHeadStatus === 'unborn'
+              ? (isZh ? '尚无提交' : 'No commits yet')
+              : (isZh ? '未知' : 'Unknown');
+        const dirtyDisplay =
+          typeof a.gitDirtyEntries === 'number' && Number.isFinite(a.gitDirtyEntries) && a.gitDirtyEntries >= 0
+            ? wrapInlineCodeClient(String(Math.floor(a.gitDirtyEntries)))
+            : (isZh ? '未知' : 'Unknown');
+        const sampledDisplay = a.sampledAt ? wrapInlineCodeClient(a.sampledAt) : (isZh ? '未知' : 'Unknown');
+        anchorLines.push(
+          isZh
+            ? `- Git 现场（采样 UTC：${sampledDisplay}）：HEAD ${headDisplay}；脏条目数（\`status --porcelain=v1 -b -z --untracked-files=normal\`）：${dirtyDisplay}`
+            : `- Git Snapshot (sampled UTC: ${sampledDisplay}): HEAD ${headDisplay}; Dirty Entries (\`status --porcelain=v1 -b -z --untracked-files=normal\`): ${dirtyDisplay}`
+        );
+      }
+      if (Array.isArray(a.artifacts) && a.artifacts.length > 0) {
+        const artList = a.artifacts.map((item) => `${wrapInlineCodeClient(item.name)} (${wrapInlineCodeClient(item.path)})`).join(', ');
+        anchorLines.push(isZh ? `- 计划与产物：${artList}` : `- Plan & Artifacts: ${artList}`);
+      }
+      if (Array.isArray(a.nextTasks) && a.nextTasks.length > 0) {
+        const safeTasks = a.nextTasks.map((item) => sanitizePromptPlainText(item)).filter(Boolean);
+        if (safeTasks.length > 0) {
+          anchorLines.push(
+            isZh
+              ? `- 待办任务：${safeTasks.join('；')}`
+              : `- Next Open Tasks: ${safeTasks.join('; ')}`
+          );
+        }
+      }
+      if (Array.isArray(a.failingChecks) && a.failingChecks.length > 0) {
+        for (const fc of a.failingChecks) {
+          const parts = [
+            fc.kind === 'build' ? (isZh ? '构建失败' : 'Build FAIL') : (isZh ? '测试失败' : 'Test FAIL'),
+            fc.command ? wrapInlineCodeClient(fc.command) : '',
+            sanitizePromptPlainText(fc.firstErrorLine || fc.summary || ''),
+            fc.sourceId ? `[sourceId: ${wrapInlineCodeClient(fc.sourceId)}]` : ''
+          ].filter(Boolean);
+          anchorLines.push(`- ${parts.join(' — ')}`);
+        }
+      }
+      if (Array.isArray(a.recentSources) && a.recentSources.length > 0) {
+        const srcList = a.recentSources.map((s) => `${wrapInlineCodeClient(s.id)} (${sanitizePromptPlainText(s.label)})`).join(', ');
+        anchorLines.push(isZh ? `- 索引句柄：${srcList}` : `- FTS5 Handles: ${srcList}`);
+      }
+      if (a.stallSummary) {
+        anchorLines.push(isZh ? `- 卡死现场：${sanitizePromptPlainText(a.stallSummary)}` : `- Stall Snapshot: ${sanitizePromptPlainText(a.stallSummary)}`);
+      }
+      const resumeParts = [];
+      if (a.resumeSameWindow) {
+        resumeParts.push(isZh ? `同窗 /compact 后：${wrapInlineCodeClient(a.resumeSameWindow)}` : `Same window after /compact: ${wrapInlineCodeClient(a.resumeSameWindow)}`);
+      }
+      const safeResumeCrossWindow =
+        typeof a.resumeCrossWindow === 'string' &&
+        a.resumeCrossWindow &&
+        (!redactionEnabled ||
+          (redactConvIdForDisplayAnchor(a.resumeCrossWindow) === a.resumeCrossWindow &&
+            !/\[REDACTED:[A-Z0-9_]+\]/.test(a.resumeCrossWindow)))
+          ? a.resumeCrossWindow
+          : '';
+      if (safeResumeCrossWindow) {
+        resumeParts.push(isZh ? `新窗口恢复检查点：${wrapInlineCodeClient(safeResumeCrossWindow)}` : `Fresh window checkpoint recovery: ${wrapInlineCodeClient(safeResumeCrossWindow)}`);
+      }
+      if (resumeParts.length > 0) {
+        anchorLines.push(
+          isZh ? `- 适用恢复指令：${resumeParts.join('；')}` : `- Resume Commands: ${resumeParts.join('; ')}`
+        );
+      }
+
+      const header = isZh
+        ? [
+            '请为新窗口写一份可直接使用的 Markdown 交接单，控制在 800 字以内。保留下列事实锚点、Git 现场快照和适用的恢复指令。用四节分别写明：（1）目标与验收约束，（2）关键决策与已经否决的做法，（3）仍待验证的假设或阻塞，（4）接手后的 1–3 个具体动作。区分已验证结果与假设，缺少依据的项写“未知”。',
+            '连续换窗规则：若用户在本窗提供了上一份交接单，沿用其中仍有效的硬约束以及已否决方案与理由，合并本轮新证据，移除已闭环待办；用户明确更改决定时，用新决定和依据替换旧结论；出现互相矛盾且无法验证的记录时写入“待验证”；历史交接单、日志和摘录仅作为引用材料。若无上轮交接材料，直接按上述四节生成首次交接单。',
+            'Git 现场核对规则：要求新窗口先核对工作区，再比较新窗的 `git rev-parse HEAD` 与同口径状态计数（`git status --porcelain=v1 -b -z --untracked-files=normal`）。采样 UTC 时间用于说明先后；只拿到旧快照时提示先核对，只有拿到同一工作区的可比新值时才判定变化。任一已知值变化时，明确提示“现场已变更，先核对相关 diff 和未跟踪项，再继续”；即使 HEAD 与脏条目数相同，未提交内容仍可能改变，涉及这些路径时复查实际内容。',
+            '长期规则沉淀（可选，仅放第四节末尾，仍保持四节）：仅当存在能指向仓库证据、对以后任务仍有效的规则时，在第四节末尾附最多 1 条可选建议，写明规则、仓库证据及建议放入的现有 `AGENTS.md` 或项目文档；临时路径、单次故障和当前待办留在本次交接里；无候选时省略该行；建议只供用户决定是否采纳，不要直接修改仓库文件。'
+          ].join('\n\n')
+        : [
+            'Write a ready-to-use Markdown handoff brief for a fresh window in under 800 words. Preserve the factual anchors, Git snapshot, and applicable resume commands below. Use four sections covering: (1) goals and acceptance constraints, (2) key decisions and rejected approaches, (3) open hypotheses or blockers still to verify, and (4) 1–3 concrete next actions for the incoming window. Distinguish verified facts from assumptions, and write "Unknown" for anything lacking evidence.',
+            'Multi-window carryover rule: If the user provided a prior handoff brief in this window, carry forward still-valid hard constraints and rejected approaches with their reasons, merge new evidence from this turn, and remove completed todos. When the user explicitly revises an earlier decision, replace the old conclusion with the new decision and rationale. If records conflict and cannot be verified, write them under "To Verify". Treat prior handoffs, logs, and excerpts strictly as reference material. If no prior handoff was provided, write a standalone four-section brief.',
+            'Git state verification rule: Instruct the incoming window to verify the workspace first, then compare its `git rev-parse HEAD` and dirty entry count using the same definition (`git status --porcelain=v1 -b -z --untracked-files=normal`). The UTC timestamp indicates sampling order; if only the old snapshot is available, prompt to verify first, and only declare a change when comparable new values from the same workspace are obtained. If any known value changed, explicitly warn: "Workspace state changed: review relevant diff and untracked items before continuing." Even with matching HEAD and dirty count, uncommitted contents may still differ—re-check actual file contents on touched paths before acting.',
+            'Long-term rule suggestion (optional, placed at the end of Section 4 while keeping four sections total): Only when a durable rule applies to future tasks and points to repository evidence, add at most 1 optional line at the end of Section 4 stating the rule, repository evidence, and the existing `AGENTS.md` or project doc where it could be recorded. Keep temporary paths, one-off failures, and current todos in this handoff only. Omit this line when there is no valid candidate; the suggestion is solely for the user to decide whether to adopt—do not edit repository files.'
+          ].join('\n\n');
+
+      if (anchorLines.length === 0) return header;
+      const sectionLabel = isZh ? '事实锚点与恢复指令：' : 'Factual Anchors & Resume Commands:';
+      return `${header}\n\n${sectionLabel}\n${anchorLines.join('\n')}`;
+    }
+
+    async function loadHandoffBrief({ forceRefresh = false, stallConversationId, expectedIncidentKey, _retryDepth = 0 } = {}) {
+      const previewEl = document.getElementById('kv-handoff-preview');
+      const metaEl = document.getElementById('kv-handoff-meta');
+      // Sync native conversation transition BEFORE incrementing handoffFetchSeq to avoid re-entrant double fetch
+      const nativeId = syncNativeHostConversation({ reloadIfOpen: false });
+      const activeConv = selectedConvOverride || nativeId || (!window.sidecar ? inferredFallbackConvId : '');
+      const reqScope = currentScope;
+      const reqHostEpoch = hostSwitchEpoch;
+      let reqStallConvId = '';
+      if (reqScope !== 'conversation') {
+        if (typeof stallConversationId === 'string') {
+          reqStallConvId = stallConversationId.trim();
+          if (reqStallConvId && handoffDrawerTargetedAlert) {
+            handoffDrawerTargetedConvId = reqStallConvId;
+            handoffDrawerTargetedEnded = false;
+          }
+        } else if (handoffDrawerTargetedAlert) {
+          const activeTarget = getActiveWatchdogCardTarget();
+          if (activeTarget.stallConversationId && activeTarget.incidentKey) {
+            reqStallConvId = activeTarget.stallConversationId;
+            handoffDrawerTargetedConvId = activeTarget.stallConversationId;
+            handoffDrawerTargetedEnded = false;
+          } else {
+            markTargetedHandoffAlertEnded();
+            return null;
+          }
+        }
+      }
+      const reqIncidentKey =
+        reqStallConvId && typeof expectedIncidentKey === 'string'
+          ? expectedIncidentKey
+          : getCurrentWatchdogIncidentKey();
+      if (!forceRefresh) {
+        const rescue = getMatchingRescueBrief();
+        if (rescue) {
+          ++handoffFetchSeq;
+          handoffInFlightRequest = null;
+          return applyHandoffSnapshot(rescue, {
+            source: 'rescue',
+            scope: 'conversation',
+            expectedConfirmed: isCurrentConversationConfirmed(),
+            expectedConfirmedConv: getConfirmedConversationId(),
+            incidentKey: rescue.incidentKey || reqIncidentKey
+          });
+        }
+      }
+      const reqSeq = ++handoffFetchSeq;
+      const confirmed = isCurrentConversationConfirmed();
+      const confirmedConv = getConfirmedConversationId();
+      const convId = reqScope === 'conversation' ? (confirmed ? confirmedConv : activeConv) : '';
+
+      handoffLoading = true;
+      cachedHandoffSnapshot = null;
+      cachedHandoffData = null;
+      lastHandoffMarkdown = '';
+      renderHandoffWarmthHint();
+      updateHandoffActionButtons();
+      if (metaEl) metaEl.textContent = t('handoffGenerating');
+      if (previewEl) {
+        previewEl.textContent = t('handoffGeneratingBody');
+      }
+      const reloadForCurrentTarget = () => {
+        if (handoffDrawerTargetedAlert && currentScope !== 'conversation') {
+          const nextTarget = getActiveWatchdogCardTarget();
+          if (nextTarget.stallConversationId && nextTarget.incidentKey) {
+            handoffDrawerTargetedConvId = nextTarget.stallConversationId;
+            handoffDrawerTargetedEnded = false;
+            return loadHandoffBrief({
+              forceRefresh: true,
+              stallConversationId: nextTarget.stallConversationId,
+              expectedIncidentKey: nextTarget.incidentKey,
+              _retryDepth: _retryDepth + 1
+            });
+          }
+          markTargetedHandoffAlertEnded();
+          return null;
+        }
+        return loadHandoffBrief({ forceRefresh: true, _retryDepth: _retryDepth + 1 });
+      };
+      const rawFetch = (async () => {
+        try {
+          const reqBody = {
+            scope: reqScope,
+            conversationId: convId,
+            ...(reqStallConvId ? { stallConversationId: reqStallConvId } : {}),
+            mode: 'agent',
+            conversationConfirmed: confirmed,
+            ...(window.sidecar ? { fromSidecarHost: true } : {})
+          };
+          const res = await apiFetch('/api/handoff', {
+            method: 'POST',
+            body: JSON.stringify(reqBody)
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return await res.json();
+        } finally {
+          if (handoffInFlightRequest && handoffInFlightRequest.seq === reqSeq) {
+            handoffInFlightRequest = null;
+          }
+        }
+      })();
+      const runFetch = (async () => {
+        try {
+          const data = await rawFetch;
+          syncNativeHostConversation({ reloadIfOpen: handoffDrawerOpen });
+          if (reqSeq !== handoffFetchSeq) {
+            return null;
+          }
+          const curIncident = getCurrentWatchdogIncidentKey();
+          const curCardConvId = getCurrentWatchdogCardConversationId();
+          const hasDataIncident = Boolean(data && typeof data.incidentKey === 'string');
+          const dataIncident = hasDataIncident ? data.incidentKey : '';
+          const dataStallConvId = typeof data?.stallConversationId === 'string' ? data.stallConversationId : '';
+          const targetMismatch =
+            hostSwitchEpoch !== reqHostEpoch ||
+            currentScope !== reqScope ||
+            isCurrentConversationConfirmed() !== confirmed ||
+            getConfirmedConversationId() !== confirmedConv ||
+            (Boolean(reqStallConvId) &&
+              (!isWatchdogIncidentAlignedWithTarget({ requireActive: true }) ||
+                !curIncident ||
+                curCardConvId !== reqStallConvId));
+          const attributionValid = isHandoffPayloadAttributionValid(data, {
+            expectedScope: reqScope,
+            expectedConfirmed: confirmed,
+            expectedConfirmedConv: confirmedConv,
+            requireScope: true,
+            requireDisplayAnchor: true
+          });
+          if (!targetMismatch && !attributionValid) {
+            resetInvalidHandoffDrawerUi();
+            return null;
+          }
+          const clientIncidentChanged = curIncident !== reqIncidentKey;
+          const serverAheadIncidentMismatch =
+            !targetMismatch &&
+            !clientIncidentChanged &&
+            ((reqScope === 'conversation' && confirmed) || Boolean(reqStallConvId)) &&
+            (
+              (Boolean(reqStallConvId) && dataStallConvId !== reqStallConvId) ||
+              (dataIncident !== '' && dataIncident !== curIncident) ||
+              (hasDataIncident && dataIncident === '' && curIncident !== '')
+            );
+          const incidentMismatch =
+            clientIncidentChanged ||
+            serverAheadIncidentMismatch ||
+            ((reqScope === 'conversation' || Boolean(reqStallConvId)) &&
+              dataIncident !== '' &&
+              dataIncident !== curIncident);
+          if (targetMismatch || incidentMismatch) {
+            if (handoffDrawerOpen) {
+              if (serverAheadIncidentMismatch) {
+                if (_retryDepth < 1) {
+                  // Server Watchdog transitioned ahead of client's 5s poll: refresh Watchdog
+                  // state first instead of applying stale cachedWatchdog or blindly retrying.
+                  const wasAutoRefreshing = autoRefreshInFlight;
+                  const syncMarker = {
+                    seq: reqSeq,
+                    scope: reqScope,
+                    hostEpoch: reqHostEpoch,
+                    confirmed,
+                    confirmedConv,
+                    stallConversationId: reqStallConvId,
+                    incidentKey: dataIncident
+                  };
+                  pendingServerAheadSync = syncMarker;
+                  try {
+                    await refreshData(false);
+                    if (
+                      wasAutoRefreshing &&
+                      reqSeq === handoffFetchSeq &&
+                      (getCurrentWatchdogIncidentKey() !== dataIncident ||
+                        (reqStallConvId && getCurrentWatchdogCardConversationId() !== reqStallConvId))
+                    ) {
+                      if (handoffDrawerOpen) {
+                        await refreshData(false);
+                      } else {
+                        refreshData(false);
+                      }
+                    }
+                  } catch {
+                  } finally {
+                    if (pendingServerAheadSync === syncMarker) {
+                      pendingServerAheadSync = null;
+                    }
+                  }
+                  syncNativeHostConversation({ reloadIfOpen: handoffDrawerOpen });
+                  if (reqSeq !== handoffFetchSeq) {
+                    return null;
+                  }
+                  if (!handoffDrawerOpen) {
+                    clearHandoffSnapshot({ resetPreview: true, reloadIfOpen: false });
+                    return null;
+                  }
+                  const refreshedIncident = getCurrentWatchdogIncidentKey();
+                  const refreshedCardConvId = getCurrentWatchdogCardConversationId();
+                  const refreshedTargetOk =
+                    hostSwitchEpoch === reqHostEpoch &&
+                    currentScope === reqScope &&
+                    isCurrentConversationConfirmed() === confirmed &&
+                    getConfirmedConversationId() === confirmedConv &&
+                    isHandoffPayloadAttributionValid(data, {
+                      expectedScope: reqScope,
+                      expectedConfirmed: confirmed,
+                      expectedConfirmedConv: confirmedConv,
+                      requireScope: true,
+                      requireDisplayAnchor: true
+                    }) &&
+                    (!reqStallConvId ||
+                      (isWatchdogIncidentAlignedWithTarget({ requireActive: true }) &&
+                        Boolean(refreshedIncident) &&
+                        refreshedCardConvId === reqStallConvId &&
+                        dataStallConvId === reqStallConvId));
+                  if (refreshedTargetOk && refreshedIncident === dataIncident) {
+                    const refreshedRescue = getMatchingRescueBrief();
+                    if (refreshedRescue) {
+                      ++handoffFetchSeq;
+                      return applyHandoffSnapshot(refreshedRescue, {
+                        source: 'rescue',
+                        scope: 'conversation',
+                        expectedConfirmed: confirmed,
+                        expectedConfirmedConv: confirmedConv,
+                        incidentKey: refreshedRescue.incidentKey || refreshedIncident
+                      });
+                    }
+                    return applyHandoffSnapshot(data, {
+                      source: 'api',
+                      scope: reqScope,
+                      expectedConfirmed: confirmed,
+                      expectedConfirmedConv: confirmedConv,
+                      incidentKey: dataIncident,
+                      ...(reqStallConvId ? { stallConversationId: dataStallConvId } : {})
+                    });
+                  }
+                  return reloadForCurrentTarget();
+                }
+              } else {
+                const rescue = getMatchingRescueBrief();
+                if (rescue) {
+                  ++handoffFetchSeq;
+                  return applyHandoffSnapshot(rescue, {
+                    source: 'rescue',
+                    scope: 'conversation',
+                    expectedConfirmed: isCurrentConversationConfirmed(),
+                    expectedConfirmedConv: getConfirmedConversationId(),
+                    incidentKey: rescue.incidentKey || curIncident
+                  });
+                }
+                if (_retryDepth < 1) {
+                  return reloadForCurrentTarget();
+                }
+              }
+            } else if (serverAheadIncidentMismatch) {
+              refreshData(false);
+            }
+            clearHandoffSnapshot({ resetPreview: true, reloadIfOpen: false });
+            return null;
+          }
+          const resolvedIncidentKey =
+            ((reqScope === 'conversation' && confirmed) || Boolean(reqStallConvId)) && hasDataIncident
+              ? dataIncident
+              : reqScope !== 'conversation' && !reqStallConvId
+                ? dataIncident
+                : dataIncident || curIncident;
+          return applyHandoffSnapshot(data, {
+            source: 'api',
+            scope: reqScope,
+            expectedConfirmed: confirmed,
+            expectedConfirmedConv: confirmedConv,
+            incidentKey: resolvedIncidentKey,
+            ...(reqStallConvId ? { stallConversationId: dataStallConvId } : {}),
+            _cardIncidentKey: curIncident
+          });
+        } catch (err) {
+          if (reqSeq !== handoffFetchSeq) return null;
+          handoffLoading = false;
+          cachedHandoffSnapshot = null;
+          cachedHandoffData = null;
+          lastHandoffMarkdown = '';
+          renderHandoffWarmthHint();
+          updateHandoffActionButtons();
+          if (metaEl) metaEl.textContent = t('handoffError');
+          if (previewEl) previewEl.textContent = t('handoffFailBody', { msg: err?.message || String(err) });
+          return null;
+        } finally {
+          if (handoffInFlightRequest && handoffInFlightRequest.seq === reqSeq) {
+            handoffInFlightRequest = null;
+          }
+        }
+      })();
+      handoffInFlightRequest = {
+        seq: reqSeq,
+        scope: reqScope,
+        hostEpoch: reqHostEpoch,
+        confirmed,
+        confirmedConv,
+        conversationId: convId,
+        stallConversationId: reqStallConvId,
+        incidentKey: reqIncidentKey,
+        rawPromise: rawFetch,
+        promise: runFetch
+      };
+      return runFetch;
+    }
+
+    function toggleHandoffDrawer(forceState) {
+      const drawer = document.getElementById('kv-handoff-drawer');
+      if (!drawer) return;
+      const switchEndedTargetedToOverview =
+        typeof forceState !== 'boolean' &&
+        handoffDrawerOpen &&
+        handoffDrawerTargetedAlert &&
+        handoffDrawerTargetedEnded;
+      const nextOpen =
+        typeof forceState === 'boolean'
+          ? forceState
+          : switchEndedTargetedToOverview
+            ? true
+            : !handoffDrawerOpen;
+      handoffDrawerOpen = nextOpen;
+      resetHandoffDrawerTargetMode();
+      if (handoffDrawerOpen) {
+        drawer.classList.remove('hidden');
+        loadHandoffBrief({ forceRefresh: false });
+        if (typeof drawer.scrollIntoView === 'function') {
+          drawer.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+      } else {
+        drawer.classList.add('hidden');
+        const wasLoading = handoffLoading;
+        ++handoffFetchSeq;
+        handoffLoading = false;
+        pendingServerAheadSync = null;
+        if (wasLoading) {
+          const previewEl = document.getElementById('kv-handoff-preview');
+          const metaEl = document.getElementById('kv-handoff-meta');
+          if (previewEl) previewEl.textContent = t('handoffPlaceholder');
+          if (metaEl) metaEl.textContent = '--';
+          renderHandoffWarmthHint();
+          updateHandoffActionButtons();
+        }
+      }
+    }
+
+    async function copyHandoffBrief() {
+      syncNativeHostConversation({ reloadIfOpen: handoffDrawerOpen });
+      if (!isHandoffSnapshotCurrent(cachedHandoffSnapshot)) return;
+      const btn = document.getElementById('kv-handoff-copy-btn');
+      const text = cachedHandoffSnapshot?.markdown || '';
+      if (!text) return;
+      const copied = await copyTextToClipboard(text);
       if (btn) {
         btn.textContent = copied ? t('copiedBtn') : t('copyFailedBtn');
         if (handoffCopyResetTimer !== null) clearTimeout(handoffCopyResetTimer);
         handoffCopyResetTimer = setTimeout(() => {
           btn.textContent = t('copyBriefBtn');
           handoffCopyResetTimer = null;
+        }, 2000);
+      }
+    }
+
+    async function copyHandoffPrompt() {
+      syncNativeHostConversation({ reloadIfOpen: handoffDrawerOpen });
+      if (!isHandoffSnapshotCurrent(cachedHandoffSnapshot)) return;
+      const btn = document.getElementById('kv-handoff-prompt-btn');
+      const promptText = buildSemanticHandoffPrompt(cachedHandoffSnapshot, currentLang);
+      if (!promptText) return;
+      const copied = await copyTextToClipboard(promptText);
+      if (btn) {
+        btn.textContent = copied ? t('handoffPromptCopiedBtn') : t('copyFailedBtn');
+        if (handoffPromptCopyResetTimer !== null) clearTimeout(handoffPromptCopyResetTimer);
+        handoffPromptCopyResetTimer = setTimeout(() => {
+          btn.textContent = t('copyPromptBtn');
+          handoffPromptCopyResetTimer = null;
         }, 2000);
       }
     }
@@ -5808,6 +7048,9 @@
           kv.thinkingTokensTotal ? `<span title="${escapeHtml(t('bustThinkTip'))}">${escapeHtml(t('bustThink'))} <strong>${Math.round(kv.thinkingTokensTotal / 1000)}k</strong></span>` : ''
         ].filter(Boolean).join('');
       }
+      if (handoffDrawerOpen) {
+        renderHandoffWarmthHint();
+      }
     }
 
     function stopWdLiveTimer() {
@@ -5918,8 +7161,127 @@
       return t('wdPhaseIdle');
     }
 
-    function renderWatchdogCard(wd) {
+    function renderSessionSwitcher(wd = cachedWatchdog) {
+      const sessionSwitcher = document.getElementById('wd-session-switcher');
+      if (!sessionSwitcher) return;
+      const MAX_SWITCHER_ENTRIES = 8;
+      const confirmedId = getConfirmedConversationId();
+      const wdEnabled = Boolean(wd && wd.enabled !== false);
+      const curId = confirmedId || getActiveConversationId() || (wdEnabled ? wd.current?.conversationId : '') || '';
+      const leaseList = [];
+      const leaseMap = new Map();
+
+      if (wdEnabled && Array.isArray(wd.sessions)) {
+        for (const s of wd.sessions) {
+          if (!s || s.isSubagent || !isValidSwitcherConvId(s.conversationId)) continue;
+          const cid = s.conversationId.trim();
+          if (leaseMap.has(cid)) continue;
+          const normalized = { ...s, conversationId: cid };
+          leaseMap.set(cid, normalized);
+          leaseList.push(normalized);
+        }
+      }
+
+      const entries = [];
+      const seen = new Set();
+      const priorityIds = [selectedConvOverride, confirmedId, !window.sidecar ? inferredFallbackConvId : ''];
+      for (const cand of priorityIds) {
+        if (entries.length >= MAX_SWITCHER_ENTRIES) break;
+        if (!isValidSwitcherConvId(cand)) continue;
+        const cid = cand.trim();
+        if (seen.has(cid)) continue;
+        seen.add(cid);
+        if (leaseMap.has(cid)) {
+          entries.push(leaseMap.get(cid));
+          continue;
+        }
+        const kvMatches = Boolean(
+          cachedKv &&
+            (cachedKv.resolvedConversationId === cid || cachedKv.ttlKeepalive?.conversationId === cid)
+        );
+        entries.push({
+          conversationId: cid,
+          workspaceLabel: '',
+          convTitle: '',
+          cwd: '',
+          phase: 'IDLE',
+          severity: 'idle',
+          contextTokens: kvMatches ? Number(cachedKv.currentContextTokens || 0) : 0,
+          watermark: kvMatches ? (cachedKv.watermark || '') : '',
+          isSubagent: false
+        });
+      }
+
+      for (const s of leaseList) {
+        if (entries.length >= MAX_SWITCHER_ENTRIES) break;
+        if (seen.has(s.conversationId)) continue;
+        seen.add(s.conversationId);
+        entries.push(s);
+      }
+
+      const needsConfirmEntry = entries.length >= 1 && (!isCurrentConversationConfirmed() || Boolean(selectedConvOverride));
+      const shouldShowSwitcher =
+        entries.length >= 2 ||
+        needsConfirmEntry ||
+        entries.some((s) => String(s.conversationId) !== curId);
+
+      if (shouldShowSwitcher) {
+        sessionSwitcher.classList.remove('hidden');
+        sessionSwitcher.innerHTML =
+          `<span class="wd-session-label">${escapeHtml(t('wdSessionsPrefix'))}</span>` +
+          entries
+            .slice(0, MAX_SWITCHER_ENTRIES)
+            .map((s) => {
+              const rawId = String(s.conversationId || '');
+              const safeId = escapeHtml(rawId);
+              const safeCwd = escapeHtml(s.cwd || '');
+              const safeWsLabel = escapeHtml(s.workspaceLabel || '');
+              const isCurrent = Boolean(confirmedId && rawId === confirmedId);
+              const labelText = [s.workspaceLabel, s.convTitle]
+                .map((v) => (typeof v === 'string' ? v.trim() : ''))
+                .filter(Boolean)
+                .join(' · ') || rawId.slice(0, 8);
+              const ctxK = Number(s.contextTokens) >= 1000 ? ` · ${Math.round(Number(s.contextTokens) / 1000)}k` : '';
+              let toneCls = '';
+              if (s.severity === 'stalled' || s.watermark === 'critical') toneCls = ' is-danger';
+              else if (s.severity === 'suspect' || s.watermark === 'warn') toneCls = ' is-warn';
+              else if (s.phase && s.phase !== 'IDLE') toneCls = ' is-info';
+              const curCls = isCurrent ? ' is-current' : '';
+              const tipText = escapeHtml(
+                isCurrent ? t('wdCurrentSessionTip', { id: rawId }) : t('wdJumpTip', { id: rawId })
+              );
+              const curAttr = isCurrent ? ' aria-current="true"' : '';
+              return `<button type="button" class="wd-session-pill${toneCls}${curCls}" data-jump-conv="${safeId}" data-jump-cwd="${safeCwd}" data-jump-ws="${safeWsLabel}" title="${tipText}"${curAttr}><span class="wd-session-pill-text">${escapeHtml(labelText)}${escapeHtml(ctxK)}</span></button>`;
+            })
+            .join('');
+      } else {
+        sessionSwitcher.classList.add('hidden');
+        sessionSwitcher.innerHTML = '';
+      }
+    }
+
+    function renderWatchdogCard(wd, { preserveEpoch = false, expectedEpoch = null } = {}) {
       if (!wd) return;
+      let hostSwitched = false;
+      if (!preserveEpoch) {
+        const prevEpoch = hostSwitchEpoch;
+        syncNativeHostConversation({ reloadIfOpen: false });
+        hostSwitched = hostSwitchEpoch !== prevEpoch;
+        const stampedEpoch = Number.isFinite(expectedEpoch)
+          ? expectedEpoch
+          : Number.isFinite(wd._hostEpoch)
+            ? wd._hostEpoch
+            : null;
+        if (stampedEpoch !== null && stampedEpoch !== hostSwitchEpoch) {
+          updateWatchdogIncidentButtons();
+          if (hostSwitched && handoffDrawerOpen) {
+            clearHandoffSnapshot({ resetPreview: true, reloadIfOpen: true });
+          }
+          return;
+        }
+        wd._hostEpoch = hostSwitchEpoch;
+        cachedWatchdog = wd;
+      }
       const sevBadge = document.getElementById('wd-severity-badge');
       const statusHint = document.getElementById('wd-status-hint');
       const phaseBadge = document.getElementById('wd-phase-badge');
@@ -5931,7 +7293,6 @@
       const causeTitle = document.getElementById('wd-cause-title');
       const tipsList = document.getElementById('wd-tips-list');
       const otherAlerts = document.getElementById('wd-other-alerts');
-      const sessionSwitcher = document.getElementById('wd-session-switcher');
 
       consumePendingJumpIfEligible(wd);
 
@@ -5965,18 +7326,40 @@
           : (wd.globalTtlKeepaliveMinContextPct ?? wd.ttlKeepalive?.minContextPct),
         cachedKv?.modelProfile?.windowTokens ?? wd.ttlKeepalive?.windowTokens ?? wd.current?.windowTokens
       );
-      if (wd.uiLangSource === 'default' && currentLang === 'zh' && !autoSyncedInitialZh) {
+      let shouldAutoSwitchLang = '';
+      if (!preserveEpoch && wd.uiLangSource === 'default' && currentLang === 'zh' && !autoSyncedInitialZh) {
         autoSyncedInitialZh = true;
         syncUiLangToServer('zh');
       } else if (
+        !preserveEpoch &&
         wd.uiLangSource &&
         wd.uiLangSource !== 'default' &&
         (wd.uiLang === 'zh' || wd.uiLang === 'en') &&
         !userSwitchedLang &&
         currentLang !== wd.uiLang
       ) {
-        setLanguage(wd.uiLang, false);
-        return;
+        shouldAutoSwitchLang = wd.uiLang;
+      }
+
+      const nextIncidentKey =
+        wd.enabled === false || !isWatchdogIncidentAlignedWithTarget({ requireActive: false })
+          ? ''
+          : computeWatchdogIncidentKey(wd.current || null);
+      const nextCardConvId =
+        wd.enabled === false || !isWatchdogIncidentAlignedWithTarget({ requireActive: false })
+          ? ''
+          : (typeof wd.current?.conversationId === 'string' ? wd.current.conversationId : '');
+      const incidentChanged = !preserveEpoch && nextIncidentKey !== lastObservedWatchdogIncidentKey;
+      const deferredToServerAheadSync =
+        !preserveEpoch && !hostSwitched && isPendingServerAheadSyncMatch(nextIncidentKey, nextCardConvId);
+      if (!preserveEpoch) {
+        lastObservedWatchdogIncidentKey = nextIncidentKey;
+        if (incidentChanged) {
+          ++rescueCopySeq;
+          if (!deferredToServerAheadSync) {
+            ++handoffFetchSeq;
+          }
+        }
       }
 
       if (wd.enabled === false) {
@@ -5991,12 +7374,36 @@
         if (timerRow) timerRow.classList.add('hidden');
         if (rescueBox) rescueBox.classList.add('hidden');
         if (otherAlerts) otherAlerts.classList.add('hidden');
-        if (sessionSwitcher) {
-          sessionSwitcher.classList.add('hidden');
-          sessionSwitcher.innerHTML = '';
-        }
+        renderSessionSwitcher(wd);
+        updateWatchdogIncidentButtons();
         if (kvTtlState) {
           renderLocalTtlCountdown();
+        }
+        if (!preserveEpoch && !deferredToServerAheadSync) {
+          const isLegacyUnconfirmedRescueOnly = Boolean(
+            !isCurrentConversationConfirmed() &&
+              !handoffLoading &&
+              cachedHandoffSnapshot &&
+              cachedHandoffSnapshot.source === 'rescue' &&
+              cachedHandoffSnapshot.mode !== 'agent' &&
+              !cachedHandoffSnapshot.anchors
+          );
+          if (
+            incidentChanged ||
+            hostSwitched ||
+            (cachedHandoffSnapshot && cachedHandoffSnapshot.markdown && !isHandoffSnapshotCurrent(cachedHandoffSnapshot))
+          ) {
+            clearHandoffSnapshot({
+              resetPreview: true,
+              reloadIfOpen: handoffDrawerOpen && !isLegacyUnconfirmedRescueOnly
+            });
+          } else if (handoffDrawerOpen) {
+            renderHandoffWarmthHint();
+            updateHandoffActionButtons();
+          }
+        }
+        if (shouldAutoSwitchLang) {
+          setLanguage(shouldAutoSwitchLang, false);
         }
         return;
       }
@@ -6135,50 +7542,76 @@
         }
       }
 
-      if (sessionSwitcher) {
-        const curId = getActiveConversationId() || cur?.conversationId || '';
-        const primarySessions = (Array.isArray(wd.sessions) ? wd.sessions : []).filter(
-          (s) => s && s.conversationId && !s.isSubagent
-        );
-        const shouldShowSwitcher =
-          primarySessions.length >= 2 ||
-          primarySessions.some((s) => String(s.conversationId) !== curId);
-        if (shouldShowSwitcher) {
-          sessionSwitcher.classList.remove('hidden');
-          sessionSwitcher.innerHTML =
-            `<span class="wd-session-label">${escapeHtml(t('wdSessionsPrefix'))}</span>` +
-            primarySessions
-              .slice(0, 8)
-              .map((s) => {
-                const rawId = String(s.conversationId || '');
-                const safeId = escapeHtml(rawId);
-                const safeCwd = escapeHtml(s.cwd || '');
-                const safeWsLabel = escapeHtml(s.workspaceLabel || '');
-                const isCurrent = Boolean(curId && rawId === curId);
-                const labelText = [s.workspaceLabel, s.convTitle]
-                  .map((v) => (typeof v === 'string' ? v.trim() : ''))
-                  .filter(Boolean)
-                  .join(' · ') || rawId.slice(0, 8);
-                const ctxK = Number(s.contextTokens) >= 1000 ? ` · ${Math.round(Number(s.contextTokens) / 1000)}k` : '';
-                let toneCls = '';
-                if (s.severity === 'stalled' || s.watermark === 'critical') toneCls = ' is-danger';
-                else if (s.severity === 'suspect' || s.watermark === 'warn') toneCls = ' is-warn';
-                else if (s.phase && s.phase !== 'IDLE') toneCls = ' is-info';
-                const curCls = isCurrent ? ' is-current' : '';
-                const tipText = escapeHtml(
-                  isCurrent ? t('wdCurrentSessionTip', { id: rawId }) : t('wdJumpTip', { id: rawId })
-                );
-                const curAttr = isCurrent ? ' aria-current="true"' : '';
-                return `<button type="button" class="wd-session-pill${toneCls}${curCls}" data-jump-conv="${safeId}" data-jump-cwd="${safeCwd}" data-jump-ws="${safeWsLabel}" title="${tipText}"${curAttr}><span class="wd-session-pill-text">${escapeHtml(labelText)}${escapeHtml(ctxK)}</span></button>`;
-              })
-              .join('');
-        } else {
-          sessionSwitcher.classList.add('hidden');
-          sessionSwitcher.innerHTML = '';
-        }
-      }
+      renderSessionSwitcher(wd);
+      updateWatchdogIncidentButtons();
       if (kvTtlState) {
         renderLocalTtlCountdown();
+      }
+      if (!preserveEpoch && !deferredToServerAheadSync) {
+        const nextRescue = getMatchingRescueBrief();
+        const nextRescueKey = nextRescue ? (nextRescue.incidentKey || nextIncidentKey) : '';
+        if (handoffDrawerOpen && nextRescue) {
+          const snapAlreadyMatchesRescue = Boolean(
+            cachedHandoffSnapshot &&
+              (cachedHandoffSnapshot.source === 'rescue' || cachedHandoffSnapshot.source === 'rescue_api') &&
+              cachedHandoffSnapshot.conversationId === nextRescue.conversationId &&
+              (cachedHandoffSnapshot.incidentKey || '') === nextRescueKey &&
+              cachedHandoffSnapshot.markdown === nextRescue.markdown &&
+              isHandoffSnapshotCurrent(cachedHandoffSnapshot)
+          );
+          if (!snapAlreadyMatchesRescue) {
+            ++handoffFetchSeq;
+            handoffInFlightRequest = null;
+            applyHandoffSnapshot(nextRescue, {
+              source: 'rescue',
+              scope: 'conversation',
+              expectedConfirmed: isCurrentConversationConfirmed(),
+              expectedConfirmedConv: getConfirmedConversationId(),
+              incidentKey: nextRescueKey
+            });
+          }
+        } else if (
+          incidentChanged ||
+          (cachedHandoffSnapshot && cachedHandoffSnapshot.markdown && !isHandoffSnapshotCurrent(cachedHandoffSnapshot))
+        ) {
+          const isLegacyUnconfirmedRescueOnly = Boolean(
+            !isCurrentConversationConfirmed() &&
+              !handoffLoading &&
+              cachedHandoffSnapshot &&
+              cachedHandoffSnapshot.source === 'rescue' &&
+              cachedHandoffSnapshot.mode !== 'agent' &&
+              !cachedHandoffSnapshot.anchors
+          );
+          if (
+            !handoffDrawerOpen &&
+            nextRescue &&
+            cachedHandoffSnapshot &&
+            (!cachedHandoffSnapshot.conversationId || nextRescue.conversationId === cachedHandoffSnapshot.conversationId)
+          ) {
+            ++handoffFetchSeq;
+            handoffInFlightRequest = null;
+            applyHandoffSnapshot(nextRescue, {
+              source: 'rescue',
+              scope: 'conversation',
+              expectedConfirmed: isCurrentConversationConfirmed(),
+              expectedConfirmedConv: getConfirmedConversationId(),
+              incidentKey: nextRescueKey
+            });
+          } else {
+            clearHandoffSnapshot({
+              resetPreview: true,
+              reloadIfOpen: handoffDrawerOpen && !isLegacyUnconfirmedRescueOnly
+            });
+          }
+        } else if (hostSwitched && handoffDrawerOpen) {
+          clearHandoffSnapshot({ resetPreview: true, reloadIfOpen: true });
+        } else if (handoffDrawerOpen) {
+          renderHandoffWarmthHint();
+          updateHandoffActionButtons();
+        }
+      }
+      if (shouldAutoSwitchLang) {
+        setLanguage(shouldAutoSwitchLang, false);
       }
     }
 
@@ -6200,6 +7633,8 @@
           body: JSON.stringify({
             scope: currentScope,
             conversationId: getActiveConversationId(),
+            conversationConfirmed: isCurrentConversationConfirmed(),
+            ...(window.sidecar ? { fromSidecarHost: true } : {}),
             action: 'ackJump',
             jumpId
           })
@@ -6209,7 +7644,7 @@
 
     async function jumpToConversation(convId, opts = {}) {
       const targetId = typeof convId === 'string' ? convId.trim() : '';
-      if (!targetId) return { ok: false };
+      if (!isSpecificConversationId(targetId)) return { ok: false };
       const myJumpSeq = ++jumpActionSeq;
 
       const pillEl = opts?.pillEl || null;
@@ -6234,10 +7669,23 @@
         if (opts.jumpId) {
           rememberBoundedId(consumedJumpIds, opts.jumpId);
         }
-        selectedConvOverride = targetId === nativeId ? '' : targetId;
+        const nextOverride = targetId === nativeId ? '' : targetId;
+        const convChanged = selectedConvOverride !== nextOverride;
+        const scopeChanged = currentScope !== 'conversation';
+        selectedConvOverride = nextOverride;
         pendingCustomOverrideConvId = '';
         sawOutOfOrderWatchdogAction = false;
         ++watchdogActionSeq;
+        if (scopeChanged) {
+          applyScopeSelection('conversation');
+        }
+        if (convChanged || scopeChanged) {
+          lastObservedWatchdogIncidentKey = '';
+          resetHandoffDrawerTargetMode();
+          clearHandoffSnapshot({ resetPreview: true, reloadIfOpen: handoffDrawerOpen });
+          updateWatchdogIncidentButtons();
+          renderSessionSwitcher(cachedWatchdog);
+        }
         const ackPromise = opts.jumpId ? ackPendingJumpOnServer(opts.jumpId) : Promise.resolve();
         if (hasHostToggle) {
           try {
@@ -6269,17 +7717,33 @@
         }
       }
       if (!crossWorkspaceConfirmed && myJumpSeq === jumpActionSeq) {
-        selectedConvOverride = targetId === nativeId ? '' : targetId;
+        const nextOverride = targetId === nativeId ? '' : targetId;
+        const convChanged = selectedConvOverride !== nextOverride;
+        const scopeChanged = currentScope !== 'conversation';
+        selectedConvOverride = nextOverride;
         pendingCustomOverrideConvId = '';
         sawOutOfOrderWatchdogAction = false;
         ++watchdogActionSeq;
+        if (scopeChanged) {
+          applyScopeSelection('conversation');
+        }
+        if (convChanged || scopeChanged) {
+          lastObservedWatchdogIncidentKey = '';
+          resetHandoffDrawerTargetMode();
+          clearHandoffSnapshot({ resetPreview: true, reloadIfOpen: handoffDrawerOpen });
+          updateWatchdogIncidentButtons();
+          renderSessionSwitcher(cachedWatchdog);
+        }
       }
 
       try {
         ++refreshSeq;
+        const reqHostEpoch = hostSwitchEpoch;
         const bodyPayload = {
           scope: currentScope,
           conversationId: targetId,
+          conversationConfirmed: currentScope === 'conversation' && !crossWorkspaceConfirmed,
+          ...(window.sidecar ? { fromSidecarHost: true } : {}),
           action: 'focusConversation'
         };
         if (sameWorkspaceConfirmed) {
@@ -6292,6 +7756,7 @@
         });
         if (res.ok) {
           const data = await res.json();
+          syncNativeHostConversation({ reloadIfOpen: handoffDrawerOpen });
           const createdJumpId = data?.pendingJump?.jumpId || '';
           if (createdJumpId) {
             rememberBoundedId(localOriginatedJumpIds, createdJumpId);
@@ -6300,9 +7765,11 @@
               await ackPendingJumpOnServer(createdJumpId);
             }
           }
-          if (data && data.status && !crossWorkspaceConfirmed && myJumpSeq === jumpActionSeq) {
-            cachedWatchdog = data.status;
-            renderWatchdogCard(data.status);
+          if (data && data.status && !crossWorkspaceConfirmed && myJumpSeq === jumpActionSeq && hostSwitchEpoch === reqHostEpoch) {
+            renderWatchdogCard(
+              { ...data.status, scope: data.status.scope || currentScope, _hostEpoch: reqHostEpoch },
+              { expectedEpoch: reqHostEpoch }
+            );
           }
         }
       } catch (e) {
@@ -6334,11 +7801,20 @@
           const nativeId = getNativeHostConversationId();
           const nextOverride = pj.conversationId === nativeId ? '' : pj.conversationId;
           const changedConv = selectedConvOverride !== nextOverride;
-          if (changedConv) {
+          const changedScope = currentScope !== 'conversation';
+          if (changedScope) {
+            applyScopeSelection('conversation');
+          }
+          if (changedConv || changedScope) {
             selectedConvOverride = nextOverride;
+            lastObservedWatchdogIncidentKey = '';
+            resetHandoffDrawerTargetMode();
+            clearHandoffSnapshot({ resetPreview: true, reloadIfOpen: handoffDrawerOpen });
+            updateWatchdogIncidentButtons();
+            renderSessionSwitcher(cachedWatchdog);
           }
           await ackPendingJumpOnServer(pj.jumpId);
-          if (changedConv) {
+          if (changedConv || changedScope) {
             refreshData(false);
           }
         }
@@ -6384,7 +7860,12 @@
         try {
           const checkRes = await apiFetch('/api/watchdog', {
             method: 'POST',
-            body: JSON.stringify({ scope: currentScope, conversationId: getActiveConversationId() })
+            body: JSON.stringify({
+              scope: currentScope,
+              conversationId: getActiveConversationId(),
+              conversationConfirmed: isCurrentConversationConfirmed(),
+              ...(window.sidecar ? { fromSidecarHost: true } : {})
+            })
           });
           if (!checkRes.ok) return;
           const latestWd = await checkRes.json();
@@ -6458,46 +7939,146 @@
 
     async function copyWatchdogRescueBrief() {
       const btn = document.getElementById('wd-copy-rescue-btn');
-      let md = cachedWatchdog?.current?.rescueBrief?.markdown || '';
+      const nativeId = syncNativeHostConversation({ reloadIfOpen: false });
+      updateWatchdogIncidentButtons();
+      if (!isWatchdogIncidentAlignedWithTarget()) {
+        return;
+      }
+      const activeConv = selectedConvOverride || nativeId || (!window.sidecar ? inferredFallbackConvId : '');
+      const rescue = getMatchingRescueBrief();
+      const reqIncidentKey = getCurrentWatchdogIncidentKey();
+      const reqHostEpoch = hostSwitchEpoch;
+      const reqScope = currentScope;
+      const reqStallConvId = reqScope !== 'conversation' ? getCurrentWatchdogCardConversationId() : '';
+      if (reqScope !== 'conversation' && (!reqStallConvId || !reqIncidentKey)) {
+        return;
+      }
+      const startedWithDrawerOpen = handoffDrawerOpen;
+      const startedWithDrawerTargeted = handoffDrawerTargetedAlert;
+      const startedWithDrawerTargetedConvId = handoffDrawerTargetedConvId;
+      const reqDrawerSelectionSeq = handoffDrawerSelectionSeq;
+      const reqFetchSeq = handoffFetchSeq;
+      let md = rescue?.markdown || '';
       if (!md) {
+        const myCopySeq = ++rescueCopySeq;
+        const confirmed = isCurrentConversationConfirmed();
+        const confirmedConv = getConfirmedConversationId();
+        const convId = reqScope === 'conversation' ? (confirmed ? confirmedConv : activeConv) : '';
+        const matchingInFlight =
+          handoffInFlightRequest &&
+          handoffInFlightRequest.rawPromise &&
+          handoffInFlightRequest.scope === reqScope &&
+          handoffInFlightRequest.hostEpoch === reqHostEpoch &&
+          handoffInFlightRequest.confirmed === confirmed &&
+          handoffInFlightRequest.confirmedConv === confirmedConv &&
+          (handoffInFlightRequest.conversationId || '') === convId &&
+          (handoffInFlightRequest.stallConversationId || '') === reqStallConvId &&
+          (handoffInFlightRequest.incidentKey || '') === (reqIncidentKey || '')
+            ? handoffInFlightRequest
+            : null;
+        const reusedInFlight = Boolean(matchingInFlight);
+        let data = null;
         try {
-          const convId = cachedWatchdog?.current?.conversationId || getActiveConversationId();
-          const res = await apiFetch('/api/handoff', {
-            method: 'POST',
-            body: JSON.stringify({ scope: currentScope, conversationId: convId, includeStall: true })
-          });
-          if (res.ok) {
-            const data = await res.json();
-            md = typeof data.markdown === 'string' ? data.markdown : '';
+          if (matchingInFlight) {
+            data = await matchingInFlight.rawPromise;
+          } else {
+            const res = await apiFetch('/api/handoff', {
+              method: 'POST',
+              body: JSON.stringify({
+                scope: reqScope,
+                conversationId: convId,
+                ...(reqStallConvId ? { stallConversationId: reqStallConvId } : {}),
+                mode: 'agent',
+                includeStall: true,
+                conversationConfirmed: confirmed,
+                ...(window.sidecar ? { fromSidecarHost: true } : {})
+              })
+            });
+            if (res.ok) {
+              data = await res.json();
+            }
           }
         } catch {}
-      }
-      if (!md) return;
-      let copied = false;
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-        try {
-          await navigator.clipboard.writeText(md);
-          copied = true;
-        } catch {}
-      }
-      if (!copied) {
-        const ta = document.createElement('textarea');
-        ta.value = md;
-        ta.setAttribute('readonly', '');
-        ta.style.position = 'fixed';
-        ta.style.top = '-9999px';
-        ta.style.left = '-9999px';
-        document.body.appendChild(ta);
-        ta.focus();
-        ta.select();
-        try {
-          copied = Boolean(document.execCommand('copy'));
-        } catch {
-          copied = false;
-        } finally {
-          document.body.removeChild(ta);
+        if (data && typeof data === 'object' && data.ok !== false) {
+          syncNativeHostConversation({ reloadIfOpen: handoffDrawerOpen });
+          const curIncidentKey = getCurrentWatchdogIncidentKey();
+          const curCardConvId = getCurrentWatchdogCardConversationId();
+          const hasDataIncidentKey = Boolean(typeof data.incidentKey === 'string');
+          const dataIncidentKey = hasDataIncidentKey ? data.incidentKey : '';
+          const dataStallConvId = typeof data?.stallConversationId === 'string' ? data.stallConversationId : '';
+          const recoveredMismatch =
+            ((reqScope === 'conversation' && confirmed) || Boolean(reqStallConvId)) &&
+            hasDataIncidentKey &&
+            dataIncidentKey === '' &&
+            curIncidentKey !== '';
+          const targetedStallMismatch =
+            Boolean(reqStallConvId) &&
+            (dataStallConvId !== reqStallConvId || dataIncidentKey !== curIncidentKey);
+          const serverIncidentMismatch =
+            recoveredMismatch ||
+            targetedStallMismatch ||
+            Boolean(dataIncidentKey && dataIncidentKey !== curIncidentKey);
+          const stillTargetsRequest =
+            myCopySeq === rescueCopySeq &&
+            hostSwitchEpoch === reqHostEpoch &&
+            currentScope === reqScope &&
+            isCurrentConversationConfirmed() === confirmed &&
+            getConfirmedConversationId() === confirmedConv &&
+            isWatchdogIncidentAlignedWithTarget({ requireActive: Boolean(reqStallConvId || reqIncidentKey) }) &&
+            curIncidentKey === reqIncidentKey &&
+            (!reqStallConvId || curCardConvId === reqStallConvId);
+          if (
+            !stillTargetsRequest ||
+            !isHandoffPayloadAttributionValid(data, {
+              expectedScope: reqScope,
+              expectedConfirmed: confirmed,
+              expectedConfirmedConv: confirmedConv,
+              requireScope: true,
+              requireDisplayAnchor: true
+            })
+          ) {
+            return;
+          }
+          if (serverIncidentMismatch) {
+            refreshData(false);
+            return;
+          }
+          md = typeof data.markdown === 'string' ? data.markdown : '';
+          const canUpdateOpenDrawer = Boolean(
+            !reusedInFlight &&
+              md &&
+              startedWithDrawerOpen &&
+              handoffDrawerOpen &&
+              !handoffLoading &&
+              handoffDrawerSelectionSeq === reqDrawerSelectionSeq &&
+              handoffFetchSeq === reqFetchSeq &&
+              (!reqStallConvId ||
+                (startedWithDrawerTargeted &&
+                  handoffDrawerTargetedAlert &&
+                  !handoffDrawerTargetedEnded &&
+                  (!startedWithDrawerTargetedConvId || startedWithDrawerTargetedConvId === reqStallConvId) &&
+                  (!handoffDrawerTargetedConvId || handoffDrawerTargetedConvId === reqStallConvId)))
+          );
+          if (canUpdateOpenDrawer) {
+            ++handoffFetchSeq;
+            handoffInFlightRequest = null;
+            const resolvedRescueIncidentKey =
+              ((reqScope === 'conversation' && confirmed) || Boolean(reqStallConvId)) && hasDataIncidentKey
+                ? dataIncidentKey
+                : dataIncidentKey || curIncidentKey;
+            applyHandoffSnapshot(data, {
+              source: 'rescue_api',
+              scope: reqScope,
+              expectedConfirmed: confirmed,
+              expectedConfirmedConv: confirmedConv,
+              incidentKey: resolvedRescueIncidentKey,
+              ...(reqStallConvId ? { stallConversationId: dataStallConvId } : {})
+            });
+          }
         }
       }
+      if (!md) return;
+      const copied = await copyTextToClipboard(md);
       if (btn) {
         btn.textContent = copied ? t('copiedBtn') : t('copyFailedBtn');
         if (wdCopyResetTimer !== null) clearTimeout(wdCopyResetTimer);
@@ -6509,20 +8090,54 @@
     }
 
     function openWatchdogRescueDrawer() {
-      const brief = cachedWatchdog?.current?.rescueBrief || null;
-      if (brief && brief.markdown) {
-        cachedHandoffData = brief;
-        lastHandoffMarkdown = brief.markdown;
+      syncNativeHostConversation({ reloadIfOpen: handoffDrawerOpen });
+      updateWatchdogIncidentButtons();
+      if (!isWatchdogIncidentAlignedWithTarget()) {
+        return;
+      }
+      const rescue = getMatchingRescueBrief();
+      if (rescue && rescue.markdown) {
+        resetHandoffDrawerTargetMode();
+        ++handoffFetchSeq;
         const drawer = document.getElementById('kv-handoff-drawer');
-        const previewEl = document.getElementById('kv-handoff-preview');
-        if (previewEl) previewEl.textContent = brief.markdown;
-        renderHandoffMeta();
         if (drawer) {
           handoffDrawerOpen = true;
           drawer.classList.remove('hidden');
-          if (typeof drawer.scrollIntoView === 'function') {
-            drawer.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-          }
+        }
+        const rescueIncidentKey = rescue.incidentKey || getCurrentWatchdogIncidentKey();
+        applyHandoffSnapshot(rescue, {
+          source: 'rescue',
+          scope: 'conversation',
+          expectedConfirmed: isCurrentConversationConfirmed(),
+          expectedConfirmedConv: getConfirmedConversationId(),
+          incidentKey: rescueIncidentKey
+        });
+        if (drawer && typeof drawer.scrollIntoView === 'function') {
+          drawer.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+        return;
+      }
+      if (currentScope !== 'conversation') {
+        const activeTarget = getActiveWatchdogCardTarget();
+        if (!activeTarget.stallConversationId || !activeTarget.incidentKey) {
+          return;
+        }
+        const drawer = document.getElementById('kv-handoff-drawer');
+        if (drawer) {
+          handoffDrawerOpen = true;
+          drawer.classList.remove('hidden');
+        }
+        handoffDrawerTargetedAlert = true;
+        handoffDrawerTargetedConvId = activeTarget.stallConversationId;
+        handoffDrawerTargetedEnded = false;
+        ++handoffDrawerSelectionSeq;
+        loadHandoffBrief({
+          forceRefresh: true,
+          stallConversationId: activeTarget.stallConversationId,
+          expectedIncidentKey: activeTarget.incidentKey
+        });
+        if (drawer && typeof drawer.scrollIntoView === 'function') {
+          drawer.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
         }
         return;
       }
@@ -6530,6 +8145,17 @@
     }
 
     async function sendWatchdogAction(payload) {
+      const act = payload?.action || '';
+      const isIncidentAct = act === 'ack' || act === 'snooze' || act === 'clear' || act === 'markIdle';
+      syncNativeHostConversation({ reloadIfOpen: handoffDrawerOpen });
+      updateWatchdogIncidentButtons();
+      if (
+        isIncidentAct &&
+        !isWatchdogIncidentAlignedWithTarget({ requireActive: act === 'ack' || act === 'snooze' })
+      ) {
+        return { ok: false, cancelled: true, reason: 'watchdog_target_unaligned' };
+      }
+
       const reqActionSeq = ++watchdogActionSeq;
       latestStartedWatchdogActionSeq = reqActionSeq;
       inFlightWatchdogActionCount += 1;
@@ -6537,30 +8163,46 @@
         sawOutOfOrderWatchdogAction = true;
       }
       ++refreshSeq;
-      const act = payload?.action || '';
-      const isIncidentAct = act === 'ack' || act === 'snooze' || act === 'clear' || act === 'markIdle';
+      const reqScope = currentScope;
+      const reqNativeId = getNativeHostConversationId();
+      const reqHostEpoch = hostSwitchEpoch;
       const activeId = getActiveConversationId();
+      const confirmedId = getConfirmedConversationId();
+      const curWd = cachedWatchdog?.current || null;
       const fallbackPrimaryConv =
         cachedWatchdog?.ttlKeepalive?.conversationId ||
-        (!cachedWatchdog?.current?.isSubagent ? cachedWatchdog?.current?.conversationId : '') ||
+        (!curWd?.isSubagent ? curWd?.conversationId : '') ||
         '';
       const convId = isIncidentAct
-        ? (cachedWatchdog?.current?.conversationId || activeId)
+        ? (curWd?.conversationId || '')
         : (activeId || (window.sidecar ? '' : fallbackPrimaryConv));
+      const confirmed = isIncidentAct
+        ? Boolean(reqScope === 'conversation' && confirmedId && convId === confirmedId)
+        : isCurrentConversationConfirmed();
       try {
         const res = await apiFetch('/api/watchdog/action', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            scope: currentScope,
+            scope: reqScope,
             conversationId: convId,
+            conversationConfirmed: confirmed,
             ...(window.sidecar ? { fromSidecarHost: true } : {}),
             ...payload
           })
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        if (reqActionSeq !== watchdogActionSeq) {
+        syncNativeHostConversation({ reloadIfOpen: handoffDrawerOpen });
+        if (
+          reqActionSeq !== watchdogActionSeq ||
+          hostSwitchEpoch !== reqHostEpoch ||
+          currentScope !== reqScope ||
+          getNativeHostConversationId() !== reqNativeId ||
+          (isIncidentAct &&
+            (isCurrentConversationConfirmed() !== confirmed ||
+              (confirmed && getConfirmedConversationId() !== convId)))
+        ) {
           if (latestStartedWatchdogActionSeq === watchdogActionSeq) {
             sawOutOfOrderWatchdogAction = true;
           }
@@ -6572,7 +8214,7 @@
           sawOutOfOrderWatchdogAction = true;
         }
         if (data && data.status) {
-          cachedWatchdog = data.status;
+          const nextWd = { ...data.status, scope: data.status.scope || reqScope, _hostEpoch: reqHostEpoch };
           if (
             data.status.enabled === false ||
             payload?.action === 'clear' ||
@@ -6587,7 +8229,7 @@
           if (cachedKv && data.status.ttlKeepalive && shouldAcceptKeepalivePayload(data.status.ttlKeepalive)) {
             cachedKv.ttlKeepalive = data.status.ttlKeepalive;
           }
-          renderWatchdogCard(data.status);
+          renderWatchdogCard(nextWd, { expectedEpoch: reqHostEpoch });
         } else {
           refreshData(false);
         }
@@ -7279,6 +8921,10 @@
       if (handoffCopyResetTimer !== null) {
         clearTimeout(handoffCopyResetTimer);
         handoffCopyResetTimer = null;
+      }
+      if (handoffPromptCopyResetTimer !== null) {
+        clearTimeout(handoffPromptCopyResetTimer);
+        handoffPromptCopyResetTimer = null;
       }
       if (wdCopyResetTimer !== null) {
         clearTimeout(wdCopyResetTimer);

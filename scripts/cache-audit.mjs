@@ -1159,8 +1159,17 @@ const WIN_TASKKILL_BIN =
     ? path.join(process.env.SystemRoot || process.env.WINDIR || "C:\\Windows", "System32", "taskkill.exe")
     : "taskkill";
 
-function killChildTree(child, usedShell) {
-  if (!child) return;
+function killChildTree(child, usedShell, onDone = null) {
+  let doneCalled = false;
+  const done = () => {
+    if (doneCalled) return;
+    doneCalled = true;
+    if (typeof onDone === "function") onDone();
+  };
+  if (!child) {
+    done();
+    return null;
+  }
   const fallbackKill = () => {
     if (child.exitCode === null) {
       try {
@@ -1172,25 +1181,37 @@ function killChildTree(child, usedShell) {
     // On Windows, child.kill("SIGTERM") on a .cmd/.bat shell wrapper only kills outer cmd.exe
     // while setting child.signalCode = "SIGTERM" and leaving grandchild node.exe alive.
     // Always run taskkill /T /F when usedShell is true or child has not exited.
-    if (!usedShell && child.exitCode !== null) return;
+    if (!usedShell && child.exitCode !== null) {
+      done();
+      return null;
+    }
     try {
       const killer = spawn(WIN_TASKKILL_BIN, ["/PID", String(child.pid), "/T", "/F"], {
         stdio: "ignore",
         windowsHide: true
       });
-      killer.on("error", fallbackKill);
+      killer.on("error", () => {
+        fallbackKill();
+        done();
+      });
       killer.on("close", (code) => {
         if (code !== 0) fallbackKill();
+        done();
       });
-      killer.unref();
-      return;
+      return killer;
     } catch {
       fallbackKill();
-      return;
+      done();
+      return null;
     }
   }
-  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (child.exitCode !== null || child.signalCode !== null) {
+    done();
+    return null;
+  }
   fallbackKill();
+  done();
+  return null;
 }
 
 /**
@@ -1335,6 +1356,9 @@ function probeMcpServerOnce({ command, args, cwd, env, timeoutMs }) {
     let settled = false;
     let initSentToolsList = false;
     let pendingOutcome = null;
+    let childClosed = false;
+    let treeKillPending = false;
+    let activeKiller = null;
     let stderrSnippet = "";
     const parseState = { buf: Buffer.alloc(0), eof: false };
     const timers = [];
@@ -1357,6 +1381,9 @@ function probeMcpServerOnce({ command, args, cwd, env, timeoutMs }) {
       try {
         child.unref();
       } catch {}
+      try {
+        activeKiller?.unref();
+      } catch {}
       resolve({
         ...outcome,
         durationMs: Date.now() - t0
@@ -1370,12 +1397,26 @@ function probeMcpServerOnce({ command, args, cwd, env, timeoutMs }) {
         child.stdin?.end();
       } catch {}
 
-      if (child.exitCode !== null && !(process.platform === "win32" && needsShell)) {
+      const isWinShell = process.platform === "win32" && needsShell;
+      if ((childClosed || child.exitCode !== null) && !isWinShell) {
         finish(outcome);
         return;
       }
 
-      if (!(process.platform === "win32" && needsShell)) {
+      const startTreeKill = () => {
+        if (settled || treeKillPending) return;
+        if (child.exitCode === null || isWinShell) {
+          treeKillPending = true;
+          activeKiller = killChildTree(child, needsShell, () => {
+            treeKillPending = false;
+            if (!settled && (childClosed || child.exitCode !== null)) {
+              finish(outcome);
+            }
+          });
+        }
+      };
+
+      if (!isWinShell) {
         const termTimer = setTimeout(() => {
           if (child.exitCode === null && child.signalCode === null) {
             try {
@@ -1387,17 +1428,19 @@ function probeMcpServerOnce({ command, args, cwd, env, timeoutMs }) {
         timers.push(termTimer);
       }
 
-      const killTimer = setTimeout(() => {
-        if (child.exitCode === null || (process.platform === "win32" && needsShell)) {
-          killChildTree(child, needsShell);
-        }
-      }, process.platform === "win32" && needsShell ? 120 : 220);
-      killTimer.unref();
-      timers.push(killTimer);
+      if (isWinShell && outcome?.status === "timeout") {
+        // Server already timed out: run taskkill /T /F immediately and wait for it to finish
+        // before resolving so grandchild processes cannot outlive cache-audit.mjs under load.
+        startTreeKill();
+      } else {
+        const killTimer = setTimeout(startTreeKill, isWinShell ? 120 : 220);
+        killTimer.unref();
+        timers.push(killTimer);
+      }
 
       const forceResolveTimer = setTimeout(() => {
         finish(outcome);
-      }, 450);
+      }, isWinShell ? 2500 : 450);
       forceResolveTimer.unref();
       timers.push(forceResolveTimer);
     };
@@ -1486,15 +1529,20 @@ function probeMcpServerOnce({ command, args, cwd, env, timeoutMs }) {
     });
 
     child.on("close", (code, signal) => {
+      childClosed = true;
       if (pendingOutcome) {
-        finish(pendingOutcome);
+        if (!treeKillPending) {
+          finish(pendingOutcome);
+        }
         return;
       }
       // Flush any trailing line without newline
       parseState.eof = true;
       handleMessages(drainMcpMessages(parseState));
       if (pendingOutcome) {
-        finish(pendingOutcome);
+        if (!treeKillPending) {
+          finish(pendingOutcome);
+        }
         return;
       }
       const detail = stderrSnippet.trim() ? `: ${stderrSnippet.trim().slice(0, 240)}` : "";

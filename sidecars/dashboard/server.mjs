@@ -24,6 +24,7 @@ import {
   readWatchdogLease,
   readWatchdogTranscriptTail,
   resolveCandidateTranscriptPath,
+  resolveTrustedCheckpointSessionId,
   WATCHDOG_PHASES,
   writeWatchdogLeaseIfUnchanged
 } from "../../context/lib/watchdog.js";
@@ -1425,13 +1426,176 @@ export function resolveAllowedHandoffCwd(rawCwd, knownRoots = []) {
   return "";
 }
 
+const RESERVED_CONFIRMED_CONV_IDS = new Set([
+  "default",
+  "all",
+  "lifetime",
+  "app",
+  "__unbound__",
+  "unknown",
+  "none",
+  "null",
+  "undefined"
+]);
+
+function validateHandoffMode(rawMode, { allowAgent = true } = {}) {
+  if (rawMode === undefined) {
+    return { ok: true, mode: "full" };
+  }
+  if (typeof rawMode !== "string") {
+    return { ok: false, error: "Field 'mode' must be a string ('full' or 'agent')" };
+  }
+  if (rawMode === "full") {
+    return { ok: true, mode: "full" };
+  }
+  if (rawMode === "agent") {
+    if (!allowAgent) {
+      return { ok: false, error: "Handoff mode 'agent' requires POST with application/json" };
+    }
+    return { ok: true, mode: "agent" };
+  }
+  return { ok: false, error: "Invalid 'mode' value: expected 'full' or 'agent'" };
+}
+
+function validateOptionalBooleanField(data, fieldName) {
+  if (data && data[fieldName] !== undefined && typeof data[fieldName] !== "boolean") {
+    return { ok: false, error: `Field '${fieldName}' must be a boolean` };
+  }
+  return { ok: true };
+}
+
+function resolveConfirmedConversation(data = {}, defaultConvId = "default") {
+  const unboundHostTab = isUnboundSidecarHostRequest(data);
+  const safeSessionId = typeof data?.sessionId === "string" ? data.sessionId.trim() : "";
+  const explicitConvId = typeof data?.conversationId === "string" ? data.conversationId.trim() : "";
+  const safeDefaultConv = typeof defaultConvId === "string" ? defaultConvId.trim() : "";
+  const rawScope = typeof data?.scope === "string" && data.scope.trim() ? data.scope.trim() : "";
+  const scope =
+    rawScope === "all"
+      ? "lifetime"
+      : rawScope === "session"
+        ? "app"
+        : rawScope || (safeSessionId === "all" ? "lifetime" : safeSessionId === "app" ? "app" : "conversation");
+
+  // Rich conversation attribution ONLY accepts explicit conversationId > native defaultConvId;
+  // NEVER falls back to checkpoint sessionId.
+  const attributedConv = unboundHostTab ? "" : explicitConvId || safeDefaultConv || "default";
+  const isSpecificConv = Boolean(
+    attributedConv &&
+      !RESERVED_CONFIRMED_CONV_IDS.has(attributedConv.toLowerCase()) &&
+      isSafeConversationId(attributedConv)
+  );
+  const confirmed = Boolean(
+    scope === "conversation" &&
+      !unboundHostTab &&
+      data?.conversationConfirmed !== false &&
+      isSpecificConv
+  );
+  const convId = unboundHostTab ? "__unbound__" : attributedConv || "default";
+  const targetSid =
+    scope === "lifetime" || scope === "all"
+      ? "all"
+      : scope === "app" || scope === "session"
+        ? "app"
+        : unboundHostTab
+          ? "__unbound__"
+          : convId;
+  const hasExplicitSessionOnly = Boolean(
+    scope === "conversation" &&
+      !unboundHostTab &&
+      !isSpecificConv &&
+      safeSessionId &&
+      safeSessionId !== "all" &&
+      safeSessionId !== "app"
+  );
+  const hasExplicitReservedOrUnsafeConv = Boolean(
+    !unboundHostTab &&
+      !isSpecificConv &&
+      explicitConvId &&
+      explicitConvId.toLowerCase() !== "default"
+  );
+
+  return {
+    scope,
+    convId,
+    targetSid,
+    unboundHostTab,
+    confirmed,
+    confirmedConversationId: confirmed ? attributedConv : "",
+    hasExplicitSessionOnly,
+    hasExplicitReservedOrUnsafeConv
+  };
+}
+
+function buildStructuredVerificationSummary(slot) {
+  if (!slot || typeof slot !== "object") return "";
+  const exitNum =
+    slot.exitCode !== null &&
+    slot.exitCode !== undefined &&
+    typeof slot.exitCode !== "boolean" &&
+    String(slot.exitCode).trim() !== "" &&
+    Number.isFinite(Number(slot.exitCode))
+      ? Number(slot.exitCode)
+      : null;
+  if (slot.ok) {
+    return exitNum !== null ? `passed (exit ${exitNum})` : "passed";
+  }
+  return exitNum !== null ? `failed (exit ${exitNum})` : "failed";
+}
+
+function stripResumeFailureExcerpts(resumeRes) {
+  if (!resumeRes || typeof resumeRes !== "object") return resumeRes;
+  const cp = resumeRes.sessionCheckpoint;
+  if (!cp || typeof cp !== "object") return resumeRes;
+  const stripSlot = (slot) => {
+    if (!slot || typeof slot !== "object") return slot;
+    const copy = { ...slot };
+    delete copy.failureExcerpt;
+    delete copy.firstErrorLine;
+    delete copy.excerpt;
+    delete copy.stderr;
+    delete copy.error;
+    copy.summary = buildStructuredVerificationSummary(copy);
+    return copy;
+  };
+  return {
+    ...resumeRes,
+    sessionCheckpoint: {
+      ...cp,
+      lastTest: stripSlot(cp.lastTest),
+      lastBuild: stripSlot(cp.lastBuild)
+    }
+  };
+}
+
 function getResumePayload(data = {}, defaultConvId = "default") {
   const store = getRuntimeStore();
   const appStartTime = getAppStartTime();
-  const { scope, convId } = resolveTargetSession(data, defaultConvId);
-  if (scope === "lifetime" || scope === "all") return store.getResumeState("all", 10);
-  if (scope === "app" || scope === "session") return store.getResumeState("app", 10, { sinceTs: appStartTime });
-  return store.getResumeState(convId, 10);
+  const {
+    scope,
+    convId,
+    unboundHostTab,
+    confirmed,
+    confirmedConversationId,
+    hasExplicitSessionOnly,
+    hasExplicitReservedOrUnsafeConv
+  } = resolveConfirmedConversation(data, defaultConvId);
+  const explicitRawSid = typeof data?.sessionId === "string" ? data.sessionId.trim() : "";
+  let res;
+  if (scope === "lifetime" || scope === "all") {
+    res = store.getResumeState("all", 10);
+  } else if (scope === "app" || scope === "session") {
+    res = store.getResumeState("app", 10, { sinceTs: appStartTime });
+  } else if (unboundHostTab || hasExplicitSessionOnly || hasExplicitReservedOrUnsafeConv) {
+    res = store.getResumeState("__unbound__", 10);
+  } else if (confirmed && confirmedConversationId) {
+    const trustedSid =
+      resolveTrustedCheckpointSessionId(store, confirmedConversationId, explicitRawSid) || convId;
+    res = store.getResumeState(trustedSid, 10);
+  } else {
+    res = store.getResumeState(convId, 10);
+  }
+  return confirmed ? res : stripResumeFailureExcerpts(res);
 }
 
 function getSourceChunksPayload(data = {}) {
@@ -1446,75 +1610,181 @@ function getSourceChunksPayload(data = {}) {
 function getHandoffPayload(data = {}, defaultConvId = "default") {
   const store = getRuntimeStore();
   const appStartTime = getAppStartTime();
-  const { scope, convId, targetSid } = resolveTargetSession(data, defaultConvId);
+  const mode = data?.mode === "agent" ? "agent" : "full";
+  const {
+    scope,
+    convId,
+    targetSid,
+    unboundHostTab,
+    confirmed,
+    confirmedConversationId,
+    hasExplicitSessionOnly,
+    hasExplicitReservedOrUnsafeConv
+  } = resolveConfirmedConversation(data, defaultConvId);
   const sinceTs = scope === "app" || scope === "session" ? appStartTime : null;
+
+  const explicitRawSid = typeof data?.sessionId === "string" ? data.sessionId.trim() : "";
+  const isIsolatedUnconfirmed =
+    scope === "conversation" &&
+    !confirmed &&
+    (unboundHostTab ||
+      data?.conversationConfirmed === false ||
+      hasExplicitSessionOnly ||
+      hasExplicitReservedOrUnsafeConv);
+
+  let effectiveCheckpointSid = targetSid;
+  if (confirmed && confirmedConversationId) {
+    effectiveCheckpointSid =
+      resolveTrustedCheckpointSessionId(store, confirmedConversationId, explicitRawSid) ||
+      confirmedConversationId;
+  } else if (isIsolatedUnconfirmed) {
+    effectiveCheckpointSid = "__unbound__";
+  }
+
   const rawCwd = typeof data.cwd === "string" ? data.cwd.trim() : "";
-  const cwd = rawCwd
-    ? resolveAllowedHandoffCwd(rawCwd, collectKnownWorktrees(store, targetSid, sinceTs))
-    : inferWorkspaceFromStore(store, targetSid, sinceTs);
+  const skipWorkspaceInference = isIsolatedUnconfirmed || (scope === "conversation" && !confirmed && mode === "agent");
+  const cwd = skipWorkspaceInference
+    ? ""
+    : rawCwd
+      ? resolveAllowedHandoffCwd(rawCwd, collectKnownWorktrees(store, effectiveCheckpointSid, sinceTs))
+      : inferWorkspaceFromStore(store, effectiveCheckpointSid, sinceTs);
   const rawMaxBytes = parseOptionalPositiveNumber(data.maxBytes);
   const maxBytes = rawMaxBytes !== undefined
     ? Math.min(16384, Math.max(256, Math.floor(rawMaxBytes)))
     : 5800;
+
+  // Skip KV-cache diag recompute in `agent` mode (drawer does not render KV-cache section);
+  // in `full` mode align cache-diag attribution strictly with the resolved conversation/checkpoint.
   let cacheDiag = null;
-  try {
-    const diag = getCacheDiagPayload(data, defaultConvId);
-    if (diag && diag.ok && diag.transcriptFound) {
-      cacheDiag = diag;
-    }
-  } catch {}
-  let stallContext = null;
-  if (data.includeStall !== false) {
+  if (mode !== "agent") {
     try {
-      const monitor = getWatchdogMonitor();
-      const targetConv = convId && convId !== "default" ? convId : "";
-      if (targetConv) {
-        monitor.tick();
-        stallContext = monitor.getStallContextForConversation(targetConv);
-      } else if (scope !== "conversation") {
-        monitor.tick();
-        stallContext = monitor.getTopAlertingStallContext();
+      const cacheDiagInput = {
+        ...data,
+        scope,
+        conversationId: confirmed
+          ? confirmedConversationId
+          : isIsolatedUnconfirmed
+            ? "__unbound__"
+            : scope === "conversation" && convId !== "default"
+              ? convId
+              : "",
+        sessionId: effectiveCheckpointSid
+      };
+      const diag = getCacheDiagPayload(cacheDiagInput, confirmed ? confirmedConversationId : "default");
+      if (diag && diag.ok && diag.transcriptFound) {
+        cacheDiag = diag;
       }
     } catch {}
   }
+
+  const rawStallConvId = typeof data?.stallConversationId === "string" ? data.stallConversationId.trim() : "";
+  const hasExplicitStallConvId = Boolean(rawStallConvId);
+  const validStallConvId =
+    hasExplicitStallConvId &&
+    !RESERVED_CONFIRMED_CONV_IDS.has(rawStallConvId.toLowerCase()) &&
+    isSafeConversationId(rawStallConvId)
+      ? rawStallConvId
+      : "";
+
+  const monitor = getWatchdogMonitor();
+  let stallContext = null;
+  if (data.includeStall !== false) {
+    try {
+      if (confirmed && confirmedConversationId) {
+        monitor.tick();
+        stallContext = monitor.getStallContextForConversation(confirmedConversationId, { includeUserInput: true });
+      } else if (scope !== "conversation") {
+        monitor.tick();
+        if (hasExplicitStallConvId) {
+          const targetedStall = validStallConvId
+            ? monitor.getStallContextForConversation(validStallConvId, { includeUserInput: false })
+            : null;
+          stallContext = targetedStall ? { ...targetedStall, lastUserInput: "" } : null;
+        } else {
+          const topStall = monitor.getTopAlertingStallContext();
+          stallContext = topStall ? { ...topStall, lastUserInput: "" } : null;
+        }
+      }
+    } catch {}
+  }
+
   const brief = buildHandoffBrief({
     store,
-    sessionId: targetSid,
+    mode,
+    conversationId: confirmedConversationId,
+    conversationConfirmed: confirmed,
+    scope,
+    sessionId: effectiveCheckpointSid,
     cwd,
     cacheDiag,
     maxBytes,
     sinceTs,
-    stallContext
+    stallContext,
+    brainRoots: Array.isArray(monitor?.brainRoots) ? monitor.brainRoots : []
   });
-  return {
+
+  const responseConvId = unboundHostTab
+    ? typeof data?.conversationId === "string" && data.conversationId.trim() === "__unbound__"
+      ? "__unbound__"
+      : ""
+    : hasExplicitSessionOnly || hasExplicitReservedOrUnsafeConv
+      ? ""
+      : convId;
+
+  const payload = {
     ok: true,
     scope,
-    conversationId: convId,
-    sessionId: targetSid,
+    conversationId: responseConvId,
+    sessionId: effectiveCheckpointSid,
     hasStallContext: Boolean(stallContext),
     markdown: brief.markdown,
     summary: brief.summary,
     bytes: brief.bytes,
     truncated: brief.truncated
   };
+
+  if (mode === "agent") {
+    payload.mode = "agent";
+    payload.confirmedConversation = brief.confirmedConversation;
+    payload.secretRedactionEnabled = brief.secretRedactionEnabled !== false;
+    payload.anchors = brief.anchors;
+    payload.sampledAt = brief.sampledAt || "";
+    payload.resumeCommand = brief.resumeCommand;
+    payload.incidentKey = stallContext?.incidentKey || "";
+    if (hasExplicitStallConvId && scope !== "conversation" && stallContext?.conversationId) {
+      payload.stallConversationId = stallContext.conversationId;
+    }
+  }
+
+  return payload;
 }
 
 function getWatchdogPayload(data = {}, defaultConvId = "default") {
-  const unboundHostTab = isUnboundSidecarHostRequest(data);
-  const { scope, convId } = resolveTargetSession(data, unboundHostTab ? "default" : defaultConvId);
+  const { scope, convId, unboundHostTab, confirmed, hasExplicitSessionOnly, hasExplicitReservedOrUnsafeConv } =
+    resolveConfirmedConversation(data, defaultConvId);
   const monitor = getWatchdogMonitor();
-  const targetConv = unboundHostTab ? "__unbound__" : convId && convId !== "default" ? convId : "";
+  const targetConv =
+    unboundHostTab || hasExplicitSessionOnly
+      ? "__unbound__"
+      : hasExplicitReservedOrUnsafeConv
+        ? (scope === "conversation" ? "__unbound__" : "")
+        : convId && convId !== "default"
+          ? convId
+          : "";
   const status = monitor.getStatus({
     conversationId: targetConv,
     scope,
-    refresh: true
+    refresh: true,
+    includeRichRescue: confirmed
   });
   return {
     ...status,
     scope,
     conversationId: unboundHostTab
       ? (typeof data?.conversationId === "string" && data.conversationId.trim() === "__unbound__" ? "__unbound__" : "")
-      : convId
+      : hasExplicitSessionOnly || hasExplicitReservedOrUnsafeConv
+        ? ""
+        : convId
   };
 }
 
@@ -1522,22 +1792,35 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
   if (data.fromSidecarHost !== undefined && typeof data.fromSidecarHost !== "boolean") {
     return { ok: false, status: 400, error: "Field 'fromSidecarHost' must be a boolean" };
   }
+  if (data.conversationConfirmed !== undefined && typeof data.conversationConfirmed !== "boolean") {
+    return { ok: false, status: 400, error: "Field 'conversationConfirmed' must be a boolean" };
+  }
   const store = getRuntimeStore();
   const monitor = getWatchdogMonitor();
-  const unboundHostTab = isUnboundSidecarHostRequest(data);
-  const { scope, convId } = resolveTargetSession(data, unboundHostTab ? "default" : defaultConvId);
-  const targetConv = convId && convId !== "default" ? convId : "";
+  const { scope, convId, unboundHostTab, confirmed, hasExplicitSessionOnly, hasExplicitReservedOrUnsafeConv } =
+    resolveConfirmedConversation(data, defaultConvId);
+  const targetConv =
+    !unboundHostTab && !hasExplicitSessionOnly && !hasExplicitReservedOrUnsafeConv && convId && convId !== "default"
+      ? convId
+      : "";
+  const statusTargetConv =
+    unboundHostTab || hasExplicitSessionOnly
+      ? "__unbound__"
+      : hasExplicitReservedOrUnsafeConv
+        ? (scope === "conversation" ? "__unbound__" : "")
+        : targetConv;
+  const getScopedStatus = (opts) => ({ ...monitor.getStatus(opts), scope });
   const action = typeof data.action === "string" && data.action.trim() ? data.action.trim() : "";
 
   if (action === "ack" || action === "snooze") {
     const res = monitor.acknowledge(targetConv, data.snoozeSec);
     if (!res.ok) return { ok: false, status: 400, error: res.error };
-    return { ...res, status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false }) };
+    return { ...res, status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: false, includeRichRescue: confirmed }) };
   }
   if (action === "clear" || action === "markIdle") {
     const res = monitor.markIdle(targetConv, "user_marked_idle");
     if (!res.ok) return { ok: false, status: 400, error: res.error };
-    return { ...res, status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false }) };
+    return { ...res, status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: false, includeRichRescue: confirmed }) };
   }
   if (action === "setEnabled") {
     const cur = store.isWatchdogEnabled();
@@ -1551,7 +1834,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       enabled: effective,
-      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed })
     };
   }
   if (action === "setDesktopNotify") {
@@ -1563,7 +1846,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       desktopNotifyEnabled: effective,
-      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed })
     };
   }
   if (action === "setTtlDesktopNotify") {
@@ -1575,7 +1858,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       ttlDesktopNotifyEnabled: effective,
-      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed })
     };
   }
   if (action === "setGlobalTtlKeepalive") {
@@ -1597,7 +1880,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       ok: true,
       globalTtlKeepaliveMaxCount: effectiveGlobal,
       fallbackTtlKeepaliveMaxCount: fallbackMax,
-      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed })
     };
   }
   if (action === "setTtlKeepaliveMinContextPct") {
@@ -1621,7 +1904,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       globalTtlKeepaliveMinContextPct: effectivePct,
-      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: true })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed })
     };
   }
   if (
@@ -1645,7 +1928,8 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
         ? "__unbound__"
         : !hasExplicitEmptyConv && targetConv && isSafeConversationId(targetConv)
           ? targetConv
-          : monitor.getStatus({ scope, refresh: false })?.ttlKeepalive?.conversationId || "__unbound__";
+          : monitor.getStatus({ scope, refresh: false, includeRichRescue: false })?.ttlKeepalive?.conversationId || "__unbound__";
+    const kaRichAllowed = Boolean(confirmed && kaConv === targetConv && kaConv !== "__unbound__");
 
     if (kaConv !== "__unbound__" && monitor._isConversationSubagent(store, kaConv)) {
       try {
@@ -1657,7 +1941,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
         isSubagent: true,
         ttlKeepaliveEnabled: false,
         ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(null),
-        status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
+        status: getScopedStatus({ conversationId: kaConv, scope, refresh: true, includeRichRescue: kaRichAllowed })
       };
     }
 
@@ -1669,7 +1953,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
         isCustomOverride: false,
         ttlKeepaliveEnabled: store.isTtlKeepaliveEnabled(kaConv),
         ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(kaConv),
-        status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
+        status: getScopedStatus({ conversationId: kaConv, scope, refresh: true, includeRichRescue: kaRichAllowed })
       };
     }
 
@@ -1707,7 +1991,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
         isCustomOverride: store.hasCustomTtlKeepaliveOverride(kaConv),
         ttlKeepaliveEnabled: store.isTtlKeepaliveEnabled(kaConv),
         ttlKeepaliveMaxCount: store.getTtlKeepaliveMaxCount(kaConv),
-        status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
+        status: getScopedStatus({ conversationId: kaConv, scope, refresh: true, includeRichRescue: kaRichAllowed })
       };
     }
 
@@ -1715,7 +1999,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     return {
       ok: true,
       conversationId: kaConv,
-      status: monitor.getStatus({ conversationId: kaConv, scope, refresh: true })
+      status: getScopedStatus({ conversationId: kaConv, scope, refresh: true, includeRichRescue: kaRichAllowed })
     };
   }
   if (action === "setUiLang") {
@@ -1729,7 +2013,7 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       ok: true,
       uiLang: info.lang,
       uiLangSource: info.source,
-      status: monitor.getStatus({ conversationId: unboundHostTab ? "__unbound__" : targetConv, scope, refresh: false })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: false, includeRichRescue: confirmed })
     };
   }
   if (action === "focusConversation") {
@@ -1743,9 +2027,17 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
       skipOsFocus: data.skipOsFocus === true
     });
     if (!res.ok) return { ok: false, status: 400, error: res.error };
+    const focusRichAllowed = Boolean(
+      scope === "conversation" &&
+        !unboundHostTab &&
+        data.conversationConfirmed !== false &&
+        res.conversationId &&
+        !RESERVED_CONFIRMED_CONV_IDS.has(res.conversationId.toLowerCase()) &&
+        isSafeConversationId(res.conversationId)
+    );
     return {
       ...res,
-      status: monitor.getStatus({ conversationId: res.conversationId, scope, refresh: false })
+      status: getScopedStatus({ conversationId: res.conversationId, scope, refresh: false, includeRichRescue: focusRichAllowed })
     };
   }
   if (action === "ackJump") {
@@ -1753,11 +2045,11 @@ function handleWatchdogActionMutation(data = {}, defaultConvId = "default") {
     if (!res.ok) return { ok: false, status: 400, error: res.error };
     return {
       ...res,
-      status: monitor.getStatus({ conversationId: targetConv, scope, refresh: false })
+      status: getScopedStatus({ conversationId: statusTargetConv, scope, refresh: false, includeRichRescue: confirmed })
     };
   }
   if (action === "tick") {
-    return monitor.getStatus({ conversationId: targetConv, scope, refresh: true });
+    return getScopedStatus({ conversationId: statusTargetConv, scope, refresh: true, includeRichRescue: confirmed });
   }
   return {
     ok: false,
@@ -2134,7 +2426,7 @@ export function createStandaloneServer({
           }
           data = { ...data, ...parsed.data };
         }
-        const fieldCheck = validateStringFields(data, ["scope", "conversationId", "sessionId", "sourceId", "cwd"]);
+        const fieldCheck = validateStringFields(data, ["scope", "conversationId", "stallConversationId", "sessionId", "sourceId", "cwd"]);
         if (!fieldCheck.ok) {
           sendJson(res, 400, { error: fieldCheck.error });
           return;
@@ -2148,6 +2440,13 @@ export function createStandaloneServer({
           return;
         }
         if (url.pathname === "/api/resume") {
+          for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+            const bCheck = validateOptionalBooleanField(data, bf);
+            if (!bCheck.ok) {
+              sendJson(res, 400, { error: bCheck.error });
+              return;
+            }
+          }
           sendJson(res, 200, getResumePayload(data));
           return;
         }
@@ -2164,13 +2463,28 @@ export function createStandaloneServer({
           return;
         }
         if (url.pathname === "/api/handoff") {
-          sendJson(res, 200, getHandoffPayload(data));
+          for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+            const bCheck = validateOptionalBooleanField(data, bf);
+            if (!bCheck.ok) {
+              sendJson(res, 400, { error: bCheck.error });
+              return;
+            }
+          }
+          const modeCheck = validateHandoffMode(data.mode, { allowAgent: req.method === "POST" });
+          if (!modeCheck.ok) {
+            sendJson(res, 400, { error: modeCheck.error });
+            return;
+          }
+          sendJson(res, 200, getHandoffPayload({ ...data, mode: modeCheck.mode }));
           return;
         }
         if (url.pathname === "/api/watchdog") {
-          if (data.fromSidecarHost !== undefined && typeof data.fromSidecarHost !== "boolean") {
-            sendJson(res, 400, { error: "Field 'fromSidecarHost' must be a boolean" });
-            return;
+          for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+            const bCheck = validateOptionalBooleanField(data, bf);
+            if (!bCheck.ok) {
+              sendJson(res, 400, { error: bCheck.error });
+              return;
+            }
           }
           sendJson(res, 200, getWatchdogPayload(data));
           return;
@@ -2320,6 +2634,7 @@ if (isDirectRun) {
         : [];
     const watchedBackendFiles = [
       __selfPath,
+      path.resolve(__dirname, "../../context/lib/handoff.js"),
       path.resolve(__dirname, "../../context/lib/watchdog.js"),
       path.resolve(__dirname, "../../context/lib/watchdog-lease.js"),
       path.resolve(__dirname, "../../context/lib/store.js"),
@@ -2452,6 +2767,10 @@ export function registerSidecarRoutes(app) {
     if (!data) return makeBadRequest("Request body must be a JSON object");
     const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
     if (!check.ok) return makeBadRequest(check.error);
+    for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+      const bCheck = validateOptionalBooleanField(data, bf);
+      if (!bCheck.ok) return makeBadRequest(bCheck.error);
+    }
     return getResumePayload(data, app.config?.conversationId);
   }, "POST");
   app.api("/api/source-chunks", (rawData) => {
@@ -2474,9 +2793,15 @@ export function registerSidecarRoutes(app) {
   app.api("/api/handoff", (rawData) => {
     const data = normalizeSidecarBody(rawData);
     if (!data) return makeBadRequest("Request body must be a JSON object");
-    const check = validateStringFields(data, ["scope", "conversationId", "sessionId", "cwd"]);
+    const check = validateStringFields(data, ["scope", "conversationId", "stallConversationId", "sessionId", "cwd"]);
     if (!check.ok) return makeBadRequest(check.error);
-    return getHandoffPayload(data, app.config?.conversationId);
+    for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+      const bCheck = validateOptionalBooleanField(data, bf);
+      if (!bCheck.ok) return makeBadRequest(bCheck.error);
+    }
+    const modeCheck = validateHandoffMode(data.mode, { allowAgent: true });
+    if (!modeCheck.ok) return makeBadRequest(modeCheck.error);
+    return getHandoffPayload({ ...data, mode: modeCheck.mode }, app.config?.conversationId);
   }, "POST");
   app.api("/api/search", (rawData) => {
     const data = normalizeSidecarBody(rawData);
@@ -2548,8 +2873,9 @@ export function registerSidecarRoutes(app) {
     if (!data) return makeBadRequest("Request body must be a JSON object");
     const check = validateStringFields(data, ["scope", "conversationId", "sessionId"]);
     if (!check.ok) return makeBadRequest(check.error);
-    if (data.fromSidecarHost !== undefined && typeof data.fromSidecarHost !== "boolean") {
-      return makeBadRequest("Field 'fromSidecarHost' must be a boolean");
+    for (const bf of ["fromSidecarHost", "conversationConfirmed"]) {
+      const bCheck = validateOptionalBooleanField(data, bf);
+      if (!bCheck.ok) return makeBadRequest(bCheck.error);
     }
     return getWatchdogPayload(data, app.config?.conversationId);
   }, "POST");
