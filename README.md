@@ -14,6 +14,7 @@ No extra dependencies · Works automatically in the background · Built-in Sidec
 [![Node.js 22.16+ (22.x) or 24+](https://img.shields.io/badge/Node.js-22.16%2B_(22.x)_or_24%2B-38bdf8.svg)](package.json)
 [![Security Policy](https://img.shields.io/badge/Security-Policy-818cf8.svg)](SECURITY.md)
 [![Glama MCP](https://glama.ai/mcp/servers/zou172866/agy-dart/badges/score.svg)](https://glama.ai/mcp/servers/zou172866/agy-dart)
+[![Clones](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zou172866/repo-traffic-archive/main/badges/Antigravity-agy-dart.json)](https://github.com/zou172866/repo-traffic-archive)
 
 [How to Install](#how-to-install) · [Changelog](#changelog) · [Security](SECURITY.md) · [Third-Party Notices](THIRD_PARTY_NOTICES.md)
 
