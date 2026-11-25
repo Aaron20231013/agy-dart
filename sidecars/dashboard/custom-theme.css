@@ -952,6 +952,21 @@ code {
   border-color: var(--border);
 }
 
+.cutoff-num-input {
+  width: 42px;
+  background: var(--bg-card);
+  border-color: var(--border);
+  color: var(--text-primary);
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.cutoff-num-input::-webkit-inner-spin-button,
+.cutoff-num-input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
 .ext-chip {
   background: var(--bg-card);
   border-color: var(--border-strong);
@@ -988,6 +1003,80 @@ details.accordion-band > summary.accordion-summary:hover {
   border-bottom-color: var(--accent-border);
 }
 
+/* Band 1b: Remaining Quota & Local Rolling Spend (v1.7+ warm paper + container-aware) */
+.quota-buckets-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.quota-bucket-item {
+  background: var(--bg-card);
+  border-color: var(--border);
+  box-shadow: var(--shadow-xs);
+}
+
+.quota-bar-track {
+  background: rgba(44, 38, 31, 0.08);
+}
+
+.quota-bar-fill {
+  background: var(--ok);
+  transition: width 240ms var(--ease-ui), background-color 200ms var(--ease-ui);
+}
+
+.quota-bar-fill.is-warn {
+  background: var(--warn);
+}
+
+.quota-bar-fill.is-critical {
+  background: var(--danger);
+}
+
+.quota-empty-note {
+  background: var(--bg-surface-raised);
+  border-color: var(--border-strong);
+}
+
+.quota-setup-drawer {
+  background: var(--bg-surface-raised);
+  border-color: var(--border-strong);
+}
+
+.quota-setup-pre {
+  background: var(--bg-card);
+  border-color: var(--border);
+}
+
+.quota-win-tab.is-active {
+  background: var(--accent);
+  color: #fdfaf2;
+}
+
+.quota-kpi-3 .kpi-cell {
+  min-width: 0;
+  padding: 7px 8px;
+}
+
+.quota-kpi-3 .kpi-value {
+  font-size: 14px;
+}
+
+.quota-kpi-3 .kpi-sub {
+  font-size: 10.5px;
+}
+
+.quota-mini-bar-wrap {
+  background: rgba(44, 38, 31, 0.06);
+}
+
+.quota-mini-bar-fill {
+  background: var(--accent);
+  transition: height 200ms var(--ease-ui);
+}
+
+.quota-mini-bar-fill.is-zero {
+  background: transparent;
+}
+
 /* Ultra-narrow safety (< 268px): allow toolbar & TTL head to wrap gracefully */
 @container dashboard (max-width: 268px) {
   .ctx-overview-box > .band-head > .band-actions {
@@ -1010,6 +1099,10 @@ details.accordion-band > summary.accordion-summary:hover {
 
   .comp-legend-item > :nth-child(4) {
     display: none;
+  }
+
+  .quota-kpi-3 {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -1136,6 +1229,22 @@ details.accordion-band > summary.accordion-summary:hover {
 
   .accordion-body {
     padding: 0 16px 16px;
+  }
+
+  .quota-buckets-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .quota-kpi-3 .kpi-cell {
+    padding: 10px 12px;
+  }
+
+  .quota-kpi-3 .kpi-value {
+    font-size: 16px;
+  }
+
+  .quota-kpi-3 .kpi-sub {
+    font-size: 11.5px;
   }
 }
 
